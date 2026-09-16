@@ -7,8 +7,6 @@
 
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { INSTALL_SYMBOL } from "./skills-manager/constants.js";
-import { createSkillFromAnswers } from "./skills-manager/creation.js";
-import { showSkillsManager } from "./skills-manager/dialog.js";
 import { recordProjectTrust } from "./skills-manager/paths.js";
 import { deleteSkill, loadSkillRegistry } from "./skills-manager/registry.js";
 import { settingBoolean, updatePackageConfig } from "./skills-manager/settings.js";
@@ -99,10 +97,19 @@ export default function skillsManager(pi: ExtensionAPI): void {
 				ctx.ui.notify("/skill manager requires interactive mode", "warning");
 				return;
 			}
+			let createSkillFromAnswers: typeof import("./skills-manager/creation.js").createSkillFromAnswers;
+			let showSkillsManager: typeof import("./skills-manager/dialog.js").showSkillsManager;
 			try {
 				await refreshRegistry(ctx.cwd);
+				[
+					{ createSkillFromAnswers },
+					{ showSkillsManager },
+				] = await Promise.all([
+					import("./skills-manager/creation.js"),
+					import("./skills-manager/dialog.js"),
+				]);
 			} catch (error) {
-				ctx.ui.notify(`Failed to load skills list: ${errorMessage(error)}`, "error");
+				ctx.ui.notify(`Failed to load skills manager: ${errorMessage(error)}`, "error");
 				return;
 			}
 			const selection = await showSkillsManager(ctx, registry, {
