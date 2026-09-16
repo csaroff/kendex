@@ -39,6 +39,15 @@ function packageConfigFromFile(file: SettingsFile): Record<string, unknown> | un
 	return asRecord(asRecord(asRecord(file.json.kendex)?.extensionManager)?.config)?.[PACKAGE_ID] as Record<string, unknown> | undefined;
 }
 
+export function piQuietStartup(cwd = process.cwd()): boolean {
+	const files = piSettingsFiles(cwd);
+	for (let index = files.length - 1; index >= 0; index--) {
+		const value = files[index]?.json.quietStartup;
+		if (typeof value === "boolean") return value;
+	}
+	return false;
+}
+
 // One reader for this package, in paths.ts, the way the other packages do it.
 // piSettingsFiles below stays for the write path, which needs the parsed file
 // and must throw on malformed JSON rather than overwrite it.

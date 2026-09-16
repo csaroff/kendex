@@ -2,7 +2,6 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { ExtensionInstallScope } from "./types.js";
 
 export function expandHome(input: string): string {
@@ -104,7 +103,7 @@ export function detectExtensionInstallScope(cwd: string): ExtensionInstallScope 
 	try {
 		const extensionFile = fileURLToPath(import.meta.url);
 		if (isWithin(extensionFile, findProjectPiDir(cwd))) return "project";
-		if (isWithin(extensionFile, getAgentDir())) return "global";
+		if (isWithin(extensionFile, userPiDir())) return "global";
 	} catch {
 		// Fall through to global for unusual loaders.
 	}
