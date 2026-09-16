@@ -16,6 +16,17 @@ mock.module("../extensions/skills-manager/startup.js", () => {
 		setStartupHideEnabled() {},
 	};
 });
+mock.module("../extensions/skills-manager/registry.js", () => {
+	loaded.push("registry");
+	return {
+		deleteSkill: async () => undefined,
+		loadSkillRegistry: async () => ({ skills: [] }),
+	};
+});
+mock.module("../extensions/skills-manager/toggle.js", () => {
+	loaded.push("toggle");
+	return { setSkillEnabled: async () => undefined };
+});
 mock.module("../extensions/skills-manager/creation.js", () => {
 	loaded.push("creation");
 	return { createSkillFromAnswers: async () => undefined };
@@ -47,9 +58,9 @@ test("startup registers the skill manager without loading its interactive UI", a
 		ui: { notify() {}, pasteToEditor() {} },
 	});
 
-	assert.deepEqual(new Set(loaded), new Set(["creation", "dialog"]));
+	assert.deepEqual(new Set(loaded), new Set(["registry", "toggle", "creation", "dialog"]));
 
 	startup.quiet = false;
 	await skillsManager({ registerCommand() {}, on() {} } as never);
-	assert.deepEqual(new Set(loaded), new Set(["creation", "dialog", "startup-patch"]));
+	assert.deepEqual(new Set(loaded), new Set(["registry", "toggle", "creation", "dialog", "startup-patch"]));
 });
