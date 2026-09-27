@@ -93,12 +93,7 @@ mod symbols;
 mod tokens;
 
 pub use blocks::{finish, flush, intro};
-#[expect(
-    unused_imports,
-    reason = "the type a link takes; the verbs converted after the pilot name it"
-)]
-pub use components::Target;
-pub use components::{Choice, Key, Status, Value};
+pub use components::{Choice, Key, Status, Target, Value};
 pub use keys::{choose, consent, typed};
 pub use live::Spinner;
 pub use modes::{Channel, Span, Style, channel, style};
@@ -289,11 +284,6 @@ pub fn note(line: &str) {
 /// A line about something that will not work as the reader expects.
 pub fn warn(line: &str) {
     tell(Tone::Warn, line);
-}
-
-/// A line about something that did not happen.
-pub fn fail(line: &str) {
-    tell(Tone::Error, line);
 }
 
 /// One composed line, escaped at the seam and then said. Nothing survives

@@ -1,11 +1,12 @@
 use clap::Args;
 
 use kendex_core::env::Env;
-use kendex_core::package::diff::{FileStatus, LineKind, VersionSel};
+use kendex_core::package::diff::{FileStatus, LineKind, PackageDiff, VersionSel};
 
 use super::pin::parse_kind;
-use super::{CliResult, resolve_scopes, say};
+use super::{CliResult, resolve_scopes};
 use crate::scope::ScopeFilter;
+use crate::ui::{self, Span, Status, Style};
 
 #[derive(Args)]
 pub struct DiffArgs {
@@ -52,16 +53,32 @@ pub fn run(env: &Env, args: DiffArgs) -> CliResult {
     let diff = kendex_core::package::diff::package_diff(
         env, &scope, kind, &args.name, &from, &to, harness,
     )?;
+    let style = ui::style();
+    ui::stderr(&style.header("diff", &args.name));
+    ui::stderr(&screen(&style, &diff));
+    Ok(())
+}
+
+fn screen(style: &Style, diff: &PackageDiff) -> Vec<String> {
     if diff.files.is_empty() {
-        say("no changes");
-        return Ok(());
+        return style.summary(Status::Done, "no changes");
     }
-    say(&format!(
+    let summary = format!(
         "+{} -{}{}",
         diff.total_additions,
         diff.total_deletions,
         if diff.truncated { "  (truncated)" } else { "" }
-    ));
+    );
+    let (mut lines, closing) = style.report_totals(
+        "changes",
+        diff.files.len(),
+        if diff.truncated {
+            Status::Notice
+        } else {
+            Status::Done
+        },
+        &summary,
+    );
     for file in &diff.files {
         let status = match file.status {
             FileStatus::Added => " (added)",
@@ -70,25 +87,26 @@ pub fn run(env: &Env, args: DiffArgs) -> CliResult {
             FileStatus::Binary => " (binary)",
             FileStatus::TooLarge => " (too large to show)",
         };
-        // The blank line before each heading is said rather than written
-        // into the line: a break in a value is a value's break, and only
-        // a call is a break of this verb's own.
-        say("");
-        say(&format!(
+        let label = format!(
             "{}{status}  +{} -{}",
             file.path, file.additions, file.deletions
-        ));
+        );
+        lines.extend(style.report_group(Status::Notice, &[Span::Prose(&label)], ""));
         for hunk in &file.hunks {
-            say(&hunk.header);
+            lines.extend(style.report_verbatim(None, &hunk.header));
             for line in &hunk.lines {
-                let marker = match line.kind {
-                    LineKind::Context => ' ',
-                    LineKind::Add => '+',
-                    LineKind::Remove => '-',
+                let (marker, status) = match line.kind {
+                    LineKind::Context => (' ', None),
+                    LineKind::Add => ('+', Some(Status::Done)),
+                    LineKind::Remove => ('-', Some(Status::Decision)),
                 };
-                say(&format!("{marker}{}", line.text));
+                lines.extend(style.report_verbatim(status, &format!("{marker}{}", line.text)));
             }
         }
     }
-    Ok(())
+    lines.extend(closing);
+    lines
 }
+
+#[cfg(test)]
+mod tests;

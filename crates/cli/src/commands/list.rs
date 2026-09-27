@@ -3,8 +3,10 @@ use kendex_core::model::{HarnessId, Scope};
 use kendex_core::scan::WarningStanding;
 use kendex_core::{scan, settings};
 
-use super::{CliResult, note, resolve_scopes, say};
+use super::{CliResult, resolve_scopes};
 use crate::scope::ScopeFilter;
+use crate::ui::report::PlainColumns;
+use crate::ui::{self, Span, Status, Style};
 
 pub fn run(env: &Env, filter: ScopeFilter, harness: Option<String>) -> CliResult {
     let harness = harness
@@ -14,12 +16,12 @@ pub fn run(env: &Env, filter: ScopeFilter, harness: Option<String>) -> CliResult
     let app_settings = settings::load(env)?;
     let result = scan::scan_scopes(env, &app_settings.harness_roots, &scopes);
 
-    let rows: Vec<[String; 5]> = result
+    let rows: Vec<Vec<String>> = result
         .items
         .iter()
         .filter(|i| harness.is_none_or(|h| i.harness == h))
         .map(|i| {
-            [
+            vec![
                 i.kind.name().to_owned(),
                 i.name.clone(),
                 i.harness.name().to_owned(),
@@ -35,33 +37,37 @@ pub fn run(env: &Env, filter: ScopeFilter, harness: Option<String>) -> CliResult
         })
         .collect();
 
-    if rows.is_empty() {
-        say("no packages found");
-    } else {
-        let mut widths = [0usize; 5];
-        for row in &rows {
-            for (w, cell) in widths.iter_mut().zip(row) {
-                *w = (*w).max(cell.len());
-            }
-        }
-        for row in &rows {
-            let line = row
-                .iter()
-                .zip(widths)
-                .map(|(cell, w)| format!("{cell:w$}"))
-                .collect::<Vec<_>>()
-                .join("  ");
-            say(line.trim_end());
-        }
-    }
+    let style = ui::style();
+    let target = scopes
+        .iter()
+        .map(Scope::label)
+        .collect::<Vec<_>>()
+        .join(", ");
+    ui::stderr(&style.header("list", &target));
+    ui::stderr(&listing(&style, &rows));
     for warning in &result.warnings {
-        match warning.standing {
-            WarningStanding::Actionable => say(&format!("warning: {warning}")),
-            // The reading stands; the word asking for a repair does not.
-            // Nothing here is missing, so the line is a diagnostic and the
-            // reader is not sent to edit another program's file.
-            WarningStanding::UnusedEmptyContainer => note(&warning.to_string()),
-        }
+        let text = warning.to_string();
+        ui::stderr(&match warning.standing {
+            WarningStanding::Actionable => style.report_warning(&text),
+            WarningStanding::UnusedEmptyContainer => {
+                style.report_row(Status::Notice, &[Span::Prose(&text)], "")
+            }
+        });
     }
     Ok(())
 }
+
+fn listing(style: &Style, rows: &[Vec<String>]) -> Vec<String> {
+    if rows.is_empty() {
+        return style.summary(Status::Done, "no packages found");
+    }
+    style.report_table(
+        "packages",
+        &["kind", "name", "harness", "scope", "state"],
+        rows,
+        PlainColumns::Padded,
+    )
+}
+
+#[cfg(test)]
+mod tests;

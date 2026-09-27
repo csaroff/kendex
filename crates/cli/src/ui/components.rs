@@ -218,18 +218,45 @@ impl Style {
                 .trim_end()
                 .to_owned(),
             ],
-            Look::Rich { palette, .. } => vec![
-                format!(
+            Look::Rich { palette, width } => {
+                let line = format!(
                     "  {}  {} {} {}  {}",
                     strong(palette, Token::Emphasis, &name),
                     paint(palette, Token::Muted, &old),
                     paint(palette, Token::Accent, arrow),
                     new,
-                    paint(palette, Token::Muted, &scope.unwrap_or_default()),
+                    paint(palette, Token::Muted, scope.as_deref().unwrap_or_default()),
                 )
                 .trim_end()
-                .to_owned(),
-            ],
+                .to_owned();
+                if cells(&line) <= width {
+                    return vec![line];
+                }
+                // Stacked where the one line does not fit: the name, then
+                // the versions and the scope indented under it.
+                let mut lines = fitted(width, "  ", 2, 2, &[Span::Prose(&name)], |chunk| {
+                    strong(palette, Token::Emphasis, chunk)
+                });
+                lines.extend(fitted(
+                    width,
+                    "    ",
+                    4,
+                    4,
+                    &[Span::Prose(&format!("{old} {arrow} {new}"))],
+                    |chunk| paint(palette, Token::Info, chunk),
+                ));
+                if let Some(scope) = scope {
+                    lines.extend(fitted(
+                        width,
+                        "    ",
+                        4,
+                        4,
+                        &[Span::Prose(&scope)],
+                        |chunk| paint(palette, Token::Muted, chunk),
+                    ));
+                }
+                lines
+            }
         }
     }
 
@@ -338,17 +365,26 @@ impl Style {
     /// so the text still reads there; plain is the text alone.
     pub fn link(&self, text: &str, target: Target<'_>) -> Vec<String> {
         let text = escaped(text);
-        let Look::Rich { palette, .. } = self.look else {
+        let Look::Rich { palette, width } = self.look else {
             return vec![format!("  {text}")];
         };
         let url = match target {
             Target::Url(url) => escaped(url),
             Target::File(path) => file_url(path),
         };
-        vec![format!(
-            "  \x1b]8;;{url}\x1b\\{}\x1b]8;;\x1b\\",
-            paint(palette, Token::Info, &text)
-        )]
+        wrap(
+            &[Span::Prose(&text)],
+            width.saturating_sub(2),
+            width.saturating_sub(2),
+        )
+        .into_iter()
+        .map(|line| {
+            format!(
+                "  \x1b]8;;{url}\x1b\\{}\x1b]8;;\x1b\\",
+                paint(palette, Token::Info, &line)
+            )
+        })
+        .collect()
     }
 
     /// Columns sized to their widest cell, a rule under the header.
@@ -358,7 +394,7 @@ impl Style {
             .iter()
             .map(|row| row.iter().map(|cell| escaped(cell)).collect())
             .collect();
-        let widths: Vec<usize> = (0..headers.len())
+        let mut widths: Vec<usize> = (0..headers.len())
             .map(|column| {
                 std::iter::once(&headers)
                     .chain(&rows)
@@ -368,6 +404,18 @@ impl Style {
                     .unwrap_or(0)
             })
             .collect();
+        if let Look::Rich { width, .. } = self.look {
+            let room = width.saturating_sub(2 + 2 * widths.len().saturating_sub(1));
+            while widths.iter().sum::<usize>() > room {
+                let Some(widest) = widths.iter_mut().max() else {
+                    break;
+                };
+                if *widest <= 1 {
+                    break;
+                }
+                *widest -= 1;
+            }
+        }
         let laid = |row: &[String], paint_cell: &dyn Fn(&str) -> String| {
             row.iter()
                 .zip(&widths)
@@ -387,17 +435,28 @@ impl Style {
             Look::Rich { palette, .. } => {
                 let rule_cells = widths.iter().sum::<usize>() + 2 * widths.len().saturating_sub(1);
                 let rule = self.glyph(Symbol::Separator).repeat(rule_cells);
-                let header = laid(&headers, &|cell| strong(palette, Token::Muted, cell));
-                [
-                    format!("  {header}"),
-                    format!("  {}", paint(palette, Token::Muted, &rule)),
-                ]
-                .into_iter()
-                .chain(
-                    rows.iter()
-                        .map(|row| format!("  {}", laid(row, &str::to_owned))),
-                )
-                .collect()
+                let wrapped = |row: &[String], paint_cell: &dyn Fn(&str) -> String| {
+                    let columns: Vec<Vec<String>> = row
+                        .iter()
+                        .zip(&widths)
+                        .map(|(cell, room)| wrap(&[Span::Prose(cell)], *room, *room))
+                        .collect();
+                    (0..columns.iter().map(Vec::len).max().unwrap_or(0))
+                        .map(|line| {
+                            let row = columns
+                                .iter()
+                                .map(|column| column.get(line).cloned().unwrap_or_default())
+                                .collect::<Vec<_>>();
+                            format!("  {}", laid(&row, paint_cell))
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let mut lines = wrapped(&headers, &|cell| strong(palette, Token::Muted, cell));
+                lines.push(format!("  {}", paint(palette, Token::Muted, &rule)));
+                for row in &rows {
+                    lines.extend(wrapped(row, &str::to_owned));
+                }
+                lines
             }
         }
     }
@@ -493,8 +552,16 @@ impl Style {
     }
 }
 
-/// Spans with each run escaped, and whether it is a command kept.
-pub(super) struct Escaped(Vec<(bool, String)>);
+/// Which kind of span a run of text was, kept beside its escaped text.
+#[derive(Clone, Copy)]
+enum Shape {
+    Prose,
+    Command,
+    Verbatim,
+}
+
+/// Spans with each run escaped, and the kind each was kept.
+pub(super) struct Escaped(Vec<(Shape, String)>);
 
 impl From<&[Span<'_>]> for Escaped {
     fn from(spans: &[Span<'_>]) -> Escaped {
@@ -502,8 +569,9 @@ impl From<&[Span<'_>]> for Escaped {
             spans
                 .iter()
                 .map(|span| match span {
-                    Span::Prose(text) => (false, escaped(text)),
-                    Span::Command(text) => (true, escaped(text)),
+                    Span::Prose(text) => (Shape::Prose, escaped(text)),
+                    Span::Command(text) => (Shape::Command, escaped(text)),
+                    Span::Verbatim(text) => (Shape::Verbatim, escaped(text)),
                 })
                 .collect(),
         )
@@ -514,9 +582,10 @@ impl Escaped {
     fn spans(&self) -> Vec<Span<'_>> {
         self.0
             .iter()
-            .map(|(command, text)| match command {
-                true => Span::Command(text),
-                false => Span::Prose(text),
+            .map(|(shape, text)| match shape {
+                Shape::Prose => Span::Prose(text),
+                Shape::Command => Span::Command(text),
+                Shape::Verbatim => Span::Verbatim(text),
             })
             .collect()
     }

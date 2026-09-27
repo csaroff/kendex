@@ -64,21 +64,38 @@ pub fn fail_refusal(headline: &str, error: &(dyn std::error::Error + 'static)) {
     }
 }
 
+impl super::Style {
+    /// A refusal within a component report: the same door choice as
+    /// [`fail_refusal`]. The headline and the error's first line are one
+    /// failed row, opening plain on the `! ` refusal key and rich on the
+    /// failed glyph; the error's further lines are its own text, a
+    /// parser's diagram among them, drawn verbatim under the row.
+    pub fn refusal(
+        &self,
+        headline: &str,
+        error: &(dyn std::error::Error + 'static),
+    ) -> Vec<String> {
+        use super::{Span, Status};
+        let (headline, body) = parts(headline, error);
+        body.iter()
+            .enumerate()
+            .flat_map(|(at, line)| match at {
+                0 => self.report_row(
+                    Status::Failed,
+                    &[Span::Prose(&headline), Span::Verbatim(line)],
+                    "! ",
+                ),
+                _ => self.report_verbatim(None, line),
+            })
+            .collect()
+    }
+}
+
 /// The lines a refusal prints on: the headline on the first, then the
 /// error's own text, escaped a line at a time where it wrote the breaks and
 /// escaped whole where it did not.
-///
-/// One place, so the two doors cannot drift apart, and no call site is
-/// handed the choice: a `&str` door is one a future caller can reach for
-/// with a message it composed out of values nobody escaped, and a value
-/// carrying a break would then forge a line of the verdict.
 fn lines(headline: &str, error: &(dyn std::error::Error + 'static)) -> Vec<String> {
-    let text = error.to_string();
-    let body: Vec<String> = match owns_its_breaks(error) {
-        true => text.split('\n').map(escaped).collect(),
-        false => vec![escaped(&text)],
-    };
-    let headline = escaped(headline);
+    let (headline, body) = parts(headline, error);
     body.into_iter()
         .enumerate()
         .map(|(at, line)| match at {
@@ -86,6 +103,23 @@ fn lines(headline: &str, error: &(dyn std::error::Error + 'static)) -> Vec<Strin
             _ => line,
         })
         .collect()
+}
+
+/// The escaped headline, and the error's text as the lines it prints on:
+/// one per break where it wrote the breaks, one whole line where it did
+/// not.
+///
+/// One place, so the two doors cannot drift apart, and no call site is
+/// handed the choice: a `&str` door is one a future caller can reach for
+/// with a message it composed out of values nobody escaped, and a value
+/// carrying a break would then forge a line of the verdict.
+fn parts(headline: &str, error: &(dyn std::error::Error + 'static)) -> (String, Vec<String>) {
+    let text = error.to_string();
+    let body: Vec<String> = match owns_its_breaks(error) {
+        true => text.split('\n').map(escaped).collect(),
+        false => vec![escaped(&text)],
+    };
+    (escaped(headline), body)
 }
 
 /// Whether this error wrote the breaks it holds: core's manifest refusal,
@@ -143,6 +177,42 @@ mod tests {
         assert_eq!(
             component_lines(&plain(), foreign.as_ref()),
             ["Error: name\\nwith\\u{1b}[31m"]
+        );
+    }
+
+    #[test]
+    fn inspection_refusal_keeps_error_boundaries_and_escapes_values() {
+        use crate::ui::testing::{plain, rich, tagged};
+        let error = Lines("first\nsecond".into());
+        assert_eq!(
+            plain().refusal("bad\npath: ", &error),
+            ["! bad\\npath: first", "second"]
+        );
+        assert_eq!(
+            tagged(&rich(80).refusal("bad\npath: ", &error)),
+            ["  <31>✗</> bad\\npath: first", "    <90>second</>"]
+        );
+        let value: Box<dyn std::error::Error> = "first\nsecond".into();
+        assert_eq!(
+            plain().refusal("error: ", value.as_ref()),
+            ["! error: first\\nsecond"]
+        );
+        // A parser's diagram keeps its indentation and its caret column,
+        // and its trailing empty line stays a line.
+        let diagram = Lines("bad\n  |\n1 | x =\n  |     ^\n".into());
+        assert_eq!(
+            plain().refusal("error: ", &diagram),
+            ["! error: bad", "  |", "1 | x =", "  |     ^", ""]
+        );
+        assert_eq!(
+            tagged(&rich(80).refusal("error: ", &diagram)),
+            [
+                "  <31>✗</> error: bad",
+                "    <90>  |</>",
+                "    <90>1 | x =</>",
+                "    <90>  |     ^</>",
+                "    ",
+            ]
         );
     }
 
