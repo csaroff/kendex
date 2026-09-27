@@ -1,0 +1,1 @@
+- CLI setup, sign-in and problem reports use the shared terminal style. Help opens with a command description before usage and options.

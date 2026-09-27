@@ -1,0 +1,20 @@
+List available versions of a package
+
+Usage: kendex versions [OPTIONS] <KIND> <NAME>
+
+Arguments:
+  <KIND>
+          agent | skill | hook | command | mcp-server | pi-extension
+
+  <NAME>
+          
+
+Options:
+  -g, --global
+          Use your personal setup instead of this project
+
+      --scope <SCOPE>
+          project | global (default project)
+
+  -h, --help
+          Print help
