@@ -1,7 +1,7 @@
 //! The terminal's rows, pinned to the design's words. The states are
 //! driven end to end through the binary in `tests/commit_offer_cli.rs`;
 //! what that child cannot reach — the interactive block's lines, its
-//! numbered choices and how an answer is read — is composed here.
+//! keyed choices and how an answer is read — is composed here.
 
 use std::path::{Path, PathBuf};
 
@@ -12,6 +12,8 @@ use kendex_core::commit_offer::{
 
 use super::block;
 use super::{Choice, Outcome};
+use crate::ui::Style;
+use crate::ui::testing::{asked, plain, rich, tagged};
 
 fn scan() -> Scan {
     Scan {
@@ -79,11 +81,11 @@ fn the_head_line_carries_the_scope_and_the_count() {
     );
 }
 
-/// The four choices in the design's order, renumbered as the preconditions
-/// remove them, `leave` always last; an open pull request rewords `push`
-/// and takes `pr` away. One row per precondition.
+/// The four choices in the design's order, skipping the ones the
+/// preconditions remove, `leave` always last; an open pull request rewords
+/// `push` and takes `pr` away. One row per precondition.
 #[test]
-fn the_choices_are_numbered_in_order_skipping_the_removed_ones() {
+fn the_choices_keep_their_order_skipping_the_removed_ones() {
     type Shape = fn(&mut Offer);
     let rows: [(&str, Shape, &[&str]); 5] = [
         (
@@ -267,21 +269,250 @@ fn a_removed_choice_prints_its_reason() {
     }
 }
 
-/// An answer that is not one of the printed numbers is `leave`: a typo, a
-/// `9`, an `x`, a bare Enter and an end of input alike.
+/// Each question's table: every choice is taken by its own key, and Enter
+/// takes the default, which never writes, pushes or opens anything except
+/// on the message question, whose default is the offered message. With
+/// `pr` gone its key picks nothing. One row per key.
 #[test]
-fn an_answer_off_the_list_leaves_the_files_as_diffs() {
-    let choices = block::choices(&offer());
-    assert_eq!(block::picked(&choices, "1"), Choice::Commit);
-    assert_eq!(block::picked(&choices, " 2\n"), Choice::Push);
-    assert_eq!(block::picked(&choices, "3"), Choice::Pr);
-    assert_eq!(block::picked(&choices, "4"), Choice::Leave);
-    for off in ["", "0", "5", "9", "x", "yes"] {
-        assert_eq!(block::picked(&choices, off), Choice::Leave, "{off:?}");
+fn each_choice_is_taken_by_its_key() {
+    use console::Key as Pressed;
+    use std::fmt::Debug;
+
+    #[track_caller]
+    fn taken<T: Copy + PartialEq + Debug>(
+        options: &[(crate::ui::Choice<'_>, T)],
+        rows: &[(Vec<Pressed>, T)],
+    ) {
+        for (keys, want) in rows {
+            let (_, answer) = asked(&plain(), options, keys);
+            assert_eq!(answer.ok(), Some(*want), "{keys:?}");
+        }
     }
-    // Renumbered: with `pr` gone, `3` is `leave`.
+
+    let everything = block::choices(&offer());
+    taken(
+        &block::keyed(&everything),
+        &[
+            (vec![Pressed::Char('c')], Choice::Commit),
+            (vec![Pressed::Char('p')], Choice::Push),
+            (vec![Pressed::Char('r')], Choice::Pr),
+            (vec![Pressed::Enter], Choice::Leave),
+        ],
+    );
     let without = block::without_pull_request(&offer());
-    assert_eq!(block::picked(&without, "3"), Choice::Leave);
+    taken(
+        &block::keyed(&without),
+        &[(vec![Pressed::Char('r'), Pressed::Char('c')], Choice::Commit)],
+    );
+    taken(
+        &block::after_refusal_choices(true),
+        &[
+            (
+                vec![Pressed::Char('a')],
+                block::AfterRefusal::Retry(block::Retry::Same),
+            ),
+            (
+                vec![Pressed::Char('m')],
+                block::AfterRefusal::Retry(block::Retry::Different),
+            ),
+            (vec![Pressed::Char('?')], block::AfterRefusal::Show),
+            (
+                vec![Pressed::Enter],
+                block::AfterRefusal::Retry(block::Retry::Leave),
+            ),
+        ],
+    );
+    taken(
+        &block::after_refusal_choices(false),
+        &[(
+            vec![Pressed::Char('?'), Pressed::Enter],
+            block::AfterRefusal::Retry(block::Retry::Leave),
+        )],
+    );
+    taken(
+        &block::AFTER_PUSH_REFUSAL,
+        &[
+            (vec![Pressed::Char('r')], block::Recover::PullRequest),
+            (vec![Pressed::Enter], block::Recover::Leave),
+        ],
+    );
+    taken(
+        &block::MESSAGE,
+        &[
+            (vec![Pressed::Char('e')], block::Message::Type),
+            (vec![Pressed::Enter], block::Message::Use),
+        ],
+    );
+    taken(
+        &block::stale_choices("set up bot-instructions here"),
+        &[
+            (vec![Pressed::Char('s')], block::Held::SetUp),
+            (vec![Pressed::Enter], block::Held::Leave),
+        ],
+    );
+}
+
+/// A small offer: two paths, a shared file, one other file, and no `gh`.
+fn small() -> Offer {
+    let mut small = offer();
+    small.scan.owned.truncate(2);
+    small.scan.others = 1;
+    small.pull_request = Err(Unavailable::GhMissing);
+    small
+}
+
+/// The offer and its question in both renderings, and what each answer
+/// draws: a key takes its choice and Enter leaves the files as diffs. A
+/// cancel draws the buttons and nothing under them, which `ui::keys` pins.
+#[test]
+fn the_offer_draws_accept_and_decline() {
+    use console::Key as Pressed;
+    let rich_offer = [
+        "",
+        "<33>!</> <1>/home/method/dev/site: 2 files kendex wrote are not committed</>",
+        "  <36>•</> .claude/skills/1/SKILL.md",
+        "  <36>•</> .claude/skills/2/SKILL.md",
+        "  <33>!</> kendex also changed 1 shared file; it writes one key in each, so committing them would commit",
+        "    your own changes to them too",
+        "    <90>.claude/settings.json</>",
+        "  <36>•</> 1 other file in this repository changed; kendex leaves those alone",
+        "  <36>•</> no pull request: gh is not installed",
+        "  <34>[c]</> <90>commit them</><90> · </><34>[p]</> <90>commit them and push to origin/main</><90> · </><1;34>[Enter]</> <1>leave them as diffs</>",
+    ];
+    let plain_offer = [
+        "! /home/method/dev/site: 2 files kendex wrote are not committed",
+        "  .claude/skills/1/SKILL.md",
+        "  .claude/skills/2/SKILL.md",
+        "  kendex also changed 1 shared file; it writes one key in each, so committing them would commit your own changes to them too",
+        "    .claude/settings.json",
+        "  1 other file in this repository changed; kendex leaves those alone",
+        "  no pull request: gh is not installed",
+        "  [c] commit them · [p] commit them and push to origin/main · [Enter] leave them as diffs",
+    ];
+    type Row = (
+        &'static str,
+        Pressed,
+        Choice,
+        &'static [&'static str],
+        &'static [&'static str],
+    );
+    let rows: [Row; 2] = [
+        (
+            "accept",
+            Pressed::Char('c'),
+            Choice::Commit,
+            &["  <34>›</> <1>commit them</>"],
+            &["  › commit them"],
+        ),
+        (
+            "decline",
+            Pressed::Enter,
+            Choice::Leave,
+            &["  <34>›</> <1>leave them as diffs</>"],
+            &["  › leave them as diffs"],
+        ),
+    ];
+    let offered = small();
+    for (what, key, want, rich_tail, plain_tail) in rows {
+        for (style, head, tail) in [
+            (rich(100), &rich_offer[..], rich_tail),
+            (plain(), &plain_offer[..], plain_tail),
+        ] {
+            let mut drawn = block::offer(&style, &offered);
+            let (lines, answer) = asked(
+                &style,
+                &block::keyed(&block::choices(&offered)),
+                std::slice::from_ref(&key),
+            );
+            drawn.extend(lines);
+            let wanted: Vec<&str> = head.iter().chain(tail.iter()).copied().collect();
+            assert_eq!(tagged(&drawn), wanted, "{what}");
+            assert_eq!(answer.ok(), Some(want), "{what}");
+        }
+    }
+}
+
+/// A refusal in both renderings: a flag naming a choice the offer lost,
+/// and a commit the repository's check refused, its findings first and
+/// the rest behind the show key.
+#[test]
+fn a_refusal_draws_its_reason_and_the_programs_words() {
+    let offered = small();
+    let reason = block::not_on_offer(&offered, Choice::Pr).expect("gh is missing");
+    let failed = Failed {
+        step: Step::Commit,
+        refusal: Refusal::Said(vec![
+            "commit-guards: step=doc-limits".to_owned(),
+            "bot-instructions: findings=1".to_owned(),
+            "drift: AGENTS.md differs from a fresh render".to_owned(),
+            "commit-guards: result=1".to_owned(),
+        ]),
+    };
+    let rows: [(Style, &[&str]); 2] = [
+        (
+            rich(100),
+            &[
+                "",
+                "<33>!</> <1>/home/method/dev/site: 2 files kendex wrote are not committed</>",
+                "  <31>✗</> no pull request: gh is not installed",
+                "  <31>✗</> the commit was refused",
+                "  <36>•</> the repository's commit check found problems:",
+                "    <90>bot-instructions: findings=1</>",
+                "    <90>drift: AGENTS.md differs from a fresh render</>",
+                "  <36>•</> the commit check printed 2 more lines",
+                "  <34>[a]</> <90>commit again with the same message</><90> · </><34>[m]</> <90>commit again with a different message</>",
+                "  <34>[?]</> <90>show everything the commit check printed</><90> · </><1;34>[Enter]</> <1>leave them as diffs</>",
+            ],
+        ),
+        (
+            plain(),
+            &[
+                "! /home/method/dev/site: 2 files kendex wrote are not committed",
+                "  no pull request: gh is not installed",
+                "  the commit was refused",
+                "  the repository's commit check found problems:",
+                "    bot-instructions: findings=1",
+                "    drift: AGENTS.md differs from a fresh render",
+                "  the commit check printed 2 more lines",
+                "  [a] commit again with the same message · [m] commit again with a different message · [?] show everything the commit check printed · [Enter] leave them as diffs",
+            ],
+        ),
+    ];
+    for (style, want) in rows {
+        let mut drawn = block::flag_refused(&style, &offered, Choice::Pr, &reason);
+        let (lines, more) = block::commit_refused(&style, &failed, super::Asking::Yes);
+        assert!(more, "the rest of the check's words did not wait");
+        drawn.extend(lines);
+        let (lines, _) = asked(&style, &block::after_refusal_choices(more), &[]);
+        drawn.extend(lines);
+        assert_eq!(tagged(&drawn), want);
+    }
+}
+
+/// A blank line in a program's words is still quoted, in both looks: git
+/// splits a hook's output by line and keeps the empty ones (ESLint's and
+/// `rustfmt --check`'s blocks), and the refusal names that output whole.
+#[test]
+fn a_blank_line_in_the_programs_words_keeps_its_place() {
+    let failed = Failed {
+        step: Step::Commit,
+        refusal: Refusal::Said(vec!["a".to_owned(), String::new(), "b".to_owned()]),
+    };
+    let rows: [(Style, &[&str]); 2] = [
+        (
+            rich(100),
+            &[
+                "  <36>•</> git said:",
+                "    <90>a</>",
+                "    ",
+                "    <90>b</>",
+            ],
+        ),
+        (plain(), &["  git said:", "    a", "    ", "    b"]),
+    ];
+    for (style, want) in rows {
+        assert_eq!(tagged(&block::everything(&style, &failed)), want);
+    }
 }
 
 /// A timed-out step reads as that step's refusal with the bound in place

@@ -274,12 +274,15 @@ pub fn apply_report(env: &Env, report: &EngineReport) -> Result<usize, Box<dyn s
 /// The answer every verb needs before it writes, asked one way. `--yes`
 /// skips it; a run with nobody to ask refuses before its first write
 /// rather than guessing, and says which flag would have answered it.
+///
+/// Asked through `ui::consent`: Enter is no and exits 1; Escape and Ctrl-C
+/// cancel, which the run exits 130 on.
 pub fn ask_before_writing(question: &str, yes: bool) -> CliResult {
     require_yes_in_non_interactive(yes)?;
     if yes {
         return Ok(());
     }
-    match ui::confirm(question)? {
+    match ui::consent(question)? {
         true => Ok(()),
         false => Err("cancelled — these changes were not written".into()),
     }

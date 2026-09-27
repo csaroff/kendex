@@ -1,11 +1,11 @@
-//! The question a run asks, and what it shows while it works.
+//! The questions a verb not yet converted asks, and what a run shows while
+//! it works. A converted verb asks through `keys` instead.
 //!
 //! A question carries its own consequence — what a yes does, in the
 //! question itself — so the answer is given against the change rather
-//! than against the verb's name. Both modes ask for the same thing: the
-//! word, then Enter. A framed prompt that submitted on one keystroke
-//! would let a stray `y` authorise a write, which is not a trade a
-//! prettier widget is worth.
+//! than against the verb's name. Both modes here ask for the same thing:
+//! the word, then Enter. The keyed read answers on one key, and its
+//! default, the key a stray press is likeliest to be, never writes.
 
 use std::io::Write;
 
@@ -25,6 +25,10 @@ fn widget() -> bool {
 /// Ask. The caller has already established there is somebody to ask: a
 /// run needing an answer with no terminal on stdin refuses before its
 /// first write rather than reaching this.
+///
+/// This and the keyed read in `keys` are the only places the CLI reads
+/// from a person, and each draws whatever block is still open before it
+/// reads.
 ///
 /// The framed prompt is cancelled with `Esc` or `Ctrl-C`. `Ctrl-D` is not
 /// one of its answers — a terminal in raw mode delivers it as a byte, not
@@ -53,44 +57,14 @@ pub fn confirm(question: &str) -> std::io::Result<bool> {
     Ok(answered(&answer))
 }
 
-/// Ask for a line of typed input, for a question whose answer is not a
-/// yes or a no.
-///
-/// This and [`confirm`] are the only places the CLI reads from a person,
-/// and both draw whatever block is still open before they read. A
-/// question asked over an undrawn block is a question about lines the
-/// reader has not been shown yet, and no call site can reach a read
-/// without coming through one of these.
-pub fn ask(label: &str) -> std::io::Result<String> {
-    super::flush();
-    let label = &escaped(label);
-    match widget() {
-        // The widget [`confirm`] uses, so the question and the answer land
-        // inside the frame the run opened rather than at column 0 beside
-        // it. Empty is an answer here — both callers read it as "accept
-        // what is already selected" — so the input is not required, and
-        // the label's trailing space is the plain rendering's cursor gap,
-        // not part of the question.
-        true => cliclack::input(label.trim_end())
-            .required(false)
-            .interact::<String>(),
-        false => {
-            let _ = write!(std::io::stderr(), "{label}");
-            let _ = std::io::stderr().flush();
-            let mut typed = String::new();
-            std::io::stdin().read_line(&mut typed)?;
-            Ok(typed)
-        }
-    }
-}
-
 /// Whether an error is a run its user cancelled.
 ///
-/// It belongs here because this is where one is made: a plain prompt lets
-/// SIGINT kill the process and the shell reports 130 itself, while the
-/// framed one reads keys in raw mode, where Ctrl-C arrives as a byte and
-/// comes back as an interrupted read. Nothing else in the CLI produces
-/// one, so nothing else decides what one means.
+/// Two readers make one, and this is the one place that says what it
+/// means. A plain prompt here lets SIGINT kill the process and the shell
+/// reports 130 itself, while the framed widget reads keys in raw mode,
+/// where Ctrl-C arrives as a byte and comes back as an interrupted read.
+/// The keyed read in `keys` returns the same interrupted error for Escape,
+/// Ctrl-C and the end of input.
 pub fn cancelled(error: &(dyn std::error::Error + 'static)) -> bool {
     error
         .downcast_ref::<std::io::Error>()

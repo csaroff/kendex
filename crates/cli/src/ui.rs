@@ -69,9 +69,10 @@
 //! **The design system.** A converted verb draws only through the
 //! components on [`Style`] — tokens, symbols, components and the three
 //! renderings in `tokens`, `symbols`, `components` and `modes` — and
-//! prints what they drew through [`stdout`] and [`stderr`]. The framed
-//! calls above serve the verbs not yet converted. `crates/cli/OUTPUT.md`
-//! is the reference.
+//! prints what they drew through [`stdout`] and [`stderr`]. It asks
+//! through [`choose`], a question answered by one key, [`consent`], the yes
+//! a write needs, and [`typed`], a question whose answer is text. The framed calls above serve the verbs not yet
+//! converted. `crates/cli/OUTPUT.md` is the reference.
 
 mod blocks;
 #[cfg_attr(
@@ -82,6 +83,7 @@ mod blocks;
     )
 )]
 mod components;
+mod keys;
 mod live;
 mod modes;
 mod prompt;
@@ -93,13 +95,14 @@ mod tokens;
 pub use blocks::{finish, flush, intro};
 #[expect(
     unused_imports,
-    reason = "the types a callout and a link take; the verbs converted after the pilot name them"
+    reason = "the type a link takes; the verbs converted after the pilot name it"
 )]
-pub use components::{Choice, Target};
-pub use components::{Status, Value};
+pub use components::Target;
+pub use components::{Choice, Key, Status, Value};
+pub use keys::{choose, consent, typed};
 pub use live::Spinner;
 pub use modes::{Channel, Span, Style, channel, style};
-pub use prompt::{ask, cancelled, confirm, spinner};
+pub use prompt::{cancelled, confirm, spinner};
 pub use refusal::{Lines, fail_refusal, outro_fail, outro_refusal};
 
 use std::io::{IsTerminal, Write};
@@ -394,6 +397,8 @@ pub(crate) mod testing {
             glyphs: Glyphs::Unicode,
         }
     }
+
+    pub use super::keys::testing::asked;
 
     pub fn ascii(style: Style) -> Style {
         Style {
