@@ -119,6 +119,7 @@ parse_argv() {
   STATE_FILE=""
   HANDOFF=tmp/handoffs/OVERSEER-HANDOFF.md
   OVERSEER_FLAGS=()
+  OVERSEER_HARNESS=""
   # How many leading words are this watch's own, before the `--` that starts
   # the overseer's flags: what the watch records of its command, and what a
   # restart from a successor pane runs again with the successor's flags.
@@ -131,6 +132,7 @@ parse_argv() {
       # window: the words are the harness's and this parser reads none of them.
       --) ARGV_BASE_COUNT=$((total - $#)); shift; OVERSEER_FLAGS=("$@"); break ;;
       --handoff) need_val "$@"; HANDOFF="$2"; shift 2 ;;
+      --harness) need_val "$@"; OVERSEER_HARNESS="$2"; shift 2 ;;
       --handoff=*) HANDOFF="${1#--handoff=}"; need_val --handoff "$HANDOFF"; shift ;;
       --repeat) need_val "$@"; REPEAT="$2"; shift 2 ;;
       --repeat=*) REPEAT="${1#--repeat=}"; need_val --repeat "$REPEAT"; shift ;;
@@ -761,6 +763,7 @@ repeat_watch() { # ARGV...
     fi
     args=(--interval "$INTERVAL" --max-loops "$MAX_LOOPS" \
           --handoff "$HANDOFF" --state "$STATE_FILE")
+    [[ -z "$OVERSEER_HARNESS" ]] || args+=(--harness "$OVERSEER_HARNESS")
     [[ -z "$SINCE" ]] || args+=(--since "$SINCE")
     for line in ${REPOS[@]+"${REPOS[@]}"}; do args+=(--repo "$line"); done
     for line in ${GIVEN_HOSTED[@]+"${GIVEN_HOSTED[@]}"}; do args+=(--hosted "$line"); done
@@ -2000,7 +2003,7 @@ overseer_relaunch_failed() { # ROW ROWS IDENTITY PANE WINDOW ATTEMPT STEP
 # the first one's reading.
 #
 # OVERSEER_MARK_KEY is the answer's own key, `mark-reached`, `mark-unmeasured`
-# or `below-mark` for either of the two below-mark lines; the KIND, VALUE,
+# or `below-mark` for the `account-below-mark` line; the KIND, VALUE,
 # MARK, ACCOUNT and RESETS globals are its fields, empty where the line
 # carries none. Exit 1 means no judgement was made at all, the note already
 # said once, and nothing may be concluded from any of them.
@@ -2047,6 +2050,7 @@ bounded_account_read() {
 overseer_marks_judge() {
   local line first field
   local errf="$WORK_DIR/overseer-mark.err"
+  local judge_args=(--check-marks)
   [[ "$OVERSEER_MARK_READ" -eq 0 ]] || return "$OVERSEER_MARK_RC"
   OVERSEER_MARK_READ=1
   # Every field belongs to THIS reading. Cleared before the line is parsed,
@@ -2068,7 +2072,8 @@ overseer_marks_judge() {
   # usage endpoint per account, and on a cache miss on the host-wide usage
   # refresh lock and a 429 retry's sleep and second request, which together can
   # outlast the pass interval.
-  if ! bounded_account_read overseer-mark-unjudged "$errf" "$SUCCEED" --check-marks; then
+  [[ -z "$OVERSEER_HARNESS" ]] || judge_args+=(--harness "$OVERSEER_HARNESS")
+  if ! bounded_account_read overseer-mark-unjudged "$errf" "$SUCCEED" "${judge_args[@]}"; then
     [[ ! -s "$errf" ]] || cat -- "$errf" >&2
     return 1
   fi
@@ -2077,8 +2082,7 @@ overseer_marks_judge() {
   case "$first" in
     'oversee-succeed: mark-reached '*) OVERSEER_MARK_KEY=mark-reached ;;
     'oversee-succeed: mark-unmeasured '*) OVERSEER_MARK_KEY=mark-unmeasured ;;
-    'oversee-succeed: window-below-mark '* | 'oversee-succeed: context-below-mark '*)
-      OVERSEER_MARK_KEY=below-mark ;;
+    'oversee-succeed: account-below-mark '*) OVERSEER_MARK_KEY=below-mark ;;
     # A line this watch has no name for settles nothing, exactly as a run that
     # failed does: it is not a mark, and it is not evidence that one lifted.
     *) overseer_note overseer-mark-unjudged "path=$SUCCEED" "line=$first"; return 1 ;;

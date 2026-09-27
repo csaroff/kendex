@@ -120,6 +120,10 @@ unmark_lanes() {
   rm -rf -- "${common:?}/lane-mail"
 }
 
+# Most cases request 50 percent; the independent token cap still applies.
+# Adapter rows use the package default across their different windows.
+CONTEXT_PCT_ENV=ORCH_HANDOFF_CONTEXT_PCT=50
+
 # The world a case runs in unless it names another: a home with no lane in it,
 # so the handoff marks' account read answers `no configured lane of this
 # harness` without reaching the network, and a fetch stub that fails if one
@@ -127,7 +131,9 @@ unmark_lanes() {
 # are cleared rather than inherited, so a case's world is only what it sets.
 OFFLINE_HOME="$TMP_ROOT/offline-home"
 NO_FETCH="$TMP_ROOT/no-fetch"
-mkdir -p "$OFFLINE_HOME"
+mkdir -p "$OFFLINE_HOME/.pi/agent"
+printf '%s\n' '{"compaction":{"enabled":false}}' > "$OFFLINE_HOME/.pi/agent/settings.json"
+CODEX_COMPACTION='{"harness":"codex","settings":{"model_auto_compact_token_limit":"9223372036854775807","model_auto_compact_token_limit_scope":"body_after_prefix","model_post_turn_compact_threshold_percent":"0"}}'
 printf '#!/bin/sh\nexit 1\n' > "$NO_FETCH"
 chmod +x "$NO_FETCH"
 # The account mark is never judged in that world, so the hook reports the gap
@@ -150,9 +156,10 @@ run_payload() { # RAW-JSON [ENV=VAL...]
   : > "$ERR_FILE"
   printf '%s' "$payload" |
     (cd "${CALL_DIR:-$LANE}" && env -u CLAUDE_CONFIG_DIR -u CLAUDE_PROJECT_DIR -u CODEX_HOME -u LANE_MAIL_ITEM \
-      -u ORCH_HANDOFF_CONTEXT_TOKENS -u ORCH_HANDOFF_HEADROOM_PCT -u ORCH_STATE_DIR \
+      -u ORCH_HANDOFF_CONTEXT_PCT -u ORCH_HANDOFF_HEADROOM_PCT -u ORCH_STATE_DIR \
       -u ORCH_OVERSEER_HEADROOM_PCT -u ORCH_OVERSEER_SUCCESSION -u TMUX -u TMUX_PANE \
-      "LANES_HOME=$OFFLINE_HOME" "ORCH_LANES_FETCH_CMD=$NO_FETCH" \
+      "LANES_HOME=$OFFLINE_HOME" "PI_CODING_AGENT_DIR=$OFFLINE_HOME/.pi/agent" \
+      DISABLE_AUTO_COMPACT=1 DISABLE_COMPACT=0 "ORCH_COMPACTION_OVERRIDES=$CODEX_COMPACTION" "ORCH_LANES_FETCH_CMD=$NO_FETCH" ${CONTEXT_PCT_ENV:+"$CONTEXT_PCT_ENV"} \
       ${CALL_ENV[@]+"${CALL_ENV[@]}"} "$@" bash "$CASE_HOOK" ${ARM_ARGS[@]+"${ARM_ARGS[@]}"}) >"$TMP_ROOT/stdout" 2>"$ERR_FILE" || RC=$?
 }
 
@@ -179,27 +186,37 @@ stop_at() { # TRANSCRIPT ACTIVE [ENV=VAL...]
 # A real transcript grows one line at a time, so a row that turns on WHICH
 # usage line the hook reads writes the first and appends the rest.
 #
-#   claude  Claude Code's own line: input_tokens beside its two cache counts.
+#   claude  Claude Code's own line: input_tokens beside its two cache counts
+#           and output_tokens, on a model whose tier runs a 1M window.
+#   sonnet  the same line on a model whose window the claude adapter leaves
+#           unnamed.
 #   pi      Pi's session entry, `appendMessage` in @earendil-works/pi-coding-agent,
 #           carrying the `Usage` of @earendil-works/pi-ai: input, output,
 #           cacheRead, cacheWrite, totalTokens and cost, none of them spelled
 #           the way Claude Code spells them.
-#   unread  a usage object carrying neither spelling, which is what the hook
-#           must report rather than sum to zero. It stands for no harness this
-#           install has measured; TOKENS is what a lane would be past its mark
-#           by if the figure could be read at all.
+#   codex   Codex's rollout: the turn context naming the model, then the
+#           token count naming the tokens the last response left in a 258400
+#           window.
+#   unread  a usage object carrying no spelling the claude adapter reads, which
+#           is what the hook must report rather than sum to zero. TOKENS is
+#           what a lane would be past its mark by if the figure could be read.
 usage_line() { # SPELLING TOKENS
   case "$1" in
-    claude)
+    claude | sonnet)
+      jq -nc --argjson t "$2" --arg m "$([ "$1" = claude ] && echo claude-opus-5-5 || echo claude-sonnet-5)" \
+        '{type:"assistant",message:{model:$m,usage:{input_tokens:1,cache_read_input_tokens:($t - 8),cache_creation_input_tokens:0,output_tokens:7}}}'
+      ;;
+    codex)
+      jq -nc '{type:"turn_context",payload:{model:"gpt-6-astra"}}'
       jq -nc --argjson t "$2" \
-        '{type:"assistant",message:{usage:{input_tokens:1,cache_read_input_tokens:($t - 1),cache_creation_input_tokens:0}}}'
+        '{type:"event_msg",payload:{type:"token_count",info:{last_token_usage:{input_tokens:($t - 7),output_tokens:7,total_tokens:$t},model_context_window:258400}}}'
       ;;
     pi)
       jq -nc --argjson t "$2" \
         '{type:"message",id:"e1",parentId:null,timestamp:"2026-09-19T00:00:00Z",
           message:{role:"assistant",model:"m",stopReason:"stop",
-                   usage:{input:1,output:7,cacheRead:($t - 1),cacheWrite:0,
-                          totalTokens:($t + 7),cost:{total:0}}}}'
+                   usage:{input:1,output:7,cacheRead:($t - 8),cacheWrite:0,
+                          totalTokens:$t,cost:{total:0}}}}'
       ;;
     unread)
       jq -nc --argjson t "$2" \
@@ -569,7 +586,7 @@ record_handoff() { # ITEM [RESUMED_AT]
 TRANSCRIPT="$TMP_ROOT/transcript.jsonl"
 
 new_handoff_lane handoff_context KEN-50
-write_transcript "$TRANSCRIPT" 499999
+write_transcript "$TRANSCRIPT" 399999
 stop_at "$TRANSCRIPT" false
 expect 0 "$GAP" "a lane under the context mark ends its turn"
 write_transcript "$TRANSCRIPT" 500000
@@ -617,22 +634,54 @@ write_transcript "$SPACED" 600000
 stop_at "$SPACED" false
 expect 2 "lane-mail-check: context=600000" "a transcript path holding a space is read, never truncated at it"
 
-# Every spelling a harness writes that usage object in, judged on one figure
-# and its inverse: under the mark the turn ends, at the mark the refusal names
-# the figure it reached. Pi's is the spelling a lane was reading as zero, so a
-# Pi lane ran its context to exhaustion with nothing held and nothing said.
-new_handoff_lane handoff_spellings KEN-90
-for SPELLING in claude pi; do
-  usage_line "$SPELLING" 499999 > "$TRANSCRIPT"
-  stop_at "$TRANSCRIPT" false
-  expect 0 "$GAP" "a $SPELLING-spelled usage line under the context mark ends the turn"
-  usage_line "$SPELLING" 500000 > "$TRANSCRIPT"
-  stop_at "$TRANSCRIPT" false
-  expect 2 "lane-mail-check: context=500000" \
-    "a $SPELLING-spelled usage line at the context mark is refused with the figure it reached"
-done
+# Each real install selects its adapter and records the reading. The table
+# covers both independent limits, unknown capacity and equality. Output tokens
+# make the percentage rows cross their mark; omitting them leaves room.
+#
+#   HOOK DIR|SPELLING|TOKENS|PAYLOAD WINDOW|FIRST LINE|RECORDED
+ADAPTER_ROWS='.claude/hooks|claude|399999||GAP|claude 399999 1000000
+.claude/hooks|claude|400000||context=400000|claude 400000 1000000
+.claude/hooks|claude|500000||context=500000|claude 500000 1000000
+.claude/hooks|sonnet|399999||window-unread=claude-sonnet-5|claude 399999 null
+.claude/hooks|sonnet|400000||context=400000|claude 400000 null
+.codex/hooks|codex|232560||GAP|codex 232560 258400
+.codex/hooks|codex|232561||context=232561|codex 232561 258400
+.pi/kendex/hooks|pi|180000|200000|GAP|pi 180000 200000
+.pi/kendex/hooks|pi|180001|200000|context=180001|pi 180001 200000
+.pi/kendex/hooks|pi|399999||window-unread=m|pi 399999 null
+.pi/kendex/hooks|pi|400000||context=400000|pi 400000 null'
+new_handoff_lane handoff_adapters KEN-90
+while IFS='|' read -r ROW_DIR ROW_SPELLING ROW_TOKENS ROW_WINDOW ROW_FIRST ROW_RECORDED; do
+  install_hook "$HOOK" "$LANE/$ROW_DIR/lane-mail-check.sh"
+  usage_line "$ROW_SPELLING" "$ROW_TOKENS" > "$TRANSCRIPT"
+  rm -f -- "${LANE:?}/tmp/lane-mail/KEN-90/context.json"
+  CONTEXT_PCT_ENV='' run_payload "$(jq -nc --arg p "$TRANSCRIPT" --arg w "$ROW_WINDOW" \
+    '{session_id:"s1",stop_hook_active:false,transcript_path:$p}
+     + (if $w == "" then {} else {context_window: ($w | tonumber)} end)')"
+  case "$ROW_FIRST" in
+    GAP) ROW_WANT="RC=0 first=$GAP" ;;
+    context=*) ROW_WANT="RC=2 first=lane-mail-check: $ROW_FIRST" ;;
+    *) ROW_WANT="RC=0 first=lane-mail-check: $ROW_FIRST" ;;
+  esac
+  assert_eq "RC=$RC first=$(first_line) recorded=$(jq -r '"\(.harness) \(.tokens) \(.window)"' \
+      "$LANE/tmp/lane-mail/KEN-90/context.json" 2>/dev/null)" \
+    "$ROW_WANT recorded=$ROW_RECORDED" \
+    "$ROW_SPELLING under $ROW_DIR at $ROW_TOKENS tokens of window ${ROW_WINDOW:-its adapter reads}: $ROW_FIRST, recorded for the report"
+done <<<"$ADAPTER_ROWS"
+# An unreadable configuration cannot erase the independent cap. The hook
+# exposes the cause beside the retained reading instead of calling it room.
+install_hook "$HOOK" "$LANE/.pi/kendex/hooks/lane-mail-check.sh"
+printf 'not-json\n' > "$OFFLINE_HOME/.pi/agent/settings.json"
+usage_line pi 400000 > "$TRANSCRIPT"
+run_payload "$(jq -nc --arg p "$TRANSCRIPT" \
+  '{session_id:"s1",stop_hook_active:false,transcript_path:$p,context_window:200000}')"
+assert_eq "$RC|$(first_line)|$(grep -c '^lane-mail-check: context=400000$' "$ERR_FILE")|$(jq -c '[.tokens,.window]' "$LANE/tmp/lane-mail/KEN-90/context.json")" \
+  '2|lane-mail-check: compaction-unread=pi|1|[400000,null]' \
+  'a broken Pi configuration retains the cap reading and reports the settings failure'
+printf '%s\n' '{"compaction":{"enabled":false}}' > "$OFFLINE_HOME/.pi/agent/settings.json"
+install_hook "$HOOK" "$LANE/.claude/hooks/lane-mail-check.sh"
 
-# A usage object neither spelling reads. The figure IS there and unread, which
+# A usage object the adapter does not read. The figure IS there and unread, which
 # is not the documented gap a payload naming no transcript leaves, so it gets
 # its own key rather than the silence that gap takes. The turn still ends: no
 # handoff record the lane writes would teach this install a harness's field
@@ -643,21 +692,25 @@ stop_at "$TRANSCRIPT" false
 assert_eq "RC=$RC first=$(first_line) judged=$(grep -c 'context=' "$ERR_FILE")" \
   "RC=0 first=lane-mail-check: usage-unread=$TRANSCRIPT judged=0" \
   "a usage object neither spelling reads is keyed, never summed to a figure the mark is judged on"
-assert_eq "$(grep -c 'neither of the field spellings' "$ERR_FILE")" "1" \
+assert_eq "$(grep -c 'none of the field names' "$ERR_FILE")" "1" \
   "and the key carries the English that says why the figure went unread"
 assert_eq "$(grep -cx "$GAP" "$ERR_FILE")" "1" \
   "and the account mark beside it is judged as it is on any other turn end"
 
 new_handoff_lane handoff_setting KEN-51
 write_transcript "$TRANSCRIPT" 500000
-stop_at "$TRANSCRIPT" false ORCH_HANDOFF_CONTEXT_TOKENS=900000
-expect 0 "$GAP" "a mark the setting raises is not reached at the same figure"
+stop_at "$TRANSCRIPT" false ORCH_HANDOFF_CONTEXT_PCT=90
+expect 2 "lane-mail-check: context=500000" "a raised percentage keeps the independent absolute cap"
+CONTEXT_PCT_ENV='' stop_at "$TRANSCRIPT" false
+expect 2 "lane-mail-check: context=500000" "the package default keeps the independent absolute cap"
 # orch-env falls back to its default only on a NON-numeric value, so a value
 # in a shape no comparison can take reaches the hook and is named here.
-stop_at "$TRANSCRIPT" false ORCH_HANDOFF_CONTEXT_TOKENS=0500000
-assert_eq "RC=$RC first=$(first_line) named=$(grep -cF -- "workflow-state set KEN-51 handoff " "$ERR_FILE")" \
-  "RC=2 first=lane-mail-check: setting-range=ORCH_HANDOFF_CONTEXT_TOKENS=0500000 named=1" \
-  "a context mark that is not a plain whole number names the value, and the record clears it"
+for VALUE in 050 101 0; do
+  stop_at "$TRANSCRIPT" false "ORCH_HANDOFF_CONTEXT_PCT=$VALUE"
+  assert_eq "RC=$RC first=$(first_line) named=$(grep -cF -- "workflow-state set KEN-51 handoff " "$ERR_FILE")" \
+    "RC=2 first=lane-mail-check: setting-range=ORCH_HANDOFF_CONTEXT_PCT=$VALUE named=1" \
+    "a context mark of $VALUE, outside whole percents 1 to 100, names the value, and the record clears it"
+done
 
 new_handoff_lane handoff_subagent KEN-52
 write_transcript "$TRANSCRIPT" 800000
@@ -719,7 +772,7 @@ chmod +x "$LANE/.claude/skills/orch/scripts/orch-env"
 write_transcript "$TRANSCRIPT" 600000
 stop_at "$TRANSCRIPT" false
 assert_eq "RC=$RC first=$(first_line) cause=$(grep -cx 'orch-env: broken' "$ERR_FILE") named=$(grep -cF -- "workflow-state set KEN-85 handoff " "$ERR_FILE")" \
-  "RC=2 first=lane-mail-check: setting=ORCH_HANDOFF_CONTEXT_TOKENS cause=1 named=1" \
+  "RC=2 first=lane-mail-check: setting=ORCH_HANDOFF_CONTEXT_PCT cause=1 named=1" \
   "a mark whose setting could not be read is refused with the reader's words and the record that clears it"
 
 # The read is bounded to the last TRANSCRIPT_WINDOW bytes, and falls back to
@@ -822,20 +875,28 @@ for status in 1 2; do
     "a lanes exiting $status leaves the account unmeasured with its own words, never refusing on a status its verb never gives"
 done
 
-# A harness this hook's install does not name has no account to read at all.
-# The context mark is still judged; the account gap is reported and the turn
-# ends, so a consumer on such a harness is never held by a mark it cannot reach.
+# A harness `lanes` keeps no inventory for has no account to read at all: Pi,
+# installed globally here. The context mark is still judged; the account gap is
+# reported and the turn ends, so a consumer on such a harness is never held by
+# a mark it cannot reach.
 new_handoff_lane handoff_unnamed_harness KEN-79
 rm -f "$LANE/.claude/skills/orch" "$LANE/.agents/skills/orch/scripts"
 global_home home-handoff
 install_hook "$HOOK" "$GLOBAL_HOME/.pi/agent/kendex/hooks/lane-mail-check.sh"
-write_transcript "$TRANSCRIPT" 1000
-stop_at "$TRANSCRIPT" false "HOME=$GLOBAL_HOME"
+# A Pi turn end: its session file, and the window its Stop payload names.
+stop_pi() { # TRANSCRIPT [ENV=VAL...]
+  local path="$1"
+  shift
+  run_payload "$(jq -nc --arg p "$path" \
+    '{session_id:"s1",stop_hook_active:false,transcript_path:$p,context_window:1000000}')" "$@"
+}
+usage_line pi 1000 > "$TRANSCRIPT"
+stop_pi "$TRANSCRIPT" "HOME=$GLOBAL_HOME"
 assert_eq "RC=$RC first=$(first_line) named=$(grep -cF -- "$GLOBAL_HOME/.pi/agent/kendex/hooks is no harness" "$ERR_FILE")" \
   "RC=0 first=lane-mail-check: account=unlisted named=1" \
   "a harness this install does not name leaves the account unjudged, named, and the turn ends"
-write_transcript "$TRANSCRIPT" 600000
-stop_at "$TRANSCRIPT" false "HOME=$GLOBAL_HOME"
+usage_line pi 600000 > "$TRANSCRIPT"
+stop_pi "$TRANSCRIPT" "HOME=$GLOBAL_HOME"
 expect 2 "lane-mail-check: context=600000" "and the context mark is judged there as everywhere"
 
 # A setting out of range dies inside `lanes` as invalid-percent, whose exit the
@@ -1118,7 +1179,7 @@ text_line() { # SPELLING TEXT
   case "$1" in
     claude)
       jq -nc --arg t "$2" \
-        '{type:"assistant",message:{role:"assistant",content:[{type:"text",text:$t}],
+        '{type:"assistant",message:{role:"assistant",model:"claude-opus-5-5",content:[{type:"text",text:$t}],
           usage:{input_tokens:1,cache_read_input_tokens:0,cache_creation_input_tokens:0}}}'
       ;;
     pi)
@@ -1267,6 +1328,7 @@ CONTEXT_MARK_LINE="oversee-succeed: mark-reached kind=context value=612000 mark=
 # The same crossing with the succession the operator turned off, which the
 # judgement reports on its own line and this hook reads nowhere else.
 OFF_MARK_LINE="oversee-succeed: mark-reached kind=context value=612000 mark=500000 succession=off headroom=80"
+OFF_HEADROOM_LINE="oversee-succeed: mark-reached kind=headroom value=4 mark=10 succession=off account=eclaude resets=2026-07-27T06:00:00Z"
 HEADROOM_MARK_LINE="oversee-succeed: mark-reached kind=headroom value=4 mark=10 succession=on account=eclaude resets=2026-07-27T06:00:00Z"
 RATE_MARK_LINE="oversee-succeed: mark-reached kind=rate value=30 mark=30 succession=on account=eclaude"
 QUALIFYING_MARK_LINE="oversee-succeed: mark-reached kind=qualifying value=1 mark=1 succession=on headroom=unreadable"
@@ -1317,8 +1379,12 @@ stop_unnamed() { # [ENV=VAL...]
     '{stop_hook_active:false,transcript_path:$p}')" "$@"
 }
 
-# The two commands an overseer's refusal names, counted in the stderr it wrote.
-overseer_route() { grep -cF -- "/oversee-succeed -- [THE PERMISSION" "$ERR_FILE"; }
+# The reading the overseer transcript below leaves, as the judge takes it.
+OVERSEER_CONTEXT=600000:1000000
+write_transcript "$TRANSCRIPT" "${OVERSEER_CONTEXT%%:*}"
+# The two commands an overseer's refusal names, counted in the stderr it wrote:
+# the succession is handed the reading this turn end took, as the judge was.
+overseer_route() { grep -cF -- "/oversee-succeed --context $OVERSEER_CONTEXT -- [THE PERMISSION" "$ERR_FILE"; }
 overseer_record_named() { grep -cF -- "workflow-state set oversee handoff " "$ERR_FILE"; }
 
 new_overseer overseer_context
@@ -1326,8 +1392,8 @@ judge_says "$BELOW_MARK_LINE"
 # shellcheck disable=SC2046
 stop_at "$TRANSCRIPT" false $(overseer_env)
 expect 0 - "an overseer the judgement puts under both marks ends its turn"
-assert_eq "$(judge_argv)" "--check-marks" \
-  "and the hook asked for the judgement and nothing else, opening no window" "$ERR_FILE"
+assert_eq "$(judge_argv)" "--check-marks --context $OVERSEER_CONTEXT" \
+  "and the hook asked for the judgement on the reading this turn end took, and nothing else, opening no window" "$ERR_FILE"
 judge_says "$CONTEXT_MARK_LINE"
 # shellcheck disable=SC2046
 stop_at "$TRANSCRIPT" false $(overseer_env)
@@ -1383,6 +1449,26 @@ expect 2 "lane-mail-check: headroom=4" \
   "an overseer the judgement puts at its account mark is refused with the headroom it read"
 assert_eq "named=$(grep -cF -- 'the ORCH_OVERSEER_HEADROOM_PCT mark of 10' "$ERR_FILE") route=$(overseer_route)" \
   "named=1 route=1" "and the refusal names the judge's own setting and the succession"
+
+# A reading whose window the adapter could not name is handed on with that
+# window empty, to the judge and to the succession the refusal names alike, so
+# the judge reports the context unmeasured rather than judging a stored figure.
+new_overseer overseer_window_unread
+usage_line sonnet 999999 > "$TRANSCRIPT"
+judge_says "$HEADROOM_MARK_LINE"
+# shellcheck disable=SC2046
+stop_at "$TRANSCRIPT" false $(overseer_env)
+assert_eq "argv=$(judge_argv | tail -n 1) route=$(grep -cF -- "/oversee-succeed --context 999999: -- [THE PERMISSION" "$ERR_FILE")" \
+  "argv=--check-marks --context 999999: route=1" \
+  "an overseer reading with no window hands its judge and its succession the tokens and no window" "$ERR_FILE"
+variant no-context-arg -e 's|^    ${CONTEXT_ARGS\[@\]+"${CONTEXT_ARGS\[@\]}"} 2>|    2>|'
+install_hook "$VARIANT_PATH" "$LANE/.claude/hooks/lane-mail-check.sh"
+write_transcript "$TRANSCRIPT" 600000
+# shellcheck disable=SC2046
+stop_at "$TRANSCRIPT" false $(overseer_env)
+assert_eq "$(judge_argv | tail -n 1)" "--check-marks" \
+  "control: a hook that withholds the reading hands its judge no context"
+install_hook "$HOOK" "$LANE/.claude/hooks/lane-mail-check.sh"
 
 for mark_row in \
   "rate|$RATE_MARK_LINE|30|ORCH_OVERSEER_WALL_MINUTES" \
@@ -1455,18 +1541,49 @@ case " $* " in
   *"#{pid}"*) printf '%s\n' "$FIXTURE_TMUX_SERVER" ;;
   *"#{window_id}"*) printf '%s\n' '@7' ;;
   *"#{pane_current_path}"*) printf '%s\n' "$FIXTURE_TMUX_PATH" ;;
-  *"#{pane_current_command}"*) printf '%s\n' claude ;;
-  *" capture-pane "*) printf '%s\n' '  kendex (ken-1453) Fable 5.1 (1M context) 52% (fixture@example.com)     /rc' ;;
+  *"#{pane_current_command}"*) printf '%s\n' "${FIXTURE_TMUX_COMMAND:-claude}" ;;
   *) exit 1 ;;
 esac
 REALTMUX
   chmod +x "$REAL_TMUX_BIN/tmux"
-  # shellcheck disable=SC2046
-  stop_at "$TRANSCRIPT" false $(overseer_env) "PATH=$REAL_TMUX_BIN:$PATH" \
-    "FIXTURE_TMUX_SERVER=$OVERSEER_SERVER" "FIXTURE_TMUX_PATH=$LANE" \
-    "ORCH_OVERSEER_SUCCESSOR_ACCOUNTS=1"
-  expect 2 "lane-mail-check: context=520000" \
-    "a real hook returns an available context mark before a slow capacity sweep reaches its ceiling"
+  # The real judge handles a node pane before slow capacity or a stored identity.
+  mkdir -p "$LANE/.codex/skills"
+  ln -s "$LANE/.claude/skills/orch" "$LANE/.codex/skills/orch"
+  install_hook "$VARIANT_PATH" "$LANE/.codex/hooks/lane-mail-check.sh"
+  usage_line codex 400000 > "$TRANSCRIPT"
+  REAL_SUCCEED="$LANE/.claude/skills/orch/scripts/oversee-succeed"
+  EARLY_RESULT='if [[ "$MODE" == check && "$CONTEXT_STATE" == due ]]; then'
+  assert_eq "$(grep -cF -- "$EARLY_RESULT" "$REAL_SUCCEED")" 1 'the context-order control finds its result once'
+  HOOK="$REAL_SUCCEED" variant context-after-identity \
+    -e 's/if \[\[ "$MODE" == check \&\& "$CONTEXT_STATE" == due \]\]; then/if [[ "$MODE" == check \&\& "$CONTEXT_STATE" == due \&\& 0 == 1 ]]; then/'
+  REAL_MV="$(command -v mv)"
+  cat > "$REAL_TMUX_BIN/mv" <<'FAILWRITE'
+#!/usr/bin/env bash
+case "$FIXTURE_WRITE:${!#}" in
+  failed:*/context.json) printf '%s\n' 'fixture context write failed' >&2; exit 1 ;;
+esac
+exec "$FIXTURE_REAL_MV" "$@"
+FAILWRITE
+  chmod +x "$REAL_TMUX_BIN/mv"
+  while IFS='|' read -r writer judge expected; do
+    rm -f -- "${REAL_SUCCEED:?}" "${LANE:?}/tmp/lane-mail/overseer/context.json"
+    cp "$judge" "$REAL_SUCCEED"
+    chmod +x "$REAL_SUCCEED"
+    # shellcheck disable=SC2046
+    stop_at "$TRANSCRIPT" false $(overseer_env) "PATH=$REAL_TMUX_BIN:$PATH" \
+      "FIXTURE_TMUX_SERVER=$OVERSEER_SERVER" "FIXTURE_TMUX_PATH=$LANE" \
+      FIXTURE_TMUX_COMMAND=node "FIXTURE_REAL_MV=$REAL_MV" "FIXTURE_WRITE=$writer" ORCH_OVERSEER_SUCCESSOR_ACCOUNTS=1
+    record=none
+    [[ ! -f "$LANE/tmp/lane-mail/overseer/context.json" ]] || \
+      record="$(jq -r '"\(.tokens) \(.window) \(.pane_key)"' "$LANE/tmp/lane-mail/overseer/context.json")"
+    assert_eq "$RC|$(grep -E '^lane-mail-check: (context=[0-9]+|marks=unjudged)$' "$ERR_FILE")|$(grep -c '^fixture context write failed$' "$ERR_FILE")|$(grep -c '^oversee-succeed: harness-unnamed ' "$ERR_FILE")|$(grep -cFx "lane-mail-check: context-unrecorded=$LANE/tmp/lane-mail/overseer/context.json" "$ERR_FILE")|$record" \
+      "$expected" "actual marks: writer=$writer judge=${judge##*/} preserves the live due reading"
+  done <<ROWS
+kept|$REPO_ROOT/skills/orch/scripts/oversee-succeed|2|lane-mail-check: context=400000|0|0|0|400000 258400 $OVERSEER_SERVER $OVERSEER_PANE
+failed|$REPO_ROOT/skills/orch/scripts/oversee-succeed|2|lane-mail-check: context=400000|1|0|1|none
+failed|$VARIANT_PATH|0|lane-mail-check: marks=unjudged|1|1|1|none
+ROWS
+  write_transcript "$TRANSCRIPT" 600000
 
   variant short-judge -e 's@^ACCOUNT_CEILING=20$@ACCOUNT_CEILING=1@'
   new_overseer overseer_ceiling
@@ -1516,21 +1633,28 @@ stop_at "$TRANSCRIPT" false $(overseer_env)
 expect 2 "lane-mail-check: context=612000" \
   "the fleet mailbox in the overseer's own checkout names no lane, and the marks are judged"
 
-# Succession off is the route turned off, and a refusal whose route is off is a
-# turn end nothing the overseer does can reach. The setting is read off the
-# judgement's own line and nowhere else, so a spelling this hook would take for
-# `on` and that script refuses cannot exist. The watch still reports the mark,
-# so the fleet is not left silent by this.
+# Succession off passes an account mark, which the watch judges and reports
+# every pass. The context mark is judged by this hook alone, so it is refused
+# whatever the setting, with the handoff record as the route once the
+# succession refuses as off. The setting is read off the judgement's own line
+# and nowhere else, so a spelling this hook would take for `on` and that
+# script refuses cannot exist.
 new_overseer overseer_succession_off
-judge_says "$OFF_MARK_LINE"
+judge_says "$OFF_HEADROOM_LINE"
 # shellcheck disable=SC2046
 stop_at "$TRANSCRIPT" false $(overseer_env)
 assert_eq "RC=$RC first=$(first_line)" "RC=0 first=-" \
-  "a crossing whose line says the succession is off ends the turn"
-judge_says "$CONTEXT_MARK_LINE"
+  "an account crossing whose line says the succession is off ends the turn"
+judge_says "$OFF_MARK_LINE"
+# shellcheck disable=SC2046
+stop_at "$TRANSCRIPT" false $(overseer_env)
+assert_eq "RC=$RC first=$(first_line) record=$(overseer_record_named)" \
+  "RC=2 first=lane-mail-check: context=612000 record=1" \
+  "a context crossing is refused with the succession off, naming the record that ends it"
+judge_says "$HEADROOM_MARK_LINE"
 # shellcheck disable=SC2046
 stop_at "$TRANSCRIPT" false $(overseer_env) ORCH_OVERSEER_SUCCESSION=off
-expect 2 "lane-mail-check: context=612000" \
+expect 2 "lane-mail-check: headroom=4" \
   "and the setting in the environment decides nothing here: the line does"
 
 # The command the overseer's route names has to be in the install, or the
@@ -2077,7 +2201,7 @@ assert_eq "$([ "$RC" -eq 2 ] && echo refused || echo passed)" "passed" \
   "control: without its exit the halt hook with no judge beside it does not refuse"
 
 # Each handoff mark's refusal replaced by a pass, its judgement still made.
-mutant no-context-mark -e 's@^    refuse_handoff context "\$TOKENS"$@    :@'
+mutant no-context-mark -e 's@^      0) \[ "\$DUE" != due \] || refuse_handoff context "\$TOKENS" ;;$@      0) : ;;@'
 new_handoff_lane control_context KEN-56
 install_hook "$MUTANT_PATH" "$LANE/.claude/hooks/lane-mail-check.sh"
 write_transcript "$TRANSCRIPT" 600000
@@ -2168,17 +2292,6 @@ write_transcript "$TRANSCRIPT" 600000
 stop_at "$TRANSCRIPT" false
 expect 0 - "control: with a read mailbox routed past the marks a lane ends past the mark"
 
-# The first usage line taken instead of the last: a long first turn a
-# compaction reset would then hold the lane for ever.
-mutant first-usage -e 's@^    tail -n 1$@    head -n 1@'
-new_handoff_lane control_first_usage KEN-74
-install_hook "$MUTANT_PATH" "$LANE/.claude/hooks/lane-mail-check.sh"
-write_transcript "$TRANSCRIPT" 600000
-append_transcript "$TRANSCRIPT" 1000
-stop_at "$TRANSCRIPT" false
-expect 2 "lane-mail-check: context=600000" \
-  "control: reading the first usage line holds a lane whose window was reset"
-
 # The continued turn refusing every resolution failure again: the session then
 # never ends, which is the loop stop_hook_active exists to end.
 mutant active-refuses -e 's@^  if \[ "\$REPORTED" = true \]; then$@  if false; then@'
@@ -2213,8 +2326,7 @@ expect 2 "lane-mail-check: context=600000" \
 # The whole-file fallback dropped: a session whose recent window is all tool
 # results reads as no context at all and runs to its wall.
 MUTANT_SOURCE="$WINDOW_HOOK" mutant no-window-fallback \
-  -e 's@^    \[ -n "\$TOKENS" \] || TOKENS=\$(transcript_tokens <"\$TRANSCRIPT") ||$@    false ||@' \
-  -e 's@^      refuse_handoff transcript unread "\$(cat -- "\$WORK_DIR/transcript.err")"$@      :@'
+  -e 's@^  if \[ -z "\$READING" \] && ! READING=\$(lane_context_reading .*); then$@  if false; then@'
 new_handoff_lane control_window KEN-78
 install_hook "$MUTANT_PATH" "$LANE/.claude/hooks/lane-mail-check.sh"
 write_transcript "$TRANSCRIPT" 600000
@@ -2222,29 +2334,6 @@ filler "$TRANSCRIPT" 2000
 stop_at "$TRANSCRIPT" false
 expect 0 "$GAP" \
   "control: without the fallback a usage line before the window reads as no context at all"
-
-# Pi's spelling dropped from the filter, the rest of it intact: a Pi lane past
-# the mark then answers with the word for a usage nothing read, and the refusal
-# that would have held it is never made.
-mutant no-pi-usage \
-  -e 's@^         elif has("input") or has("cacheRead") or has("cacheWrite")$@         elif false@'
-new_handoff_lane control_pi_usage KEN-92
-install_hook "$MUTANT_PATH" "$LANE/.claude/hooks/lane-mail-check.sh"
-usage_line pi 600000 > "$TRANSCRIPT"
-stop_at "$TRANSCRIPT" false
-expect 0 "lane-mail-check: usage-unread=$TRANSCRIPT" \
-  "control: without Pi's spelling a Pi lane past the context mark is never refused"
-
-# The unread answer folded back into a figure of zero: a usage object neither
-# spelling reads then passes as a small window, with no key to say the mark
-# went unjudged, which is the silence every other unjudgeable mark here breaks.
-mutant zero-usage -e 's@^         else empty end) // \$unread.*@         else 0 end)'"'"' 2>"$WORK_DIR/transcript.err" |@'
-new_handoff_lane control_zero_usage KEN-93
-install_hook "$MUTANT_PATH" "$LANE/.claude/hooks/lane-mail-check.sh"
-usage_line unread 900000 > "$TRANSCRIPT"
-stop_at "$TRANSCRIPT" false
-expect 0 "$GAP" \
-  "control: summed to zero, a usage object neither spelling reads passes as a small window"
 
 # The record's time put back in the template: the lane is asked for it again,
 # and the row above that says it is not goes red.
@@ -2268,17 +2357,24 @@ stop_at "$TRANSCRIPT" false $(overseer_env "%3")
 expect 2 "lane-mail-check: context=612000" \
   "control: without the pane comparison a session the fleet state never named is held"
 
-# The succession field's control: the arm that passes the turn removed. The
-# refusal then names a route the operator has turned off, which no turn end the
-# overseer reaches can clear.
-mutant overseer-succession -e 's@^  \[ "\$SUCCESSION" != off \] || return 0$@  :@'
+# The succession field's controls, one per rule it enforces: the arm that
+# passes an account mark removed, and the context exception removed.
+mutant overseer-succession -e 's@^  \[ "\$SUCCESSION" != off \] || \[ "\$MARK_KIND" = context \] || return 0$@  :@'
 new_overseer control_succession_off
+install_hook "$MUTANT_PATH" "$LANE/.claude/hooks/lane-mail-check.sh"
+judge_says "$OFF_HEADROOM_LINE"
+# shellcheck disable=SC2046
+stop_at "$TRANSCRIPT" false $(overseer_env)
+expect 2 "lane-mail-check: headroom=4" \
+  "control: without the field read an account mark is refused with its route turned off"
+mutant overseer-succession-context -e 's@ || \[ "\$MARK_KIND" = context \] || return 0$@ || return 0@'
+new_overseer control_succession_context
 install_hook "$MUTANT_PATH" "$LANE/.claude/hooks/lane-mail-check.sh"
 judge_says "$OFF_MARK_LINE"
 # shellcheck disable=SC2046
 stop_at "$TRANSCRIPT" false $(overseer_env)
-expect 2 "lane-mail-check: context=612000" \
-  "control: without the field read the overseer is refused with its route turned off"
+assert_eq "RC=$RC first=$(first_line)" "RC=0 first=-" \
+  "control: without the context exception a context crossing under succession off is told nothing"
 
 # The fleet record's own control: the writer comparison removed, so a record
 # any session left on the shared item answers for this one and its turn end is

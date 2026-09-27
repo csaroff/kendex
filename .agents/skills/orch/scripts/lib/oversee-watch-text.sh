@@ -16,7 +16,7 @@ Usage: oversee-watch [--interval SECS] [--max-loops N] [--since ISO8601]
                      [--item ISSUE_ID]... [--repo OWNER/REPO]...
                      [--hosted ITEM=REMOTE_ROOT]... [--root ITEM=PATH]...
                      [--handoff PATH] [--state PATH [--skip-lane WINDOW]...]
-                     [LANE_WINDOW...] [-- OVERSEER_FLAGS...]
+                     [--harness claude|codex] [LANE_WINDOW...] [-- OVERSEER_FLAGS...]
        oversee-watch --repeat SECS --state PATH [any option above]...
 
 Blocks until the fleet needs the overseer, then prints every event it found
@@ -85,14 +85,14 @@ The long pass's events, checked and reported in this order:
                              naming the account and when its binding bucket
                              frees up goes to both channels and the repeat
                              stops
-  EVENT overseer-mark <pane> kind=<context|headroom|rate|qualifying> value=<N> mark=<N>
+  EVENT overseer-mark <pane> kind=<headroom|rate|qualifying> value=<N> mark=<N>
                              succession=<on|off>
-                             the OVERSEER's own context use or account headroom
-                             reached its own mark, judged by
-                             `oversee-succeed --check-marks` so the rule is
-                             stated once. It reaches an overseer BETWEEN turn
-                             ends, where its own turn-end hook cannot: the hook
-                             refuses at the same marks, and a session part way
+                             the OVERSEER's own account reached its mark,
+                             judged by `oversee-succeed --check-marks`; its
+                             context mark is its turn-end hook's alone. It
+                             reaches an overseer BETWEEN turn ends, where that
+                             hook cannot: the hook refuses at the same marks,
+                             and a session part way
                              through a long turn meets neither until this line.
                              The route follows on the next line. Emitted once
                              at the crossing and again every
@@ -368,6 +368,8 @@ Options:
                       and a has-session call failing for any other reason,
                       no server at the socket among them, as tmux-failed
                       naming that socket
+  --harness H         the OVERSEER's harness, handed to each oversee-succeed
+                      call; a Codex pane reads node, which names neither
   -- OVERSEER_FLAGS...
                       the flags the OVERSEER itself runs under — its
                       permission flags, plus its current model and effort
@@ -586,7 +588,7 @@ ow_message() { # REASON FIELD=VALUE...
     unread-secs-invalid) text='ORCH_DIRECTIVE_UNREAD_SECS takes a whole number of seconds, with no leading zero.' ;;
     dead-passes-invalid) text='ORCH_OVERSEER_DEAD_PASSES must be a positive integer.' ;;
     mark-repeat-invalid) text='ORCH_OVERSEER_MARK_REPEAT must be a positive integer.' ;;
-    overseer-mark-unjudged) text='The overseer own-mark judgement could not be made this pass, so its context use and account headroom settle nothing here. A standing mark is not cleared by a reading that failed; oversee-succeed owns the judgement and its own keyed line says why.' ;;
+    overseer-mark-unjudged) text='The overseer own-mark judgement could not be made this pass, so its account marks settle nothing here. A standing mark is not cleared by a reading that failed; oversee-succeed owns the judgement and its own keyed line says why.' ;;
     overseer-wall-unjudged) text='The overseer pane read walled and the account judgement that would confirm it could not be made, so nothing is acted on: this pane carries the limit banners this watch relays about OTHER lanes, and the screen alone cannot tell those from the overseer own account running out. The reading is left to the next pass.' ;;
     overseer-wall-unconfirmed) text='The overseer pane read walled and its own account measures room, so the banner on that screen is one this watch relayed about another lane and the overseer is working. Nothing is launched and no window is closed. The fields name the judgement that refuted it.' ;;
     overseer-unwatched) text='The overseer pane is not being watched, so an overseer that dies is reported by nothing. The field names what is missing.' ;;
