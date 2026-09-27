@@ -52,8 +52,8 @@ FLEET_DIR="$TMP_ROOT/fleet-state"
 mkdir -p "$FLEET_DIR"
 mkdir -p "$SCRIPTS/lib" "$FIXTURE/skills/linear/scripts" "$BIN"
 cp "$TEST_DIR/../scripts/lane-close" "$SCRIPTS/lane-close"
-cp "$TEST_DIR/../scripts/lib/lane-state.sh" "$SCRIPTS/lib/lane-state.sh"
-cp "$TEST_DIR/../scripts/lib/lane-host-slots.sh" "$SCRIPTS/lib/lane-host-slots.sh"
+cp "$TEST_DIR/../scripts/lib/lane-state.sh" "$TEST_DIR/../scripts/lib/date-ladder.sh" \
+  "$TEST_DIR/../scripts/lib/usage-reset.sh" "$TEST_DIR/../scripts/lib/lane-host-slots.sh" "$SCRIPTS/lib/"
 chmod +x "$SCRIPTS/lane-close"
 
 cat >"$SCRIPTS/workflow-state" <<'EOF'
@@ -146,6 +146,20 @@ pending_ask() { # AGE_SECONDS
   printf '{"id":"%s-9-31","kind":"ask","at":"2026-09-21T05:45:00Z","from":"KEN-1","text":"which base"}' \
     "$((now - $1))"
 }
+
+# lanes answers `pick --lane` for the account the record names with the exit
+# LANE_CLOSE_LANES_STATUS gives it: 0 room, 3 walled, 5 unmeasured.
+export LANE_CLOSE_LANES_CALLS="$TMP_ROOT/lanes-calls"
+cat >"$SCRIPTS/lanes" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$LANE_CLOSE_LANES_CALLS"
+case "${LANE_CLOSE_LANES_STATUS:-0}" in
+  0) printf 'CLAUDE_CONFIG_DIR=%s\n' "$3" ;;
+  3) printf 'lanes: pick-lane-walled %s wall=100\n' "$3" >&2 ;;
+esac
+exit "${LANE_CLOSE_LANES_STATUS:-0}"
+EOF
+chmod +x "$SCRIPTS/lanes"
 
 # dev-validate-run records each --stop. The records' /srv/worktree is no
 # directory here, so only a row that points mail_root at one reaches it.
@@ -264,6 +278,10 @@ write_panes() { # COMMAND [DUPLICATE] [SESSION]
 # TEXT after the marker: nothing, or a draft nobody sent. `codex_screen` is the
 # measured Codex capture.
 claude_screen() { printf '%s%s\n' "$CLAUDE_COMPOSER" "${1:-}" >"$SCREEN"; }
+# A limit banner under the lane's last turn, above its composer, naming RESET.
+walled_screen() { # RESET
+  printf '%s\n\n%s\n%s\n' '⏺ I will keep going.' "You've hit your session limit · resets $1" "$CLAUDE_COMPOSER" >"$SCREEN"
+}
 codex_screen() { cp -- "$PANE_FIXTURES/codex-composer-idle.txt" "$SCREEN"; }
 
 # A local lane's harness: a real process, so the SIGTERM and its exit are
@@ -343,7 +361,7 @@ lib_mutant() { # NAME OLD NEW [APPEND]
   local name="$1" old="$2" new="$3" dir sibling
   dir="$TMP_ROOT/libmut-$name"
   mkdir -p "$dir/skills/orch/scripts/lib" "$dir/skills/linear/scripts"
-  for sibling in lane-close workflow-state lane-host lane-mail dev-validate-run; do
+  for sibling in lane-close workflow-state lane-host lane-mail dev-validate-run lanes lib/date-ladder.sh lib/usage-reset.sh; do
     ln -s "$SCRIPTS/$sibling" "$dir/skills/orch/scripts/$sibling"
   done
   ln -s "$FIXTURE/skills/linear/scripts/linear.sh" "$dir/skills/linear/scripts/linear.sh"
@@ -549,6 +567,41 @@ write_state running claude ""; write_panes python; claude_screen
 run_close "$SCRIPT"
 assert_eq "rc=$RC failed=$(grep -c '^lane-close: stop-failed item=KEN-1 harness=claude cause=worktree-read-failed$' <<<"$ERR" || true) kill=$(grep -c '^kill-window ' "$CALLS" || true) status=$(jq -r '.lanes[0].status' "$STATE")" \
   'rc=1 failed=1 kill=0 status=running' 'a local stop that cannot resolve the worktree refuses and keeps the window'
+
+echo '=== a limit banner the account has outlived does not hold a finished lane ==='
+# A banner stays below the last turn of a lane it parked after the window
+# resets. The account the record names settles it: room lifts a banner that
+# dates no reset still ahead, and the finished lane closes like any idle one.
+# A clock reset leaves the account to answer alone; a dated one, the weekly
+# wall's shape, printing its year, lifts once that date is behind. The account
+# is read for the model the record names, the one the launch gate judged it on,
+# and over the whole account where the record names none.
+while IFS='|' read -r model reset argv name; do
+  write_state running claude /host; write_panes python; walled_screen "$reset"; : >"$LANE_CLOSE_LANES_CALLS"
+  jq --arg model "$model" '.lanes[0].model = (if $model == "-" then null else $model end)' "$STATE" >"$STATE.next" && mv -- "$STATE.next" "$STATE"
+  run_close "$SCRIPT" </dev/null
+  assert_eq "rc=$RC lanes=$(cat "$LANE_CLOSE_LANES_CALLS") stop=$(stop_count KEN-1 claude) status=$(jq -r '.lanes[0].status' "$STATE")" \
+    "rc=0 lanes=pick --lane /lane --harness claude$argv stop=1 status=done" "$name"
+done <<'ROWS'
+model|21:00| --model model|a lifted banner over an account reading room for the recorded model closes the finished lane
+model|Oct 7, 2020, 11:32am (UTC)| --model model|a dated banner whose reset is behind, over an account reading room, closes the finished lane
+-|21:00||a record naming no model reads the whole account
+ROWS
+# Each reading the wall stands on refuses, naming it.
+while IFS='|' read -r lanes_status reset want name; do
+  write_state running claude /host; write_panes python; walled_screen "$reset"
+  LANE_CLOSE_LANES_STATUS="$lanes_status" run_close "$SCRIPT" </dev/null
+  assert_eq "rc=$RC live=$(grep -c "^lane-close: lane-live item=KEN-1 state=walled pane=%7 $want\$" <<<"$ERR" || true) stop=$(stop_count KEN-1 claude) status=$(jq -r '.lanes[0].status' "$STATE")" \
+    'rc=1 live=1 stop=0 status=running' "$name"
+done <<'ROWS'
+3|21:00|account=walled|a stale banner over an account still walled refuses as walled
+0|Oct 7, 2099, 11:32am (Mars/Olympus)|account=room resets=unresolved|a reset in a zone this host has no zoneinfo for keeps the wall
+0|Feb 30, 2099, 4pm (UTC)|account=room resets=unresolved|a dated reset date rejects keeps the wall
+5|21:00|account=unmeasured|an account nothing measured leaves the banner standing
+4|21:00|account=unlisted|an account no configured lane names leaves the banner standing
+1|21:00|account=read-failed|a lanes read that fails leaves the banner standing
+0|Oct 7, 2099, 11:32am (UTC)|account=room resets=2099-10-07T11:32:00Z|a banner dating its reset still ahead outranks a room reading
+ROWS
 
 echo '=== a failed stop keeps the lane and its record ==='
 write_state running codex /host; write_panes python; codex_screen

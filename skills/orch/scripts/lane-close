@@ -8,8 +8,11 @@ LANE_HOST="$SCRIPT_DIR/lane-host"
 LANE_MAIL="$SCRIPT_DIR/lane-mail"
 DEV_VALIDATE_RUN="$SCRIPT_DIR/dev-validate-run"
 LINEAR="$SCRIPT_DIR/../../linear/scripts/linear.sh"
+LANES="$SCRIPT_DIR/lanes"
 source "$SCRIPT_DIR/lib/lane-state.sh"
 source "$SCRIPT_DIR/lib/lane-host-slots.sh"
+source "$SCRIPT_DIR/lib/date-ladder.sh"
+source "$SCRIPT_DIR/lib/usage-reset.sh"
 
 message() { # REASON FIELD=VALUE...
   local reason="$1" field
@@ -25,7 +28,16 @@ message() { # REASON FIELD=VALUE...
     pane-missing) printf '%s\n' 'No tmux pane carries the recorded window name.' ;;
     pane-ambiguous) printf '%s\n' 'More than one tmux pane carries the recorded window name.' ;;
     pane-read-failed) printf '%s\n' 'The lane pane could not be read.' ;;
-    lane-live) printf '%s\n' 'The lane is not finished. Close-out changed nothing.' ;;
+    lane-live)
+      printf '%s\n' 'The lane is not finished. Close-out changed nothing.' \
+        'state=walled is a limit banner below the lane'"'"'s last turn that its account reading did not lift. account= is that reading, taken for the model the record names, or over the whole account where it names none:' \
+        '  room            lanes pick --lane read room, and the banner names a reset still ahead in resets=,' \
+        '                  or resets=unresolved: a reset clause this host could not resolve, such as one in a zone it has no zoneinfo for.' \
+        '  walled          lanes pick --lane read the account at or above ORCH_LANE_MAX_PCT.' \
+        '  unmeasured      lanes pick --lane measured nothing for the account; its words are on the lines above.' \
+        '  unlisted        the recorded account is no configured lane of the harness.' \
+        '  read-failed     lanes pick --lane failed; its words are on the lines above.' \
+        '  none            the record names no account, or its harness is not one lanes measures.' ;;
     tracker-read-failed)
       printf '%s\n' \
         'The tracker state could not be read. Close-out changed nothing. cause names which read did not answer:' \
@@ -73,10 +85,16 @@ Usage: lane-close [--state-dir PATH] [--keep-sandbox]
 
 Close one lane recorded in the oversee workflow state. The command refuses a
 live lane. It accepts an exited lane, or an idle lane whose tracker item is
-terminal. An idle lane's harness is ended by SIGTERM, never by typing into its
-pane: through lane-host stop for a record carrying host, and for a local lane
-by the same stop against the worktree the record's mail_root names. The close
-then waits up to ORCH_LANE_CLOSE_SECS (default 15) for the pane to read exited.
+terminal. A limit banner below the lane's last turn is passed over only where
+`lanes pick --lane` reads the account the record names as room, for the model
+the record names or over the whole account where it names none, and the banner
+names no dated reset still ahead and no reset this host cannot resolve; the
+lane is then judged by the rest of its screen. Every other reading keeps the
+lane walled.
+An idle lane's harness is ended by SIGTERM, never by typing into its pane:
+through lane-host stop for a record carrying host, and for a local lane by the
+same stop against the worktree the record's mail_root names. The close then
+waits up to ORCH_LANE_CLOSE_SECS (default 15) for the pane to read exited.
 A hosted stop answering status 4 beside a stop-worktree-removed item=ITEM line
 on its stderr, the item's worktree already removed by its own close-out, prints
 stop-skipped cause=worktree-removed and goes straight to the host close and
@@ -492,6 +510,81 @@ pane_screen="$(tmux capture-pane -pJ -t "$pane_id" 2>/dev/null)" \
 lane_state state listed "$pane_cmd" "$pane_pid" "$pane_screen" \
   || { message pane-read-failed "item=$ITEM" "pane=$pane_id" >&2; exit 1; }
 
+# usage-reset.sh's one import: a reset clause the banner scan could not read.
+die() { message pane-read-failed "item=$ITEM" "pane=$pane_id" "cause=$1" >&2; exit 1; }
+
+# A limit banner stays on a lane's screen after the window it reports resets,
+# since the lane it parked takes no turn to scroll it away. So a `walled`
+# screen is weighed against the account the record names, and it stops
+# answering only where that account reads room and the banner names no reset
+# still ahead. WALL_ACCOUNT is the lane-live message's account= word, and
+# WALL_RESETS a dated reset the banner names still ahead, or `unresolved` for a
+# reset clause that resolved to no time, empty otherwise. A clock or weekday
+# reset names no day, and with no sighting to pin one to it leaves the account
+# reading to answer alone.
+WALL_ACCOUNT=none
+WALL_RESETS=""
+read_wall() {
+  local rc=0 account model model_args=() slice banner key at now clause_rc=0
+  if ! account="$(record_field account)"; then message record-invalid "item=$ITEM" "field=account" >&2; exit 1; fi
+  if ! model="$(record_field model)"; then message record-invalid "item=$ITEM" "field=model" >&2; exit 1; fi
+  case "$harness" in claude|codex) ;; *) return 0 ;; esac
+  [[ -n "$account" ]] || return 0
+  [[ -x "$LANES" ]] || { message helper-missing "item=$ITEM" "path=$LANES" >&2; exit 1; }
+  # The model the launch gate judged this account on, so close reads the wall
+  # launch read. A record naming none, open-terminal's launch whose --cmd names
+  # no model, is read over the whole account: that binding bucket is the widest
+  # reading, so it lifts no wall the model's own would keep.
+  [[ -z "$model" ]] || model_args=(--model "$model")
+  "$LANES" pick --lane "$account" --harness "$harness" ${model_args[@]+"${model_args[@]}"} >/dev/null || rc=$?
+  case "$rc" in
+    0) WALL_ACCOUNT=room ;;
+    3) WALL_ACCOUNT=walled ;;
+    4) WALL_ACCOUNT=unlisted ;;
+    5) WALL_ACCOUNT=unmeasured ;;
+    *) WALL_ACCOUNT=read-failed ;;
+  esac
+  [[ "$WALL_ACCOUNT" == room ]] || return 0
+  # The reset is read from the banner because no record carries it: the lanes
+  # usage record holds resets only for the windows it measures, so a wall
+  # outside them is known from the banner alone.
+  slice="$(pane_below_last_turn "$pane_screen")" \
+    || { message pane-read-failed "item=$ITEM" "pane=$pane_id" >&2; exit 1; }
+  banner="$(lane_limit_banner "$slice")" \
+    || { message pane-read-failed "item=$ITEM" "pane=$pane_id" >&2; exit 1; }
+  # die has already named the failed scan when this substitution fails.
+  key="$(usage_reset_key "$banner")" || exit 1
+  # No key is either a banner naming no reset, which the account answers
+  # alone, or a clause the grammar matched and could not key, such as a zone
+  # this host has no zoneinfo for, which keeps the wall.
+  if [[ -z "$key" ]]; then
+    grep -Eq -- "$USAGE_RESET_ANY_RE" <<<"$banner" || clause_rc=$?
+    case "$clause_rc" in
+      0) WALL_RESETS=unresolved ;;
+      1) ;;
+      *) message pane-read-failed "item=$ITEM" "pane=$pane_id" "cause=reset" >&2; exit 1 ;;
+    esac
+    return 0
+  fi
+  [[ "$key" == dated'|'* ]] || return 0
+  now="$(date -u +%s)" || { message pane-read-failed "item=$ITEM" "pane=$pane_id" "cause=clock" >&2; exit 1; }
+  # A dated clause date rejects, `resets Feb 30, 4pm` among them, resolves to
+  # no time, which is no evidence the reset is behind.
+  if ! at="$(usage_reset_epoch "$key" "$now")" || [[ -z "$at" ]]; then
+    WALL_RESETS=unresolved
+    return 0
+  fi
+  [[ "$at" -gt "$now" ]] || return 0
+  WALL_RESETS="$(from_epoch "$at" '%Y-%m-%dT%H:%M:%SZ')" || WALL_RESETS="$at"
+}
+if [[ "$state" == walled ]]; then
+  read_wall
+  if [[ "$WALL_ACCOUNT" == room && -z "$WALL_RESETS" ]]; then
+    lane_state state listed "$pane_cmd" "$pane_pid" "$pane_screen" "" room \
+      || { message pane-read-failed "item=$ITEM" "pane=$pane_id" >&2; exit 1; }
+  fi
+fi
+
 case "$state" in
   exited) ;;
   idle)
@@ -502,6 +595,9 @@ case "$state" in
       1) message lane-live "item=$ITEM" "state=idle" "pane=$pane_id" >&2; exit 1 ;;
       *) message tracker-read-failed "item=$ITEM" "tracker=$tracker" "source=$tracker_source" "cause=$TRACKER_CAUSE" >&2; exit 1 ;;
     esac ;;
+  walled)
+    message lane-live "item=$ITEM" "state=walled" "pane=$pane_id" "account=$WALL_ACCOUNT" ${WALL_RESETS:+"resets=$WALL_RESETS"} >&2
+    exit 1 ;;
   *) message lane-live "item=$ITEM" "state=$state" "pane=$pane_id" >&2; exit 1 ;;
 esac
 
