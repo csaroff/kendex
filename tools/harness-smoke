@@ -36,6 +36,8 @@
 # the row checks the harness lists that text), `unanswerable` (this machine
 # or this harness cannot answer, with the reason), or `skipped` (left out by
 # --only, or by the frontmatter of the hook a row measures, with its reason).
+# Copilot also answers one row per package this checkout ships, under the
+# package table below, which adds `differs`, `excluded` and `pending`.
 # Silence is never a pass: a run that says nothing about the
 # package is a fail, and a run the harness could not complete is
 # unanswerable with its last line.
@@ -64,12 +66,13 @@
 # isolated HOME holding a whole copy of `~/.gemini` (a partial copy makes agy
 # hang on its login flow).
 #
-# Exit 0 when every row passed (advisory and skipped included), 1 when any
-# row failed, 2 when the fixture could not be installed or `kendex verify`
-# refused it, 3 when nothing failed but a row was unanswerable, so a harness
-# that died on the render never reads as a clean run. Model turns: seven on
-# claude, three on codex, two on antigravity, five on pi, one each on gemini
-# and copilot, two on cursor when logged in.
+# Exit 0 when every row passed (advisory, skipped, differs and excluded
+# included), 1 when any row failed, 2 when the fixture could not be installed
+# or `kendex verify` refused it, 3 when nothing failed but a row was
+# unanswerable or pending, so a harness that died on the render never reads
+# as a clean run. Model turns: seven on claude, three on codex, two on
+# antigravity, five on pi, one on gemini, five on copilot, two on cursor when
+# logged in.
 #
 # The report is the row table: one aligned line per row as it is decided, then
 # the same rows as a markdown table under `| harness | row | result |
@@ -111,6 +114,12 @@ message_text() { # KEY VALUE [EXTRA] — the English for one key, and all of it
       echo "that hook could not be read, or its frontmatter gives no event, so the event that hands a lane its mail over is unknown." ;;
     mail-delivery)
       echo "that table gives no lane-mail-check cell for some harness this script installs into, so which harness gets a lane's mail by which mechanism is unknown." ;;
+    packages)
+      echo "no package of that kind was found there, so the Copilot package table would list none of them: the checkout or this script's reader is broken." ;;
+    package-cell)
+      echo "hooks/README.md gives no copilot cell for that hook, so whether kendex installs it on Copilot is unknown." ;;
+    package-row)
+      echo "the Copilot package table has no answer, or a second one, for that row: tools/harness-smoke is broken." ;;
     setup)
       echo "that step of a scratch project could not be taken, so no row could be measured." ;;
     update-pi)
@@ -241,6 +250,16 @@ description: Harness smoke fixture agent; proves a kendex-rendered agent loads.
 
 You are the smoke agent. Reply with exactly SMOKE-AGENT-LOADED and nothing else.
 EOF
+# The Copilot package table's subagent row: this agent knows the answer only
+# from the repository instructions that table's project carries.
+cat >"$CATALOG/agents/smoke-rules.md" <<'EOF'
+---
+name: smoke-rules
+description: Harness smoke fixture agent; proves a kendex-rendered agent run as a subagent reads the repository's instructions.
+---
+
+Reply with exactly the value your repository instructions give for SMOKE-RULES followed by -VIA-AGENT, or with exactly NO-RULES-VIA-AGENT when they give none, and nothing else.
+EOF
 cat >"$CATALOG/commands/smoke-command.md" <<EOF
 ---
 description: "Harness smoke fixture command: proves a kendex-rendered command loads."
@@ -263,7 +282,10 @@ EOF
   # claimed by a rename and then run, so a second tool call finds nothing and
   # every other row, which drops none, runs this body unchanged.
   if [ "$1" = PreToolUse ]; then
+    # The PATH the harness ran this hook with, which the Copilot package table
+    # reads to tell a hook run without its recorder from one never run.
     cat <<'EOF'
+printf '%s\n' "$PATH" >>"$root/smoke-path"
 if [ -x "$root/smoke-sentinel" ] && mv -- "$root/smoke-sentinel" "$root/smoke-sent"; then
   "$root/smoke-sent" >>"$root/smoke-sent.log" 2>&1 || :
 fi
@@ -292,7 +314,7 @@ EOF
 # name: smoke-tool
 # event: PreToolUse
 # description: Harness smoke fixture hook; appends its event and path to smoke-fired at the project root before a tool runs.
-# safety: Appends to two files at the project root, and where a row planted one, renames smoke-sentinel to smoke-sent and runs it once; never refuses a tool.
+# safety: Appends to three files at the project root, and where a row planted one, renames smoke-sentinel to smoke-sent and runs it once; never refuses a tool.
 # timeout: 10
 # harnesses: $HOOK_HARNESSES
 # ---
@@ -407,18 +429,21 @@ setup() { # WHAT CMD... — WHAT names the step on the keyed line
   KEEP=1
   refuse_cause setup "$what" "$err"
 }
+scratch_repo() { # DIR — a git repository with one commit and an empty project manifest
+  setup 'the scratch project directory' mkdir -p "$1/.agents"
+  setup 'the scratch repository' git -C "$1" init -q
+  setup "the scratch repository's identity" \
+    git -C "$1" config user.email harness-smoke@kendex.invalid
+  setup "the scratch repository's identity" \
+    git -C "$1" config user.name harness-smoke
+  setup "the scratch repository's first commit" \
+    git -C "$1" commit -q --allow-empty -m 'scratch project for tools/harness-smoke'
+  printf 'schema = 6\n' >"$1/kendex.toml"
+}
 install_for() { # HARNESS — sets PROJECT and MARKER, exits 2 when kendex cannot install or verify
   PROJECT="$DIR/$1/project"
   MARKER="$PROJECT/smoke-fired"
-  setup 'the scratch project directory' mkdir -p "$PROJECT/.agents"
-  setup 'the scratch repository' git -C "$PROJECT" init -q
-  setup "the scratch repository's identity" \
-    git -C "$PROJECT" config user.email harness-smoke@kendex.invalid
-  setup "the scratch repository's identity" \
-    git -C "$PROJECT" config user.name harness-smoke
-  setup "the scratch repository's first commit" \
-    git -C "$PROJECT" commit -q --allow-empty -m 'scratch project for tools/harness-smoke'
-  printf 'schema = 6\n' >"$PROJECT/kendex.toml"
+  scratch_repo "$PROJECT"
   # shellcheck disable=SC2046 # add_flags emits whole flags to be split.
   if ! (cd "$PROJECT" && kendex add "$CATALOG" $(add_flags "$1") --harness "$1" -y) \
     >"$LOGS/$1-kendex-add.log" 2>&1; then
@@ -449,7 +474,7 @@ ROWS=""
 row() { # HARNESS QUESTION RESULT EVIDENCE
   case "$3" in
     fail) FAILED=$((FAILED + 1)) ;;
-    unanswerable) UNANSWERED=$((UNANSWERED + 1)) ;;
+    unanswerable | pending) UNANSWERED=$((UNANSWERED + 1)) ;;
   esac
   ROWS="$ROWS$(printf '| %s | %s | %s | %s |' "$1" "$2" "$3" "$4")
 "
@@ -910,6 +935,7 @@ absent() { # HARNESS CLI — every row of a harness whose CLI is not installed
 skipped() {
   local q
   for q in $(questions "$1"); do row "$1" "$q" skipped 'not in --only'; done
+  [ "$1" != copilot ] || pkg_emit skipped
 }
 wants() { case " $ONLY " in *" $1 "*) return 0 ;; esac; return 1; }
 
@@ -1172,7 +1198,7 @@ gemini_rows() {
 # trust entry. Copilot CLI reads no command surface of its own, so it gets no
 # command row.
 copilot_rows() {
-  have copilot || { absent copilot copilot; return; }
+  have copilot || { absent copilot copilot; copilot_packages absent; return; }
   install_for copilot
   local home
   home=$(copied_home copilot-home "${COPILOT_HOME:-$HOME/.copilot}" config.json)
@@ -1188,6 +1214,7 @@ copilot_rows() {
   judge copilot mcp '^ +smoke-mcp \(local\)' '' 'copilot mcp list'
   mail_row copilot 'this script runs no lane session on copilot' ''
   question_row copilot - 'this script runs no lane session on copilot'
+  copilot_packages live "$home"
 }
 
 # Antigravity: agy reads a project's `.agents/` only for a folder the session
@@ -1242,6 +1269,500 @@ antigravity_rows() {
   fi
   mail_row antigravity 'this script runs no lane session on antigravity' ''
   question_row antigravity - 'this script runs no lane session on antigravity'
+}
+
+# ---- the Copilot package table ---------------------------------------------
+# One row per package this checkout ships, asked of Copilot CLI: every hook,
+# skill and agent under SELF, each instruction source Copilot merges, the skill
+# directory a COPILOT_HOME hides, and what a hook or a skill's helper script
+# receives from a Copilot tool call. pkg_rows is the one list of those rows,
+# and pkg_emit prints each once, from the answer pkg_fixed gives where no
+# machine changes it, else from the mode: `pending` with its proof command
+# where copilot is not on PATH, `skipped` where --only leaves it out, and the
+# one answer a producer below recorded where copilot ran. Beside the results
+# above, a row here reads `differs` (it works, and its evidence says how it
+# differs from Claude Code), `excluded` (kendex installs no Copilot render of
+# that hook, for the reason the copilot cell of hooks/README.md gives), or
+# `pending`. The skill, instruction and skill-directory rows need no model turn
+# and answer wherever copilot is on PATH. The agent, hook, helper, duplicate
+# and subagent rows need a login and spend four model turns: the agent listing,
+# one session of tool calls, the duplicate count and the subagent.
+# `agent:effort` reads skipped: nothing here reads the effort a subagent runs
+# at.
+#
+# The package project installs every hook the copilot cell calls enforced,
+# every skill and every agent from SELF, plus the fixture's smoke-rules agent
+# and smoke-tool hook, and runs its model turns with COPILOT_ALLOW_ALL=true,
+# which `copilot help environment` names as the value that trusts the working
+# directory and loads its hooks. Every hook it installs reads its payload with
+# `cat`, so a `cat` first on the session's PATH records, for a caller under
+# .github/hooks, the payload, the directory and the environment names, then
+# hands the payload on unchanged; the fixture hook writes the PATH it ran
+# with, which is what tells a hook run without the recorder from a repository
+# hook that never ran. The session's tool calls run a helper that records the
+# directory and the environment names, then one command per hook below that
+# the hook refuses; each but `cd /` ends by writing a marker a refused call
+# never writes, and each is short-circuited so nothing it names runs when no
+# hook refuses it. A hook with a trigger passes only where a payload it read
+# carries its trigger, the installed hook refuses that recorded payload when
+# the row replays it, and, for every trigger but `cd /`, which leaves nothing
+# to read, the marker was never written.
+PKG_PROOF='tools/harness-smoke --only copilot on a host where copilot is on PATH and logged in'
+PKG_RULES='SMOKE-RULES is SMOKE-RULES-REACHED.'
+# shellcheck disable=SC2016 # the model is handed $HARNESS_SMOKE_UNSET as text a hook refuses
+PKG_TRIGGERS='block-argv-kill|true || pkill -f harness-smoke-absent
+block-unsafe-rm|true || rm -rf $HARNESS_SMOKE_UNSET/harness-smoke-absent
+block-repo-copy|true || cp -r /harness-smoke-absent/.git /tmp/harness-smoke-copy
+block-bare-cd|cd /'
+# Where the hooks' payload reader finds the command, in every shape it reads.
+PKG_COMMAND_JQ='(.tool_input.command // .command // (.toolArgs | if type == "string" then fromjson else . end | .command?)) | strings'
+# The field separator of the tables below: no row name, cell or evidence holds it.
+PKG_SEP=$(printf '\037')
+pkg_list() { # KIND — the names this checkout ships of that kind, one per line
+  local f
+  case "$1" in
+    hook) for f in "$SELF"/hooks/*.sh; do if [ -f "$f" ]; then f=${f##*/}; printf '%s\n' "${f%.sh}"; fi; done ;;
+    skill) for f in "$SELF"/skills/*/SKILL.md; do if [ -f "$f" ]; then f=${f%/SKILL.md}; printf '%s\n' "${f##*/}"; fi; done ;;
+    agent) for f in "$SELF"/agents/*.md; do if [ -f "$f" ]; then f=${f##*/}; printf '%s\n' "${f%.md}"; fi; done ;;
+    mcp) for f in "$SELF"/mcp/*.toml; do if [ -f "$f" ]; then f=${f##*/}; printf '%s\n' "${f%.toml}"; fi; done ;;
+  esac
+}
+# The table lists what these readers find, so a reader that finds nothing would
+# print a table that says nothing; each kind but mcp, which this checkout ships
+# none of, has to find one member, and every hook has to have a copilot cell,
+# which is read here once for every later reader.
+PKG_CELLS=""
+if wants copilot; then
+  for pkg_kind in hook skill agent; do
+    [ -n "$(pkg_list "$pkg_kind")" ] || refuse packages "$SELF/${pkg_kind}s"
+  done
+  for pkg_hook in $(pkg_list hook); do
+    pkg_cell=""
+    pkg_cell=$(mail_cell copilot "$pkg_hook") ||
+      refuse_cause package-cell "$pkg_hook" "$(cat -- "$MAIL_CELL_ERR")"
+    [ -n "$pkg_cell" ] || refuse package-cell "$pkg_hook"
+    PKG_CELLS="$PKG_CELLS$pkg_hook$PKG_SEP$pkg_cell
+"
+  done
+fi
+pkg_lookup() { # TABLE KEY — the value after KEY's separator; 1 where KEY has no line
+  local line
+  while IFS= read -r line; do
+    [ "${line%%"$PKG_SEP"*}" != "$2" ] || { printf '%s' "${line#*"$PKG_SEP"}"; return 0; }
+  done <<<"$1"
+  return 1
+}
+pkg_cell() { pkg_lookup "$PKG_CELLS" "$1" || :; } # HOOK — its copilot cell
+pkg_trigger() { # HOOK — its trigger, empty for none
+  local line
+  while IFS= read -r line; do
+    [ "${line%%|*}" != "$1" ] || { printf '%s' "${line#*|}"; return 0; }
+  done <<<"$PKG_TRIGGERS"
+}
+pkg_rows() { # — every row of the table, in the order it prints
+  local name
+  for name in $(pkg_list hook); do printf 'hook:%s\n' "$name"; done
+  for name in $(pkg_list skill); do printf 'skill:%s\n' "$name"; done
+  for name in $(pkg_list agent) effort; do printf 'agent:%s\n' "$name"; done
+  for name in AGENTS.md CLAUDE.md copilot-instructions.md instructions nested duplicate subagent; do
+    printf 'instruction:%s\n' "$name"
+  done
+  printf 'skill-dirs:COPILOT_HOME\n'
+  for name in payload cwd env; do printf 'helper:%s\n' "$name"; done
+  for name in $(pkg_list mcp); do printf 'mcp:%s\n' "$name"; done
+  [ -n "$(pkg_list mcp)" ] || printf 'mcp:catalog\n'
+}
+pkg_fixed() { # ROW — RESULT<SEP>EVIDENCE where no machine changes the answer, else nothing
+  local cell
+  case "$1" in
+    hook:*)
+      cell=$(pkg_cell "${1#hook:}") || cell=""
+      [ "$cell" = enforced ] || printf 'excluded%skendex installs no Copilot render: %s (hooks/README.md)' "$PKG_SEP" "$cell" ;;
+    agent:effort)
+      printf 'skipped%snothing here reads the effort a subagent runs at, so the effort question D008 leaves open is not measured' "$PKG_SEP" ;;
+    mcp:catalog)
+      printf 'skipped%sthis checkout ships no MCP server; the copilot mcp row above proves Copilot loads a kendex-rendered one' "$PKG_SEP" ;;
+    mcp:*)
+      printf 'skipped%sthe package project installs no MCP server' "$PKG_SEP" ;;
+  esac
+}
+PKG_RESULTS=""
+pkg_set() { # ROW RESULT EVIDENCE — the one answer a live row takes
+  if pkg_lookup "$PKG_RESULTS" "$1" >/dev/null || [ -n "$(pkg_fixed "$1")" ]; then
+    say package-row "$1"
+    exit 2
+  fi
+  PKG_RESULTS="$PKG_RESULTS$1$PKG_SEP$2$PKG_SEP$3
+"
+}
+pkg_emit() { # MODE — absent, skipped or live; one row per name pkg_rows lists
+  local name answer
+  for name in $(pkg_rows); do
+    answer=$(pkg_fixed "$name")
+    case "$1:$answer" in
+      skipped:*) answer="skipped${PKG_SEP}not in --only" ;;
+      *:?*) ;;
+      absent:) answer="pending${PKG_SEP}pending: copilot is not on PATH; proof: $PKG_PROOF" ;;
+      live:)
+        answer=$(pkg_lookup "$PKG_RESULTS" "$name") || {
+          say package-row "$name"
+          exit 2
+        } ;;
+    esac
+    row copilot "$name" "${answer%%"$PKG_SEP"*}" "${answer#*"$PKG_SEP"}"
+  done
+}
+
+# The package project: SELF's packages as the copilot cell allows, the fixture's
+# subagent and marker hook, the instruction sources, the helper, the recorder.
+PKG=""
+PKG_RECORDER=""
+pkg_world() { # — sets PKG and PKG_RECORDER, exits 2 when kendex cannot install or verify
+  local name enforced="" real_cat records cat_q
+  PKG="$DIR/copilot-packages/project"
+  PKG_RECORDER="$DIR/copilot-packages/bin"
+  scratch_repo "$PKG"
+  for name in $(pkg_list hook); do
+    [ "$(pkg_cell "$name")" != enforced ] || enforced="$enforced,$name"
+  done
+  if ! (cd "$PKG" && kendex add "$SELF" --skill "$(pkg_list skill | paste -s -d , -)" \
+    --agent "$(pkg_list agent | paste -s -d , -)" --hook "${enforced#,}" --harness copilot -y) \
+    >"$LOGS/copilot-packages-kendex-add.log" 2>&1; then
+    refused add copilot "$LOGS/copilot-packages-kendex-add.log"
+  fi
+  if ! (cd "$PKG" && kendex add "$CATALOG" --agent smoke-rules --hook smoke-tool --harness copilot -y) \
+    >"$LOGS/copilot-packages-kendex-add-fixture.log" 2>&1; then
+    refused add copilot "$LOGS/copilot-packages-kendex-add-fixture.log"
+  fi
+  if ! (cd "$PKG" && kendex verify --scope project) >"$LOGS/copilot-packages-kendex-verify.log" 2>&1; then
+    refused verify copilot "$LOGS/copilot-packages-kendex-verify.log"
+  fi
+  note verified copilot "$PKG"
+  # CLAUDE.md is the one-line import kendex writes beside AGENTS.md, which is
+  # what the duplicate row asks about.
+  setup 'the package instruction directories' mkdir -p "$PKG/sub" "$PKG/.github/instructions" \
+    "$PKG/smoke-payloads" "$PKG/smoke-triggers" "$PKG_RECORDER"
+  printf '# Harness smoke\n\n%s\n' "$PKG_RULES" >"$PKG/AGENTS.md"
+  printf '@AGENTS.md\n' >"$PKG/CLAUDE.md"
+  printf 'Harness smoke Copilot instructions.\n' >"$PKG/.github/copilot-instructions.md"
+  printf -- '---\napplyTo: "**"\n---\n\nHarness smoke path instructions.\n' \
+    >"$PKG/.github/instructions/smoke.instructions.md"
+  printf 'Harness smoke nested instructions.\n' >"$PKG/sub/AGENTS.md"
+  cat >"$PKG/smoke-helper" <<'EOF'
+#!/bin/sh
+pwd >"$0.cwd"
+env | sed 's/=.*//' | sort >"$0.env"
+EOF
+  real_cat=$(command -v cat)
+  records=$(printf '%q' "$PKG/smoke-payloads")
+  cat_q=$(printf '%q' "$real_cat")
+  cat >"$PKG_RECORDER/cat" <<EOF
+#!/bin/sh
+if [ "\$#" -eq 0 ]; then
+  caller=\$(ps -o args= -p "\$PPID" 2>/dev/null) || caller=""
+  case "\$caller" in
+    */.github/hooks/*.sh*)
+      hook=\${caller##*/.github/hooks/}
+      rec=$records/\${hook%%.sh*}.\$\$
+      $cat_q >"\$rec.payload" || exit 1
+      pwd >"\$rec.cwd"
+      env | sed 's/=.*//' | sort >"\$rec.env"
+      exec $cat_q "\$rec.payload"
+      ;;
+  esac
+fi
+exec $cat_q "\$@"
+EOF
+  setup 'the helper and the recorder' chmod +x "$PKG/smoke-helper" "$PKG_RECORDER/cat"
+}
+
+# Every row judged on text the model relays asks through here. The turn sees
+# the task tool alone (`--available-tools`), so the model cannot read the
+# project's files or run a shell: the agent names it lists are its task tool's,
+# the rule it counts is the one in its context, and the subagent's answer is
+# the subagent's. The duplicate count needs no tool, and the task tool is the
+# one it is left, the only built-in Copilot's documentation names.
+pkg_ask() { # LOG PROMPT
+  run "$1" env COPILOT_HOME="$PKG_HOME" COPILOT_ALLOW_ALL=true copilot -p "$2" \
+    --available-tools task --allow-all-tools -s
+}
+# One listing, one row per name: a skill under Project skills, an agent on a
+# line of its own in the model's answer.
+pkg_listed() { # ROW PATTERN COMMAND-TEXT — OUT and STATUS hold the listing
+  if grep -qE -e "$2" <<<"$OUT"; then
+    pkg_set "$1" pass "$3 lists it"
+  elif [ "$STATUS" -ne 0 ]; then
+    pkg_set "$1" unanswerable "$3 exited $STATUS: $(clip "$(last_line)")"
+  else
+    pkg_set "$1" fail "$3 does not list it; its last line: $(clip "$(last_line)")"
+  fi
+}
+pkg_sources() { # — the sourcePath of each source the listing in OUT names, one per line
+  jq -r '.[].sourcePath' <<<"$OUT" 2>/dev/null
+}
+PKG_BOTH_LISTED=0
+pkg_instruction_rows() {
+  local root_sources="" sub_sources="" q
+  run copilot-instructions-root env COPILOT_HOME="$PKG_HOME" copilot instruction list --json
+  if [ "$STATUS" -ne 0 ] || ! root_sources=$(pkg_sources); then
+    for q in AGENTS.md CLAUDE.md copilot-instructions.md instructions nested; do
+      pkg_set "instruction:$q" unanswerable "copilot instruction list --json at the project root exited $STATUS or printed no JSON: $(clip "$(last_line)")"
+    done
+    return 0
+  fi
+  for q in AGENTS.md CLAUDE.md copilot-instructions.md:.github/copilot-instructions.md \
+    instructions:.github/instructions/smoke.instructions.md; do
+    case "$q" in *:*) ;; *) q="$q:$q" ;; esac
+    if grep -qFx -- "${q#*:}" <<<"$root_sources"; then
+      pkg_set "instruction:${q%%:*}" pass "copilot instruction list --json at the project root lists ${q#*:}"
+    else
+      pkg_set "instruction:${q%%:*}" fail "copilot instruction list --json at the project root does not list ${q#*:} (sources: $(clip "$(paste -s -d , - <<<"$root_sources")"))"
+    fi
+  done
+  grep -qFx AGENTS.md <<<"$root_sources" && grep -qFx CLAUDE.md <<<"$root_sources" && PKG_BOTH_LISTED=1
+  # A nested AGENTS.md: listed from a session started in sub/, and whether a
+  # session started at the root lists it too, which Claude Code's reading of
+  # a nested file as its session touches that directory has no counterpart of.
+  PROJECT="$PKG/sub" run copilot-instructions-sub env COPILOT_HOME="$PKG_HOME" copilot instruction list --json
+  if [ "$STATUS" -ne 0 ] || ! sub_sources=$(pkg_sources); then
+    pkg_set instruction:nested unanswerable "copilot instruction list --json in sub/ exited $STATUS or printed no JSON: $(clip "$(last_line)")"
+  elif ! grep -qFx -- sub/AGENTS.md <<<"$sub_sources"; then
+    pkg_set instruction:nested fail "copilot instruction list --json in sub/ does not list sub/AGENTS.md"
+  elif grep -qFx -- sub/AGENTS.md <<<"$root_sources"; then
+    pkg_set instruction:nested pass "copilot instruction list --json lists sub/AGENTS.md from sub/ and from the project root"
+  else
+    pkg_set instruction:nested differs "copilot instruction list --json lists sub/AGENTS.md for a session started in sub/ and not for one started at the root: a nested AGENTS.md is read for the working directory only"
+  fi
+}
+pkg_duplicate_row() {
+  local answer listed="the instruction listing did not show both AGENTS.md and CLAUDE.md, and"
+  [ "$PKG_BOTH_LISTED" -eq 0 ] || listed="AGENTS.md and CLAUDE.md, which imports it, are both listed, and"
+  pkg_ask copilot-packages-duplicate \
+    "How many times does the exact line '$PKG_RULES' appear across all the instructions you were given? Reply with the number alone."
+  answer=$(last_line) || answer=""
+  case "$STATUS:$answer" in
+    0:1) pkg_set instruction:duplicate pass "$listed the model counts the AGENTS.md line once" ;;
+    0:2) pkg_set instruction:duplicate differs "$listed the model counts the AGENTS.md line twice: the text reaches the context twice" ;;
+    0:*) pkg_set instruction:duplicate fail "the model answered '$(clip "$answer")', not a count of 1 or 2" ;;
+    *) pkg_set instruction:duplicate unanswerable "copilot -p exited $STATUS: $(clip "$answer")" ;;
+  esac
+}
+# The smoke-rules agent builds its answer from the repository's rules and a
+# suffix only its own instructions name, so the parent, which reads the same
+# rules, cannot give the passing line itself.
+pkg_subagent_row() {
+  local label='copilot -p (task tool running smoke-rules, model-relayed)'
+  pkg_ask copilot-packages-subagent \
+    'Use your task tool to run the smoke-rules custom agent. Reply with exactly the text it returned and nothing else.'
+  if grep -qx 'SMOKE-RULES-REACHED-VIA-AGENT' <<<"$OUT"; then
+    pkg_set instruction:subagent pass "$label said SMOKE-RULES-REACHED-VIA-AGENT"
+  elif grep -qx 'NO-RULES-VIA-AGENT' <<<"$OUT"; then
+    pkg_set instruction:subagent fail "$label said NO-RULES-VIA-AGENT: the subagent read no repository instructions"
+  elif [ "$STATUS" -ne 0 ]; then
+    pkg_set instruction:subagent unanswerable "$label exited $STATUS: $(clip "$(last_line)")"
+  else
+    pkg_set instruction:subagent fail "$label did not relay an answer the subagent built; its last line: $(clip "$(last_line)")"
+  fi
+}
+
+# The session of tool calls: the helper, then one refused command per hook.
+pkg_hook_task() {
+  local line hook command n=2
+  printf 'Run each of these shell commands with your shell tool, one tool call per command, in this order. Run each exactly once, whether or not it is refused or fails, and run nothing else. Then reply with exactly: ok\n1. %q\n' "$PKG/smoke-helper"
+  while IFS= read -r line; do
+    hook=${line%%|*}
+    command=${line#*|}
+    case "$hook" in block-bare-cd) ;; *) command="$command; touch $(printf '%q' "$PKG/smoke-triggers/$hook")" ;; esac
+    printf '%s. %s\n' "$n" "$command"
+    n=$((n + 1))
+  done <<<"$PKG_TRIGGERS"
+}
+pkg_record() { # HOOK SUFFIX — the first record that hook left with that suffix; 1 for none
+  local f
+  for f in "$PKG/smoke-payloads/$1".*."$2"; do
+    if [ -f "$f" ]; then printf '%s' "$f"; return 0; fi
+  done
+  return 1
+}
+pkg_trigger_record() { # HOOK TRIGGER — the first payload that hook read carrying TRIGGER; 1 for none
+  local f command
+  for f in "$PKG/smoke-payloads/$1".*.payload; do
+    [ -f "$f" ] || continue
+    command=$(jq -r "$PKG_COMMAND_JQ" <"$f" 2>/dev/null) || continue
+    case "$command" in *"$2"*) printf '%s' "$f"; return 0 ;; esac
+  done
+  return 1
+}
+# The one verdict of the session when no repository hook read a payload, for
+# every row that session answers; empty result where some hook did.
+PKG_SESSION_RESULT=""
+PKG_SESSION_EVIDENCE=""
+pkg_session_verdict() {
+  local f line path_had=0
+  PKG_SESSION_RESULT=""
+  PKG_SESSION_EVIDENCE=""
+  for f in "$PKG/smoke-payloads"/*.payload; do
+    [ ! -f "$f" ] || return 0
+  done
+  if [ -f "$MARKER" ] && grep -q '^PreToolUse ' "$MARKER"; then
+    if [ -f "$PKG/smoke-path" ]; then
+      while IFS= read -r line; do
+        case ":$line:" in *":$PKG_RECORDER:"*) path_had=1 ;; esac
+      done <"$PKG/smoke-path"
+    fi
+    if [ "$path_had" -eq 1 ]; then
+      PKG_SESSION_RESULT=fail
+      PKG_SESSION_EVIDENCE="the fixture hook, which has no matcher, ran at preToolUse with the recorder on its PATH, and no repository hook, each matched to the shell tool, ran: the rendered matcher never matches Copilot's shell tool"
+    else
+      PKG_SESSION_RESULT=unanswerable
+      PKG_SESSION_EVIDENCE="the fixture hook ran at preToolUse without the recorder on its PATH: Copilot starts hooks without the launch PATH, so no repository hook's payload could be recorded"
+    fi
+  elif [ "$STATUS" -ne 0 ]; then
+    PKG_SESSION_RESULT=unanswerable
+    PKG_SESSION_EVIDENCE="copilot -p exited $STATUS: $(clip "$(last_line)")"
+  elif ! [ -f "$PKG/smoke-helper.cwd" ]; then
+    PKG_SESSION_RESULT=unanswerable
+    PKG_SESSION_EVIDENCE="the model ran none of the commands; its last line: $(clip "$(last_line)")"
+  else
+    PKG_SESSION_RESULT=fail
+    PKG_SESSION_EVIDENCE='the model ran its tool calls, and Copilot ran no repository hook, the fixture hook included'
+  fi
+}
+pkg_hook_row() { # HOOK — after the session
+  local hook=$1 row="hook:$1" event trigger rec rc=0 marker="$PKG/smoke-triggers/$1"
+  event=$(sed -n 's/^# event: //p' "$SELF/hooks/$hook.sh")
+  if ! pkg_record "$hook" payload >/dev/null; then
+    if [ -n "$PKG_SESSION_RESULT" ]; then
+      pkg_set "$row" "$PKG_SESSION_RESULT" "$PKG_SESSION_EVIDENCE"
+    else
+      pkg_set "$row" fail "never ran at $event, while other hooks read their payloads"
+    fi
+    return 0
+  fi
+  trigger=$(pkg_trigger "$hook") || trigger=""
+  if [ -z "$trigger" ]; then
+    pkg_set "$row" pass "ran at $event, reading the payload Copilot sent; its refusals need a world this project lacks, and its suite holds them"
+    return 0
+  fi
+  if ! rec=$(pkg_trigger_record "$hook" "$trigger"); then
+    pkg_set "$row" unanswerable "the trigger never reached this hook: no payload it read carries '$trigger'"
+    return 0
+  fi
+  (cd "$PKG" && bash "$PKG/.github/hooks/$hook.sh" <"$rec") >"$LOGS/copilot-replay-$hook.log" 2>&1 || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    pkg_set "$row" fail "passes the payload Copilot sent for '$trigger' when the row replays it"
+  elif [ "$hook" = block-bare-cd ]; then
+    pkg_set "$row" pass "received '$trigger' at $event and refuses Copilot's payload for it when replayed (exit $rc); a refused bare cd leaves no marker"
+  elif [ -e "$marker" ]; then
+    pkg_set "$row" fail "refuses Copilot's payload for its trigger when replayed (exit $rc), and the call still ran: $marker was written"
+  else
+    pkg_set "$row" pass "received its trigger at $event, refuses Copilot's payload for it when replayed (exit $rc), and the call never ran: $marker was never written"
+  fi
+}
+pkg_helper_rows() {
+  local rec keys hook_cwd tool_cwd hook_env tool_env names q
+  if [ -n "$PKG_SESSION_RESULT" ] && ! [ -f "$PKG/smoke-helper.cwd" ]; then
+    for q in payload cwd env; do pkg_set "helper:$q" "$PKG_SESSION_RESULT" "$PKG_SESSION_EVIDENCE"; done
+    return 0
+  fi
+  if ! rec=$(pkg_record block-argv-kill payload); then
+    pkg_set helper:payload "${PKG_SESSION_RESULT:-fail}" "${PKG_SESSION_EVIDENCE:-block-argv-kill left no preToolUse payload, while other hooks read theirs}"
+  elif keys=$(jq -r 'keys_unsorted | join(",")' <"$rec" 2>/dev/null) &&
+    jq -e "$PKG_COMMAND_JQ" <"$rec" >/dev/null 2>&1; then
+    pkg_set helper:payload pass "the preToolUse payload carries the command where the hooks' reader looks; its keys: $(clip "$keys")"
+  else
+    pkg_set helper:payload fail "the preToolUse payload carries no command the hooks' reader reads; it begins: $(clip "$(head -c 160 "$rec")")"
+  fi
+  hook_cwd=""
+  hook_env=""
+  if rec=$(pkg_record block-argv-kill cwd); then hook_cwd=$(cat -- "$rec") || hook_cwd=""; fi
+  if rec=$(pkg_record block-argv-kill env); then hook_env=$(cat -- "$rec") || hook_env=""; fi
+  tool_cwd=$(cat -- "$PKG/smoke-helper.cwd" 2>/dev/null) || tool_cwd=""
+  tool_env=$(cat -- "$PKG/smoke-helper.env" 2>/dev/null) || tool_env=""
+  if [ -z "$hook_cwd" ] || [ -z "$tool_cwd" ]; then
+    pkg_set helper:cwd unanswerable "a record is missing: the hook's directory '${hook_cwd:-none}', the tool call's '${tool_cwd:-none}'"
+  elif [ "$hook_cwd" = "$PKG" ] && [ "$tool_cwd" = "$PKG" ]; then
+    pkg_set helper:cwd pass "a hook and a tool call both run in the project root"
+  else
+    pkg_set helper:cwd differs "the project root is $PKG; a hook runs in $hook_cwd, a tool call in $tool_cwd"
+  fi
+  names=$(grep -E '^(COPILOT_|GITHUB_COPILOT|CLAUDE)' <<<"$tool_env" | paste -s -d , -) || names=""
+  if [ -z "$hook_env" ] || [ -z "$tool_env" ]; then
+    pkg_set helper:env unanswerable "a record is missing: the hook's environment ($(grep -c . <<<"$hook_env") names), the tool call's ($(grep -c . <<<"$tool_env") names)"
+  elif grep -qFx HARNESS_SMOKE_ENV <<<"$hook_env" && grep -qFx HARNESS_SMOKE_ENV <<<"$tool_env"; then
+    pkg_set helper:env pass "the launch environment reaches a hook and a tool call; harness names a tool call sees: ${names:-none}"
+  else
+    pkg_set helper:env fail "HARNESS_SMOKE_ENV, set on the launch, is missing from the hook's or the tool call's environment; harness names a tool call sees: ${names:-none}"
+  fi
+}
+pkg_hook_session() {
+  local name
+  rm -f -- "$MARKER" "$PKG/smoke-path"
+  run copilot-packages-hooks env PATH="$PKG_RECORDER:$PATH" HARNESS_SMOKE_ENV=1 COPILOT_HOME="$PKG_HOME" \
+    COPILOT_ALLOW_ALL=true copilot -p "$(pkg_hook_task)" --allow-all-tools -s
+  pkg_session_verdict
+  for name in $(pkg_list hook); do
+    [ "$(pkg_cell "$name")" != enforced ] || pkg_hook_row "$name"
+  done
+  pkg_helper_rows
+}
+
+# Every COPILOT_HOME hides ~/.agents/skills; COPILOT_SKILLS_DIRS names it back.
+# Each of the three listings is judged by its exit and by whether it lists the
+# skill, separately: a listing that failed and names nothing answered nothing.
+pkg_skill_dirs_row() {
+  local home="$DIR/copilot-skill-dirs/home" state="$DIR/copilot-skill-dirs/copilot-home"
+  local which listed="" failed=""
+  setup 'the skill-directory homes' mkdir -p "$home/.agents/skills/smoke-personal" "$state"
+  printf -- '---\nname: smoke-personal\ndescription: Harness smoke fixture personal skill.\n---\n\nReply with exactly SMOKE-PERSONAL-LOADED.\n' \
+    >"$home/.agents/skills/smoke-personal/SKILL.md"
+  for which in bare home dirs; do
+    case "$which" in
+      bare) run copilot-skill-dirs-bare env -u COPILOT_HOME HOME="$home" copilot skill list ;;
+      home) run copilot-skill-dirs-home env HOME="$home" COPILOT_HOME="$state" copilot skill list ;;
+      dirs) run copilot-skill-dirs-dirs env HOME="$home" COPILOT_HOME="$state" \
+        COPILOT_SKILLS_DIRS="$home/.agents/skills" copilot skill list ;;
+    esac
+    if grep -qE '^  smoke-personal - ' <<<"$OUT"; then
+      listed="$listed $which"
+    elif [ "$STATUS" -ne 0 ] && [ -z "$failed" ]; then
+      failed="copilot skill list ($which) exited $STATUS: $(clip "$(last_line)")"
+    fi
+  done
+  case "$listed:$failed" in
+    " bare home dirs":*) pkg_set skill-dirs:COPILOT_HOME pass 'copilot skill list lists ~/.agents/skills with and without COPILOT_HOME' ;;
+    *:?*) pkg_set skill-dirs:COPILOT_HOME unanswerable "$failed" ;;
+    " bare dirs":) pkg_set skill-dirs:COPILOT_HOME differs 'copilot skill list drops ~/.agents/skills once COPILOT_HOME is set, and COPILOT_SKILLS_DIRS=~/.agents/skills brings it back: a launch that sets COPILOT_HOME exports both' ;;
+    " bare"*) pkg_set skill-dirs:COPILOT_HOME fail 'copilot skill list under COPILOT_HOME with COPILOT_SKILLS_DIRS=~/.agents/skills does not list it' ;;
+    *) pkg_set skill-dirs:COPILOT_HOME fail 'copilot skill list with no COPILOT_HOME does not list ~/.agents/skills' ;;
+  esac
+}
+
+PKG_HOME=""
+copilot_packages() { # MODE [HOME] — absent: copilot is not on PATH; live: HOME is the isolated COPILOT_HOME
+  local name
+  if [ "$1" = absent ]; then
+    pkg_emit absent
+    return
+  fi
+  PKG_HOME=$2
+  pkg_world
+  local PROJECT="$PKG" MARKER="$PKG/smoke-fired"
+  run copilot-packages-skills env COPILOT_HOME="$PKG_HOME" copilot skill list
+  for name in $(pkg_list skill); do
+    pkg_listed "skill:$name" "^  $name - " 'copilot skill list'
+  done
+  pkg_ask copilot-packages-agents \
+    'List the names of the custom agents your task tool can run, one per line, and nothing else.'
+  for name in $(pkg_list agent); do
+    pkg_listed "agent:$name" "^[-*[:space:]]*${name}[[:space:]]*\$" 'copilot -p (model-relayed agent listing)'
+  done
+  pkg_hook_session
+  pkg_instruction_rows
+  pkg_duplicate_row
+  pkg_subagent_row
+  pkg_skill_dirs_row
+  pkg_emit live
 }
 
 printf '%-11s %-9s %-12s %s\n' harness row result evidence
