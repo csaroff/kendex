@@ -246,8 +246,8 @@ ORCH_REPORT_COLUMNS = "issue,what it is,why it matters"
 # Zero disables the rate trigger.
 ORCH_OVERSEER_WALL_MINUTES = "20"
 
-# Maximum number of better successor accounts that starts succession.
-# Zero disables the qualifying-account trigger.
+# The qualifying-account trigger, by the rule oversee-succeed --help states.
+# Zero disables it.
 ORCH_OVERSEER_SUCCESSOR_ACCOUNTS = "1"
 
 # Consecutive oversee-watch passes the overseer's own pane must read exited

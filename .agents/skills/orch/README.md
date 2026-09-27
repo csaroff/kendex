@@ -60,10 +60,10 @@ Non-secret settings go in committed `kendex.settings.toml` under `[env]`; secret
 | `ORCH_OVERSEER_QUESTION_TOOL` | `off` strips successors' question tool | `on` |
 | `ORCH_OVERSEER_SUCCESSION` | `on` lets `oversee-succeed` launch the successor overseer; `off` launches nothing and turns off the turn-end refusal naming it; the `overseer-mark` watch line still goes out. A live overseer asks the user to start the next session. A dead or walled one gets a notice only | `on` |
 | `ORCH_OVERSEER_DEAD_PASSES` | Consecutive watch passes that must read the overseer pane as exited, or as walled, before the watch reports it; a walled reading needs its account judged at or below the trigger too | `2` |
-| `ORCH_OVERSEER_HEADROOM_PCT` | Account headroom at or below which `oversee-succeed` succeeds the overseer onto an account above it, and refuses its turn end through `lane-mail-check` | `5` |
-| `ORCH_OVERSEER_WALL_MINUTES` | Projected wall minutes that fire overseer succession. `0` disables this trigger | `20` |
-| `ORCH_OVERSEER_SUCCESSOR_ACCOUNTS` | Remaining qualifying successor accounts that fire succession. `0` disables this trigger | `1` |
-| `ORCH_OVERSEER_MARK_REPEAT` | Watch passes a standing `overseer-mark` waits before it is reported again | `5` |
+| `ORCH_OVERSEER_HEADROOM_PCT` | Account headroom at or below which the overseer succeeds onto an account above it and `lane-mail-check` refuses its turn end | `5` |
+| `ORCH_OVERSEER_WALL_MINUTES` | Projected wall minutes that fire overseer succession. `0` disables it | `20` |
+| `ORCH_OVERSEER_SUCCESSOR_ACCOUNTS` | Qualifying-account count that fires succession, by the rule `oversee-succeed --help` states. `0` disables it | `1` |
+| `ORCH_OVERSEER_MARK_REPEAT` | Watch passes a standing `overseer-mark` waits before it repeats | `5` |
 | Recording settings | `ORCH_FLEET_LOG_ROW_BYTES`, `ORCH_TAKEOVER_ROWS`, `ORCH_RECORD_RETENTION_DAYS`, `ORCH_PROGRESS_REPORT_DIR`: [recording policy](schemas/workflow-state.md#recording-policy) | |
 | Report settings | `ORCH_REPORT`, `ORCH_REPORT_EVERY_MINUTES`, `ORCH_REPORT_EVERY_ISSUES`, `ORCH_REPORT_UPCOMING`, `ORCH_REPORT_COLUMNS`: `oversee-report --help` | |
 | Watch settings | `ORCH_WATCH_TAIL_LINES`, `ORCH_WATCH_PREPARE_SECS`: `oversee-watch --help` § Environment | |
