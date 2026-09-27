@@ -126,7 +126,7 @@ Non-secret settings go in committed `kendex.settings.toml` under `[env]`; `.env.
 
 ## Runtime Notes
 
-> If you are running in **Codex**: `approval required by policy, but AskForApproval is set to Never` flags the command's SHAPE. Never retry it, never wait for approval; rewrite it per [references/codex-runtime.md](references/codex-runtime.md). Run long waiters through [Waiter launch](references/waiter-launch.md); CI waiting uses `.agents/skills/orch/scripts/ci-wait`. Spawn generated agents through `scripts/spawn-adapter` with `fork_context: false`, then `send_input` a `DELEGATION:`-prefixed `<delegation_format>`.
+> If you are running in **Codex**: `approval required by policy, but AskForApproval is set to Never` means an execpolicy rule matched the command, not its shell form. Never retry it, never wait for approval; act per [references/codex-runtime.md](references/codex-runtime.md), which states what each launch mode refuses. Run long waiters through [Waiter launch](references/waiter-launch.md); CI waiting uses `.agents/skills/orch/scripts/ci-wait`. Spawn generated agents through `scripts/spawn-adapter` with `fork_context: false`, then `send_input` a `DELEGATION:`-prefixed `<delegation_format>`.
 
 > If you are running in **OpenCode**: store the `task_id` returned by `functions.task` in workflow state (`child_sessions[agent].agent_id`, `review_agent_ids[reviewer-name]`) and re-delegate with `functions.task(task_id=<stored_id>)`. Spawn fresh only when no ID is stored, one resume attempt failed, or the task is confirmed dead.
 
@@ -148,7 +148,7 @@ Delegation, agent lifecycle, round closure, coordination, and lane output: [refe
 
 #### Harness-Safe Shell
 
-**Run exactly one simple command per tool call with explicit arguments.** Rejected shapes and substitutes: [references/codex-runtime.md](references/codex-runtime.md). Normalize delegated command lists the same way before they enter a prompt: an env-assignment prefix becomes a precondition check plus the bare command. A finding's location, description, or cause never crosses argv: write it to a file with the harness file-write tool and bind the path (`--items-file`, `append-file`, jq `--slurpfile`).
+**Run exactly one simple command per tool call with explicit arguments.** Substitutes, and what each Codex launch mode refuses: [references/codex-runtime.md](references/codex-runtime.md). Normalize delegated command lists the same way before they enter a prompt: an env-assignment prefix becomes a precondition check plus the bare command. A finding's location, description, or cause never crosses argv: write it to a file with the harness file-write tool and bind the path (`--items-file`, `append-file`, jq `--slurpfile`).
 
 #### Tracker Resolution
 
