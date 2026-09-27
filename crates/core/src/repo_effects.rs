@@ -85,14 +85,19 @@ fn resolve_script<'a>(
 }
 
 /// Run a resolved script from the repository root and relay what it said.
+/// With an `index`, git in the script reads that index file rather than the
+/// repository's own.
 fn launch_script(
     repo: &std::path::Path,
     program: &std::path::Path,
     argv: Vec<std::ffi::OsString>,
+    index: Option<&std::path::Path>,
 ) -> crate::error::Result<crate::guard::GuardReport> {
-    let output = crate::process::Hardened::package_script(program, argv, repo)
-        .run()
-        .map_err(|error| err(error.to_string()))?;
+    let mut script = crate::process::Hardened::package_script(program, argv, repo);
+    if let Some(index) = index {
+        script = script.env("GIT_INDEX_FILE", &index.to_string_lossy());
+    }
+    let output = script.run().map_err(|error| err(error.to_string()))?;
     Ok(crate::guard::relay(&output))
 }
 
@@ -108,7 +113,19 @@ pub fn run_script(
     spec: &str,
 ) -> crate::error::Result<crate::guard::GuardReport> {
     let (repo, program, argv) = resolve_script(scope, root, spec)?;
-    launch_script(repo, &program, argv)
+    launch_script(repo, &program, argv, None)
+}
+
+/// Run a declared script with git pointed at the index file `index`, the
+/// way a pre-commit hook runs over the index a commit hands it.
+pub(crate) fn run_script_over(
+    scope: &crate::model::Scope,
+    root: &std::path::Path,
+    spec: &str,
+    index: &std::path::Path,
+) -> crate::error::Result<crate::guard::GuardReport> {
+    let (repo, program, argv) = resolve_script(scope, root, spec)?;
+    launch_script(repo, &program, argv, Some(index))
 }
 
 /// Run another verb through the program named by a declared script.
@@ -119,7 +136,7 @@ pub(crate) fn run_script_program(
     argv: Vec<std::ffi::OsString>,
 ) -> crate::error::Result<crate::guard::GuardReport> {
     let (repo, program, _) = resolve_script(scope, root, declared)?;
-    launch_script(repo, &program, argv)
+    launch_script(repo, &program, argv, None)
 }
 
 /// Whether kendex recorded arming this package's declared effect here.
@@ -140,6 +157,39 @@ pub fn armed_here(
         armed::record_dir(&repo, touches_git(&declared.effects)),
         &declared.name,
     )
+}
+
+/// The main checkout of the repository, where this scope is a linked work
+/// tree of it and kendex recorded setting this package's checkout effect up
+/// there but not here.
+///
+/// A checkout effect's record belongs to the work tree it was made in, so
+/// a linked work tree of a set-up repository reads as not set up. That
+/// stays so: the work tree's own copy of the package is the code a record
+/// here would let kendex run. What this answer is for is the other half,
+/// that the state is never silent. A surface that finds the package not
+/// set up here names the main checkout and offers the setup in one step.
+///
+/// The main checkout's own git directory is the common one, so its record
+/// for a checkout effect sits where a shared effect's record does. `None`
+/// for a shared effect, whose one record every work tree already reads.
+pub fn set_up_in_main_checkout(
+    scope: &crate::model::Scope,
+    declared: &DeclaredEffects,
+) -> crate::error::Result<Option<std::path::PathBuf>> {
+    let crate::model::Scope::Project { root } = scope else {
+        return Ok(None);
+    };
+    if touches_git(&declared.effects) {
+        return Ok(None);
+    }
+    let Some(repo) = crate::guard::Repo::probe(root)? else {
+        return Ok(None);
+    };
+    if !repo.is_linked() || !armed::recorded(armed::record_dir(&repo, true), &declared.name)? {
+        return Ok(None);
+    }
+    repo.main_checkout().map(Some)
 }
 
 pub(crate) fn err(message: impl Into<String>) -> crate::error::CoreError {
@@ -165,7 +215,7 @@ pub fn arm(
         });
     };
     let (repo, program, argv) = resolve_script(scope, &declared.root, installer)?;
-    let report = launch_script(repo, &program, argv)?;
+    let report = launch_script(repo, &program, argv, None)?;
     if report.code != 0 {
         return Err(ArmError::Failed {
             name: declared.name.clone(),

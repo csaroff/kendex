@@ -384,15 +384,22 @@ export const commands = {
 	 */
 	commitOfferScan: (roots: string[], since: ProjectBaseline[]) => typedError<ProjectOffer[], string>(__TAURI_INVOKE("commit_offer_scan", { roots, since })),
 	/**
-	 *  Build the offer for one project because a person asked for it, rather
-	 *  than because a write left it behind.
+	 *  Build the offer for one project on the window's own ask, rather than
+	 *  because a write's scan left it behind.
 	 * 
 	 *  The setting that turns off asking is not consulted: it decides whether
-	 *  kendex opens the question by itself, and this is the person opening it.
-	 *  Nothing is attributed to an action either — there is none — so every
-	 *  pending change is theirs to choose from.
+	 *  kendex opens the question by itself, and this is the window asking.
+	 *  `since` is the reading an offer on screen was scoped to, where the
+	 *  window reads that offer again after a step it ran: the answer keeps the
+	 *  action's attribution, and a read that fails or finds the project
+	 *  blocked says so rather than reading as nothing pending. Without one a
+	 *  person opened the review, and nothing is attributed to an action, so
+	 *  every pending change is theirs to choose from.
 	 */
-	commitOfferOpen: (root: string) => typedError<OpenOffer, string>(__TAURI_INVOKE("commit_offer_open", { root })),
+	commitOfferOpen: (root: string, since: {
+	root: string,
+	held: HeldPath[],
+} | null) => typedError<OpenOffer, string>(__TAURI_INVOKE("commit_offer_open", { root, since })),
 	/**
 	 *  What changed in one file the offer covers, for the viewer the window
 	 *  opens on it.
@@ -4025,6 +4032,21 @@ export type ProjectOffer = {
 	 *  `--set-upstream`.
 	 */
 	tracked: boolean,
+	/**
+	 *  Packages whose files in this repository a commit of every pending
+	 *  change would carry out of date. Where the commit on offer is that
+	 *  one and any is listed, it is not offered: the dialog offers their
+	 *  setup, or leaving the files as diffs.
+	 */
+	stale: StalePackage[],
+	/**
+	 *  The same reading for a commit of only this action's work,
+	 *  `action_paths`, which a write-opened offer starts on. An older
+	 *  pending change can hold every pending change while this action's
+	 *  own commit is clean. Equal to `stale` where no action opened the
+	 *  offer.
+	 */
+	staleAction: StalePackage[],
 };
 
 /**
@@ -4217,6 +4239,17 @@ export type RepoEffects = {
 	 *  names: see `super::armed`.
 	 */
 	checker: string | null,
+	/**
+	 *  The read-only command that says whether the package's files are
+	 *  current in the commit the index holds, rather than in the working
+	 *  tree. Absent means the package has no such check, and kendex judges
+	 *  a commit carrying its files by `checker` alone.
+	 * 
+	 *  kendex runs it as declared, with `GIT_INDEX_FILE` naming the index
+	 *  of the commit it is about to offer, under the same licence and exit
+	 *  taxonomy as `checker`.
+	 */
+	stagedChecker: string | null,
 	/**  How to undo the effect by hand, for the disclosure's last line. */
 	removal: string | null,
 	/**
@@ -5056,6 +5089,44 @@ export type SourcesAfter_Serialize = {
 	sources: SourceRow[],
 	undone?: string[],
 };
+
+/**
+ *  One package holding the commit, from
+ *  [`kendex_core::commit_offer::stale`].
+ */
+export type StalePackage = {
+	name: string,
+	why: StaleWhy,
+	/**  What the package's check said, escaped. Empty where it did not run. */
+	said: string[],
+	/**
+	 *  Whether running the package's setup can clear this hold, which is
+	 *  what the window offers the setup and its disclosure on. A split
+	 *  cannot: only committing the files together clears it.
+	 */
+	setUpClears: boolean,
+	/**
+	 *  What the setup changes, the block the dialog shows before its yes.
+	 *  Its `declared` is handed back to `repo_effects_apply` untouched;
+	 *  every word drawn is the disclosure's own display text.
+	 */
+	disclosure: Disclosure,
+};
+
+export type StaleWhy = 
+/**  kendex has not set the package up in this checkout. */
+"notSetUp" | 
+/**  The package's check says its files are out of date. */
+"outOfDate" | 
+/**  The package's check could not answer. */
+"unchecked" | 
+/**
+ *  The package's check fails over the commit, which carries some of
+ *  its changed files and leaves out a change they were rendered from:
+ *  `said` names the changed inputs left out, then the check's words.
+ *  No setup clears it.
+ */
+"split";
 
 /**
  *  What stands at the folder a project would be reconnected to.

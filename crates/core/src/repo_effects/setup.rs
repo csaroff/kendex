@@ -29,7 +29,7 @@
 //! and why the surface reporting it offers a way to ask the package
 //! directly.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use specta::Type;
@@ -138,6 +138,22 @@ impl SetupStatus {
 
 /// The declared setup's standing in this project.
 pub fn status(scope: &Scope, declared: &DeclaredEffects, ask: Ask) -> SetupStatus {
+    asked(scope, declared, ask, None)
+}
+
+/// The declared setup's standing over the commit the index file at `index`
+/// holds, rather than over the working tree: the declared staged checker,
+/// run with git pointed at that index. Licensed as [`Ask::Surface`] is, and
+/// [`SetupState::Unavailable`] for a package that declares none.
+pub(crate) fn status_of_index(
+    scope: &Scope,
+    declared: &DeclaredEffects,
+    index: &Path,
+) -> SetupStatus {
+    asked(scope, declared, Ask::Surface, Some(index))
+}
+
+fn asked(scope: &Scope, declared: &DeclaredEffects, ask: Ask, index: Option<&Path>) -> SetupStatus {
     let can_apply = declared.effects.installer.is_some();
     let shared = super::touches_git(&declared.effects);
     // Not a project, so there is no repository for an effect to stand in.
@@ -154,7 +170,11 @@ pub fn status(scope: &Scope, declared: &DeclaredEffects, ask: Ask) -> SetupStatu
             shared,
         };
     };
-    let Some(checker) = &declared.effects.checker else {
+    let checker = match index {
+        None => &declared.effects.checker,
+        Some(_) => &declared.effects.staged_checker,
+    };
+    let Some(checker) = checker else {
         return SetupStatus {
             state: SetupState::Unavailable,
             said: Vec::new(),
@@ -179,7 +199,9 @@ pub fn status(scope: &Scope, declared: &DeclaredEffects, ask: Ask) -> SetupStatu
             shared,
         };
     }
-    run(scope, declared, checker, can_apply, shared, armed_here)
+    run(
+        scope, declared, checker, index, can_apply, shared, armed_here,
+    )
 }
 
 /// Run the declared check and report what its exit status carried.
@@ -194,11 +216,16 @@ fn run(
     scope: &Scope,
     declared: &DeclaredEffects,
     checker: &str,
+    index: Option<&Path>,
     can_apply: bool,
     shared: bool,
     armed_here: bool,
 ) -> SetupStatus {
-    let report = match super::run_script(scope, &declared.root, checker) {
+    let report = match index {
+        None => super::run_script(scope, &declared.root, checker),
+        Some(index) => super::run_script_over(scope, &declared.root, checker, index),
+    };
+    let report = match report {
         Ok(report) => report,
         Err(error) => return could_not_check(can_apply, true, shared, error.to_string()),
     };
