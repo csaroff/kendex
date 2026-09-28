@@ -211,10 +211,11 @@ export function registerBash(pi: ExtensionAPI, agent: any, cwd: string): void {
 			}
 			clearBlink(context);
 			clearBashLiveTailTimer(liveTailState);
-			const exit = commandExit(output);
+			const failed = Boolean(context?.isError || result?.isError);
+			const exit = failed ? commandExit(output) : 0;
 			const count = lineCount(output);
-			const exitLabel = exit === null ? "exit 0" : `exit ${exit}`;
-			let summary = exit !== null && exit !== 0 ? theme.fg("error", exitLabel) : theme.fg("success", exitLabel);
+			const exitLabel = exit === null ? "failed" : `exit ${exit}`;
+			let summary = theme.fg(failed ? "error" : "success", exitLabel);
 			summary += theme.fg("dim", ` · ${count} line${count === 1 ? "" : "s"}`);
 			if (resultTruncated(result)) summary += theme.fg("warning", " · truncated");
 			const mode = bashOutputMode(effectiveCwd);

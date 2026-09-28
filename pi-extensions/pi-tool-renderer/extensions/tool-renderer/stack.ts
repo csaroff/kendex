@@ -8,7 +8,6 @@ import {
 } from "./settings.js";
 import { stackPrefix, toolLabel, treeConnector, treeStem, type TreeBranch } from "./theme.js";
 import {
-	commandExit,
 	joinPhrases,
 	lineCount,
 	makeEmpty,
@@ -105,10 +104,8 @@ function stackItemSummary(item: StackItem, theme: any): string {
 		return text;
 	}
 	if (item.toolName === "bash") {
-		const exit = commandExit(item.resultText);
 		const count = lineCount(item.resultText);
-		const exitLabel = exit === null ? "exit 0" : `exit ${exit}`;
-		let text = exit !== null && exit !== 0 ? theme.fg("error", exitLabel) : theme.fg("success", exitLabel);
+		let text = theme.fg("success", "exit 0");
 		text += theme.fg("dim", ` · ${count} line${count === 1 ? "" : "s"}`);
 		if (item.truncated) text += theme.fg("warning", " · truncated");
 		return text;
