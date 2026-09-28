@@ -70,7 +70,7 @@ cat > "$BIN/kendex" <<'STUB'
 #!/bin/sh
 case "$1:$2:$3" in
   tier-model:claude:1) echo fable ;;
-  tier-model:claude:3) echo sonnet ;;
+  tier-model:claude:3) echo claude-sonnet-4-6 ;;
   tier-model:codex:1) echo gpt-6-astra ;;
   *) exit 1 ;;
 esac
@@ -587,6 +587,11 @@ run_succeed callerflags '' -- --model fable --effort high --permission-mode bypa
 assert_eq "$RC|$(overseers)|$(recorded claude)" \
   "0|1|lane=$H/.claude;-n;overseer;$CLAUDE_COMPACT;--model;fable;--effort;high;--permission-mode;bypassPermissions;--verbose;$BRIEF;" \
   "the caller entry carries the caller's model, effort and permission words whole"
+new_caller "$MARK"
+run_succeed attachedcaller '' -- --model=sonnet --effort high --permission-mode bypassPermissions --verbose
+assert_eq "$RC|$(overseers)|$(recorded claude)" \
+  "0|1|lane=$H/.claude;-n;overseer;$CLAUDE_COMPACT;--model=claude-sonnet-5;--effort;high;--permission-mode;bypassPermissions;--verbose;$BRIEF;" \
+  "a caller's attached sonnet model word is carried as the model id"
 
 claude_usage 95 20 5 Opus > "$FIXTURE_DIR/.claude.json"
 
@@ -610,6 +615,14 @@ roundtrip() { # HARNESS MODEL EFFORT — the model and effort read back, `;`-joi
 assert_eq "$(roundtrip claude fable high)|$(roundtrip codex gpt-6-astra high)|$(roundtrip opencode grok-5 high)|$(roundtrip pi sonnet high)|$(roundtrip copilot claude-fable-5.1 high)" \
   "fable;high|gpt-6-astra;high|grok-5;|sonnet;high|claude-fable-5.1;high" \
   "every row's written words read back as the model and effort they were written from"
+# A claude successor on the sonnet or haiku rank is written with the model id,
+# which no ANTHROPIC_DEFAULT_*_MODEL pin moves; another harness keeps its word.
+assert_eq "$(roundtrip claude sonnet high)|$(roundtrip claude haiku high)|$(roundtrip pi sonnet high)" \
+  "claude-sonnet-5;high|claude-haiku-4-5;high|sonnet;high" "a claude alias is written as its model id"
+IDCTL="$(mutant_scripts idctl lib/lane-launch.sh)" || exit 1
+mutate_file "$IDCTL/lib/lane-launch.sh" '$(printf %q "$(launch_choice_model_id "$1" "$2")")' '$(printf %q "$2")'
+assert_eq "$(source "$IDCTL/lib/lane-launch.sh"; roundtrip claude sonnet high)" "sonnet;high" \
+  "control: a writer that names the model as given writes the bare alias"
 
 # Control: the reader answers from the row's own spellings. The same launches
 # with a character in front of every word read back neither choice, so the row
@@ -703,17 +716,17 @@ assert_eq "$RC|$(sed -n 1p <<<"$OUT")|$(caller_open)|$(overseers)|$(recorded cod
 # model's window, so an entry whose claude model has none would open a successor
 # that compacts rather than hands off: the same setting to fix, ending the run
 # before any window opens. The caller's own entry is judged on the model its
-# flags carry, so a sonnet overseer with an empty preference is refused too.
+# flags carry, so such an overseer with an empty preference is refused too.
 new_caller "$MARK"
 run_succeed nowindow 'claude:3:high,codex:1:high'
 assert_eq "$RC|$(sed -n 1p <<<"$OUT")|$(caller_open)|$(overseers)|$(recorded codex)" \
-  "1|oversee-succeed: model-window-unknown entry=claude:3:high model=sonnet|yes|0|none" \
+  "1|oversee-succeed: model-window-unknown entry=claude:3:high model=claude-sonnet-4-6|yes|0|none" \
   "an entry whose claude model has no window refuses model-window-unknown and stops the walk"
 new_caller "$MARK"
-run_succeed sonnetcaller '' -- --model sonnet --effort high
+run_succeed sonnetcaller '' -- --model claude-sonnet-4-6 --effort high
 assert_eq "$RC|$(sed -n 1p <<<"$OUT")|$(caller_open)|$(overseers)" \
-  "1|oversee-succeed: model-window-unknown entry=caller model=sonnet|yes|0" \
-  "a sonnet overseer with an empty preference is refused on its own entry"
+  "1|oversee-succeed: model-window-unknown entry=caller model=claude-sonnet-4-6|yes|0" \
+  "an overseer on a model with no window and an empty preference is refused on its own entry"
 
 # An overseer started by hand names no account in its environment, and the one
 # it is spending is the harness's own default. The caller entry launches its
@@ -1968,7 +1981,7 @@ assert_eq "$RC|$(layout)|$(caller_open)|$(recorded claude)" \
   "a spent window scoped to the model this overseer runs fires the account mark"
 
 # The model reaches the account mark on every claude tier, not only the ones
-# the window table names. This caller runs Sonnet, which that table leaves out,
+# the window table names. This caller runs Sonnet 4.5, which that table leaves out,
 # so its reading carries no window. Judged with no model at all, this account's
 # only spent window, scoped to Opus at exactly the trigger, would fire and hand
 # the session over for a window no Sonnet turn draws on.

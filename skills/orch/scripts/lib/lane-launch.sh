@@ -455,6 +455,13 @@ launch_choice_effort() { # HARNESS TEXT [TEXT]
 # neither word. Status 1 where a MODEL is named and the table holds no row for
 # that harness, which is not an answer but the absence of one. A harness whose
 # row has no effort spelling takes the model alone; so does an empty EFFORT.
+# The model a launch of HARNESS writes for MODEL: a claude alias the adapter
+# maps is written as its id, so no ANTHROPIC_DEFAULT_*_MODEL pin moves the
+# model its window was judged on; every other model as named.
+launch_choice_model_id() { # HARNESS MODEL
+  if [[ "$1" == claude ]]; then lane_adapter_claude_model_id "${2:-}"; else printf '%s\n' "${2:-}"; fi
+}
+
 launch_choice_write() { # HARNESS MODEL EFFORT
   local row model_spellings effort_spellings attach word out
   # No model to pass is an answer: the caller names neither word, and an effort
@@ -466,7 +473,7 @@ launch_choice_write() { # HARNESS MODEL EFFORT
   [[ -n "$row" ]] || return 1
   IFS='|' read -r _ model_spellings effort_spellings _ attach _ _ _ <<<"$row"
   read -r word _ <<<"$model_spellings"
-  out="$word $(printf %q "$2")"
+  out="$word $(printf %q "$(launch_choice_model_id "$1" "$2")")"
   if [[ "$effort_spellings" != - && -n "$3" ]]; then
     read -r word _ <<<"$effort_spellings"
     if [[ "$word" == *= ]]; then
@@ -504,7 +511,11 @@ launch_choice_permission_write() { # HARNESS
 # `--question-off` its question-tool words after them, then WORD... in order
 # with every row's settings, compaction and question-tool runs taken out
 # wherever each stands whole. The model is `--model MODEL` where the caller
-# writes it outside WORD..., and otherwise the one WORD... names.
+# writes it outside WORD..., and otherwise the one WORD... names; a WORD...
+# naming it, in either form launch_choice_value reads, is written as
+# launch_choice_model_id gives it and judged so, and one still naming the
+# alias after that is judged as the alias. open-terminal's fleet gate asks
+# this same judge.
 # LAUNCH_CHOICE_COMPACTION says what became of the compaction words: `on`,
 # `none` for a row that has none, `no-model` where no model is named and
 # `no-window` where its window is unnamed, the last two leaving compaction on. A caller's flags handed
@@ -514,7 +525,7 @@ launch_choice_permission_write() { # HARNESS
 # Runs are matched newline-bounded, since a caller's flag word can hold a space.
 LAUNCH_CHOICE_COMPACTION=""
 launch_choice_lead_settings() { # [--question-off] [--model MODEL] HARNESS WORD...
-  local question_off=false model="" model_given=false compaction_rc=0 own_compaction
+  local question_off=false model="" model_given=false compaction_rc=0 own_compaction model_id spelling
   if [[ "${1:-}" == --question-off ]]; then
     question_off=true
     shift
@@ -526,13 +537,27 @@ launch_choice_lead_settings() { # [--question-off] [--model MODEL] HARNESS WORD.
   local harness="$1" nl=$'\n' lead="" row name settings question compaction run words line
   shift
   [[ "$model_given" == true ]] || model="$(launch_choice_value "$(launch_choice_model_spellings "$harness")" "$*")"
-  own_compaction="$(launch_choice_compaction "$harness" "$model")" || compaction_rc=$?
+  model_id="$(launch_choice_model_id "$harness" "$model")"
+  words="$nl$(printf '%s\n' "$@")$nl"
+  if [[ "$model_id" != "$model" ]]; then
+    # Both forms launch_choice_value reads: `--model VALUE` and `--model=VALUE`.
+    for spelling in $(launch_choice_model_spellings "$harness"); do
+      if [[ "$spelling" != *= ]]; then
+        words="${words//"$nl$spelling$nl$model$nl"/$nl$spelling$nl$model_id$nl}"
+        spelling="$spelling="
+      fi
+      words="${words//"$nl$spelling$model$nl"/$nl$spelling$model_id$nl}"
+    done
+    # A spelling still naming the alias runs it as named, and is judged so.
+    [[ "$(launch_choice_value "$(launch_choice_model_spellings "$harness")" "${words//$nl/ }")" != "$model" ]] \
+      || model_id="$model"
+  fi
+  own_compaction="$(launch_choice_compaction "$harness" "$model_id")" || compaction_rc=$?
   case "$compaction_rc:$own_compaction" in
     0:) LAUNCH_CHOICE_COMPACTION=none ;;
     0:*) LAUNCH_CHOICE_COMPACTION=on ;;
     *) LAUNCH_CHOICE_COMPACTION=no-window; [[ -n "$model" ]] || LAUNCH_CHOICE_COMPACTION=no-model ;;
   esac
-  words="$nl$(printf '%s\n' "$@")$nl"
   for row in "${LAUNCH_CHOICE_FLAGS[@]}"; do
     IFS='|' read -r name _ _ _ _ _ _ settings question compaction <<<"$row"
     for run in "$settings" "$compaction" "$question"; do
