@@ -180,6 +180,49 @@ def with_lane_binding($model; $binding_floor):
             then (((100 - $binding.pct) * ._rate_elapsed_s / ($delta * 60)) | ceil)
             else null end)};
 
+# with_lane_projection($burn_default) over one record with_lane_binding has
+# judged: the room the account has left an hour from now if every live lane
+# on it keeps burning, which is what a launch onto it inherits. A wall reading
+# lags the launches in flight by minutes, so an account read as having the
+# most room fills until it walls; the projection charges each live claim its
+# expected burn before any verdict is taken.
+#
+# burn_pct_per_lane_hour is the judged window measured rate shared out across
+# the live claims where both exist, and $burn_default, ORCH_LANE_BURN_PCT_PER_HOUR,
+# where they do not: a rate taken with nothing claimed says nothing about what
+# one lane costs, and an unmeasured rate says nothing at all.
+#
+# The default is points of the 5-hour session window. A weekly window, the
+# plan-wide one or a model-scoped one, holds the same hour of work as the
+# share 5 of its 168 hours is, so it is charged the default times 5/168:
+# charged whole, an account weekly-bound at 86 percent with two lanes would
+# project past 95 and be dropped with days of room left.
+# projected_headroom_pct is the judged headroom less the claims times that
+# burn, null where the wall is null, since nothing measured the account, or the
+# claims are null, since the claim store could not be read: an unknown count is
+# never charged as zero lanes.
+def with_lane_projection($burn_default):
+  (if .usage_rate_state == "measured" and (.claims // 0) > 0
+   then .usage_rate_pct_per_min * 60 / .claims
+   elif .binding_bucket == "session" then $burn_default
+   else $burn_default * 5 / 168 end) as $burn
+  | . + {burn_pct_per_lane_hour: (if .wall == null then null else $burn end),
+         projected_headroom_pct:
+           (if .wall == null or .claims == null then null
+            else 100 - .wall - .claims * $burn end)};
+
+# judged_wall over one record with_lane_projection has read: the projected
+# use wall_verdict judges, for the chooser and `pick --lane --projected`, so a
+# named lane is refused on the rule the chooser drops it on. Null, which
+# wall_verdict reads as unmeasured, where no projection was made: a wall
+# nobody read, or claims nobody could count. Both callers refuse an unread
+# claim store before judging, and this arm keeps one that reached it from
+# reading as zero lanes in flight.
+def judged_wall:
+  if .projected_headroom_pct == null then null
+  else 100 - .projected_headroom_pct
+  end;
+
 def lane_public: del(._rate_prior, ._rate_elapsed_s, ._id);
 
 # One spelling for every reset a lane record carries: whole-second UTC with a

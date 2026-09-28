@@ -622,11 +622,17 @@ lane_check() {
 # launch runs on: which reading stands for the account is `lanes`'
 # host_row_or_local, which says so on its `lanes: pick-local-reading` line
 # where this machine's reading stands in.
+#
+# A fleet launch runs the pick under ORCH_STATE_DIR set to its --state-dir, so
+# the overseer seat `lanes` omits is the one the fleet the launch records into
+# names, whichever checkout the launch runs from; the value resolves as
+# --state-dir does for workflow-state.
 pick_auto_lane() {
-  local model_args=()
+  local model_args=() state_env=()
   [[ -z "$LAUNCH_MODEL" ]] || model_args=(--model "$LAUNCH_MODEL")
-  ORCH_LANE_HOST="$LANE_HOST" "$LANES_CLI" pick --harness "$LANE_HARNESS" ${LANE_PCT_ARGS[@]+"${LANE_PCT_ARGS[@]}"} \
-    ${model_args[@]+"${model_args[@]}"}
+  [[ "$FLEET" != true ]] || state_env=("ORCH_STATE_DIR=$STATE_DIR")
+  env ${state_env[@]+"${state_env[@]}"} ORCH_LANE_HOST="$LANE_HOST" "$LANES_CLI" pick --harness "$LANE_HARNESS" \
+    ${LANE_PCT_ARGS[@]+"${LANE_PCT_ARGS[@]}"} ${model_args[@]+"${model_args[@]}"}
 }
 # A Pi launch on the Copilot pool runs under PI_CODING_AGENT_DIR set to its
 # lane (lane_env_prefix), so every reader here of Pi's root, the fleet gate's
@@ -704,17 +710,19 @@ host_account_read() { # CONFIG_DIR HARNESS
   esac
 }
 # The usage judge for a lane the caller NAMED, asked of `lanes pick --lane` on
-# the model the launch passes. Returns 1 with its refusal printed. The block
-# that calls it below says why each answer is what it is.
+# the model the launch passes, with --projected: this launch adds a lane to the
+# account, so it is judged on the wall `--lane auto` judges, the reading plus
+# the expected burn of the lanes already on it. Returns 1 with its refusal
+# printed. The block that calls it below says why each answer is what it is.
 named_lane_judge() {
-  local lane_rc=0 lane_record lane_wall lane_bucket lane_status
+  local lane_rc=0 lane_record lane_wall lane_bucket lane_projected lane_status
   # `held`, `missing` or `unanswered`, and empty until something asks. Only the
   # unmeasured arm below reads it, so that arm is the one place that asks.
   HOST_ACCOUNT=""
   [[ -x "$LANES_CLI" ]] || { ot_message helper-missing "path=$LANES_CLI" >&2; return 1; }
   lane_rc=0
   lane_record="$(ORCH_LANE_HOST="$LANE_HOST" "$LANES_CLI" pick --lane "${LANE_ENV#*=}" --harness "$LAUNCH_HARNESS" \
-    --model "$LAUNCH_MODEL" ${LANE_PCT_ARGS[@]+"${LANE_PCT_ARGS[@]}"} --json)" || lane_rc=$?
+    --model "$LAUNCH_MODEL" --projected ${LANE_PCT_ARGS[@]+"${LANE_PCT_ARGS[@]}"} --json)" || lane_rc=$?
   case "$lane_rc" in
     0) ;;
     # 4 is `lanes` holding no record for this directory — a config dir outside
@@ -732,8 +740,13 @@ named_lane_judge() {
         ot_message lane-judge-failed "lane=${LANE_ENV#*=}" "model=$LAUNCH_MODEL" "exit=invalid-bucket" >&2
         return 1
       }
+      # `none` where `lanes` could not read the claims and judged the wall alone.
+      lane_projected="$(jq -r '.projected_headroom_pct // "none"' <<<"$lane_record")" || {
+        ot_message lane-judge-failed "lane=${LANE_ENV#*=}" "model=$LAUNCH_MODEL" "exit=invalid-projection" >&2
+        return 1
+      }
       ot_message lane-model-walled "lane=${LANE_ENV#*=}" "model=$LAUNCH_MODEL" \
-        "pct=$lane_wall" "bucket=$lane_bucket" >&2
+        "pct=$lane_wall" "bucket=$lane_bucket" "projected-headroom=$lane_projected" >&2
       return 1
       ;;
     # NOTHING MEASURED THE ACCOUNT. Three answers, and the provider decides
@@ -789,11 +802,10 @@ named_lane_judge() {
         return 1
       fi
       ;;
-    # An unreadable claim store is not among these: this gate asks for a wall,
-    # which no claim count enters, so `lanes` reports the store on stderr as a
-    # notice and answers the wall anyway. The same policy as the claim write
-    # below, which is never fatal either.
-    #
+    # 6 is a claim store `lanes` could not read: this gate charges the lanes on
+    # the account, and none counted is not none in flight, so the launch is
+    # refused as `--lane auto` refuses it.
+    6) ot_message lane-claims-unreadable "lane=${LANE_ENV#*=}" >&2; return 1 ;;
     # Anything else is the judge itself failing, including the threshold it
     # refused as malformed. Its own keyed `lanes:` line is already on stderr
     # above this one and names which, so this line names none.
