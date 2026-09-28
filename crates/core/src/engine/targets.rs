@@ -154,6 +154,38 @@ while [ -n \"$r\" ] && ! [ -f \"$r/$p\" ]; do [ \"$r\" = / ] && r= || {{ r=${{r%
     )
 }
 
+/// The words every Claude Code command that runs an installed hook script
+/// opens with: in a Copilot CLI hook process the command exits 0 before its
+/// script runs. A custom hook declared as a command is registered as written,
+/// without them, and Copilot still runs it.
+///
+/// Copilot CLI reads the `hooks` of `.claude/settings.json` and
+/// `.claude/settings.local.json` at the root of the repository it runs in and
+/// runs every entry beside its own. Measured on Copilot CLI 1.0.88: a hook
+/// installed for both harnesses then runs twice per event, once from
+/// `.github/hooks/` and once from `.claude/hooks/`, and a hook whose
+/// `harnesses:` line leaves Copilot out runs anyway, on a Claude-shaped
+/// payload that carries no `transcript_path`. Copilot sets
+/// `COPILOT_PROJECT_DIR` in the environment of every hook it starts, whatever
+/// file registered it, and not in the environment of its tool calls. So a
+/// Claude Code session started from a Copilot tool call, which inherits that
+/// call's environment, still runs its hooks, and a Copilot session started
+/// from a Claude Code tool call skips these commands. Claude Code sets no such
+/// variable. Copilot documents none of this. Against the Copilot CLI installed
+/// where it runs, `tools/harness-smoke` fails its Copilot `helper:env` row
+/// where a tool call carries `COPILOT_PROJECT_DIR`, and its `mixed-hook` rows
+/// check that Copilot skips the `.claude/hooks` copies and runs its own while
+/// Claude Code runs both; the nested sessions are as measured, and no row
+/// re-checks them. Floor: Copilot CLI 1.0.88, the release measured; a
+/// release that sets no such variable runs the script as it did before this
+/// prefix. The prefix goes once Copilot stops running these registrations or
+/// offers a setting that leaves `.claude/settings*.json` hooks out alone.
+///
+/// The prefix names no path, so [`crate::hook::command_stem`] still names the
+/// hook by its script. A registry entry is identified with or without it
+/// (`configedit::nested::hook_key`).
+pub(crate) const CLAUDE_OUTSIDE_COPILOT: &str = "[ -z \"${COPILOT_PROJECT_DIR-}\" ] || exit 0; ";
+
 /// A command naming its script outright, `bash "<path>"`, where `path` is
 /// already fit to stand inside double quotes. A declared environment binds the
 /// path first and stands before the interpreter word, so the script is still
@@ -219,6 +251,7 @@ pub(crate) fn hook_target(
                     vars,
                 ),
             };
+            let command = format!("{CLAUDE_OUTSIDE_COPILOT}{command}");
             Some(HookTarget::Script {
                 path,
                 command,
