@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Tests for the session-drift-check hook.
 #
-# The hook is a thin adapter over `kendex check --quiet`. What it decides is
+# The hook is a thin adapter over `kendex check --quiet --report-only`. What it decides is
 # which arm the check's exit code chose, and that is a value on its keyed
 # lines: `drift=found`, `check=incomplete` or `check=could-not-run`, with
 # `exit=<code>` beside the two that name one. The rows pin those and the hook's
@@ -18,7 +18,8 @@
 #   keyed     the hook's own keyed lines, in order, joined by `;`; `-` when it
 #             writes none. A `line=` value renders as `line=<n>`: the row pins
 #             that the failing line is reported, not which line it was
-# Every row also asserts the hook's exit 0, the argv `check --quiet`, and that
+# Every row also asserts the hook's exit 0, the argv `check --quiet
+# --report-only`, and that
 # stderr is empty — this hook writes to stdout, the session-start context
 # channel, and nothing else.
 #
@@ -83,6 +84,9 @@ fake_out() {
     error-inside-a-line) printf '%s' $'could not check:\n  source github.com/x/y unreachable since 2026-08-01: error: cannot lock ref' ;;
     Error-line) printf '%s' 'Error: loading lock file' ;;
     usage-error) printf '%s' $'error: unexpected argument \'--bogus\' found\n\nUsage: kendex check --quiet' ;;
+    # A kendex older than --report-only: clap's refusal as a real one prints
+    # it, lowercase `error:`, exit 2.
+    too-old) printf '%s' $'error: unexpected argument \'--report-only\' found\n\nUsage: kendex check [OPTIONS]' ;;
     fatal) printf '%s' 'kendex: fatal' ;;
     # A report that spells a keyed line of its own. What the hook relays is
     # data, and data cannot forge the hook's contract: the keyed block is the
@@ -218,7 +222,7 @@ run_table() {
       printf '%s => %s\n' "$label" "$got"
       continue
     fi
-    assert_eq "$got" "rc=0 calls=check --quiet keyed=$stdout stderr=empty" "$label"
+    assert_eq "$got" "rc=0 calls=check --quiet --report-only keyed=$stdout stderr=empty" "$label"
   done <<<"$rows"
   [[ "$((PASS + FAIL))" -gt "$before" ]] || { echo "no row was asserted (a probe run renders rows instead)" >&2; exit 2; }
 }
@@ -237,11 +241,16 @@ an error: inside a report line is still a completed report|2|error-inside-a-line
 exit 2 with no output is a failure to run, not an empty partial report|2|-|check=could-not-run;exit=2
 an Error: line at exit 2 is a failure to run|2|Error-line|check=could-not-run;exit=2
 a usage error: at exit 2 is a failure to run, never partial|2|usage-error|check=could-not-run;exit=2
+a kendex that refuses --report-only is named too old, with the install route|2|too-old|check=kendex-too-old;install=curl -fsSL https://kendex.ai/install.sh | sh
 exit 3 is a failure to run, and the code is the value|3|fatal|check=could-not-run;exit=3
 exit 3 with no output chooses the same arm|3|-|check=could-not-run;exit=3
 "
 run_row 1 unevaluated >/dev/null
 assert_eq "$(relayed_text)" "$(fake_out unevaluated)" "the final action line is relayed byte for byte"
+# The too-old notice runs nothing in the flag's place: one call, with the flag.
+run_row 2 too-old >/dev/null
+assert_eq "$(calls)" "check --quiet --report-only" "a kendex that refuses the flag is not asked again without it"
+assert_contains "$(relayed_text)" "error: unexpected argument '--report-only' found" "kendex's refusal is relayed under the notice"
 
 echo "session-drift-check: unreadable stdin"
 # Strict mode must not let a failed payload read abort the session start.
@@ -343,7 +352,7 @@ run_raw() {
 run_raw '{"tool_input":{"source":"resume"},"source":"startup"}' "$BIN_DIR"
 assert_eq "keyed=$(keyed_of) relayed=$(relayed_of)" "keyed=drift=found relayed=$REPORT_LINES" \
   "a nested source does not silence a fresh start"
-assert_eq "$(cat "$ARGS_LOG")" "check --quiet" "…and the check still runs"
+assert_eq "$(cat "$ARGS_LOG")" "check --quiet --report-only" "…and the check still runs"
 
 run_raw '{"tool_input":{"source":"startup"},"source":"resume"}' "$BIN_DIR"
 assert_eq "$out" "" "a nested source does not make a resume report"
@@ -416,7 +425,7 @@ set -e
 printf '%s' "$out" >"$TMP_ROOT/stdout"
 assert_eq "$rc" 0 "dash-leading project dir exits 0"
 assert_eq "$out" "" "dash-leading project dir is entered, not parsed as an option"
-assert_eq "$(cat "$ARGS_LOG")" "check --quiet" "dash-leading project dir still runs the check"
+assert_eq "$(cat "$ARGS_LOG")" "check --quiet --report-only" "dash-leading project dir still runs the check"
 assert_eq "$(cd "$TMP_ROOT/-dash" && pwd -P)" "$(cd "$(cat "$CWD_LOG")" && pwd -P)" \
   "runs kendex inside the dash-leading project dir"
 

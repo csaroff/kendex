@@ -210,6 +210,8 @@ pub(super) struct ScopeCheck<'a> {
     /// names it.
     pub(super) deadline: std::time::Instant,
     pub(super) budget: std::time::Duration,
+    /// Whether the check may write a project's committed install record.
+    pub(super) mode: crate::drift::copies::CheckMode,
     /// Where the scope's Pi packages install and the root Pi loads beside
     /// it in this session, resolved once for every Pi line; the settings
     /// read that failed when it did not resolve.
@@ -622,8 +624,13 @@ impl ScopeCheck<'_> {
     /// carrying committed renders and no record, the copy an earlier
     /// build left unrecorded — is recorded without a word: either exit
     /// would land the same bytes, and a line about it would teach the
-    /// reader to skim. A copy that differs is stale, with the count, in
-    /// the section an agent reads first: the state this is most often is
+    /// reader to skim. Where the check may not write the committed record
+    /// (D007: the session-start hooks' report-only check, or a checkout off the
+    /// branch it is written on) it is not recorded, and a line names the
+    /// missing row with no fix, since that branch records it after the
+    /// merge. A copy that
+    /// differs is stale, with the count, in the section an agent reads
+    /// first: the state this is most often is
     /// a render some commits behind its source. Its fix is the take-over
     /// only where the pass answered for the whole scope; otherwise the
     /// plan, which names every position, is what to see next. A position
@@ -653,7 +660,7 @@ impl ScopeCheck<'_> {
         if occupied.is_empty() {
             return;
         }
-        let (verdicts, record_failed) = match crate::drift::copies::settle(
+        let (verdicts, record_failed, unrecorded) = match crate::drift::copies::settle(
             self.env,
             self.scope,
             manifest,
@@ -661,11 +668,13 @@ impl ScopeCheck<'_> {
             &occupied,
             self.deadline,
             self.budget,
+            self.mode,
         ) {
             crate::drift::copies::Settled::Judged {
                 verdicts,
                 record_failed,
-            } => (verdicts, record_failed),
+                unrecorded,
+            } => (verdicts, record_failed, unrecorded),
             // The plan is the judgement; without it every blocked line
             // stands as the stat found it, and the reason the judgement
             // is missing is a line of its own.
@@ -705,7 +714,12 @@ impl ScopeCheck<'_> {
         }
         for (key, install) in &occupied {
             match verdicts.get(key) {
-                Some(crate::drift::copies::Verdict::Recorded) => {}
+                // Its line is the unrecorded entry's, below, beside the
+                // entries a stat cannot see.
+                Some(
+                    crate::drift::copies::Verdict::Recorded
+                    | crate::drift::copies::Verdict::Unrecorded,
+                ) => {}
                 Some(crate::drift::copies::Verdict::Differs {
                     files,
                     rendered_from,
@@ -725,6 +739,9 @@ impl ScopeCheck<'_> {
                     self.blocked_line(install, sections);
                 }
             }
+        }
+        if let Some(unrecorded) = unrecorded {
+            self.unrecorded_lines(&unrecorded, sections);
         }
     }
 
@@ -767,6 +784,78 @@ impl ScopeCheck<'_> {
                 },
             }),
         ));
+    }
+
+    /// One line per entry the check proved on disk and left out of the
+    /// committed record, occupied or not: where its render sits, the
+    /// record's hash for it (none) beside the render's, or the files it is
+    /// registered in where it wrote none, and why the record stays as it
+    /// is. No remedy: the record is written on the default
+    /// branch after the merge, or by a check run there by hand.
+    fn unrecorded_lines(
+        &self,
+        unrecorded: &crate::drift::copies::Unrecorded,
+        sections: &mut Sections,
+    ) {
+        let why = match &unrecorded.why {
+            crate::drift::copies::Withheld::OffBranch(off) => {
+                let checkout = match &off.head {
+                    Some(branch) => format!("branch '{}'", shown(branch)),
+                    None => "a detached HEAD".to_owned(),
+                };
+                format!(
+                    "{checkout} leaves the record as '{}' holds it, and '{}' records it after the merge",
+                    shown(&off.records_on),
+                    shown(&off.records_on)
+                )
+            }
+            crate::drift::copies::Withheld::ReportOnly => {
+                "the session check leaves the record as this checkout holds it".to_owned()
+            }
+        };
+        let root = match self.scope {
+            Scope::Project { root } => Some(root.as_path()),
+            Scope::Global => None,
+        };
+        let listed = |paths: Vec<std::path::PathBuf>| {
+            paths
+                .iter()
+                .map(|path| {
+                    let below = root.and_then(|root| path.strip_prefix(root).ok());
+                    shown(&crate::paths::slashed(below.unwrap_or(path)))
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        for entry in unrecorded.entries.values() {
+            // Where the render sits and what it hashes to; an installation
+            // that wrote no file of its own (a plugin, an MCP server, a
+            // hook whose body is a command) is its registration instead,
+            // which has no rendered hash to name.
+            let files = crate::engine::installed_paths(self.env, self.scope, entry);
+            let registered = crate::engine::registered_in(self.env, self.scope, entry);
+            let at = match (files.is_empty(), registered.is_empty()) {
+                (false, _) => format!(
+                    ": {}, recorded hash none, rendered hash {}",
+                    listed(files),
+                    shown(entry.rendered_hash.as_deref().unwrap_or("none"))
+                ),
+                (true, false) => format!(": registered in {}", listed(registered)),
+                (true, true) => String::new(),
+            };
+            sections.unrecorded.push(drift(
+                format!(
+                    "{}{} '{}' for {} has no row in the install record{}; {}",
+                    self.prefix,
+                    entry.kind.name(),
+                    shown(&entry.name),
+                    entry.harness.display_name(),
+                    at,
+                    why
+                ),
+                None,
+            ));
+        }
     }
 
     /// The plan is the judgement; without it every blocked line stands as
