@@ -607,8 +607,8 @@ roundtrip() { # HARNESS MODEL EFFORT — the model and effort read back, `;`-joi
     "$(launch_choice_value "$(launch_choice_model_spellings "$1")" "$words")" \
     "$(launch_choice_effort "$1" "$words" '')"
 }
-assert_eq "$(roundtrip claude fable high)|$(roundtrip codex gpt-6-astra high)|$(roundtrip opencode grok-5 high)|$(roundtrip pi sonnet high)" \
-  "fable;high|gpt-6-astra;high|grok-5;|sonnet;high" \
+assert_eq "$(roundtrip claude fable high)|$(roundtrip codex gpt-6-astra high)|$(roundtrip opencode grok-5 high)|$(roundtrip pi sonnet high)|$(roundtrip copilot claude-fable-5.1 high)" \
+  "fable;high|gpt-6-astra;high|grok-5;|sonnet;high|claude-fable-5.1;high" \
   "every row's written words read back as the model and effort they were written from"
 
 # Control: the reader answers from the row's own spellings. The same launches
@@ -624,8 +624,8 @@ misspelt() { # HARNESS MODEL EFFORT — the same, read back from words no row na
     "$(launch_choice_value "$(launch_choice_model_spellings "$1")" "$out")" \
     "$(launch_choice_effort "$1" "$out" '')"
 }
-assert_eq "$(misspelt claude fable high)|$(misspelt codex gpt-6-astra high)|$(misspelt opencode grok-5 high)|$(misspelt pi sonnet high)" \
-  ";|;|;|;" \
+assert_eq "$(misspelt claude fable high)|$(misspelt codex gpt-6-astra high)|$(misspelt opencode grok-5 high)|$(misspelt pi sonnet high)|$(misspelt copilot claude-fable-5.1 high)" \
+  ";|;|;|;|;" \
   "control: those words spelt as ones no row names read back neither choice"
 
 # The same table's effort spellings, which open-terminal prints in its
@@ -635,8 +635,8 @@ assert_eq "$(misspelt claude fable high)|$(misspelt codex gpt-6-astra high)|$(mi
 # effort flag for one; one that answered for a harness the table does not name
 # would refuse every custom launch. Both are pinned here, beside the row list
 # they are read from.
-assert_eq "$(launch_choice_effort_spellings claude)|$(launch_choice_effort_spellings codex)|$(launch_choice_effort_spellings pi)|$(launch_choice_effort_spellings opencode)|$(launch_choice_effort_spellings nosuch)|$(launch_choice_effort_spellings '')" \
-  "--effort|model_reasoning_effort=|--thinking|||" \
+assert_eq "$(launch_choice_effort_spellings claude)|$(launch_choice_effort_spellings codex)|$(launch_choice_effort_spellings pi)|$(launch_choice_effort_spellings copilot)|$(launch_choice_effort_spellings opencode)|$(launch_choice_effort_spellings nosuch)|$(launch_choice_effort_spellings '')" \
+  "--effort|model_reasoning_effort=|--thinking|--reasoning-effort|||" \
   "the effort spellings accessor answers each row's list, and nothing for a flagless or unnamed harness"
 
 permission_write_status() {
@@ -644,20 +644,20 @@ permission_write_status() {
   launch_choice_permission_write "$1" >/dev/null 2>&1 || rc=$?
   printf '%s\n' "$rc"
 }
-assert_eq "$(launch_choice_permission_write claude)|$(launch_choice_permission_write codex)|$(permission_write_status opencode)|$(permission_write_status nosuch)" \
-  "--dangerously-skip-permissions|--dangerously-bypass-approvals-and-sandbox|1|1" \
+assert_eq "$(launch_choice_permission_write claude)|$(launch_choice_permission_write codex)|$(launch_choice_permission_write copilot)|$(permission_write_status opencode)|$(permission_write_status nosuch)" \
+  "--dangerously-skip-permissions|--dangerously-bypass-approvals-and-sandbox|--allow-all|1|1" \
   "the permission writer answers required rows and refuses sentinel and unknown rows"
-assert_eq "$(launch_choice_transfer_permission_spellings claude)|$(launch_choice_transfer_permission_spellings codex)" \
-  "--dangerously-skip-permissions --permission-mode=bypassPermissions|--dangerously-bypass-approvals-and-sandbox" \
-  "the transfer set excludes restricted unattended modes"
+assert_eq "$(launch_choice_transfer_permission_spellings claude)|$(launch_choice_transfer_permission_spellings codex)|$(launch_choice_transfer_permission_spellings copilot)" \
+  "--dangerously-skip-permissions --permission-mode=bypassPermissions|--dangerously-bypass-approvals-and-sandbox|--allow-all --yolo" \
+  "the transfer set excludes restricted unattended modes, and copilot's tools-only word among them"
 transferable_status() { # HARNESS TEXT
   local rc=0
   launch_choice_permission_transferable "$1" "$2" || rc=$?
   printf '%s\n' "$rc"
 }
-assert_eq "$(transferable_status claude '--model fable --dangerously-skip-permissions --verbose')|$(transferable_status claude '--permission-mode bypassPermissions')|$(transferable_status claude '--dangerously-skip-permissions --permission-mode dontAsk')|$(transferable_status claude '--dangerously-skip-permissions --permission-mode plan')|$(transferable_status claude '--permission-mode dontAsk')|$(transferable_status claude '--model fable')|$(transferable_status codex '--dangerously-bypass-approvals-and-sandbox -a never')|$(transferable_status opencode '--model x')" \
-  "0|0|1|1|1|1|1|1" \
-  "the transfer judge admits one full bypass alone and refuses a mix, a restricted word, and nothing"
+assert_eq "$(transferable_status claude '--model fable --dangerously-skip-permissions --verbose')|$(transferable_status claude '--permission-mode bypassPermissions')|$(transferable_status claude '--dangerously-skip-permissions --permission-mode dontAsk')|$(transferable_status claude '--dangerously-skip-permissions --permission-mode plan')|$(transferable_status claude '--permission-mode dontAsk')|$(transferable_status claude '--model fable')|$(transferable_status codex '--dangerously-bypass-approvals-and-sandbox -a never')|$(transferable_status opencode '--model x')|$(transferable_status copilot '--allow-all --context long_context')|$(transferable_status copilot '--yolo')|$(transferable_status copilot '--allow-all-tools')|$(transferable_status copilot '--allow-all --yolo')" \
+  "0|0|1|1|1|1|1|1|0|0|1|1" \
+  "the transfer judge admits one full bypass alone and refuses a mix, a restricted word, and nothing; copilot's tools-only word is restricted"
 
 # The account mark, with the context well under the context mark: the caller's
 # own account is at headroom 5 and the successor goes to the claude lane
@@ -1478,6 +1478,51 @@ SUCCEED_BIN="$PRINTREC/oversee-succeed" run_succeed printrecctl '' --print-launc
 assert_eq "$RC|$OUT" \
   "0|env CLAUDE_CONFIG_DIR='$H/.claude' claude -n overseer $CLAUDE_COMPACT_LINE '$BRIEF'" \
   "control: a print that ignores the record names the environment's account for the recorded pane"
+fleet_state
+
+# A Copilot overseer: the printed line is its own row's, the brief on -i and
+# the account its record names under COPILOT_HOME. Every other mode needs a
+# reading of a Copilot account, which lanes does not make, and refuses before
+# any; a record naming no account refuses the line rather than print one on
+# an account nothing named.
+COPILOT_LINE="env COPILOT_HOME='$H/.1copilot' copilot --autopilot --max-autopilot-continues 3 --allow-all -i '$BRIEF'"
+copilot_row() { # NAME [SUCCEED_BIN] ARGS... — the run on a pane whose record names $H/.1copilot
+  local name="$1" bin="$2"
+  shift 2
+  new_caller "$UNDER_MARK"
+  record_account "$CALLER_PANE" "$H/.1copilot"
+  SUCCEED_BIN="${bin:-$SUCCEED}" run_succeed "$name" '' "$@"
+}
+copilot_row printcopilot '' --print-launch-line --harness copilot -- --allow-all
+assert_eq "$RC|$OUT|$(overseers)" "0|$COPILOT_LINE|0" \
+  "a copilot overseer's printed line runs copilot on its recorded account with the brief on -i"
+copilot_row checkcopilot '' --check-marks --harness copilot
+assert_eq "$RC|$(sed -n 1p <<<"$OUT")" "1|oversee-succeed: copilot-unmeasured pane=$CALLER_PANE mode=check" \
+  "a copilot overseer's marks are refused before any account reading, lanes measuring none"
+fleet_state
+new_caller "$UNDER_MARK"
+run_succeed printcopilotnone '' --print-launch-line --harness copilot -- --allow-all
+assert_eq "$RC|$(sed -n 1p <<<"$OUT")" "1|oversee-succeed: copilot-account-unknown pane=$CALLER_PANE" \
+  "a copilot overseer whose record names no account prints no line"
+# Controls, one per rule: the builder's copilot arm, the refusal of every
+# judging mode, and the refusal of a line with no account.
+COPILOTARM="$(mutant_scripts copilotarm lib/overseer-launch.sh)" || exit 1
+mutate_file "$COPILOTARM/lib/overseer-launch.sh" '    copilot) OL_LANE_VAR=COPILOT_HOME; cmd="copilot"; brief_flag=" -i" ;;' '    copilot-x) ;;'
+copilot_row printcopilotctl "$COPILOTARM/oversee-succeed" --print-launch-line --harness copilot -- --allow-all
+assert_eq "$RC|$(grep -c "^env CODEX_HOME='$H/.1copilot' codex " <<<"$OUT")" "0|1" \
+  "control: without its arm the copilot line is built as codex's"
+COPILOTMODE="$(mutant_scripts copilotmode oversee-succeed)" || exit 1
+mutate_file "$COPILOTMODE/oversee-succeed" '[[ "$CALLER_HARNESS" != copilot || "$MODE" == print ]]' '[[ "$CALLER_HARNESS" != copilot || "$MODE" != print ]]'
+copilot_row checkcopilotctl "$COPILOTMODE/oversee-succeed" --check-marks --harness copilot
+assert_eq "$RC|$(grep -c '^oversee-succeed: copilot-unmeasured ' <<<"$OUT")" "0|0" \
+  "control: without the refusal a copilot overseer's marks are judged on a reading lanes cannot make"
+COPILOTACCT="$(mutant_scripts copilotacct oversee-succeed)" || exit 1
+mutate_file "$COPILOTACCT/oversee-succeed" '[[ -n "$CALLER_CFG" ]] || die copilot-account-unknown' ': || die copilot-account-unknown'
+fleet_state
+new_caller "$UNDER_MARK"
+SUCCEED_BIN="$COPILOTACCT/oversee-succeed" run_succeed printcopilotnonectl '' --print-launch-line --harness copilot -- --allow-all
+assert_eq "$RC|$(grep -c "^env COPILOT_HOME='' copilot " <<<"$OUT")" "0|1" \
+  "control: without the refusal the line opens copilot on an empty COPILOT_HOME"
 fleet_state
 
 # The printed line is replayed verbatim into a DEAD pane, and nobody is at that
