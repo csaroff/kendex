@@ -31,11 +31,11 @@
 #   none, exactly as a live caller's do, and no
 #   recorded line is needed to launch its successor. What it cannot do is take
 #   a turn, so it never reaches the mark judgement that would hand it over.
-#   This mode is therefore the succession with the WALL in place of the mark,
-#   and it changes the ACCOUNT and nothing else: no mark is judged, the
-#   preference is not walked, this session's own harness, model, effort and
-#   permission flags are kept, and `lanes pick` names the account, never the
-#   one the walled pane is spending. `--dead-pane` cannot serve it, because that mode deliberately
+#   This mode is therefore the succession with the WALL in place of the mark:
+#   no mark is judged, the preference is walked as step 3 walks it, ending in
+#   the caller entry, which keeps this session's own harness, model, effort
+#   and permission flags, and `lanes pick` names the account, never the one
+#   the walled pane is spending. `--dead-pane` cannot serve it, because that mode deliberately
 #   picks no lane — the recorded line IS its choice, and for a walled overseer
 #   that line names the account that just walled.
 #
@@ -128,12 +128,16 @@
 #        prints `mark-reached` and a reading that could not be taken prints
 #        `mark-unmeasured`, either of which ends the run there; a reached mark
 #        otherwise falls through to step 3.
-#     3. Walk ORCH_OVERSEER_PREFERENCE, comma-separated `harness:rank:effort`
-#        entries: harness claude or codex, rank a position on the kendex tier
-#        ladder (1 is the top tier; `kendex tier-model` names its model),
-#        effort a lowercase word. Every launch but one goes through `lanes
-#        pick --harness --model --min-headroom-pct`, the headroom trigger
-#        itself, so no successor is opened on an account at or below it. The
+#     3. Walk ORCH_OVERSEER_PREFERENCE, comma-separated `harness:model:effort`
+#        entries: harness claude or codex, model a model name or a rank on the
+#        kendex tier ladder (1 is the top tier; `kendex tier-model` names its
+#        model), effort a lowercase word. Unset, the setting is the ladder
+#        lib/overseer-launch.sh's OL_DEFAULT_PREFERENCE names; set to empty,
+#        it names no entry. Every launch but one goes through `lanes pick
+#        --harness --model --min-headroom-pct`, the headroom trigger itself,
+#        so no successor is opened on an account at or below it, and among
+#        the accounts with room it is `lanes pick`'s own order that puts one
+#        carrying live lane claims behind an empty one. The
 #        bound is judged on the bucket that walls the model that entry passes,
 #        and the pick is held to the reading the SUCCESSOR will take of itself
 #        at its own account mark, so it is never opened onto an account its
@@ -153,7 +157,9 @@
 #        A named entry's LAUNCH carries the model and effort words its own row
 #        writes. A same-harness entry keeps the caller's permission words
 #        exactly. A cross-harness entry transfers only a full-bypass posture
-#        that both rows define, then writes the target row's spelling.
+#        that both rows define, then writes the target row's spelling; under
+#        any other posture it is skipped before its pick, with
+#        `entry-permission-untransferable` on stderr, and the walk goes on.
 #        The walk ALWAYS ends in one further entry, the caller's own
 #        harness and lane ($CLAUDE_CONFIG_DIR or $CODEX_HOME) with no model or
 #        effort flag of its own: the overseer passes its model and effort
@@ -275,15 +281,15 @@
 #                    confirming read can settle in. At 1 that floor is the whole
 #                    budget and the running-turn wait gets a single probe; at 2
 #                    and 3 each wait gets one second (default 60)
-#   -- FLAGS...      Passed to the harness word by word, each quoted. A caller,
-#                    print or walled entry carries every word unchanged but
+#   -- FLAGS...      Passed to the harness word by word, each quoted. A caller
+#                    or print entry carries every word unchanged but
 #                    the question-tool words, which every entry carries
 #                    exactly when ORCH_QUESTION_TOOL is off, its default. A
 #                    named same-harness entry replaces model and effort but
 #                    keeps permission words exact. A named cross-harness entry
 #                    accepts one transferable full-bypass posture, and no other
-#                    permission word, and writes the target harness's spelling.
-#                    A mix refuses before launch. Print mode records this
+#                    permission word, and writes the target harness's spelling;
+#                    under any other posture the walk skips it. Print mode records this
 #                    session rather than a later preference.
 #                    Refused beside --dead-pane, whose line already holds them
 #   --harness H      The harness this overseer runs, claude or codex, where its
@@ -353,10 +359,9 @@
 #                    harness, account, model and directory where it names the
 #                    pane, as for a live caller, and --harness and the pane
 #                    where it names none, and step 3 picks the lane
-#                    as it does for a live succession — walking the caller
-#                    entry alone whatever ORCH_OVERSEER_PREFERENCE names, and
-#                    refusing a pick that names the account the walled pane is
-#                    spending. Its
+#                    as it does for a live succession, with the account the
+#                    walled pane is spending left out of every pick and a pick
+#                    that names it anyway refused. Its
 #                    window is where the successor lands. The command built is
 #                    printed bare on stdout before the window opens, so the
 #                    caller's own output records the line it sent, and it is
@@ -433,17 +438,18 @@ message() { # KEY FIELD=VALUE...
     account-below-mark) text='No account mark is reached. This run was handed no --context reading, so the context mark was not judged; the overseer turn-end hook judges it on the reading it takes. The headroom field says what the account mark found: a number above the trigger, or none or unreadable where nothing measured it.' ;;
     mark-reached) text='This overseer is at or past one of its own marks and has to hand this session over. Run oversee-succeed with the permission, model and effort flags this session runs under; where succession is off, write the overseer handoff file and ask for a fresh overseer session by hand.' ;;
     mark-unmeasured) text='One trigger could not be measured this time, and no other trigger fired. Nothing is launched and nothing is settled: a reading that failed is never a mark that lifted, so a caller holding a standing mark keeps it. The reason field names the figure that was missing.' ;;
-    invalid-preference) text='ORCH_OVERSEER_PREFERENCE entries are harness:rank:effort with harness claude or codex.' ;;
+    invalid-preference) text='ORCH_OVERSEER_PREFERENCE entries are harness:model:effort with harness claude or codex and model a model name or a tier ladder rank.' ;;
     lanes-failed) text='A lanes read failed on a path about to launch; no lane is chosen on a guess.' ;;
     walled-lane-unknown) text='The account this walled overseer is spending could not be named, so the one account its successor must not open on is unknown and nothing was launched. A session carrying neither of the two account variables, under a harness whose default this reader cannot resolve, is the shape that reaches this.' ;;
-    model-failed) text='kendex tier-model named no model for this entry.' ;;
-    model-window-unknown) text='The claude adapter names no context window for the model this entry resolves to, and a successor runs with its compaction off, so it would reach its wall with no handoff mark. Nothing was launched. Name a rank whose model the window table in lib/adapters/claude.sh names.' ;;
+    model-failed) text='kendex tier-model named no model for this entry: its rank is past the tier ladder, or its model name is none the ladder names for its harness.' ;;
+    model-window-unknown) text='The claude adapter names no context window for the model this entry resolves to, and a successor runs with its compaction off, so it would reach its wall with no handoff mark. Nothing was launched. Name a model, or a rank whose model, the window table in lib/adapters/claude.sh names.' ;;
     launch-choice-failed) text='The launch flag table cannot state a required model or an equivalent cross-harness permission posture. Nothing was launched.' ;;
     no-lane-qualifies) text='No lane walked is above the headroom trigger; nothing was launched and this overseer keeps running. The walk is every ORCH_OVERSEER_PREFERENCE entry, counted in entries, and then the fleet-wide sweep of the harness the fallback field names, which is none where the walk never reached that entry, so a preference aimed at a spent harness is not what this says. walled and unmeasured are the accounts those sweeps refused and the accounts nothing could measure, counted once per sweep. The mark field names the trigger. At mark=headroom the account and resets fields name the account that ran out and when the bucket this session spends frees up. At mark=wall the caller pane read walled and no mark was judged, so no account is named here; the caller that read that wall names it.' ;;
     launch-trust-missing) text='The folder-trust entry for the caller directory could not be made in the config this successor would read, so nothing was launched and the caller keeps running. The successor would open on the folder-trust question and wait there for an answer nobody at the pane gives. The reason field names what failed: trust-refused is an answer already recorded for that directory that is not trust, which this will not overwrite; config-unreadable is the account config present and unreadable or unparseable, a dangling shim link being the usual codex cause; account-store is the account transcript directory that could not be made; home-path, home-create, home-link, home-entry, config-write and config-install are the private CODEX_HOME under the account, or the claude config dir .claude.json, that could not be built, so check that the account directory is writable, home-entry naming a real file or directory sitting where a link to the account belongs; entry-unreadable is the entry written and not read back.' ;;
     launch-failed) text='The successor could not be launched; the caller keeps running.' ;;
     interrupted) text='A signal stopped the script; the successor window was closed and the caller keeps running.' ;;
     successor-launch) text='The successor command is built; the form names how the picked lane reaches the harness.' ;;
+    entry-permission-untransferable) text='The caller runs under permission words with no equivalent on the harness this entry names, so a successor there would change what it may do. The entry is skipped and the walk goes on to the next one, ending at the harness the caller runs.' ;;
     successor-lane-spent) text='The pick named the very account this walled overseer is running on, which its successor may never open on: an inventory that has not caught up with the wall on that pane can still report room there. The entry is skipped, so a fleet whose only candidate is that account refuses rather than relaunching into the wall.' ;;
     successor-dialog) text='The successor stopped at a dialog nobody is there to answer; the caller keeps running. The pane line follows.' ;;
     successor-not-working) text='The successor never showed a running turn; the caller keeps running.' ;;
@@ -971,14 +977,12 @@ fi
 # and `dead` walks nothing: the recorded line IS the choice, already made by
 # whichever of the two modes above wrote it.
 #
-# `walled` walks the caller entry alone too, for the reason `print` does: it
-# recovers THIS session rather than choosing where a later one goes, so its
-# successor keeps this session's harness, model, effort and permission flags
-# and changes its ACCOUNT and nothing else. Walking the preference there would
-# write a model and effort of its own beside the ones the caller's own flags
-# already carry, and the command would name two. The account is the whole of
-# what this mode chooses, and it chooses it below rather than keeping the
-# caller's own, which is the account that walled.
+# `walled` walks the preference as a live succession does: the wall that
+# stopped this session can be the bucket of its own model alone, and another
+# model may still have room on the same fleet. A named entry writes its own
+# model and effort and strips the caller's pair, as it does at a mark, so the
+# command names one of each. The walk still never opens on the account that
+# walled (WALLED_LANE_ID below).
 build_entries() {
   ENTRIES=()
   # The named entries alone, for the refusal to report: the caller fallback below
@@ -989,13 +993,13 @@ build_entries() {
   # and `none` where it never did, so the refusal says whether the last resort
   # actually ran rather than restating that one exists.
   FALLBACK_WALKED=none
-  if [[ "$MODE" == print || "$MODE" == walled ]]; then
+  if [[ "$MODE" == print ]]; then
     ENTRIES=(caller)
   else
     # The parse is lib/overseer-launch.sh's ol_preference_entries, the one
     # `oversee launch` reads the same setting with, so the two launchers cannot
     # come to admit different entries.
-    ol_preference_entries "${ORCH_OVERSEER_PREFERENCE:-}" || die invalid-preference "entry=$OL_BAD_ENTRY"
+    ol_preference_entries "$(ol_preference)" || die invalid-preference "entry=$OL_BAD_ENTRY"
     ENTRIES=(${OL_ENTRIES[@]+"${OL_ENTRIES[@]}"})
     NAMED_ENTRIES="$OL_NAMED"
     # The walk ALWAYS ends here, whatever the setting says. The caller entry is
@@ -1015,10 +1019,14 @@ build_entries() {
 # itself. $2 is the model the successor of this entry will run: the one the
 # entry passes, or for the caller entry the one this pane already runs, since
 # that entry hands the overseer's own flags on. The rate and qualifying marks
-# exclude the caller's own account: the successor must move off it.
+# exclude the caller's own account: the successor must move off it. So does
+# `walled`: an entry of another model is judged on that model's bucket, where
+# the walled account can still read room, and a pick naming it would drop the
+# entry although another account has room.
 pick_lane_dir() { # HARNESS [MODEL]
   local exclude=""
   case "$MARK_KIND" in rate|qualifying) exclude="$CALLER_CFG" ;; esac
+  [[ "$MODE" != walled ]] || exclude="$WALLED_LANE"
   ol_pick_lane "$1" "${2:-}" "$HEADROOM_TRIGGER" "$exclude"
 }
 
@@ -1066,16 +1074,25 @@ walk_entries() {
       # trigger, as a claude caller's is, the rule the condition below applies.
       lane_dir="$CALLER_CFG"
     else
-      IFS=: read -r harness rank effort <<<"$entry"
       # The model is resolved BEFORE the lane, so the pick is judged on the bucket
       # that walls the model this entry will pass. An account with weekly room but
       # none left for that model is exit 3 below, which falls to the next entry,
       # rather than a successor whose first turn is a usage banner. A rank the
       # tier ladder cannot answer ends the run here rather than skipping the
       # entry: it is a setting to fix, not a lane to pass over.
-      model="$(kendex tier-model "$harness" "$rank" 2>"$DEP_ERR")" && [[ -n "$model" ]] \
-        || die model-failed "entry=$entry"
+      ol_entry_model "$entry" || die model-failed "entry=$entry"
+      harness="$OL_ENTRY_HARNESS" model="$OL_ENTRY_MODEL" effort="$OL_ENTRY_EFFORT"
       pick_model="$model"
+      # An entry of another harness takes the caller's permission posture only
+      # where lib/lane-launch.sh's transfer judge admits it. Where it does not,
+      # the entry is skipped rather than chosen and refused after the walk, so
+      # the walk still reaches the entries after it and the caller's own.
+      # `check` is handed no permission words, so it judges room alone.
+      if [[ "$MODE" != check && "$harness" != "$CALLER_HARNESS" ]] \
+         && ! launch_choice_permission_transferable "$CALLER_HARNESS" "${HARNESS_FLAGS[*]+${HARNESS_FLAGS[*]}}"; then
+        message entry-permission-untransferable "entry=$entry" "source=$CALLER_HARNESS" "target=$harness" >&2
+        continue
+      fi
     fi
     # The caller's own lane is kept on `has-room` alone. At the trigger it is
     # the account that ran out, and a successor opened on it walls as this
@@ -1108,10 +1125,10 @@ walk_entries() {
         3) continue ;;
         *) die lanes-failed "entry=$entry" "exit=$rc" ;;
       esac
-      # WALLED_LANE above says why this account is refused. The ENTRY is
-      # skipped rather than the pick re-run without it, so a fleet whose only
-      # candidate is the spent account refuses instead of reopening on it, and
-      # an inventory stale enough to name it is not trusted to order the rest.
+      # WALLED_LANE above says why this account is refused. The pick already
+      # leaves it out, so this is the backstop for an inventory that names it
+      # anyway: the ENTRY is skipped rather than the pick re-run, since an
+      # inventory stale enough to name it is not trusted to order the rest.
       if [[ "$MODE" == walled && "$(lane_account_id "$OL_PICKED_DIR")" == "$WALLED_LANE_ID" ]]; then
         message successor-lane-spent "lane=$WALLED_LANE" "entry=$entry" >&2
         continue
@@ -1241,8 +1258,7 @@ if [[ "$MODE" == check ]]; then
 fi
 
 # The account the walled pane is SPENDING: the one account its successor may
-# never open on. Read once before the walk, because `walled` walks the caller
-# entry alone.
+# never open on. Read once before the walk, which holds every entry to it.
 #
 # The pick judges room and nothing else, so a reading that still shows room
 # for the account whose own screen carries the wall — an inventory not yet

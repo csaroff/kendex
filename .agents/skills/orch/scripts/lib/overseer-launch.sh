@@ -7,9 +7,12 @@
 # What differs between them is policy and stays with the caller: which marks
 # fire, how a predecessor's flags carry over, which entries the account walk
 # tries. `oversee-watch` sources it too, through lib/watch-overseer-record.sh,
-# for OL_JQ_DEFS alone. What is shared is here:
+# for OL_JQ_DEFS and ol_preference. What is shared is here:
 #
+#   ol_preference          the ORCH_OVERSEER_PREFERENCE value, its default
+#                          ladder where the setting is unset
 #   ol_preference_entries  the ORCH_OVERSEER_PREFERENCE parse
+#   ol_entry_model         one entry's harness, model and effort
 #   ol_lanes               `lanes` on this machine's copy of each account
 #   ol_pick_record         one `lanes pick --json` record, for a caller's
 #                          own counts
@@ -64,10 +67,23 @@ ol_runtime_supported() {
   [[ "$OL_RUNTIME" == tmux ]] || { OL_REASON=runtime-unsupported; return 1; }
 }
 
+# The ladder a fleet walks where no settings file names
+# ORCH_OVERSEER_PREFERENCE: Fable, then Opus 5.5, then GPT-5.6 Sol on codex,
+# each at high effort, so a Fable wall moves the overseer onto another model
+# rather than leaving it with no successor, at a mark and at the wall alike.
+# Set to empty, the setting names no entries, which is a caller's own rule to
+# read.
+OL_DEFAULT_PREFERENCE="claude:fable:high,claude:claude-opus-5-5:high,codex:gpt-5.6-sol:high"
+ol_preference() {
+  printf '%s\n' "${ORCH_OVERSEER_PREFERENCE-$OL_DEFAULT_PREFERENCE}"
+}
+
 # ol_preference_entries VALUE — VALUE, ORCH_OVERSEER_PREFERENCE's
-# comma-separated `harness:rank:effort` entries, into OL_ENTRIES, with
-# OL_NAMED the count. An entry outside the shape returns 1 with it in
-# OL_BAD_ENTRY. An empty VALUE is no entries and no refusal.
+# comma-separated `harness:model:effort` entries, into OL_ENTRIES, with
+# OL_NAMED the count. `model` is a model name or a kendex tier ladder rank,
+# which is digits alone and which no model name is. An entry outside the
+# shape returns 1 with it in OL_BAD_ENTRY. An empty VALUE is no entries and
+# no refusal.
 OL_ENTRIES=()
 OL_NAMED=0
 OL_BAD_ENTRY=""
@@ -80,10 +96,38 @@ ol_preference_entries() { # VALUE
   while [[ -n "$rest" ]]; do
     entry="${rest%%,*}"
     rest="${rest#*,}"
-    [[ "$entry" =~ ^(claude|codex):[1-9][0-9]*:[a-z]+$ ]] || { OL_BAD_ENTRY="$entry"; return 1; }
+    [[ "$entry" =~ ^(claude|codex):([1-9][0-9]*|[a-z][a-z0-9.-]*):[a-z]+$ ]] || { OL_BAD_ENTRY="$entry"; return 1; }
     OL_ENTRIES+=("$entry")
     OL_NAMED=$((OL_NAMED + 1))
   done
+}
+
+# ol_entry_model ENTRY — one entry ol_preference_entries admitted, split into
+# OL_ENTRY_HARNESS, OL_ENTRY_MODEL and OL_ENTRY_EFFORT: a rank as `kendex
+# tier-model` names it, a name as written once the tier ladder is shown to
+# know it. A codex name is known where it IS a model the ladder names for
+# codex; a claude name where it carries one, since the claude ladder names
+# model families (`opus`) that a full id (`claude-opus-5-5`) spells inside it.
+# Returns 1 for a rank the ladder cannot answer and for a name it does not
+# know, which the walk refuses rather than skips: either is a setting to fix,
+# and a misspelled name would otherwise reach the pick, which then drops
+# every model-scoped window, and the launch line as written.
+OL_ENTRY_HARNESS="" OL_ENTRY_MODEL="" OL_ENTRY_EFFORT=""
+ol_entry_model() { # ENTRY
+  local rank=1 known
+  IFS=: read -r OL_ENTRY_HARNESS OL_ENTRY_MODEL OL_ENTRY_EFFORT <<<"$1"
+  if [[ "$OL_ENTRY_MODEL" =~ ^[0-9]+$ ]]; then
+    OL_ENTRY_MODEL="$(kendex tier-model "$OL_ENTRY_HARNESS" "$OL_ENTRY_MODEL" 2>"$DEP_ERR")" && [[ -n "$OL_ENTRY_MODEL" ]]
+    return
+  fi
+  # Every rank until `kendex tier-model` refuses one past the ladder's end.
+  while known="$(kendex tier-model "$OL_ENTRY_HARNESS" "$rank" 2>"$DEP_ERR")" && [[ -n "$known" ]]; do
+    case "$OL_ENTRY_HARNESS:$OL_ENTRY_MODEL" in
+      "codex:$known"|"claude:"*"$known"*) return 0 ;;
+    esac
+    rank=$((rank + 1))
+  done
+  return 1
 }
 
 # ol_lanes ARGS... — `lanes` as every overseer read of an account asks it,

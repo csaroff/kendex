@@ -53,6 +53,8 @@ cat > "$BIN/kendex" <<'STUB'
 #!/bin/sh
 case "$1:$2:$3" in
   tier-model:claude:1) echo fable ;;
+  tier-model:codex:1) echo gpt-6-astra ;;
+  tier-model:codex:2) echo gpt-5.6-sol ;;
   *) exit 1 ;;
 esac
 STUB
@@ -80,10 +82,12 @@ TMUX_ADDR="$(tm display-message -p '#{socket_path},#{pid},0')"
 
 # run_oversee ENV=VAL... -- ARGS... — the script under an explicit, whole
 # environment with no $TMUX, from the work directory workflow-state resolves
-# `tmp` under, or from RUN_DIR where a row sets it. Sets OUT (both streams)
-# and RC.
+# `tmp` under, or from RUN_DIR where a row sets it. ORCH_OVERSEER_PREFERENCE is
+# claude:1:high, or LAUNCH_PREF where a row sets it, `unset` exporting none.
+# Sets OUT (both streams) and RC.
 run_oversee() {
-  local env_args=()
+  local env_args=() pref=(ORCH_OVERSEER_PREFERENCE="${LAUNCH_PREF:-claude:1:high}")
+  [[ "${LAUNCH_PREF:-}" != unset ]] || pref=()
   while [[ $# -gt 0 && "$1" != -- ]]; do env_args+=("$1"); shift; done
   shift
   rm -f "${TMP_ROOT:?}"/argv.*
@@ -91,7 +95,7 @@ run_oversee() {
   OUT="$(cd "${RUN_DIR:-$TMP_ROOT/work}" && env -i HOME="$H" PATH="$BIN:$PATH" TMUX_TMPDIR="$TMUX_DIR" \
     LANES_HOME="$H" FIXTURE_DIR="$FIXTURE_DIR" OVERSEE_WATCH_STATE_DIR="$TMP_ROOT/state" \
     ORCH_LANES_FETCH_CMD="$FETCHER" ORCH_LANE_DIRS="$H/.claude:$H/.eclaude" ORCH_LANES_USAGE_TTL=0 \
-    ORCH_OVERSEER_PREFERENCE="claude:1:high" ORCH_TMUX_SESSION=fleet \
+    ${pref[@]+"${pref[@]}"} ORCH_TMUX_SESSION=fleet \
     ${env_args[@]+"${env_args[@]}"} "${OVERSEE_BIN:-$OVERSEE}" "$@" 2>&1 </dev/null)" || RC=$?
 }
 FLEET_STATE="$TMP_ROOT/work/tmp/workflow-state-oversee.json"
@@ -161,7 +165,8 @@ assert_eq "$RC|$(keyed overseer-not-working "$OUT" | sed -n 1p | sed 's/session=
 # The refusals before anything opens.
 for row in \
   "ORCH_OVERSEER_PREFERENCE=|preference-empty setting=ORCH_OVERSEER_PREFERENCE|an empty preference" \
-  "ORCH_OVERSEER_PREFERENCE=claude:one:high|invalid-preference entry=claude:one:high|an entry outside the shape" \
+  "ORCH_OVERSEER_PREFERENCE=claude:Opus:high|invalid-preference entry=claude:Opus:high|an entry outside the shape" \
+  "ORCH_OVERSEER_PREFERENCE=codex:gpt-5.6-sl:high|model-failed entry=codex:gpt-5.6-sl:high|a codex model name the tier ladder does not name" \
   "ORCH_TMUX_SESSION=|session-unresolved consulted=--session,ORCH_TMUX_SESSION|no session named" \
   "ORCH_TMUX_SESSION=fleetz|tmux-session-missing session=fleetz server=$SOCKET|a session tmux does not hold" \
   "ORCH_OVERSEER_HOST=$TMP_ROOT/other|runtime-unsupported host=$TMP_ROOT/other|a runtime other than tmux" \
@@ -270,6 +275,14 @@ run_oversee ORCH_QUESTION_TOOL=overseer -- launch --wait-secs 20
 assert_eq "$RC|$(recorded_argv)" \
   "0|lane=$H/.claude;-n;overseer;--model;fable;--effort;high;$BYPASS;$BRIEF;" \
   "ORCH_QUESTION_TOOL=overseer launches the overseer with its question tool"
+tm kill-window -t "$(recorded window)"
+
+# A fleet whose settings name no preference: the first launch walks the default
+# ladder and opens on its Fable rung, a model name the tier ladder knows.
+LAUNCH_PREF=unset run_oversee -- launch --wait-secs 20
+assert_eq "$RC|$(recorded model)|$(recorded_argv)" \
+  "0|fable|lane=$H/.claude;-n;overseer;--model;fable;--effort;high;$BYPASS;$QUESTION_OFF;$BRIEF;" \
+  "an unset preference launches the first overseer on the default ladder's Fable rung"
 tm kill-window -t "$(recorded window)"
 
 # The writer's control: a record write that leaves the launch identity out,
