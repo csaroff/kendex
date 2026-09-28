@@ -1,10 +1,11 @@
-import { afterEach, beforeEach, expect, mock, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { afterEach, beforeEach, expect, jest, mock, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import qolDefault from "../extensions/qol.ts";
 import { QOL_BUDGET_GUARD_SENTINEL } from "../extensions/qol/budget-guard.ts";
+import { statusMessage } from "../extensions/qol/status-message.ts";
 
 interface CompactCall { customInstructions?: string; onComplete?: () => void; onError?: (e: Error) => void }
 
@@ -116,6 +117,7 @@ afterEach(async () => {
 			}
 		}
 	} finally {
+		jest.useRealTimers();
 		if (workdir) rmSync(workdir, { force: true, recursive: true });
 		if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
@@ -151,6 +153,24 @@ async function completeCompaction(h: World): Promise<boolean> {
 	call?.onComplete?.();
 	await h.settlement;
 	return h.settled;
+}
+
+/** The user Pi settings file: Pi core's `compaction` object, absent where
+ * `enabled` is undefined, beside the QOL package config. A defined `project`
+ * also writes the project file with only Pi's key. */
+function writePiSettings(enabled: boolean | undefined, qol: Record<string, unknown> = {}, project?: boolean): void {
+	const settings = {
+		...(enabled === undefined ? {} : { compaction: { enabled } }),
+		kendex: { extensionManager: { config: { "@vanillagreen/pi-qol": qol } } },
+	};
+	writeFileSync(join(workdir, "settings.json"), `${JSON.stringify(settings)}\n`, "utf8");
+	if (project === undefined) return;
+	mkdirSync(join(workdir, ".pi"), { recursive: true });
+	writeFileSync(join(workdir, ".pi", "settings.json"), `${JSON.stringify({ compaction: { enabled: project } })}\n`, "utf8");
+}
+
+function statusLine(h: World, label: string): string | undefined {
+	return statusMessage(h.ctx as any).split("\n").find((line) => line.startsWith(`${label}: `));
 }
 
 function sessionCompact(h: World, fromExtension = true, ctx = h.ctx): void {
@@ -325,6 +345,48 @@ const rows: Array<{
 		],
 		expected: [0, { calls: 1, settled: false }, true, 0, { calls: 1, settled: false }, true, 1, { calls: 2, settled: false }, true],
 	},
+	...([
+		{ trigger: "budgetGuard", user: false, fires: 0, status: "Budget guard: disabled by Pi compaction.enabled=false" },
+		{ trigger: "budgetGuard", user: true, fires: 1, status: "Budget guard: enabled (budgetPercent=85, budgetTokens=-1)" },
+		{ trigger: "budgetGuard", user: undefined, fires: 1, status: "Budget guard: enabled (budgetPercent=85, budgetTokens=-1)" },
+		{ trigger: "budgetGuard", user: true, qol: { "compaction.budgetGuardEnabled": false }, fires: 0, status: "Budget guard: disabled" },
+		{ trigger: "budgetGuard", user: true, project: false, fires: 0, status: "Budget guard: disabled by Pi compaction.enabled=false" },
+		{ trigger: "budgetGuard", user: false, project: true, fires: 1, status: "Budget guard: enabled (budgetPercent=85, budgetTokens=-1)" },
+		{ trigger: "idle", user: false, qol: { "compaction.idleEnabled": true }, fires: 0, status: "Idle compaction: disabled by Pi compaction.enabled=false" },
+		{ trigger: "idle", user: true, qol: { "compaction.idleEnabled": true }, fires: 1, status: "Idle compaction: enabled after 1s idle" },
+		{ trigger: "idle", user: undefined, qol: { "compaction.idleEnabled": true }, fires: 1, status: "Idle compaction: enabled after 1s idle" },
+		{ trigger: "idle", user: true, fires: 0, status: "Idle compaction: disabled" },
+	] as Array<{ trigger: "budgetGuard" | "idle"; user?: boolean; project?: boolean; qol?: Record<string, unknown>; fires: number; status: string }>).map((gate) => ({
+		name: `${gate.trigger} with Pi compaction.enabled user=${gate.user} project=${gate.project} and QOL ${JSON.stringify(gate.qol ?? {})}`,
+		setup: (h: World) => {
+			writePiSettings(gate.user, { ...gate.qol, "compaction.idleTimeoutSeconds": 1 }, gate.project);
+			if (gate.project !== undefined) h.ctx.isProjectTrusted = () => true;
+			if (gate.trigger === "idle") {
+				h.ctx.getContextUsage = () => ({ contextWindow: 1_000_000, percent: 25, tokens: 250_000 });
+				jest.useFakeTimers();
+			} else {
+				h.ctx.getContextUsage = () => ({ contextWindow: 200_000, percent: 100, tokens: 200_000 });
+			}
+		},
+		actions: [
+			agentEnd,
+			gate.trigger === "idle"
+				? (h: World) => {
+					jest.advanceTimersByTime(1_000);
+					return h.ctx.compact.mock.calls.length;
+				}
+				: async (h: World) => {
+					const settlement = h.fake.handlers.agent_settled!({ type: "agent_settled" }, h.ctx);
+					await Promise.resolve();
+					const calls = h.ctx.compact.mock.calls.length;
+					(h.ctx.compact.mock.calls[0]?.[0] as CompactCall | undefined)?.onComplete?.();
+					await settlement;
+					return calls;
+				},
+			(h: World) => statusLine(h, gate.status.slice(0, gate.status.indexOf(":"))),
+		],
+		expected: [0, gate.fires, gate.status],
+	})),
 ];
 
 for (const row of rows) {
