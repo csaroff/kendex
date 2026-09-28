@@ -698,8 +698,10 @@ overseer_fleet_log() { # NOTICE_FILE RECORD_FILE ERR_FILE
 }
 
 # A session record the start could not write, said on stderr and in the fleet
-# log and then left behind: the watch goes on to judge the pane, which is
-# read from tmux and not from the record. The reason and its fields are the
+# log and then left behind: the watch goes on to judge the session, from the
+# exit status and rows file the record already holds for this pane where it
+# names them, and from the pane, the named fallback, where it names none
+# (overseer_pane_read). The reason and its fields are the
 # keyed line's, and the fleet log row repeats the reason and the pane so the
 # successor that reads the log at takeover sees what this watch could not
 # record; the other fields stay on stderr, since a path= is as long as the
@@ -2303,18 +2305,41 @@ overseer_mark_check() { # ROWS IDENTITY PANE
   OVERSEER_MARK_ROWS="$(lane_row_set overseer-mark "$rows" "$identity" "$kind|$passes")"
 }
 
-# The overseer's own pane as one reading: OV_WINDOW, OV_IDENTITY (`<server>
-# <pane>`, the key its rows are kept under), OV_SCREEN and OV_STATE, the shared
-# judge's word for it. The long pass reads it before its checks and the mail
-# pass before it takes any mail, so both read one pane the one way. A pane that
-# cannot be read is noted once and returns 1: its state settles nothing.
+# The overseer's own session as one reading: OV_WINDOW, OV_IDENTITY (`<server>
+# <pane>`, the key its rows are kept under), OV_STATE, the word the shared
+# judge would give it, and OV_SOURCE, what settled that word. The long pass
+# reads it before its checks and the mail pass before it takes any mail, so
+# both read one session the one way. A pane that cannot be read is noted once
+# and returns 1: its state settles nothing.
+#
+# An exit status `overseer-run` wrote into the record, over a pane whose
+# process is a bare shell with nothing under it, settles it first, as
+# `exited`, OV_SOURCE `record`. The harness's own rows settle it next
+# (lib/session-rows.sh), OV_SOURCE `rows`: a SessionEnd for any reason but
+# `clear` or `resume` is `exited` only over a pane whose process is a bare
+# shell with nothing under it, and live over a running process; a usage-limit
+# StopFailure is `walled` whatever the screen shows, and overseer_judge holds
+# it to the account judgement. A session its rows call live is still `exited` when
+# the pane's process is a bare shell with nothing under it, which a harness
+# killed before its SessionEnd hook ran leaves, OV_SOURCE `process`: a process
+# fact, read as lib/lane-state.sh's own rung reads it, never the screen.
+#
+# THE NAMED FALLBACK: where the rows cannot judge, because the record names no
+# rows file for this pane, the file holds no row yet, its last row names a
+# harness that emits neither event (Codex, Pi) or it cannot be read, the pane
+# is captured and judged by lib/lane-state.sh's rungs as it was before the
+# rows existed, OV_SOURCE `pane`, and the pass says so once under
+# overseer-fallback with the cause. OV_SCREEN holds that capture, empty on
+# every other source.
 OV_WINDOW=""
 OV_IDENTITY=""
 OV_SCREEN=""
 OV_STATE=""
+OV_SOURCE=""
 overseer_pane_read() { # PANE
-  local pane="$1" pane_identity server actual_pane obs pid cmd
+  local pane="$1" pane_identity server actual_pane obs pid cmd rows cause exit_status
   local errf="$WORK_DIR/overseer.err"
+  OV_SCREEN=""
   OV_WINDOW="$(tmux display-message -p -t "$pane" '#{window_id}' 2>"$errf")" \
     || { overseer_note overseer-unreadable "pane=$pane" "field=window_id"; return 1; }
   if ! pane_identity="$(tmux display-message -p -t "$pane" '#{pid} #{pane_id}' 2>"$errf")"; then
@@ -2334,10 +2359,69 @@ overseer_pane_read() { # PANE
   fi
   [[ "$obs" =~ ^[0-9]+[[:blank:]]+[^[:space:]] ]] \
     || { overseer_note overseer-unreadable "pane=$pane" "value=${obs:-<empty>}"; return 1; }
-  OV_SCREEN="$(tmux capture-pane -pJ -t "$pane" 2>"$errf")" \
-    || { overseer_note overseer-unreadable "pane=$pane" "field=capture"; return 1; }
   pid="${obs%%[[:blank:]]*}"
   cmd="${obs#*[[:blank:]]}"
+  # The rows file and the exit status the record holds for THIS pane on THIS
+  # server, and neither for a record naming another session: that one's are
+  # not this pane's. An exit status is `overseer-run`'s, written once the
+  # launch line returned (lib/overseer-launch.sh § ol_record_exit), and it
+  # settles the session, `source=record`, only over the state that return
+  # leaves: a bare shell with nothing under it. A harness the person started
+  # again in the same pane is a child of that shell, and the status is an
+  # earlier session's.
+  cause=unrecorded exit_status=""
+  if ! rows="$("$WORKFLOW_STATE" ${WORKFLOW_STATE_ARGS[@]+"${WORKFLOW_STATE_ARGS[@]}"} get oversee \
+    "if (.overseer.server // \"\") == \"$server\" and (.overseer.pane // \"\") == \"$pane\"
+     then \"\\(.overseer.exit.status // \"\")\\t\\(.overseer.session_rows // \"\")\" else \"\" end" 2>"$errf")"; then
+    cause=state-unreadable rows=""
+  fi
+  if [[ "$rows" == *$'\t'* ]]; then exit_status="${rows%%$'\t'*}" rows="${rows#*$'\t'}"; fi
+  if [[ -n "$exit_status" ]] && is_bare_shell "$cmd"; then
+    pane_has_child "$pid" || true
+    case "$LANE_PROBE_RC" in
+      1) OV_STATE=exited; OV_SOURCE=record; return 0 ;;
+      0) ;;
+      *) note_probe_unusable "$pane" ;;
+    esac
+  fi
+  if [[ -n "$rows" ]]; then
+    cause=unreadable
+    if session_rows_verdict "$rows"; then cause="$SESSION_ROWS_VERDICT"; fi
+  fi
+  # A SessionEnd settles the session only over the bare shell its harness's
+  # exit leaves, the fact the recorded-exit rung reads: over a live harness it
+  # says nothing about the session running now.
+  if [[ "$cause" == ended ]]; then
+    cause=live
+    if is_bare_shell "$cmd"; then
+      pane_has_child "$pid" || true
+      case "$LANE_PROBE_RC" in
+        1) cause=ended ;;
+        0) ;;
+        *) note_probe_unusable "$pane" ;;
+      esac
+    fi
+  fi
+  case "$cause" in
+    ended) OV_STATE=exited; OV_SOURCE=rows; return 0 ;;
+    walled) OV_STATE=walled; OV_SOURCE=rows; return 0 ;;
+    live)
+      OV_STATE=working; OV_SOURCE=rows
+      if is_bare_shell "$cmd"; then
+        pane_has_child "$pid" || true
+        case "$LANE_PROBE_RC" in
+          0) ;;
+          1) OV_STATE=exited; OV_SOURCE=process ;;
+          *) note_probe_unusable "$pane" ;;
+        esac
+      fi
+      return 0 ;;
+    none | unsupported | unrecorded | unreadable | state-unreadable) ;;
+  esac
+  overseer_note overseer-fallback "pane=$pane" "cause=$cause"
+  OV_SOURCE=pane
+  OV_SCREEN="$(tmux capture-pane -pJ -t "$pane" 2>"$errf")" \
+    || { overseer_note overseer-unreadable "pane=$pane" "field=capture"; return 1; }
   # The sixth argument is empty for the reason check_lanes gives: this watch's
   # vantage point is the pane, and a screen the pane rungs cannot settle is
   # `unjudged`, never `exited`.
@@ -2351,24 +2435,32 @@ overseer_pane_read() { # PANE
 # `exited` is the harness gone; `walled` is the account spent under a harness
 # still running, which takes no turn, so it answers no lane, reads no mail and
 # cannot hand itself over — the same unattended fleet a death leaves, reached
-# by the other road. The screen's wall is one reading, and over THIS pane it is
-# not enough on its own: overseer_wall_confirmed says why, and asks the
-# account judgement that settles it. A wall the account refutes, or one no
-# judgement could be made on, is `live`, as is every other reading: nothing
-# here holds an overseer that may be working.
+# by the other road. A wall the rows record is the harness's own word about its
+# own session, and nothing but a finished turn writes the row that lifts it,
+# so the first turn after the reset would read walled for its whole length:
+# the account judgement refutes it, and it stands unless that judgement
+# measures the account below its mark, room. A wall read off the screen, the
+# fallback, is not enough on its own: overseer_wall_confirmed says why, and
+# asks the same judgement to confirm it; one it refutes, or one no judgement
+# could be made on, is `live`, as is every other reading: nothing here holds
+# an overseer that may be working.
 OV_VERDICT=live
 overseer_judge() { # PANE
   OV_VERDICT=live
   case "$OV_STATE" in
     exited) OV_VERDICT=exited ;;
-    walled) if overseer_wall_confirmed "$1"; then OV_VERDICT=walled; fi ;;
+    walled)
+      if [[ "$OV_SOURCE" == rows ]]; then
+        if ! overseer_marks_judge || [[ "$OVERSEER_MARK_KEY" != below-mark ]]; then OV_VERDICT=walled
+        else overseer_note overseer-wall-lifted "pane=$1"; fi
+      elif overseer_wall_confirmed "$1"; then OV_VERDICT=walled; fi ;;
     *) ;;
   esac
 }
 
 check_overseer() {
   local pane="${TMUX_PANE:-}" window screen prior count succession plan
-  local record record_field identity rows attempt completed
+  local record record_field identity rows attempt completed passes=""
   local ov_case row other succeed_rc below banner banner_rc
   local errf="$WORK_DIR/overseer.err"
   # Off tmux there is no overseer pane to read, and with no workflow-state
@@ -2405,6 +2497,16 @@ check_overseer() {
   record="$OVERSEER_RECORD_KEY"
 
   overseer_judge "$pane"
+  # An account the mark judgement reads at zero headroom is a wall whether or
+  # not the harness has met it yet: its next turn fails, and a walled session
+  # hands nothing over, so the succession runs from here, `source=account`.
+  # The judgement is the pass's one memoised reading, which the live arm's
+  # mark check reads too.
+  if [[ "$OV_VERDICT" == live ]] && overseer_marks_judge \
+     && [[ "$OVERSEER_MARK_KEY" == mark-reached && "$OVERSEER_MARK_KIND" == headroom \
+           && "$OVERSEER_MARK_VALUE" == 0 ]]; then
+    OV_VERDICT=walled OV_SOURCE=account
+  fi
   ov_case=""
   case "$OV_VERDICT" in
     exited) ov_case=dead ;;
@@ -2459,7 +2561,12 @@ check_overseer() {
       || die state-read-failed "" "pane=$pane" "row=$row" "value=$prior"
     count=1
     [[ -z "$prior" ]] || count=$((prior + 1))
-    if (( count < DEAD_PASSES )); then
+    # A wall the harness's own row or the account's zero states needs no
+    # second reading: it is not a screen caught between frames, and each pass
+    # it waits is a pass the fleet runs unattended.
+    passes="$DEAD_PASSES"
+    [[ "$ov_case" != walled || "$OV_SOURCE" == pane ]] || passes=1
+    if (( count < passes )); then
       lane_row_commit "$(lane_row_set "$row" "$rows" "$identity" "$count")"
       return 1
     fi
@@ -2492,14 +2599,18 @@ check_overseer() {
     else
       lane_row_commit "$(lane_row_set "$row" "$rows" "$identity" reported)"
     fi
-    echo "EVENT $row $pane window=$window passes=$DEAD_PASSES succession=$succession$record_field"
-    # The wall's own window under the line, as every lane usage-limit event
-    # carries one: the overseer's handling reads the banner with the screen on
-    # both sides of it, and the reader of THIS event has the same question
-    # about the same text. Asked of the same judge over the same slice the
-    # `walled` rung read, so the two cannot disagree; a disagreement stops the
-    # pass under the reasons check_lanes gives them.
-    if [[ "$ov_case" == walled ]]; then
+    echo "EVENT $row $pane window=$window passes=${passes:-$DEAD_PASSES} succession=$succession source=$OV_SOURCE$record_field"
+    # The wall's own words under the line, as every lane usage-limit event
+    # carries them. A rows wall carries the harness's own message, the limit
+    # and its reset, or `message=unrecorded` where its row holds none. A screen wall carries the banner with the screen on both
+    # sides of it, asked of the same judge over the same slice the `walled`
+    # rung read, so the two cannot disagree; a disagreement stops the pass
+    # under the reasons check_lanes gives them.
+    if [[ "$ov_case" == walled && "$OV_SOURCE" == rows ]]; then
+      jq -r '.message // "message=unrecorded"' <<<"$SESSION_ROW" || die limit-banner-missing "" "pane=$pane"
+    elif [[ "$ov_case" == walled && "$OV_SOURCE" == account ]]; then
+      echo "account=${OVERSEER_MARK_ACCOUNT:-unknown} headroom=0 resets=${OVERSEER_MARK_RESETS:-none}"
+    elif [[ "$ov_case" == walled ]]; then
       below="$(pane_below_last_turn "$screen")"
       banner_rc=0
       banner="$(lane_limit_banner "$below")" || banner_rc=$?
@@ -3105,8 +3216,11 @@ overseer_down() {
     [[ -n "$LONG_PID" ]]
     return
   fi
+  # Both walls ask the account judgement, so both are memoised: a screen wall
+  # on its banner, a rows wall on its row.
   if [[ "$OV_STATE" == walled ]]; then
-    banner="$(lane_limit_banner "$(pane_below_last_turn "$OV_SCREEN")")" || banner=""
+    if [[ "$OV_SOURCE" == rows ]]; then banner="$SESSION_ROW"
+    else banner="$(lane_limit_banner "$(pane_below_last_turn "$OV_SCREEN")")" || banner=""; fi
     if [[ -n "$OV_WALL_AT" && "$banner" == "$OV_WALL_BANNER" && $((PASS_NOW - OV_WALL_AT)) -lt "$INTERVAL" ]]; then
       [[ "$OV_WALL_VERDICT" == walled ]]
       return
