@@ -13,7 +13,7 @@ set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib/git-env.sh"
 # Every lane this suite measures lives under LANES_HOME; an inherited lane
 # setting would point discovery at the operator's real accounts.
-unset ORCH_LANE_DIRS ORCH_LANE_ALIASES ORCH_LANE_EXCLUDE ORCH_LANE_RETIRE ORCH_LANES_USAGE_TTL CODEX_HOME
+unset ORCH_LANE_DIRS ORCH_LANE_ALIASES ORCH_LANE_EXCLUDE ORCH_LANE_RETIRE ORCH_LANE_COPILOT_POOL ORCH_LANES_USAGE_TTL CODEX_HOME
 # The renewal's own settings, for the same reason: with one of these exported a
 # developer runs a different suite from CI, where the expired-lane rows below
 # stay expired, and a row could reach a live helper or the real token endpoint.
@@ -398,6 +398,9 @@ counted() {
 #   claims        claim files recorded (`nolog`: no store directory)
 #   cmd_lane      the lane the launched command's env prefix names, read from
 #                 the tmux log, single-quoted as the launch shell needs it
+#   pi_root       the same for a PI_CODING_AGENT_DIR prefix, or none
+#   poolrefusal   every field of the first copilot-pool-* line, key first, or none
+#   compactionon  the file field of the first compaction-on line, or none
 #   claim_lanes   the distinct lanes those claims name, sorted
 #   claim_window  the window the single claim names; claim_pane its pane id
 #   out_lanes     the lanes the launch output names, in order
@@ -442,6 +445,15 @@ observe() {
       creates) value="$(counted '^create ' "$RUN/worktree.log")" ;;
       claims) value="$([[ -d "$RUN/state/claims" ]] && ls -1 "$RUN/state/claims" | wc -l | tr -d '[:space:]' || echo nolog)" ;;
       cmd_lane) value="$(grep -oE "env CLAUDE_CONFIG_DIR='[^']*'" "$RUN/tmux.log" 2>/dev/null | sed -E -e "s/^env CLAUDE_CONFIG_DIR='//" -e "s/'\$//" -e "s#^$H/\\.##" | sort -u | paste -sd, - || true)"; value="${value:-none}" ;;
+      pi_root) value="$(grep -oE "env PI_CODING_AGENT_DIR='[^']*'" "$RUN/tmux.log" 2>/dev/null | sed -E -e "s/^env PI_CODING_AGENT_DIR='//" -e "s/'\$//" -e "s#^$H/\\.##" | sort -u | paste -sd, - || true)"; value="${value:-none}" ;;
+      compactionon)
+        value="$(awk '$1 == "open-terminal:" && $2 == "compaction-on" { print $4; exit }' <<<"$OUT")"
+        value="${value:-none}"
+        ;;
+      poolrefusal)
+        value="$(awk '$1 == "open-terminal:" && $2 ~ /^copilot-pool-/ { $1 = ""; sub(/^ +/, ""); gsub(/ +/, ","); print; exit }' <<<"$OUT")"
+        value="${value:-none}"
+        ;;
       claim_lanes) value="$(cat "$RUN"/state/claims/*.claim 2>/dev/null | cut -f3 | sed "s#^$H/\\.##" | sort -u | paste -sd, - || true)"; value="${value:-none}" ;;
       claim_window) value="$(cat "$RUN"/state/claims/*.claim 2>/dev/null | cut -f4 || true)" ;;
       claim_pane) value="$(cat "$RUN"/state/claims/*.claim 2>/dev/null | cut -f2 || true)" ;;
@@ -708,6 +720,78 @@ run_ot "" --harness pi --lane "$H/.claude" --cmd "pi --model sonnet:high $QUESTI
 assert_eq "$(observe "rc=0 launched=1 modelmissing=none effortmissing=none")" \
   "rc=0 launched=1 modelmissing=none effortmissing=none" \
   "pi's level named on the model value inside the --cmd template names the effort too"
+
+echo "=== a Pi launch on a Copilot model qualifies on the stated Copilot pool ==="
+# Such a launch spends Copilot credits and no Claude window, so a bound that
+# walls every Claude seat here (claude 20, eclaude 80, nclaude 95 against 15)
+# leaves it launching on a pool ORCH_LANE_COPILOT_POOL states with room, under
+# Pi's own root variable naming that account, and a pool nothing states or
+# every stated pool spent refuses it by a cause naming the setting, auto and
+# named alike. A named Pi lane on the pool is judged by the same `lanes pick
+# --lane` a claude lane is, its model read with the provider Pi's own flag
+# names; a Pi lane on any other model keeps the Claude variable and no judge.
+mkdir -p "$H/.pi1"
+PI_POOL="ORCH_LANE_COPILOT_POOL=$H/.pi1"
+PI_COPILOT='cmd=true --model github-copilot/claude-sonnet-5:high'
+PI_PROVIDER='cmd=true --provider github-copilot --model claude-sonnet-5 --thinking high'
+table \
+  "auto launches on the stated pool under Pi's root variable while every Claude seat is walled|$PI_POOL=100000/1000000;$PI_COPILOT|--harness pi --lane auto --lane-max-pct 15 CC-1660|rc=0 launched=1 pi_root=pi1 cmd_lane=none claim_lanes=pi1" \
+  "auto with no stated pool refuses by the setting, before anything launches|$PI_COPILOT|--harness pi --lane auto CC-1661|rc=1 launched=nolog creates=nolog poolrefusal=copilot-pool-unstated,setting=ORCH_LANE_COPILOT_POOL" \
+  "auto with every stated pool spent refuses as the owner's reading, not a reset to wait for|$PI_POOL=1000000/1000000;$PI_COPILOT|--harness pi --lane auto CC-1666|rc=1 launched=nolog creates=nolog poolrefusal=copilot-pool-walled,setting=ORCH_LANE_COPILOT_POOL" \
+  "a named account the pool reading does not cover is refused as unmeasured|$PI_POOL=100000/1000000;$PI_COPILOT|--harness pi --lane $H/.eclaude CC-1662|rc=1 launched=nolog unreadable=lane=$H/.eclaude,model=github-copilot/claude-sonnet-5:high,step=windows" \
+  "a named account whose pool is spent is refused on the monthly bucket|$PI_POOL=1000000/1000000;$PI_COPILOT|--harness pi --lane $H/.pi1 CC-1663|rc=1 launched=nolog walled=lane=$H/.pi1,model=github-copilot/claude-sonnet-5:high,pct=100,bucket=monthly" \
+  "a named account whose pool has room launches under Pi's root variable while every Claude seat is walled|$PI_POOL=100000/1000000;$PI_COPILOT|--harness pi --lane $H/.pi1 --lane-max-pct 15 CC-1664|rc=0 launched=1 pi_root=pi1 cmd_lane=none walled=none unreadable=none" \
+  "the provider on Pi's own flag is the Copilot pool too, judged on the named account|$PI_POOL=100000/1000000;$PI_PROVIDER|--harness pi --lane $H/.eclaude CC-1667|rc=1 launched=nolog unreadable=lane=$H/.eclaude,model=github-copilot/claude-sonnet-5,step=windows" \
+  "a Pi lane on another model keeps the Claude variable and launches unjudged|cmd=true --model sonnet:high|--harness pi --lane $H/.eclaude CC-1668|rc=0 launched=1 cmd_lane=eclaude pi_root=none"
+# Controls, one per rule: the named gate back on claude and codex alone
+# launches the unmeasured account unjudged; the prefix back on the Claude
+# variable for the pool starts Pi on a root nobody picked; and the provider
+# flag unread launches its Copilot model unjudged.
+pi_control() { # NAME FILE OLD NEW ENV ARGS... — sets OPEN_TERMINAL back after one run
+  local shipped="$OPEN_TERMINAL" dir
+  dir="$(mutant_scripts "$1/orch" "$2")" || exit 1
+  orch_fixture_shared_libs "$TMP_ROOT/$1/orch"
+  mutate_file "$dir/$2" "$3" "$4"
+  OPEN_TERMINAL="$dir/open-terminal"
+  shift 4
+  run_ot "$@"
+  OPEN_TERMINAL="$shipped"
+}
+pi_control ctl-pi-gate open-terminal '"$LANE_AUTO" == true || -z "$(lane_pick_harness "$LAUNCH_HARNESS" "$LAUNCH_MODEL")"' \
+  '"$LANE_AUTO" == true || ! "$LAUNCH_HARNESS" =~ ^(claude|codex)$' "$PI_POOL=100000/1000000;$PI_COPILOT" --harness pi --lane "$H/.eclaude" CC-1662
+assert_eq "$(observe "rc=0 launched=1 unreadable=none")" "rc=0 launched=1 unreadable=none" \
+  "control: a named-lane gate for claude and codex alone launches a Pi lane on an unmeasured Copilot pool"
+pi_control ctl-pi-root lib/lane-launch.sh '[[ "$(lane_pick_harness "$1" "${3:-}")" != pi ]] || var=PI_CODING_AGENT_DIR' ':' \
+  "$PI_POOL=100000/1000000;$PI_COPILOT" --harness pi --lane "$H/.pi1" CC-1664
+assert_eq "$(observe "rc=0 pi_root=none cmd_lane=pi1")" "rc=0 pi_root=none cmd_lane=pi1" \
+  "control: the Claude variable for a Pi lane on the pool leaves Pi on a root nobody picked"
+pi_control ctl-pi-provider lib/lane-launch.sh '[[ -z "$provider" ]] || model="$provider/$model"' ':' \
+  "$PI_POOL=100000/1000000;$PI_PROVIDER" --harness pi --lane "$H/.eclaude" CC-1667
+assert_eq "$(observe "rc=0 launched=1 unreadable=none")" "rc=0 launched=1 unreadable=none" \
+  "control: the provider flag unread launches a Pi lane on the Copilot pool unjudged"
+
+# A fleet batch on the pool re-picks each item after the first, and the Pi root
+# that re-pick names is the one the fleet gate reads: here pi1 (10) takes the
+# first item, its claim moves the second onto pi2 (20), whose own settings turn
+# compaction on, so the second is refused naming that file. Its control drops
+# the re-pick's root and gate, and the second item launches unchecked.
+pi_fleet_root() { # DIR COMPACTION
+  mkdir -p "$1/packages/@vanillagreen/pi-hooks/extensions"
+  printf 'export const f = { context_window: 1 };\n' > "$1/packages/@vanillagreen/pi-hooks/extensions/vocab.ts"
+  printf '{"compaction":{"enabled":%s}}\n' "$2" > "$1/settings.json"
+}
+pi_fleet_root "$H/.pi1" false
+pi_fleet_root "$H/.pi2" true
+PI_BATCH="ORCH_LANE_COPILOT_POOL=$H/.pi1=100000/1000000,$H/.pi2=200000/1000000;$PI_COPILOT"
+run_ot "$PI_BATCH" --harness pi --lane auto --state-dir "$TMP_ROOT/pi-fleet-1" CC-1670 CC-1671
+assert_eq "$(observe "launched=1 pi_root=pi1 compactionon=file=$H/.pi2/settings.json")" \
+  "launched=1 pi_root=pi1 compactionon=file=$H/.pi2/settings.json" \
+  "a fleet batch's re-pick onto a second pool account is gated on that account's own settings"
+pi_control ctl-pi-repick open-terminal 'ot_message lane-selected "lane=$LANE_ENV"; pi_lane_root_apply || return 1; }' \
+  'ot_message lane-selected "lane=$LANE_ENV"; }' "$PI_BATCH" --harness pi --lane auto --state-dir "$TMP_ROOT/pi-fleet-2" CC-1670 CC-1671
+assert_eq "$(observe "launched=2 pi_root=pi1,pi2 compactionon=none")" "launched=2 pi_root=pi1,pi2 compactionon=none" \
+  "control: a re-pick that keeps the first root launches the second item on an account nobody gated"
+rm -f -- "${H:?}/.pi1/settings.json" "${H:?}/.pi2/settings.json"
 
 echo "=== a launch is refused when the model it passes has no window left ==="
 # An account with plan-wide weekly room can still have none left for ONE model.
@@ -1009,6 +1093,22 @@ run_ot "ORCH_LANE_ALIASES=eclaude=work;flags=--model opus --thinking high" --hos
 assert_eq "$(observe "rc=0 creates=nolog launched=1") remote=$(typed "exec bash -lc 'cd /srv/lane && exec pi $Q--exclude-tools$Q ${Q}question$Q $Q--model$Q ${Q}opus$Q $Q--thinking$Q ${Q}high$Q -c $Q$HOSTED_LINE$Q'")" \
   "rc=0 creates=nolog launched=1 remote=1" \
   "a hosted pi relaunch continues natively with the continuation line"
+# A hosted Pi relaunch on a Copilot model whose pool nothing states is refused
+# as unmeasured, and open-terminal does not ask whether the provider holds the
+# account: the pool reading is the owner's statement, which no provider copy
+# measures, so a provider holding it would not turn the refusal into a launch.
+run_ot "ORCH_LANE_ALIASES=eclaude=work;flags=--model github-copilot/claude-sonnet-5 --thinking high" --host "$HOST_STUB" --harness pi --lane work --repo o/r --relaunch CC-1665
+assert_eq "$(observe "rc=1 launched=nolog unreadable=lane=$H/.eclaude,model=github-copilot/claude-sonnet-5,step=windows unanswered=0 relaunchgate=0")" \
+  "rc=1 launched=nolog unreadable=lane=$H/.eclaude,model=github-copilot/claude-sonnet-5,step=windows unanswered=0 relaunchgate=0" \
+  "a hosted Pi relaunch on an unstated Copilot pool is refused as unmeasured, open-terminal never asking whether the provider holds the account"
+PI_OT_SHIPPED="$OPEN_TERMINAL"
+OPEN_TERMINAL="$(mutant_scripts ctl-pi-host/orch open-terminal)/open-terminal" || exit 1
+orch_fixture_shared_libs "$TMP_ROOT/ctl-pi-host/orch"
+mutate_file "$OPEN_TERMINAL" '[[ "$LANE_HOST" == local || "$LAUNCH_HARNESS" == pi ]]' '[[ "$LANE_HOST" == local ]]'
+run_ot "ORCH_LANE_ALIASES=eclaude=work;flags=--model github-copilot/claude-sonnet-5 --thinking high" --host "$HOST_STUB" --harness pi --lane work --repo o/r --relaunch CC-1665
+assert_eq "$(observe "rc=1 unanswered=1")" "rc=1 unanswered=1" \
+  "control: a Pi relaunch that asks the provider reports its accounts verb as unanswered"
+OPEN_TERMINAL="$PI_OT_SHIPPED"
 run_ot "ORCH_LANE_ALIASES=eclaude=work;flags=-m gpt-6-astra -c model_reasoning_effort=high" --host "$HOST_STUB" --harness codex --lane work --repo o/r --relaunch CC-49
 assert_eq "$(observe "rc=0 creates=nolog launched=1") remote=$(typed "exec bash -lc 'cd /srv/lane && exec env ORCH_COMPACTION_OVERRIDES=$Q{\"harness\":\"codex\",\"settings\":{\"model_auto_compact_token_limit\":\"9223372036854775807\",\"model_auto_compact_token_limit_scope\":\"body_after_prefix\",\"model_post_turn_compact_threshold_percent\":\"0\"}}$Q codex $Q-c$Q ${Q}check_for_update_on_startup=false$Q $Q-c$Q ${Q}model_auto_compact_token_limit=9223372036854775807$Q $Q-c$Q ${Q}model_auto_compact_token_limit_scope=body_after_prefix$Q $Q-c$Q ${Q}model_post_turn_compact_threshold_percent=0$Q $Q-c$Q ${Q}features.default_mode_request_user_input=false$Q $Q-m$Q ${Q}gpt-6-astra$Q $Q-c$Q ${Q}model_reasoning_effort=high$Q resume --last'") line=$(typed "Resume the orch workflow for CC-49")" \
   "rc=0 creates=nolog launched=1 remote=1 line=0" \
@@ -1223,8 +1323,8 @@ assert_eq "$RC" "0" "control warm-up: the relaunch caches the provider's row nam
 TOKEN_OT_SHIPPED="$OPEN_TERMINAL"
 OPEN_TERMINAL="$(mutant_scripts ctl-held-cached/orch open-terminal)/open-terminal" || exit 1
 orch_fixture_shared_libs "$TMP_ROOT/ctl-held-cached/orch"
-mutate_file "$OPEN_TERMINAL" '[[ "$LANE_HOST" == local ]] || host_account_read "${LANE_ENV#*=}" "$LAUNCH_HARNESS"' \
-  '[[ "$LANE_HOST" == local ]] || { [[ "$(jq -r .measured_through <<<"$lane_record")" == host ]] && HOST_ACCOUNT=held; } || host_account_read "${LANE_ENV#*=}" "$LAUNCH_HARNESS"'
+mutate_file "$OPEN_TERMINAL" '[[ "$LANE_HOST" == local || "$LAUNCH_HARNESS" == pi ]] || host_account_read "${LANE_ENV#*=}" "$LAUNCH_HARNESS"' \
+  '[[ "$LANE_HOST" == local || "$LAUNCH_HARNESS" == pi ]] || { [[ "$(jq -r .measured_through <<<"$lane_record")" == host ]] && HOST_ACCOUNT=held; } || host_account_read "${LANE_ENV#*=}" "$LAUNCH_HARNESS"'
 run_ot "OVERSEE_WATCH_STATE_DIR=$TOKEN_CTL_STATE;LANE_HOST_STUB_ACCOUNTS=$TMP_ROOT/hosted-accounts-none.tsv;$RELAUNCH_FLAGS" \
   --host "$HOST_STUB" --harness claude --lane "$H/.tokclaude" --repo o/r --relaunch CC-125
 assert_eq "$(observe "rc=0 launched=1 relaunchgate=1")" "rc=0 launched=1 relaunchgate=1" \
