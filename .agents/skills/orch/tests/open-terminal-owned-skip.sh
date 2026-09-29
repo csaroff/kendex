@@ -355,6 +355,10 @@ CODEX_COMPACTION="'-c' 'model_auto_compact_token_limit=9223372036854775807' '-c'
 CLAUDE_QUESTION_OFF="'--disallowedTools=AskUserQuestion,EnterPlanMode'"
 CODEX_QUESTION_OFF="'-c' 'features.default_mode_request_user_input=false'"
 PI_QUESTION_OFF="'--exclude-tools' 'question'"
+# A Pi continuation line then closes on its unattended words, the text read
+# from lib/lane-launch.sh, which renders and judges them.
+PI_UNATTENDED_TEXT="$(bash -c 'source "$1" && launch_choice_unattended pi' _ "$SCRIPTS_DIR/lib/lane-launch.sh")"
+[[ -n "$PI_UNATTENDED_TEXT" ]] || { echo "lib/lane-launch.sh named no pi unattended text" >&2; exit 1; }
 # occurrences TEXT NEEDLE — how many times NEEDLE stands in TEXT.
 occurrences() { local rest="${1//"$2"/}"; printf '%s\n' "$(( (${#1} - ${#rest}) / ${#2} ))"; }
 # A claude or pi lane re-arms its mailbox monitor; a codex lane arms none,
@@ -363,13 +367,13 @@ RELAUNCH_LINE="Resume the orch workflow for CC-1 from where this session stopped
 REARM=", then re-arm your mailbox monitor on .agents/skills/orch/scripts/lane-mail watch --item CC-1 through your harness background wake"
 CONTEXT_FILE="$TMP_ROOT/wt/CC-1/tmp/lane-mail/CC-1/context.json"
 mkdir -p "${CONTEXT_FILE%/*}"
-for row in "claude|claude -n CC-1 $CLAUDE_QUESTION_OFF --resume $CLAUDE222|$REARM|$CLAUDE222" "codex|codex resume $CODEX_SETTINGS $CODEX_COMPACTION $CODEX_QUESTION_OFF $CODEX444||$CODEX444" "pi|pi $PI_QUESTION_OFF --session $SESSION_HOME/.pi/agent/sessions/repo/session.jsonl|$REARM|$PI_SESSION_ID"; do
-  IFS='|' read -r harness expected rearm context_session <<<"$row"
+for row in "claude|claude -n CC-1 $CLAUDE_QUESTION_OFF --resume $CLAUDE222|$REARM|$CLAUDE222|" "codex|codex resume $CODEX_SETTINGS $CODEX_COMPACTION $CODEX_QUESTION_OFF $CODEX444||$CODEX444|" "pi|pi $PI_QUESTION_OFF --session $SESSION_HOME/.pi/agent/sessions/repo/session.jsonl|$REARM|$PI_SESSION_ID| $PI_UNATTENDED_TEXT"; do
+  IFS='|' read -r harness expected rearm context_session unattended <<<"$row"
   context_record="$(jq -nc --arg h "$harness" --arg s "$context_session" '{harness:$h,session_id:$s,tokens:400000,window:1000000}')"
   printf '%s\n' "$context_record" > "$CONTEXT_FILE"
   capture="$TMP_ROOT/resume-$harness.cmd"
   OT_CAPTURE="$capture" LANES_HOME="$SESSION_HOME" CODEX_HOME_OVERRIDE="$SESSION_HOME/.selected-codex" run_case "resume-$harness" -- --relaunch --harness "$harness" CC-1
-  for _ in {1..10000}; do [[ -f "$capture" ]] && break; done; assert_contains "$(cat "$capture")" "$expected '$RELAUNCH_LINE$rearm.'" "$harness relaunch resumes with the continuation line"
+  for _ in {1..10000}; do [[ -f "$capture" ]] && break; done; assert_contains "$(cat "$capture")" "$expected '$RELAUNCH_LINE$rearm.$unattended'" "$harness relaunch resumes with the continuation line"
   assert_eq "rc=$RC context=$(cat "$CONTEXT_FILE" 2>/dev/null || true)" "rc=0 context=$context_record" \
     "$harness relaunch keeps the selected session's exact context reading"
   for lifetime in different fresh; do
@@ -455,7 +459,7 @@ PI_UNTRUSTED="$TMP_ROOT/wt/CC-5"; mkdir -p "$PI_UNTRUSTED/.pi" "$PI_UNTRUSTED/pi
 printf '%s\n' '{"type":"message","message":{"role":"user","content":"start CC-5"}}' >"$PI_UNTRUSTED/pi-sessions/session.jsonl"
 printf '%s\n' '{"sessionDir":"pi-sessions"}' >"$PI_UNTRUSTED/.pi/settings.json"
 OT_CAPTURE="$TMP_ROOT/resume-pi-untrusted.cmd" LANES_HOME="$SESSION_HOME" run_case resume-pi-untrusted -- --relaunch --harness pi CC-5
-for _ in {1..10000}; do [[ -f "$TMP_ROOT/resume-pi-untrusted.cmd" ]] && break; done; assert_contains "$(cat "$TMP_ROOT/resume-pi-untrusted.cmd")" "pi $PI_QUESTION_OFF '/skill:orch start CC-5'" "pi relaunch ignores an untrusted project sessionDir"
+for _ in {1..10000}; do [[ -f "$TMP_ROOT/resume-pi-untrusted.cmd" ]] && break; done; assert_contains "$(cat "$TMP_ROOT/resume-pi-untrusted.cmd")" "pi $PI_QUESTION_OFF '/skill:orch start CC-5 $PI_UNATTENDED_TEXT'" "pi relaunch ignores an untrusted project sessionDir"
 
 # --wake hands the lane's own session the line that reads its inbox, through
 # the harness's native resume, from a detached command.
@@ -472,7 +476,7 @@ exit "${WAKE_STUB_RC:-0}"
 EOF
 chmod +x "$BIN/claude"; ln -s claude "$BIN/codex"; ln -s claude "$BIN/pi-bridge"
 WAKE_LINE="Run .agents/skills/orch/scripts/lane-mail inbox --item CC-1 and act on every directive it prints."
-for row in "claude|claude -n CC-1 --disallowedTools=AskUserQuestion,EnterPlanMode --resume $CLAUDE222 -p $WAKE_LINE" "codex|codex exec resume -c check_for_update_on_startup=false -c model_auto_compact_token_limit=9223372036854775807 -c model_auto_compact_token_limit_scope=body_after_prefix -c model_post_turn_compact_threshold_percent=0 -c features.default_mode_request_user_input=false $CODEX444 $WAKE_LINE" "pi|pi-bridge send --cwd $TMP_ROOT/wt/CC-1 $WAKE_LINE"; do
+for row in "claude|claude -n CC-1 --disallowedTools=AskUserQuestion,EnterPlanMode --resume $CLAUDE222 -p $WAKE_LINE" "codex|codex exec resume -c check_for_update_on_startup=false -c model_auto_compact_token_limit=9223372036854775807 -c model_auto_compact_token_limit_scope=body_after_prefix -c model_post_turn_compact_threshold_percent=0 -c features.default_mode_request_user_input=false $CODEX444 $WAKE_LINE" "pi|pi-bridge send --cwd $TMP_ROOT/wt/CC-1 $WAKE_LINE $PI_UNATTENDED_TEXT"; do
   IFS='|' read -r harness expected <<<"$row"
   capture="$TMP_ROOT/wake-$harness.cmd"
   OT_CAPTURE="$capture" LANES_HOME="$SESSION_HOME" CODEX_HOME_OVERRIDE="$SESSION_HOME/.selected-codex" run_case "wake-$harness" -- --wake --harness "$harness" CC-1
@@ -502,7 +506,7 @@ mkdir -p "$TMP_ROOT/wt/issue-2708"
 git -C "$TMP_ROOT/wt/issue-2708" init -q
 OT_CAPTURE="$TMP_ROOT/wake-gh.cmd" run_case wake-gh -- --wake --tracker github --repo o/r --harness pi 2708
 assert_eq "$(cat "$TMP_ROOT/wake-gh.cmd" 2>/dev/null)" \
-  "pi-bridge send --cwd $TMP_ROOT/wt/issue-2708 Run .agents/skills/orch/scripts/lane-mail inbox --item issue-2708 and act on every directive it prints." \
+  "pi-bridge send --cwd $TMP_ROOT/wt/issue-2708 Run .agents/skills/orch/scripts/lane-mail inbox --item issue-2708 and act on every directive it prints. $PI_UNATTENDED_TEXT" \
   "a GitHub wake names the worktree id its mailbox is bound under, never the bare issue number"
 
 OT_CAPTURE="$TMP_ROOT/wake-failed.cmd" WAKE_STUB_RC=3 run_case wake-failed -- --wake --harness pi CC-1
