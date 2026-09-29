@@ -51,9 +51,7 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/adapters/claude.sh"
 # `pi-claude/` model is one of them: pi-claude-bridge runs Claude Code on the
 # credential CLAUDE_CONFIG_DIR names, so that variable IS the Claude seat it
 # spends, and a Pi lane named on a Claude config dir is never handed that dir as
-# its Pi root. `lanes` measures no Copilot CLI account, so a copilot value
-# reaches here from a lane the caller named and never from a pick. A harness
-# added to this repository adds its arm HERE.
+# its Pi root. A harness added to this repository adds its arm HERE.
 #
 # COPILOT_HOME is Copilot's one account variable: it moves the whole config
 # root, settings, state and login list alike, so the directory IS the account
@@ -69,8 +67,9 @@ lane_env_prefix() { # HARNESS DIR [MODEL]
 }
 
 # The harness whose accounts `lanes pick` judges a launch of HARNESS on MODEL
-# under, which is the account that launch spends. Claude and codex spend their
-# own accounts' windows, whatever the model. A Pi launch spends the account its
+# under, which is the account that launch spends. Claude, codex and copilot
+# spend their own accounts' windows, whatever the model: a Copilot account's
+# monthly pool is one for every model. A Pi launch spends the account its
 # model's provider bills: `pi-claude/` is pi-claude-bridge on a Claude seat,
 # judged as claude on MODEL; `github-copilot/` is the Copilot pool, which
 # `lanes pick --harness pi` reads. Every other Pi provider, and a Pi model naming
@@ -85,7 +84,7 @@ lane_env_prefix() { # HARNESS DIR [MODEL]
 # and the Pi adapter records, provider included.
 lane_pick_harness() { # HARNESS MODEL
   case "$1" in
-    claude | codex) printf '%s\n' "$1" ;;
+    claude | codex | copilot) printf '%s\n' "$1" ;;
     pi)
       case "$2" in
         pi-claude/*) printf '%s\n' claude ;;
@@ -177,20 +176,22 @@ lane_pick_harness() { # HARNESS MODEL
 #             and URLs asking. `--autopilot` starts the session in autopilot
 #             mode, which sends the session continuation messages of its own,
 #             as many as `--max-autopilot-continues <count>` allows, 5 by
-#             default. Both are launch settings, carried by every command built
-#             here, a resume included: nobody sits at a lane's pane to answer a
-#             turn that stopped short, and 3 bounds what such a stop, or a turn
-#             ended to wait on the lane's mailbox monitor, spends of the
-#             account's pool. `--context long_context` sets the context
-#             window tier, and `--no-auto-update` keeps the CLI from
-#             downloading an update the pane then runs: launch settings too,
-#             named on the command rather than left to the account's settings
-#             file, whose defaultMode and defaultPermissionMode a resumed
-#             session ignores (`copilot help config`). `-i <prompt>`
-#             starts the interactive session and submits the prompt, and
-#             `--resume=<id>` resumes a session by its id; open-terminal's
-#             start_cmd renders both. The rest of what every copilot command
-#             carries is environment, lane_copilot_env below.
+#             default. `--context long_context` selects the 1M window where
+#             the default is about 200K, so the handoff's 400000-token cap
+#             comes before the automatic compaction Copilot starts at about 80
+#             percent of the window, and `--no-auto-update` keeps a newer CLI
+#             from installing itself under a running lane. All are launch
+#             settings, carried by every command built here, a resume
+#             included, named on the command rather than left to the
+#             account's settings file, whose defaultMode and
+#             defaultPermissionMode a resumed session ignores (`copilot help
+#             config`): nobody sits at a lane's pane to answer a turn that
+#             stopped short, and 3 bounds what such a stop, or a turn ended to
+#             wait on the lane's mailbox monitor, spends of the account's
+#             pool. `-i <prompt>` starts the interactive session and submits
+#             the prompt, and `--resume=<id>` resumes a session by its id;
+#             open-terminal's start_cmd renders both. The rest of what every
+#             copilot command carries is environment, lane_copilot_env below.
 # The question-tool words, measured on the same installs:
 #   claude    `claude --help`: `--disallowedTools <tools...>`, comma or space
 #             separated. Variadic, so the words are one `=` token: a bare
@@ -926,6 +927,10 @@ lane_codex_recorded() { # DIR CONFIG...
 # the three variables above, so a caller names the route in its own launch line.
 #
 #   LANE_TRUST_ROUTE   `none` for a harness that asks no such question,
+#                      `allow-all-env` for copilot, whose folder trust the
+#                      launch line grants through COPILOT_ALLOW_ALL=true where
+#                      the command carries a full allow-all spelling
+#                      (lane_copilot_env), so nothing is written for it,
 #                      `preapproved` where the account's own config already
 #                      trusts the directory, `launch-home` where the codex arm
 #                      built a private home carrying the entry, and
@@ -954,6 +959,7 @@ lane_trust_prepare() { # HARNESS LANE_DIR LAUNCH_DIR
   case "$1" in
     codex) lane_codex_trust_prepare "$2" "$3" ;;
     claude) lane_claude_trust_prepare "$2" "$3" ;;
+    copilot) LANE_TRUST_ROUTE=allow-all-env; return 0 ;;
     *) LANE_TRUST_ROUTE=none; return 0 ;;
   esac
 }
@@ -1276,55 +1282,76 @@ lane_launch_compaction_env() { # CMD HARNESS VERIFIED
 # which turns tmux's automatic rename off, so the title keeps the name it was
 # given and never carries the launch line.
 #
-# A copilot command carries lane_copilot_env's words besides, and a copilot
-# launch that names no account passes an empty LANE_VAR and LANE_DIR: its line
-# is those words alone, the account being whatever the pane's own COPILOT_HOME
-# names.
+# A copilot command carries its whole account environment under both forms,
+# because a launcher that exports COPILOT_HOME for its own name exports
+# nothing else: the account variable here, and the words lane_copilot_env
+# below prints.
 lane_launch_line() { # CMD HARNESS LANE_VAR LANE_DIR FORM
-  local cmd="$1" harness="$2" var="$3" dir="$4" form="$5" extra="" verified=true account=""
-  case "$harness" in
-    codex)
-      [[ "$form" != unchecked ]] || verified=false
-      extra=$(lane_launch_compaction_env "$cmd" "$harness" "$verified") || return 1 ;;
-    copilot) extra="$(lane_copilot_env "$cmd")" || return 1 ;;
-  esac
-  [[ -z "$var" ]] || account="$var=$(lane_single_quote "$dir")"
+  local cmd="$1" harness="$2" var="$3" dir="$4" form="$5" compaction="" verified=true env_words
+  if [[ "$harness" == codex ]]; then
+    [[ "$form" != unchecked ]] || verified=false
+    compaction=$(lane_launch_compaction_env "$cmd" "$harness" "$verified") || return 1
+  fi
+  if [[ "$harness" != copilot ]]; then
+    case "$form" in
+      launcher:*) printf '%s%s %s\n' "${compaction:+env $compaction }" "$(lane_single_quote "${form#launcher:}")" "${cmd#"$harness" }" ;;
+      *) printf 'env %s=%s %s%s\n' "$var" "$(lane_single_quote "$dir")" "${compaction:+$compaction }" "$cmd" ;;
+    esac
+    return
+  fi
+  env_words="$(lane_copilot_env "$cmd" "$(lane_single_quote "${LANES_HOME:-$HOME}/.agents/skills")")"
   case "$form" in
-    launcher:*) printf '%s%s %s\n' "${extra:+env $extra }" "$(lane_single_quote "${form#launcher:}")" "${cmd#"$harness" }" ;;
-    *) printf 'env %s%s%s\n' "${account:+$account }" "${extra:+$extra }" "$cmd" ;;
+    launcher:*) printf '%s %s %s\n' "$env_words" "$(lane_single_quote "${form#launcher:}")" "${cmd#"$harness" }" ;;
+    *) printf '%s %s=%s %s\n' "$env_words" "$var" "$(lane_single_quote "$dir")" "$cmd" ;;
   esac
 }
 
-# The environment a copilot command CMD carries, fresh or resumed, a lane's or
-# an overseer's, as the assignments `env` takes ahead of the command:
-#   COPILOT_ALLOW_ALL=true  only where CMD itself carries a full allow-all
-#                  spelling, `--allow-all` or `--yolo` (lane_copilot_allows_all
-#                  below). Any truthy value approves every tool, and exactly
-#                  `true` also trusts the working directory without prompting,
-#                  loading its hooks and skills (`copilot help environment`,
-#                  1.0.88). So it adds folder trust to a posture the caller
-#                  already chose, never tool approval the caller left out.
-#   COPILOT_ALLOW_ALL=  (empty) on every other CMD, so a COPILOT_ALLOW_ALL the
-#                  launching shell exports never reaches it: a command without
-#                  either spelling keeps its permission prompts and its
-#                  folder-trust dialog, as open-terminal's permission-prompt
-#                  warning says. An assignment a --cmd template writes itself
-#                  follows this one, and wins.
-#   COPILOT_SKILLS_DIRS  the shared skills under HOME, ~/.agents/skills, where
-#                  kendex installs a global skill for Copilot: any COPILOT_HOME
-#                  hides them, and this names them back (measured by
-#                  tools/harness-smoke, skill-dirs:COPILOT_HOME).
-# The GitHub tokens stay: a lane's own gh calls sign in with GH_TOKEN. Copilot
-# reads COPILOT_GITHUB_TOKEN, the account token a host exports, ahead of
-# GH_TOKEN and GITHUB_TOKEN (same help), and logs "Unsupported token type,
-# ignoring" for a token it does not accept (measured on 1.0.88), so no token
-# value is written into a command.
-# Returns 1 where HOME is empty, with nothing to name the skills by.
-lane_copilot_env() { # CMD
-  local allow="COPILOT_ALLOW_ALL= "
-  [[ -n "${HOME:-}" ]] || return 1
-  ! lane_copilot_allows_all "$1" || allow="COPILOT_ALLOW_ALL=true "
-  printf '%sCOPILOT_SKILLS_DIRS=%s\n' "$allow" "$(lane_single_quote "$HOME/.agents/skills")"
+# The Copilot launch policy for a command CMD, fresh or resumed, a lane's or
+# an overseer's, one owner for the local launch line above and the hosted
+# command open-terminal hands a provider: the `env` words that go in front of
+# `copilot`, SKILLS the shell word naming the shared skills tree, a quoted path
+# locally and "$HOME/.agents/skills" unexpanded for a host, whose own login
+# shell expands it. Run after that login shell's profile, so a
+# COPILOT_GITHUB_TOKEN the profile exports is cleared too.
+#   -u COPILOT_GITHUB_TOKEN       Copilot reads COPILOT_GITHUB_TOKEN, then
+#                                 GH_TOKEN, then GITHUB_TOKEN, then the login
+#                                 stored in the account's config.json, and
+#                                 1.0.88 refuses a placeholder handed in
+#                                 COPILOT_GITHUB_TOKEN, so that one is cleared.
+#                                 GH_TOKEN and GITHUB_TOKEN stay: a fleet host
+#                                 holds the GitHub App token (ghs_) there,
+#                                 which 1.0.88 skips with "Unsupported token
+#                                 type, ignoring", so the stored login stays
+#                                 the identity and a lane's own gh calls keep
+#                                 signing in with GH_TOKEN. A user token, gho_
+#                                 or a PAT, in either one signs Copilot in as
+#                                 that user instead.
+#   COPILOT_SKILLS_DIRS           any COPILOT_HOME value turns the shared
+#                                 `~/.agents/skills` tree off; naming it puts
+#                                 the shared skills back (measured by
+#                                 tools/harness-smoke, skill-dirs:COPILOT_HOME).
+#   COPILOT_ALLOW_ALL=true        only where CMD itself carries a full
+#                                 allow-all spelling, `--allow-all` or `--yolo`
+#                                 (lane_copilot_allows_all below). Any truthy
+#                                 value approves every tool, and exactly `true`
+#                                 also trusts the working directory without
+#                                 prompting, loading its hooks and skills
+#                                 (`copilot help environment`, 1.0.88). So it
+#                                 adds folder trust to a posture the caller
+#                                 already chose, never tool approval the
+#                                 caller left out.
+#   COPILOT_ALLOW_ALL=            (empty) on every other CMD, so a
+#                                 COPILOT_ALLOW_ALL the launching shell exports
+#                                 never reaches it: a command without either
+#                                 spelling keeps its permission prompts and its
+#                                 folder-trust dialog, as open-terminal's
+#                                 permission-prompt warning says. An assignment
+#                                 a --cmd template writes itself follows this
+#                                 one, and wins.
+lane_copilot_env() { # CMD SKILLS
+  local allow="COPILOT_ALLOW_ALL="
+  ! lane_copilot_allows_all "$1" || allow="COPILOT_ALLOW_ALL=true"
+  printf 'env -u COPILOT_GITHUB_TOKEN COPILOT_SKILLS_DIRS=%s %s\n' "$2" "$allow"
 }
 
 # Whether CMD carries one of the copilot row's transferable permission

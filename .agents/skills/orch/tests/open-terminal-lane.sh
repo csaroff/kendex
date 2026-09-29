@@ -248,11 +248,14 @@ counted() {
 #   cmd_lane      the lane the launched command's env prefix names, read from
 #                 the tmux log, single-quoted as the launch shell needs it
 #   pi_root       the same for a PI_CODING_AGENT_DIR prefix, or none
+#   copilot_home  the same for the COPILOT_HOME the launch line sets, or none
 #   pickrefusal   every field of the first refusal of an `auto` pick, a
 #                 copilot-pool-*, lane-provider-unmeasured or lane-unavailable
 #                 line, key first, or none
 #   hostseat      every field of the host-pi-claude-seat line, or none
 #   compactionon  the file field of the first compaction-on line, or none
+#   statusline    the cause and file fields of the first status-line refusal,
+#                 or none
 #   claim_lanes   the distinct lanes those claims name, sorted
 #   claim_window  the window the single claim names; claim_pane its pane id
 #   out_lanes     the lanes the launch output names, in order
@@ -299,8 +302,13 @@ observe() {
       claims) value="$([[ -d "$RUN/state/claims" ]] && ls -1 "$RUN/state/claims" | wc -l | tr -d '[:space:]' || echo nolog)" ;;
       cmd_lane) value="$(grep -oE "env CLAUDE_CONFIG_DIR='[^']*'" "$RUN/tmux.log" 2>/dev/null | sed -E -e "s/^env CLAUDE_CONFIG_DIR='//" -e "s/'\$//" -e "s#^$H/\\.##" | sort -u | paste -sd, - || true)"; value="${value:-none}" ;;
       pi_root) value="$(grep -oE "env PI_CODING_AGENT_DIR='[^']*'" "$RUN/tmux.log" 2>/dev/null | sed -E -e "s/^env PI_CODING_AGENT_DIR='//" -e "s/'\$//" -e "s#^$H/\\.##" | sort -u | paste -sd, - || true)"; value="${value:-none}" ;;
+      copilot_home) value="$(grep -oE "COPILOT_HOME='[^']*'" "$RUN/tmux.log" 2>/dev/null | sed -E -e "s/^COPILOT_HOME='//" -e "s/'\$//" -e "s#^$H/\\.##" | sort -u | paste -sd, - || true)"; value="${value:-none}" ;;
       compactionon)
         value="$(awk '$1 == "open-terminal:" && $2 == "compaction-on" { print $4; exit }' <<<"$OUT")"
+        value="${value:-none}"
+        ;;
+      statusline)
+        value="$(awk '$1 == "open-terminal:" && $2 == "unsupported-for-oversee" && $4 == "reason=status-line" { print $5 "," $6; exit }' <<<"$OUT")"
         value="${value:-none}"
         ;;
       pickrefusal)
@@ -647,11 +655,31 @@ run_ot "$PI_BATCH" --harness pi --lane auto --state-dir "$TMP_ROOT/pi-fleet-1" C
 assert_eq "$(observe "launched=1 pi_root=pi1 compactionon=file=$H/.pi2/settings.json")" \
   "launched=1 pi_root=pi1 compactionon=file=$H/.pi2/settings.json" \
   "a fleet batch's re-pick onto a second pool account is gated on that account's own settings"
-pi_control ctl-pi-repick open-terminal 'ot_message lane-selected "lane=$LANE_ENV"; pi_lane_root_apply || return 1; }' \
-  'ot_message lane-selected "lane=$LANE_ENV"; }' "$PI_BATCH" --harness pi --lane auto --state-dir "$TMP_ROOT/pi-fleet-2" CC-1670 CC-1671
+pi_control ctl-pi-repick open-terminal 'ot_message lane-selected "lane=$LANE_ENV"; pi_lane_root_apply && copilot_fleet_gate || return 1; }' \
+  'ot_message lane-selected "lane=$LANE_ENV"; copilot_fleet_gate || return 1; }' "$PI_BATCH" --harness pi --lane auto --state-dir "$TMP_ROOT/pi-fleet-2" CC-1670 CC-1671
 assert_eq "$(observe "launched=2 pi_root=pi1,pi2 compactionon=none")" "launched=2 pi_root=pi1,pi2 compactionon=none" \
   "control: a re-pick that keeps the first root launches the second item on an account nobody gated"
 rm -f -- "${H:?}/.pi1/settings.json" "${H:?}/.pi2/settings.json"
+
+# The same re-pick on the Copilot pool is gated on the second account's status
+# line: copilot1 (10) takes the first item, its claim moves the second onto
+# copilot2 (20), which has no settings file, so the second is refused. Its
+# control drops the re-pick's gate, and the second item launches with no status
+# line to write its session record.
+mkdir -p "$H/.copilot1" "$H/.copilot2"
+printf '{}\n' > "$H/.copilot1/config.json"
+printf '{}\n' > "$H/.copilot2/config.json"
+printf '{"statusLine":{"type":"command","command":"%s","refreshInterval":30}}\n' "$SCRIPTS_DIR/copilot-statusline" > "$H/.copilot1/settings.json"
+CP_BATCH="ORCH_LANE_COPILOT_POOL=$H/.copilot1=100000/1000000,$H/.copilot2=200000/1000000;cmd=true --model claude-sonnet-5 --reasoning-effort high"
+run_ot "$CP_BATCH" --harness copilot --lane auto --state-dir "$TMP_ROOT/cp-fleet-1" CC-1680 CC-1681
+assert_eq "$(observe "launched=1 copilot_home=copilot1 statusline=cause=settings-missing,file=$H/.copilot2/settings.json")" \
+  "launched=1 copilot_home=copilot1 statusline=cause=settings-missing,file=$H/.copilot2/settings.json" \
+  "a Copilot batch's re-pick onto a second pool account is gated on that account's own status line"
+pi_control ctl-copilot-repick open-terminal 'pi_lane_root_apply && copilot_fleet_gate || return 1; }' \
+  'pi_lane_root_apply || return 1; }' "$CP_BATCH" --harness copilot --lane auto --state-dir "$TMP_ROOT/cp-fleet-2" CC-1680 CC-1681
+assert_eq "$(observe "launched=2 copilot_home=copilot1,copilot2 statusline=none")" "launched=2 copilot_home=copilot1,copilot2 statusline=none" \
+  "control: a re-pick with no Copilot gate launches the second item on an account whose status line nobody read"
+rm -rf -- "${H:?}/.copilot1" "${H:?}/.copilot2"
 
 echo "=== a Pi launch on a pi-claude model is judged on the Claude seat it spends ==="
 # pi-claude-bridge runs Claude Code on the Claude seat CLAUDE_CONFIG_DIR names,
@@ -1026,6 +1054,35 @@ run_ot "ORCH_LANE_ALIASES=eclaude=work;flags=--model github-copilot/claude-sonne
 assert_eq "$(observe "rc=1 unanswered=1")" "rc=1 unanswered=1" \
   "control: a Pi relaunch that asks the provider reports its accounts verb as unanswered"
 OPEN_TERMINAL="$PI_OT_SHIPPED"
+# A hosted copilot launch: the account holds its login and a pool with room,
+# the provider is handed --harness copilot, and the remote line runs copilot
+# under the launch policy lib/lane-launch.sh's lane_copilot_env prints, the
+# skills tree named by the host's own $HOME, with no local COPILOT_HOME: the
+# provider's prefix sets that.
+mkdir -p "$H/.1copilot"
+printf '{"copilot_tokens":"gho_fixture"}\n' > "$H/.1copilot/config.json"
+printf '%s\n' '{"quota_snapshots":{"premium_interactions":{"entitlement":1000,"remaining":900}}}' > "$FIXTURE_DIR/.1copilot.json"
+COPILOT_HOSTED="flags=--model claude-opus-5 --reasoning-effort high --allow-all"
+run_ot "$COPILOT_HOSTED" --host "$HOST_STUB" --harness copilot --lane "$H/.1copilot" --repo o/r CC-1935
+COPILOT_REMOTE="exec bash -lc 'cd /srv/lane && exec env -u COPILOT_GITHUB_TOKEN COPILOT_SKILLS_DIRS=\"\$HOME/.agents/skills\" COPILOT_ALLOW_ALL=true copilot $Q--autopilot$Q"
+assert_eq "$(observe "rc=0 launched=1") create=$(host_call | tr ';' '\n' | grep -c '^create,--item,CC-1935,--repo,o/r,--harness,copilot,--account,1copilot$') remote=$(typed "$COPILOT_REMOTE") local=$(typed COPILOT_HOME=)" \
+  "rc=0 launched=1 create=1 remote=1 local=0" \
+  "a hosted copilot launch creates with --harness copilot and runs copilot under the launch policy, the provider setting COPILOT_HOME"
+COPILOT_OT_SHIPPED="$OPEN_TERMINAL"
+OPEN_TERMINAL="$(mutant_scripts ctl-copilot-host/orch open-terminal)/open-terminal" || exit 1
+orch_fixture_shared_libs "$TMP_ROOT/ctl-copilot-host/orch"
+mutate_file "$OPEN_TERMINAL" '"$LANE_ENV" || ! "$HARNESS" =~ ^(claude|codex|pi|copilot)$ ) ]]; then' '"$LANE_ENV" || ! "$HARNESS" =~ ^(claude|codex|pi)$ ) ]]; then'
+run_ot "$COPILOT_HOSTED" --host "$HOST_STUB" --harness copilot --lane "$H/.1copilot" --repo o/r CC-1935
+assert_eq "$(observe "rc=1 launched=nolog") invalid=$(awk '$2 == "host-invalid" { print $NF }' <<<"$OUT")" "rc=1 launched=nolog invalid=harness=copilot" \
+  "control: without copilot in the host protocol's harnesses a hosted copilot launch is host-invalid"
+OPEN_TERMINAL="$COPILOT_OT_SHIPPED"
+OPEN_TERMINAL="$(mutant_scripts ctl-copilot-policy/orch open-terminal)/open-terminal" || exit 1
+orch_fixture_shared_libs "$TMP_ROOT/ctl-copilot-policy/orch"
+mutate_file "$OPEN_TERMINAL" '[[ "$HARNESS" != copilot ]] || cmd="$(lane_copilot_env' '[[ "$HARNESS" == copilot ]] || cmd="$(lane_copilot_env'
+run_ot "$COPILOT_HOSTED" --host "$HOST_STUB" --harness copilot --lane "$H/.1copilot" --repo o/r CC-1936
+assert_eq "$(observe "rc=0 launched=1") policy=$(typed "COPILOT_ALLOW_ALL=true copilot")" "rc=0 launched=1 policy=0" \
+  "control: without the hosted policy a hosted copilot lane keeps the COPILOT_GITHUB_TOKEN its host exports"
+OPEN_TERMINAL="$COPILOT_OT_SHIPPED"
 run_ot "ORCH_LANE_ALIASES=eclaude=work;flags=-m gpt-6-astra -c model_reasoning_effort=high" --host "$HOST_STUB" --harness codex --lane work --repo o/r --relaunch CC-49
 assert_eq "$(observe "rc=0 creates=nolog launched=1") remote=$(typed "exec bash -lc 'cd /srv/lane && exec env ORCH_COMPACTION_OVERRIDES=$Q{\"harness\":\"codex\",\"settings\":{\"model_auto_compact_token_limit\":\"9223372036854775807\",\"model_auto_compact_token_limit_scope\":\"body_after_prefix\",\"model_post_turn_compact_threshold_percent\":\"0\"}}$Q codex $Q-c$Q ${Q}check_for_update_on_startup=false$Q $Q-c$Q ${Q}model_auto_compact_token_limit=9223372036854775807$Q $Q-c$Q ${Q}model_auto_compact_token_limit_scope=body_after_prefix$Q $Q-c$Q ${Q}model_post_turn_compact_threshold_percent=0$Q $Q-c$Q ${Q}features.default_mode_request_user_input=false$Q $Q-m$Q ${Q}gpt-6-astra$Q $Q-c$Q ${Q}model_reasoning_effort=high$Q resume --last'") line=$(typed "Resume the orch workflow for CC-49")" \
   "rc=0 creates=nolog launched=1 remote=1 line=0" \

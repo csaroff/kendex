@@ -52,9 +52,12 @@ mkdir -p "$BIN" "$TMP_ROOT/work"
 # of the config dir it runs under, it draws the dialog line and waits, which
 # is what a successor launched without the entry meets. The codex stub asks
 # none, its trust being the launch-home rows' subject.
-for harness in claude codex; do
-  lane_var=CLAUDE_CONFIG_DIR
-  [[ "$harness" == claude ]] || lane_var=CODEX_HOME
+for harness in claude codex copilot; do
+  case "$harness" in
+    claude) lane_var=CLAUDE_CONFIG_DIR ;;
+    codex) lane_var=CODEX_HOME ;;
+    copilot) lane_var=COPILOT_HOME ;;
+  esac
   trust_gate=""
   [[ "$harness" != claude ]] || trust_gate="jq -e --arg d \"\$(pwd -P)\" '.projects[\$d].hasTrustDialogAccepted == true' \"\${CLAUDE_CONFIG_DIR:-\$HOME/.claude}/.claude.json\" >/dev/null 2>&1 || { echo 'Do you trust the files in this folder?'; exec sleep 100000; }"
   cat > "$BIN/$harness" <<STUB
@@ -86,7 +89,7 @@ STUB
 # the process name tmux reads, so the shape rule never sees the harness word.
 cp "$(command -v sleep)" "$BIN/hclaude"
 cp "$(command -v sleep)" "$BIN/node"
-chmod +x "$BIN/claude" "$BIN/codex" "$BIN/kendex" "$BIN/hclaude" "$BIN/node"
+chmod +x "$BIN/claude" "$BIN/codex" "$BIN/copilot" "$BIN/kendex" "$BIN/hclaude" "$BIN/node"
 
 # The trigger every headroom fixture below is derived from: a lane at exactly
 # TRIGGER percent headroom has no room and one at TRIGGER+1 does, so the rows
@@ -1554,12 +1557,12 @@ assert_eq "$RC|$OUT" \
 fleet_state
 
 # A Copilot overseer: the printed line is its own row's, the brief on -i and
-# the account its record names under COPILOT_HOME. Every other mode needs a
-# reading of a Copilot account, which lanes does not make, and refuses before
-# any; a record naming no account refuses the line rather than print one on
-# an account nothing named.
-COPILOT_ENV="COPILOT_ALLOW_ALL=true COPILOT_SKILLS_DIRS='$H/.agents/skills'"
-COPILOT_LINE="env COPILOT_HOME='$H/.1copilot' $COPILOT_ENV copilot --autopilot --max-autopilot-continues 3 --context long_context --no-auto-update --allow-all -i '$BRIEF'"
+# the account its record names under COPILOT_HOME with the rest of a Copilot
+# launch's environment. Its marks are judged on the account's monthly pool,
+# which lanes measures; a record naming no account refuses the line rather
+# than print one on an account nothing named.
+COPILOT_ENV="env -u COPILOT_GITHUB_TOKEN COPILOT_SKILLS_DIRS='$H/.agents/skills' COPILOT_ALLOW_ALL=true"
+COPILOT_LINE="$COPILOT_ENV COPILOT_HOME='$H/.1copilot' copilot --autopilot --max-autopilot-continues 3 --context long_context --no-auto-update --allow-all -i '$BRIEF'"
 copilot_row() { # NAME [SUCCEED_BIN] ARGS... — the run on a pane whose record names $H/.1copilot
   local name="$1" bin="$2"
   shift 2
@@ -1570,9 +1573,67 @@ copilot_row() { # NAME [SUCCEED_BIN] ARGS... — the run on a pane whose record 
 copilot_row printcopilot '' --print-launch-line --harness copilot -- --allow-all
 assert_eq "$RC|$OUT|$(overseers)" "0|$COPILOT_LINE|0" \
   "a copilot overseer's printed line runs copilot on its recorded account with the brief on -i"
-copilot_row checkcopilot '' --check-marks --harness copilot
-assert_eq "$RC|$(sed -n 1p <<<"$OUT")" "1|oversee-succeed: copilot-unmeasured pane=$CALLER_PANE mode=check" \
-  "a copilot overseer's marks are refused before any account reading, lanes measuring none"
+# The account its record names holds a stored login and an 80 percent spent
+# pool.
+mkdir -p "$H/.1copilot"
+printf '{"copilot_tokens":"gho_fixture"}\n' > "$H/.1copilot/config.json"
+printf '%s\n' '{"quota_snapshots":{"premium_interactions":{"entitlement":1000,"remaining":200}}}' > "$FIXTURE_DIR/.1copilot.json"
+COPILOT_DIRS="$H/.claude:$H/.eclaude:$H/.codex:$H/.1copilot"
+LANE_DIRS="$COPILOT_DIRS" copilot_row checkcopilot '' --check-marks --harness copilot
+assert_eq "$RC|$(sed -n 1p <<<"$OUT")" "0|oversee-succeed: context-below-mark tokens=100000 window=1000000 mark=50 headroom=20" \
+  "a copilot overseer's marks are judged on its account's monthly pool"
+fleet_state
+
+# A Copilot overseer succeeds as the others do: at its headroom mark, and on a
+# wall, `lanes pick --harness copilot` names a second Copilot account, whose
+# status line writes the session record its successor's context is judged on.
+# @SL@ is that status line, an executable copilot-statusline.
+COP_SL="$TMP_ROOT/sl/copilot-statusline"
+mkdir -p "$TMP_ROOT/sl" "$H/.2copilot"
+printf '#!/bin/sh\n' > "$COP_SL"
+chmod +x "$COP_SL"
+printf '{"copilot_tokens":"gho_second"}\n' > "$H/.2copilot/config.json"
+printf '{"statusLine":{"type":"command","command":"%s","refreshInterval":30}}\n' "$COP_SL" > "$H/.2copilot/settings.json"
+printf '%s\n' '{"quota_snapshots":{"premium_interactions":{"entitlement":1000,"remaining":900}}}' > "$FIXTURE_DIR/.2copilot.json"
+# The caller's own pool at 97 percent used, at or under the headroom trigger.
+printf '%s\n' '{"quota_snapshots":{"premium_interactions":{"entitlement":1000,"remaining":30}}}' > "$FIXTURE_DIR/.1copilot.json"
+COPILOT_PAIR="$H/.claude:$H/.eclaude:$H/.codex:$H/.1copilot:$H/.2copilot"
+COP_SUCCESSOR="lane=$H/.2copilot;--autopilot;--max-autopilot-continues;3;--context;long_context;--no-auto-update;--allow-all;-i;$BRIEF;"
+LANE_DIRS="$COPILOT_PAIR" copilot_row copsucceed '' --harness copilot -- --allow-all
+assert_eq "$RC|$(layout)|$(caller_open)|$(recorded copilot)" "0|1 overseer;|no|$COP_SUCCESSOR" \
+  "a copilot overseer at its headroom mark succeeds onto the second copilot account"
+fleet_state
+new_caller "$UNDER_MARK"
+record_account "$CALLER_PANE" "$H/.1copilot"
+LANE_DIRS="$COPILOT_PAIR" run_succeed copwalled '' --walled-pane "$CALLER_PANE" --harness copilot -- --allow-all
+assert_eq "$RC|$(layout)|$(caller_open)|$(recorded copilot)" "0|1 overseer;|no|$COP_SUCCESSOR" \
+  "a walled copilot overseer is replaced on the second copilot account"
+fleet_state
+# The second account's status line gone: it writes no record, so it is no
+# successor, and the walk ends with no lane qualifying.
+printf '{}\n' > "$H/.2copilot/settings.json"
+LANE_DIRS="$COPILOT_PAIR" copilot_row copnostatus '' --harness copilot -- --allow-all
+assert_eq "$RC|$(grep -c "^oversee-succeed: successor-status-line lane=$H/.2copilot entry=caller cause=no-status-line" <<<"$OUT")|$(recorded copilot)" "3|1|none" \
+  "a copilot account whose status line writes no record is skipped as a successor"
+printf '{"statusLine":{"type":"command","command":"%s","refreshInterval":30}}\n' "$COP_SL" > "$H/.2copilot/settings.json"
+fleet_state
+# Control: the harness list ol_pick_record once kept, restored, reads a
+# copilot account as one lanes does not measure and the succession dies.
+COPILOTLIST="$(mutant_scripts copilotlist lib/overseer-launch.sh)" || exit 1
+mutate_file "$COPILOTLIST/lib/overseer-launch.sh" '  ol_account_measured "$harness" || return 4' '  case "$harness" in claude | codex | pi) ;; *) return 4 ;; esac'
+LANE_DIRS="$COPILOT_PAIR" copilot_row copsucceedctl "$COPILOTLIST/oversee-succeed" --harness copilot -- --allow-all
+assert_eq "$RC|$(sed -n 1p <<<"$OUT")" "1|oversee-succeed: lanes-failed entry=caller exit=4" \
+  "control: with its own harness list the pick fails a copilot succession as a lanes read that never ran"
+# Control: the successor status-line check cut, the account writing no record
+# is picked.
+COPILOTSL="$(mutant_scripts copilotsl lib/overseer-launch.sh)" || exit 1
+mutate_file "$COPILOTSL/lib/overseer-launch.sh" '    if [[ "$OL_HARNESS" == copilot ]] && ! lane_adapter_copilot_status_line "$OL_PICKED_DIR"; then' '    if false; then'
+printf '{}\n' > "$H/.2copilot/settings.json"
+LANE_DIRS="$COPILOT_PAIR" copilot_row copnostatusctl "$COPILOTSL/oversee-succeed" --harness copilot -- --allow-all
+assert_eq "$RC|$(recorded copilot)" "0|$COP_SUCCESSOR" \
+  "control: without the check a successor opens on an account whose context nothing measures"
+printf '{"statusLine":{"type":"command","command":"%s","refreshInterval":30}}\n' "$COP_SL" > "$H/.2copilot/settings.json"
+printf '%s\n' '{"quota_snapshots":{"premium_interactions":{"entitlement":1000,"remaining":200}}}' > "$FIXTURE_DIR/.1copilot.json"
 fleet_state
 new_caller "$UNDER_MARK"
 run_succeed printcopilotnone '' --print-launch-line --harness copilot -- --allow-all
@@ -1583,13 +1644,13 @@ assert_eq "$RC|$(sed -n 1p <<<"$OUT")" "1|oversee-succeed: copilot-account-unkno
 COPILOTARM="$(mutant_scripts copilotarm lib/overseer-launch.sh)" || exit 1
 mutate_file "$COPILOTARM/lib/overseer-launch.sh" '    copilot) cmd="copilot" brief_flag=" -i" ;;' '    copilot-x) ;;'
 copilot_row printcopilotctl "$COPILOTARM/oversee-succeed" --print-launch-line --harness copilot -- --allow-all
-assert_eq "$RC|$(grep -c -F "env COPILOT_HOME='$H/.1copilot' $COPILOT_ENV codex " <<<"$OUT")" "0|1" \
+assert_eq "$RC|$(grep -c -F "$COPILOT_ENV COPILOT_HOME='$H/.1copilot' codex " <<<"$OUT")" "0|1" \
   "control: without its arm the copilot line is built as codex's"
-COPILOTMODE="$(mutant_scripts copilotmode oversee-succeed)" || exit 1
-mutate_file "$COPILOTMODE/oversee-succeed" '[[ "$CALLER_HARNESS" != copilot || "$MODE" == print ]]' '[[ "$CALLER_HARNESS" != copilot || "$MODE" != print ]]'
-copilot_row checkcopilotctl "$COPILOTMODE/oversee-succeed" --check-marks --harness copilot
-assert_eq "$RC|$(grep -c '^oversee-succeed: copilot-unmeasured ' <<<"$OUT")" "0|0" \
-  "control: without the refusal a copilot overseer's marks are judged on a reading lanes cannot make"
+COPILOTMODE="$(mutant_scripts copilotmode lib/lane-launch.sh)" || exit 1
+mutate_file "$COPILOTMODE/lib/lane-launch.sh" '    claude | codex | copilot) printf' '    claude | codex) printf'
+LANE_DIRS="$COPILOT_DIRS" copilot_row checkcopilotctl "$COPILOTMODE/oversee-succeed" --check-marks --harness copilot
+assert_eq "$RC|$(sed -n 1p <<<"$OUT")" "0|oversee-succeed: mark-unmeasured kind=headroom reason=headroom-none succession=on" \
+  "control: with lanes judging no copilot pick the copilot overseer's account is one lanes measures none of"
 COPILOTACCT="$(mutant_scripts copilotacct oversee-succeed)" || exit 1
 mutate_file "$COPILOTACCT/oversee-succeed" '[[ "$CALLER_HARNESS" != copilot || -n "$CALLER_CFG" ]] || die copilot-account-unknown' ': || die copilot-account-unknown'
 fleet_state

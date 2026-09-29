@@ -226,6 +226,64 @@ exec git "$@"
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(parse(landed.read_bytes()), expected or data)
 
+    def copilot_create(self):
+        """A copilot create's fields, on a host whose login profile exports every token again."""
+        result = self.create(harness="copilot")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (self.root / ".bash_profile").write_text(
+            "export GH_TOKEN=profile-token COPILOT_GITHUB_TOKEN=profile-placeholder GITHUB_TOKEN=profile-actions-token\n")
+        return dict(word.split("=", 1) for word in result.stdout.decode().strip().split("\t"))
+
+    def copilot_run(self, fields, library=None):
+        """The create's prefix running the command open-terminal hands it, under LIBRARY's launch policy or none."""
+        probe = ('printf "%s|%s|%s|%s|%s|%s" "${COPILOT_GITHUB_TOKEN-unset}" "${GH_TOKEN-unset}" "${GITHUB_TOKEN-unset}"'
+                 ' "$COPILOT_HOME" "$COPILOT_SKILLS_DIRS" "$COPILOT_ALLOW_ALL"')
+        words = ""
+        if library:
+            # The launch policy's one owner, as open-terminal's hosted arm calls it
+            # for a command carrying --allow-all.
+            words = subprocess.run(["bash", "-c", '. "$1" && lane_copilot_env "$2" "$3"', "_",
+                                    str(library), "copilot --allow-all", '"$HOME/.agents/skills"'],
+                                   check=True, capture_output=True).stdout.decode().strip() + " "
+        command = "cd / && exec " + words + "sh -c " + shlex.quote(probe)
+        return subprocess.run(["bash", "-c", fields["remote-prefix"] + " " + shlex.quote(command)],
+                              env={**self.env, "COPILOT_GITHUB_TOKEN": "placeholder", "GH_TOKEN": "app-token",
+                                   "GITHUB_TOKEN": "actions-token", "HOME": str(self.root)},
+                              capture_output=True)
+
+    def test_create_runs_copilot_on_its_stored_login(self):
+        """A copilot lane copies no credential, its provider sets COPILOT_HOME alone, and the launch policy clears the COPILOT_GITHUB_TOKEN the host's profile exports while GH_TOKEN and GITHUB_TOKEN reach the lane."""
+        before = sorted(p.name for p in Path(self.row["account"]).iterdir()) if Path(self.row["account"]).exists() else []
+        fields = self.copilot_create()
+        run = self.copilot_run(fields, PACKAGE / "scripts/lib/lane-launch.sh")
+        after = sorted(p.name for p in Path(self.row["account"]).iterdir()) if Path(self.row["account"]).exists() else []
+        self.assertEqual(after, before)
+        self.assertEqual(fields["remote-prefix"], "exec env " + shlex.quote("COPILOT_HOME=" + self.row["account"]) + " bash -lc")
+        self.assertEqual(run.stdout.decode(), "|".join(["unset", "profile-token", "profile-actions-token", self.row["account"],
+                                                        str(self.root / ".agents/skills"), "true"]), run.stderr)
+
+    def test_control_copilot_command_without_its_policy(self):
+        """Control: the same prefix running the command with no launch policy leaves the profile's tokens on the lane."""
+        run = self.copilot_run(self.copilot_create())
+        self.assertEqual(run.stdout.decode().split("|")[:3],
+                         ["profile-placeholder", "profile-token", "profile-actions-token"], run.stderr)
+
+    def test_control_copilot_policy_without_its_clearing(self):
+        """Control: the clearing cut from a copy of the policy leaves the profile's COPILOT_GITHUB_TOKEN on the lane."""
+        fields = self.copilot_create()
+        clearing = "printf 'env -u COPILOT_GITHUB_TOKEN COPILOT_SKILLS_DIRS"
+        lib = self.root / "policy-copy"
+        shutil.copytree(PACKAGE / "scripts/lib", lib)
+        library = lib / "lane-launch.sh"
+        original = library.read_text()
+        self.assertEqual(original.count(clearing), 1)
+        library.write_text(original.replace(clearing, "printf 'env COPILOT_SKILLS_DIRS"))
+        self.assertNotIn(clearing, library.read_text())
+        run = self.copilot_run(fields, library)
+        self.assertEqual(run.stdout.decode(), "|".join(["profile-placeholder", "profile-token", "profile-actions-token",
+                                                        self.row["account"], str(self.root / ".agents/skills"), "true"]),
+                         run.stderr)
+
     def worktree_root(self):
         return Path(subprocess.run([self.env["REAL_GIT"], "-C", self.row["clone"] + "-worktree",
                                     "rev-parse", "--show-toplevel"],
