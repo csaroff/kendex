@@ -98,6 +98,7 @@ tm set-option -g renumber-windows off
 tm set-option -g default-shell /bin/sh
 tm set-option -g default-command "PATH=$BIN:\$PATH; export PATH; exec /bin/sh"
 SERVER_PID="$(tm display-message -p '#{pid}')"
+SERVER_START="$(tm display-message -p '#{start_time}')"
 SOCKET="$TMUX_DIR/tmux-$(id -u)/default"
 TMUX_ADDR="$(tm display-message -p '#{socket_path},#{pid},0')"
 
@@ -125,6 +126,7 @@ keyed() { awk -v k="oversee: $1" 'index($0, k) == 1 { found = 1 } found' <<<"$2"
 field() { sed -n "s/.* $2=\([^ ]*\).*/\1/p" <<<"$(sed -n 1p <<<"$1")"; }
 layout() { tm list-windows -t fleet -F '#{window_index} #{window_name}' | awk '$1 > 0' | tr '\n' ';'; }
 overseers() { tm list-windows -t fleet -F '#{window_name}' | awk '$0 == "overseer"' | wc -l | tr -d ' '; }
+listed() { tm list-panes -a -F '#{pane_id}' | grep -cxF -- "$1" || true; }
 recorded_argv() { if [[ -f "$TMP_ROOT/argv.claude" ]]; then tr '\n' ';' < "$TMP_ROOT/argv.claude"; else printf 'none'; fi; }
 BRIEF='Read .agents/skills/orch/SKILL.md and execute the orch oversee workflow after reading the overseer handoff at tmp/handoffs/OVERSEER-HANDOFF.md'
 
@@ -140,9 +142,9 @@ SESSION="$(field "$LAUNCHED" session)"
 assert_eq "$RC|$(sed -n 's/window=@[0-9]*/window=@N/; s/session=%[0-9]*/session=%N/p' <<<"$LAUNCHED")|$(layout)|$(recorded_argv)" \
   "0|oversee: overseer-launched session=%N window=@N server=$SOCKET generation=1 lane=$H/.claude|1 overseer;|lane=$H/.claude;-n;overseer;--model;fable;--effort;high;$BYPASS;$COMPACT;$QUESTION_OFF;$BRIEF;" \
   "a first launch from outside tmux opens the overseer at the end of the named session and records it"
-assert_eq "$(recorded runtime)|$(recorded server)|$(recorded pane)|$(recorded window)|$(recorded account)|$(recorded generation)|$(recorded launch_line)" \
-  "tmux|$SERVER_PID|$SESSION|$(tm display-message -p -t "$SESSION" '#{window_id}')|$H/.claude|1|env CLAUDE_CONFIG_DIR='$H/.claude' claude -n overseer --model fable --effort high $BYPASS $(printf '%q' "$COMPACT") $(printf '%q' "$QUESTION_OFF") '$BRIEF'" \
-  "the session record names the runtime, server, pane, window, account, line and generation"
+assert_eq "$(recorded runtime)|$(recorded server)|$(recorded server_start)|$(recorded pane)|$(recorded window)|$(recorded account)|$(recorded generation)|$(recorded launch_line)" \
+  "tmux|$SERVER_PID|$SERVER_START|$SESSION|$(tm display-message -p -t "$SESSION" '#{window_id}')|$H/.claude|1|env CLAUDE_CONFIG_DIR='$H/.claude' claude -n overseer --model fable --effort high $BYPASS $(printf '%q' "$COMPACT") $(printf '%q' "$QUESTION_OFF") '$BRIEF'" \
+  "the session record names the runtime, server and its start, pane, window, account, line and generation"
 WORK_REAL="$(cd "$TMP_ROOT/work" && pwd -P)"
 identity() { printf '%s|' "$(recorded harness)" "$(recorded account)" "$(recorded home)" "$(recorded model)" "$(recorded effort)" "$(recorded cwd)"; }
 assert_eq "$(identity)" "claude|$H/.claude|$H/.claude|fable|high|$WORK_REAL|" \
@@ -157,6 +159,83 @@ run_oversee -- launch --wait-secs 20
 assert_eq "$RC|$(sed -n 1p <<<"$OUT")|$(overseers)|$(recorded generation)" \
   "1|oversee: overseer-live session=$SESSION server=$SOCKET generation=1|1|1" \
   "a launch beside a live recorded overseer refuses naming it and opens nothing"
+# A record carrying no server start, the shape a writer that recorded none
+# left, names no session, but its pane live on the recorded server pid may be
+# the running overseer, so the launch refuses rather than open a second one.
+cp -- "$FLEET_STATE" "$TMP_ROOT/state.live"
+jq 'del(.overseer.server_start)' "$TMP_ROOT/state.live" > "$FLEET_STATE" || exit 1
+run_oversee -- launch --wait-secs 20
+assert_eq "$RC|$(sed -n 1p <<<"$OUT")|$(overseers)|$(recorded generation)" \
+  "1|oversee: overseer-live session=$SESSION server=$SOCKET generation=1|1|1" \
+  "a launch beside a live pane a record with no server start names refuses and opens nothing"
+# Yet that record names no predecessor: its pane may be one a later server
+# handed the same pid and pane id, so --predecessor on it refuses and the
+# succession stops nothing.
+run_oversee -- launch --predecessor "$SESSION" --wait-secs 20
+assert_eq "$RC|$(sed -n 1p <<<"$OUT")|$(overseers)|$(listed "$SESSION")|$(recorded generation)" \
+  "1|oversee: predecessor-not-live session=$SESSION live=none server=$SOCKET|1|1|1" \
+  "a --predecessor naming the live pane a record with no server start names is refused and left running"
+# Its control: a predecessor check that takes a startless record's live pane
+# stops that pane. It runs over a pane of its own, since the succession stops
+# it and $SESSION serves the rows below.
+cp -- "$FLEET_STATE" "$TMP_ROOT/state.startless"
+STARTLESS_PANE="$(tm new-window -d -t fleet -n startless -P -F '#{pane_id}' 'exec sleep 100000')"
+jq --arg pane "$STARTLESS_PANE" '.overseer.pane = $pane' "$TMP_ROOT/state.startless" > "$FLEET_STATE" || exit 1
+STARTLESSPREDCTL="$(mutant_scripts startlesspredctl oversee)" || exit 1
+mutate_file "$STARTLESSPREDCTL/oversee" \
+  '[[ -z "$PREDECESSOR" || "$named_pane" == "$PREDECESSOR" ]] \' '[[ -z "$PREDECESSOR" || "$live_pane" == "$PREDECESSOR" ]] \'
+OVERSEE_BIN="$STARTLESSPREDCTL/oversee" run_oversee -- launch --predecessor "$STARTLESS_PANE" --wait-secs 20
+assert_eq "$RC|$(listed "$STARTLESS_PANE")" "0|0" \
+  "control: a predecessor check that takes a startless record's live pane stops it"
+tm kill-window -t "$(recorded window)"
+mv -- "$TMP_ROOT/state.startless" "$FLEET_STATE"
+# Its control: a liveness check that takes a startless record as naming no
+# session opens a second overseer beside the first.
+STARTLESSCTL="$(mutant_scripts startlessctl oversee)" || exit 1
+mutate_file "$STARTLESSCTL/oversee" \
+  'if .server_start == null then .server_start = $start else . end' 'if .server_start == null then . else . end'
+OVERSEE_BIN="$STARTLESSCTL/oversee" run_oversee -- launch --wait-secs 20
+assert_eq "$RC|$(overseers)" "0|2" \
+  "control: a launch that judges a startless record as naming no session opens a second overseer"
+tm kill-window -t "$(recorded window)"
+mv -- "$TMP_ROOT/state.live" "$FLEET_STATE"
+# A tmux that answers every call but the server start read
+# (lib/tmux-server.sh § tmux_server_start) of the pane the nostart-pane file
+# names, for the rows where that read fails.
+NOSTART_BIN="$TMP_ROOT/nostart-bin"
+mkdir -p "$NOSTART_BIN"
+REAL_TMUX="$(command -v tmux)"
+cat > "$NOSTART_BIN/tmux" <<STUB
+#!/bin/sh
+pane="\$(cat '$TMP_ROOT/nostart-pane')"
+start=0 target=0
+for a in "\$@"; do
+  [ "\$a" = '#{pid} #{start_time}' ] && start=1
+  [ "\$a" = "\$pane" ] && target=1
+done
+[ "\$start\$target" = 11 ] && exit 1
+exec '$REAL_TMUX' "\$@"
+STUB
+chmod +x "$NOSTART_BIN/tmux"
+NOSTART_PATH="$NOSTART_BIN:$BIN:$PATH"
+printf '%s\n' "$SESSION" > "$TMP_ROOT/nostart-pane"
+# A live recorded pane whose server start cannot be read may be that
+# overseer, so the launch refuses rather than open a second one beside it.
+run_oversee PATH="$NOSTART_PATH" -- launch --wait-secs 20
+assert_eq "$RC|$(sed -n 1p <<<"$OUT")|$(overseers)|$(recorded generation)" \
+  "1|oversee: launch-failed step=server-start session=$SESSION server=$SOCKET|1|1" \
+  "a launch beside a live recorded pane whose server start cannot be read refuses and opens nothing"
+# Its control: an unread start judged as no start reads the live overseer's
+# bound record as another session's and opens a second overseer.
+NOSTARTCTL="$(mutant_scripts nostartctl oversee)" || exit 1
+mutate_file "$NOSTARTCTL/oversee" \
+  '      || die launch-failed step=server-start "session=$live_pane" "server=$SERVER_SOCKET"' '      || live_start=""'
+cp -- "$FLEET_STATE" "$TMP_ROOT/state.live"
+OVERSEE_BIN="$NOSTARTCTL/oversee" run_oversee PATH="$NOSTART_PATH" -- launch --wait-secs 20
+assert_eq "$RC|$(overseers)" "0|2" \
+  "control: a launch that judges an unread start as none opens a second overseer beside the first"
+tm kill-window -t "$(recorded window)"
+mv -- "$TMP_ROOT/state.live" "$FLEET_STATE"
 # The must-fail control: a launcher that skips the liveness check opens a
 # second overseer beside the first.
 LIVECTL="$(mutant_scripts livectl oversee)" || exit 1
@@ -244,9 +323,9 @@ assert_eq "$RC|$(sed -n 1p <<<"$OUT")|$(overseers)" \
 HAND="$(tm new-window -d -t fleet:4 -n hand -P -F '#{pane_id}' "exec '$BIN/hclaude' 100000")"
 PRIOR_LINE="$(recorded launch_line)"
 run_oversee TMUX="$TMUX_ADDR" TMUX_PANE="$HAND" CLAUDE_CONFIG_DIR="$H/.eclaude" -- register
-assert_eq "$RC|$(sed -n 1p <<<"$OUT")|$(keyed registered "$OUT" | sed -n 1p)|$(recorded runtime)|$(recorded account)|$(recorded launch_line)" \
-  "0|oversee: identity-fallback session=$HAND cause=no-start-row|oversee: registered session=$HAND window=$(tm display-message -p -t "$HAND" '#{window_id}') server=$SERVER_PID generation=4 account=$H/.eclaude|tmux|$H/.eclaude|none" \
-  "register with no SessionStart row reads the pane as the named fallback, says so, writes the record one generation past it, and drops the launch line the record held"
+assert_eq "$RC|$(sed -n 1p <<<"$OUT")|$(keyed registered "$OUT" | sed -n 1p)|$(recorded runtime)|$(recorded account)|$(recorded launch_line)|$(recorded server_start)" \
+  "0|oversee: identity-fallback session=$HAND cause=no-start-row|oversee: registered session=$HAND window=$(tm display-message -p -t "$HAND" '#{window_id}') server=$SERVER_PID generation=4 account=$H/.eclaude|tmux|$H/.eclaude|none|$SERVER_START" \
+  "register with no SessionStart row reads the pane as the named fallback, says so, writes the record one generation past it with its server's start, and drops the launch line the record held"
 # The line's control: a writer that keeps the prior's fields whole leaves the
 # launched session's line on the hand-opened one, and a death of the latter
 # would replay the former's command. The line the real register just dropped
@@ -267,6 +346,35 @@ mutate_file "$REGCTL/oversee" '    claude) harness=claude ;;' '    claude) ;;'
 OVERSEE_BIN="$REGCTL/oversee" run_oversee TMUX="$TMUX_ADDR" TMUX_PANE="$HAND" CLAUDE_CONFIG_DIR="$H/.eclaude" -- register
 assert_eq "$RC|$(recorded harness)" "0|none" \
   "control: a register that reads no harness records none"
+# The start's control: a writer that drops the server start records none.
+STARTCTL="$(mutant_scripts startctl lib/overseer-launch.sh)" || exit 1
+mutate_file "$STARTCTL/lib/overseer-launch.sh" 'server_start: ($start | tonumber)}' 'server_start: null}'
+cp -- "$FLEET_STATE" "$TMP_ROOT/state.bound"
+OVERSEE_BIN="$STARTCTL/oversee" run_oversee TMUX="$TMUX_ADDR" TMUX_PANE="$HAND" CLAUDE_CONFIG_DIR="$H/.eclaude" -- register
+assert_eq "$RC|$(recorded server_start)" "0|none" \
+  "control: a register whose writer drops the server start records none"
+mv -- "$TMP_ROOT/state.bound" "$FLEET_STATE"
+# A server start that cannot be read writes nothing: a record with no start
+# would name no session.
+run_oversee TMUX="$TMUX_ADDR" TMUX_PANE="$HAND" CLAUDE_CONFIG_DIR="$H/.eclaude" -- register
+BOUND_RECORD="$(jq -c .overseer "$FLEET_STATE")"
+printf '%s\n' "$HAND" > "$TMP_ROOT/nostart-pane"
+run_oversee PATH="$NOSTART_PATH" TMUX="$TMUX_ADDR" TMUX_PANE="$HAND" CLAUDE_CONFIG_DIR="$H/.eclaude" -- register
+assert_eq "$RC|$(keyed record-unwritten "$OUT" | sed -n 1p)|$(jq -c .overseer "$FLEET_STATE")" \
+  "1|oversee: record-unwritten field=overseer|$BOUND_RECORD" \
+  "a register whose server start cannot be read refuses and leaves the record as it stood"
+# Its control: a writer that takes an unread start as none records the pane
+# with no start.
+UNREADCTL="$(mutant_scripts unreadctl lib/overseer-launch.sh)" || exit 1
+mutate_file "$UNREADCTL/lib/overseer-launch.sh" \
+  '    if ! start="$(ol_session_start "$4" "$2")"; then' '    if ! start="$(ol_session_start "$4" "$2")" && false; then'
+mutate_file "$UNREADCTL/lib/overseer-launch.sh" \
+  'server_start: ($start | tonumber)}' 'server_start: (if $start == "" then null else $start | tonumber end)}'
+cp -- "$FLEET_STATE" "$TMP_ROOT/state.bound"
+OVERSEE_BIN="$UNREADCTL/oversee" run_oversee PATH="$NOSTART_PATH" TMUX="$TMUX_ADDR" TMUX_PANE="$HAND" CLAUDE_CONFIG_DIR="$H/.eclaude" -- register
+assert_eq "$RC|$(recorded server_start)" "0|none" \
+  "control: a register that takes an unread start as none records the pane with no start"
+mv -- "$TMP_ROOT/state.bound" "$FLEET_STATE"
 # register from the session's own SessionStart row (lib/session-rows.sh), in
 # the shape Claude Code 2.1.283's hook emits it: the harness, account and
 # model the row states, not the environment's, and the rows file recorded.
@@ -481,7 +589,6 @@ run_oversee -- launch --wait-secs 20
 PRED="$(recorded pane)"
 PRED_GEN="$(recorded generation)"
 PRED_INDEX="$(tm display-message -p -t "$PRED" '#{window_index}')"
-listed() { tm list-panes -a -F '#{pane_id}' | grep -cxF -- "$1" || true; }
 run_oversee -- launch --predecessor "$PRED" --wait-secs 20
 SUCCEEDED="$(keyed overseer-launched "$OUT" | sed -n 1p)"
 SUCC="$(field "$SUCCEEDED" session)"
@@ -503,7 +610,7 @@ assert_eq "$RC|$(sed -n 1p <<<"$OUT")|$(overseers)|$(listed "$OTHER")" \
   "a predecessor the fleet does not record as its live overseer is refused and left running"
 # Its control: without the check the launch stops that pane.
 PREDCTL="$(mutant_scripts predctl oversee)" || exit 1
-mutate_file "$PREDCTL/oversee" '[[ -z "$PREDECESSOR" || "$live_pane" == "$PREDECESSOR" ]] \' 'true \'
+mutate_file "$PREDCTL/oversee" '[[ -z "$PREDECESSOR" || "$named_pane" == "$PREDECESSOR" ]] \' 'true \'
 OVERSEE_BIN="$PREDCTL/oversee" run_oversee -- launch --predecessor "$OTHER" --wait-secs 20
 assert_eq "$RC|$(listed "$OTHER")" "0|0" \
   "control: a launch without the predecessor check stops a pane the fleet never recorded"
@@ -650,33 +757,51 @@ tm kill-window -t "$(tm list-windows -t fleet -F '#{window_id} #{window_name}' |
 
 # A record from an earlier tmux server naming a pane id this server reuses is
 # no live overseer: the launch opens the next generation over it, and a
-# --predecessor naming that pane is refused, the pane left running.
+# --predecessor naming that pane is refused, the pane left running. One row
+# per way the record tells that server from this one: another server pid, and
+# this pid bound to an earlier server's start, a server a restart handed the
+# same pid.
 STALE="$(tm new-window -d -t fleet -n stale -P -F '#{pane_id}' 'exec sleep 100000')"
-stale_record() {
-  jq --arg pane "$STALE" '.overseer.pane = $pane | .overseer.server = "1"' "$FLEET_STATE" > "$FLEET_STATE.tmp" \
+EARLIER_START=$((SERVER_START - 3600))
+stale_record() { # SERVER START
+  jq --arg pane "$STALE" --arg server "$1" --arg start "$2" '.overseer.pane = $pane | .overseer.server = $server
+    | .overseer.server_start = ($start | tonumber)' "$FLEET_STATE" > "$FLEET_STATE.tmp" \
     && mv -- "$FLEET_STATE.tmp" "$FLEET_STATE"
 }
-stale_record
-STALE_GEN="$(recorded generation)"
-run_oversee -- launch --predecessor "$STALE" --wait-secs 20
-assert_eq "$RC|$(sed -n 1p <<<"$OUT")|$(overseers)|$(listed "$STALE")" \
-  "1|oversee: predecessor-not-live session=$STALE live=none server=$SOCKET|0|1" \
-  "a --predecessor naming a pane an earlier server's record names is refused and left running"
-# Its control: a liveness check reading the pane alone takes the stale record
-# for a live overseer.
-SERVERCTL="$(mutant_scripts serverctl oversee)" || exit 1
-mutate_file "$SERVERCTL/oversee" \
-  'if [[ "$OL_INSPECT_STATE" == gone || "$OL_INSPECT_SERVER" != "$live_server" ]]; then live_pane=""; fi' \
-  'if [[ "$OL_INSPECT_STATE" == gone ]]; then live_pane=""; fi'
-OVERSEE_BIN="$SERVERCTL/oversee" run_oversee -- launch --wait-secs 20
-assert_eq "$RC|$(sed -n 1p <<<"$OUT")|$(overseers)" \
-  "1|oversee: overseer-live session=$STALE server=$SOCKET generation=$STALE_GEN|0" \
-  "control: a liveness check that ignores the server refuses over an earlier server's record"
-run_oversee -- launch --wait-secs 20
-assert_eq "$RC|$(recorded generation)|$(overseers)|$(listed "$STALE")" \
-  "0|$((STALE_GEN + 1))|1|1" \
-  "a launch over an earlier server's record opens the next generation"
-tm kill-window -t "$(recorded window)"
+for row in "1|$SERVER_START|another server pid" "$SERVER_PID|$EARLIER_START|this server pid bound to an earlier start"; do
+  IFS='|' read -r row_server row_start row_what <<<"$row"
+  stale_record "$row_server" "$row_start"
+  STALE_GEN="$(recorded generation)"
+  run_oversee -- launch --predecessor "$STALE" --wait-secs 20
+  assert_eq "$RC|$(sed -n 1p <<<"$OUT")|$(overseers)|$(listed "$STALE")" \
+    "1|oversee: predecessor-not-live session=$STALE live=none server=$SOCKET|0|1" \
+    "a --predecessor naming a pane an earlier server's record names by $row_what is refused and left running"
+  run_oversee -- launch --wait-secs 20
+  assert_eq "$RC|$(recorded generation)|$(overseers)|$(listed "$STALE")" \
+    "0|$((STALE_GEN + 1))|1|1" \
+    "a launch over an earlier server's record naming $row_what opens the next generation"
+  tm kill-window -t "$(recorded window)"
+done
+# The controls, one per clause of ol_names that tells the servers apart: a
+# liveness check whose test ignores the server pid, or the server start,
+# takes that row's record for a live overseer and refuses.
+stale_control() { # NAME OLD NEW SERVER START WHAT
+  local ctl
+  ctl="$(mutant_scripts "$1" lib/overseer-launch.sh)" || exit 1
+  mutate_file "$ctl/lib/overseer-launch.sh" "$2" "$3"
+  stale_record "$4" "$5"
+  STALE_GEN="$(recorded generation)"
+  OVERSEE_BIN="$ctl/oversee" run_oversee -- launch --wait-secs 20
+  assert_eq "$RC|$(sed -n 1p <<<"$OUT")|$(overseers)" \
+    "1|oversee: overseer-live session=$STALE server=$SOCKET generation=$STALE_GEN|0" \
+    "control: a liveness check that ignores the $6 refuses over an earlier server's record"
+}
+stale_control serverctl \
+  '  def ol_names($server; $start; $session): type == "object" and (.server // "") == $server' \
+  '  def ol_names($server; $start; $session): type == "object"' 1 "$SERVER_START" "server pid"
+stale_control startctl-live \
+  '    and (.server_start | tostring) == $start;' '    and true;' \
+  "$SERVER_PID" "$EARLIER_START" "server start"
 tm kill-window -t "$STALE"
 
 # A first launch on a codex entry: the entry's model and effort, codex's

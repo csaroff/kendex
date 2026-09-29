@@ -379,9 +379,9 @@ start's `lane-mail inbox --item overseer` moves too, acknowledged only once
 its notes are printed, whatever state directory, --since or checkout this
 watch runs with. A session start's read between the peek and the
 acknowledgement reports a note twice. The lane-mail hooks move it too, for
-a lead session in the checkout while no repeat watch holds the fleet state:
-with single passes, every lead session there, the overseer included. A line
-they take is not reported here.
+the session the fleet record names while no repeat watch holds the fleet
+state: with single passes, the overseer itself. A line they take is not
+reported here.
 Before every mail pass the overseer's session is read once, as the long pass
 reads it; while it reads exited, or walled, no mailbox is read, so a
 successor finds what was sent in the meantime. A rows wall stands unless its
@@ -517,11 +517,12 @@ Options:
                       from the pane, the named fallback, where it names
                       none; a death relaunches from the line the fleet
                       state already holds where its record names this pane
-                      by server and pane id, the last line a launch, a
-                      succession or a watch start recorded for it, which a
-                      session restarted by hand may not have been started
-                      with; a record naming another pane, or none, reports
-                      the death with no successor, naming that record
+                      by server, server start and pane id, the last line a
+                      launch, a succession or a watch start recorded for
+                      it, which a session restarted by hand may not have
+                      been started with; a record naming another pane, or
+                      none, reports the death with no successor, naming
+                      that record
   --repeat SECS       the watch for a session: run one watch per pass with
                       the other options, sleep SECS after it exits, or
                       ORCH_WATCH_MAIL_INTERVAL where that is shorter and the
@@ -744,7 +745,7 @@ USAGE
 # restate it in prose. Bounded in length by that row: the fleet log takes
 # ORCH_FLEET_LOG_ROW_BYTES per row, and the row carries the notice's reason
 # and pane ahead of this, never a path.
-OW_REPLAY_RULE='A death replays the held line only where the record names this pane by server and pane id: the last line a launch, a succession or a watch start recorded for it, which a session restarted by hand may not have started with. A record naming another pane, or no line, means a death with no successor.'
+OW_REPLAY_RULE='A death replays the held line only where the record names this pane by server, server start and pane id: the last line a launch, a succession or a watch start recorded for it, which a session restarted by hand may not have started with. A record naming another pane, or no line, means a death with no successor.'
 
 ow_message() { # REASON FIELD=VALUE...
   local reason="$1" text field
@@ -772,7 +773,7 @@ ow_message() { # REASON FIELD=VALUE...
     overseer-unreadable) text='The overseer pane could not be read, so its state settles nothing this pass.' ;;
     overseer-fallback) text='The overseer session rows could not judge it, so this pass judges its pane, the named fallback, as the watch did before the rows existed. The cause names why: no rows file recorded for this pane (unrecorded), a fleet state that could not be read (state-unreadable), no row in the file yet (none), a row naming a harness that emits no session end or usage-limit event (unsupported), or a file that could not be read (unreadable).' ;;
     overseer-line-missing) text='This start could not build the overseer launch line, so the fleet state keeps the line it already holds, or none. The pane is still watched. '"$OW_REPLAY_RULE"' The held field is that line, none where the record holds none for this pane, or unread where the record could not be read. The detail under this line is the refusal of oversee-succeed --print-launch-line.' ;;
-    overseer-unrecorded) text='This start could not record the overseer pane in the fleet state, so the record stays as it was. The pane is still watched. '"$OW_REPLAY_RULE"' The held field is that line, none where the record holds none for this pane, or unread where the record, or the pane key that names it, could not be read. The step field names what failed.' ;;
+    overseer-unrecorded) text='This start could not record the overseer pane in the fleet state, so the record stays as it was. The pane is still watched. '"$OW_REPLAY_RULE"' The held field is that line, none where the record holds none for this pane, or unread where the record, or the pane key or server start that names it, could not be read. The step field names what failed.' ;;
     overseer-notice-failed) text='An overseer notice could not be delivered on the channel the field names. A notice from a pass still had its event line printed; a notice from the watch start has none.' ;;
     overseer-relaunch-failed) text='oversee-succeed refused or failed the relaunch; the overseer is not replaced and this watch keeps running. Its own keyed line says why.' ;;
     overseer-recovery-blocked) text='No account in the fleet qualifies for a successor, so the recovery stops rather than retry the same accounts. The fields name the spent account and the reset its banner states; a notice carrying both went to the fleet log and the overseer mailbox.' ;;
