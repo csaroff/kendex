@@ -1,0 +1,70 @@
+import { expect, test } from "bun:test";
+import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { registerBash, registerEdit, registerRead, registerReadOnly, registerWrite } from "../tool-renderer/tools.js";
+import { registerToolBatch } from "../tool-renderer/batch.js";
+import { useWorld } from "./helpers/world.js";
+
+const world = useWorld();
+const registrations = [
+	["read", registerRead],
+	["bash", registerBash],
+	["edit", registerEdit],
+	["write", registerWrite],
+	["grep", (pi: ExtensionAPI, host: object, cwd: string) => registerReadOnly(pi, host, cwd, "grep")],
+	["find", (pi: ExtensionAPI, host: object, cwd: string) => registerReadOnly(pi, host, cwd, "find")],
+	["ls", (pi: ExtensionAPI, host: object, cwd: string) => registerReadOnly(pi, host, cwd, "ls")],
+] as const;
+
+for (const [name, register] of registrations) {
+	test(`${name} forwards the execution context without changing the other arguments`, async () => {
+		let received: unknown[] = [];
+		let definition: ToolDefinition | undefined;
+		const original = {
+			description: "fixture",
+			parameters: {},
+			execute: async (...arguments_: unknown[]) => {
+				received = arguments_;
+				return { content: [] };
+			},
+		};
+		const host = {
+			createReadTool: () => original, createBashTool: () => original,
+			createEditTool: () => original, createWriteTool: () => original,
+			createGrepTool: () => original, createFindTool: () => original, createLsTool: () => original,
+		};
+		register({ registerTool: (tool: ToolDefinition) => { definition = tool; } } as ExtensionAPI, host, world().cwd);
+		expect(definition).toBeDefined();
+		const input = {};
+		const signal = new AbortController().signal;
+		const onUpdate = () => {};
+		const context = { cwd: world().cwd } as ExtensionContext;
+		await definition!.execute("call", input, signal, onUpdate, context);
+		expect(received).toEqual(["call", input, signal, onUpdate, context]);
+		expect(received[4]).toBe(context);
+	});
+}
+
+test("tool_batch forwards the unchanged context to every child tool", async () => {
+	const received: unknown[][] = [];
+	let definition: ToolDefinition | undefined;
+	const original = {
+		execute: async (...arguments_: unknown[]) => {
+			received.push(arguments_);
+			return { content: [] };
+		},
+	};
+	const host = {
+		createReadTool: () => original, createBashTool: () => original,
+		createGrepTool: () => original, createFindTool: () => original, createLsTool: () => original,
+	};
+	registerToolBatch({ registerTool: (tool: ToolDefinition) => { definition = tool; } } as ExtensionAPI, host, world().cwd);
+	expect(definition).toBeDefined();
+	const names = ["read", "bash", "grep", "find", "ls"];
+	const context = { cwd: world().cwd } as ExtensionContext;
+	await definition!.execute("batch", { calls: names.map((tool) => ({ tool, args: {} })) }, undefined, undefined, context);
+	expect(received).toHaveLength(names.length);
+	for (const [index, arguments_] of received.entries()) {
+		expect(arguments_[0]).toBe(`batch:${index}`);
+		expect(arguments_[4]).toBe(context);
+	}
+});

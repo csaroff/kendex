@@ -2,6 +2,10 @@
 
 ## Consumer-impacting changes
 
+### 2.0.3
+
+- Bash commands and `tool_batch` children run through the renderer keep Pi's session and model metadata: `PI_SESSION_ID`, `PI_SESSION_FILE`, `PI_PROVIDER`, `PI_MODEL` and `PI_REASONING_LEVEL` reach the command instead of arriving empty. The replacement tools and batch child calls forward Pi's execution context to the built-in tool unchanged (#3101).
+
 ### 2.0.2
 
 - Batch refusal, timeout, and result notices start with stable keys and values.

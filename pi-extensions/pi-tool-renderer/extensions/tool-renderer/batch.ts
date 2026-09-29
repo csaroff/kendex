@@ -315,7 +315,7 @@ export function registerToolBatch(pi: ExtensionAPI, agent: any, cwd: string): vo
 						}, batchCallTimeoutMs);
 					});
 					const result = await Promise.race([
-						original.execute(`${toolCallId}:${index}`, call.args, childController.signal, undefined),
+						original.execute(`${toolCallId}:${index}`, call.args, childController.signal, undefined, context),
 						timeoutPromise,
 					]);
 					return {
