@@ -8,13 +8,19 @@
 # output whole. The world is one merged PR:
 #   commits      the first authored at 09:00; the final head committed 10:10
 #   force push   10:20, over a head whose gate had passed at 10:05
-#   reviews      a user's at 09:30, then a Bot's at 09:40 and 10:30
+#   reviews      a user's at 09:30, then a Bot's at 09:40 and 10:30, and the
+#                PR author's own, an app's, answering a thread at 10:35
 #   gate         the final head's success at 10:25
 #   head CI      a pull_request suite 10:20-10:40 and an app suite with no
 #                workflow run 10:22-10:45; the merge commit's merge_group
 #                suite 11:00-11:15, and a push suite there that is no one's
 #   merge flow   auto-merge enabled 10:26 and again 10:50, queued 10:55,
 #                merged 11:20
+#   head branch  `feature`, whose activity log holds an earlier life of the
+#                name (created 08:00, deleted 08:30), then this one: created
+#                09:05, a push at 09:50 of a head the force push later
+#                rewrote, the final head's push at 10:12, the force push at
+#                10:20, and the deletion after the merge at 11:21
 set -euo pipefail
 
 unset GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE GIT_INDEX_FILE
@@ -59,7 +65,8 @@ response() {
                                checkRuns: {pageInfo: {hasNextPage: false}, nodes: $runs}};
     def gate($state; $hm): {status: {context: {state: $state, createdAt: t($hm)}}};
     {data: {repository: {pullRequest: {
-      number: 42, state: "MERGED", createdAt: t("09:10"), mergedAt: t("11:20"),
+      number: 42, state: "MERGED", createdAt: t("09:10"), mergedAt: t("11:20"), author: {login: "lane-app"},
+      headRefName: "feature", headRepository: {nameWithOwner: "owner/repo"},
       mergeCommit: {oid: "m1", checkSuites: {pageInfo: {hasNextPage: false}, nodes: [
         suite("merge_group"; [run("test"; "11:00"; "11:15")]), suite("push"; [run("test"; "11:21"; "11:40")])]}},
       firstCommit: {nodes: [{commit: {authoredDate: t("09:00")}}]},
@@ -67,11 +74,12 @@ response() {
         + {checkSuites: {pageInfo: {hasNextPage: false}, nodes: [
             suite("pull_request"; [run("lint"; "10:20"; "10:30"), run("test"; "10:21"; "10:40")]),
             suite(null; [run("scan"; "10:22"; "10:45")])]}})}]},
-      commits: {totalCount: 1, nodes: [{commit: {oid: "h2"}}]},
-      reviews: {totalCount: 3, nodes: [
-        {submittedAt: t("09:30"), author: {__typename: "User"}},
-        {submittedAt: t("09:40"), author: {__typename: "Bot"}},
-        {submittedAt: t("10:30"), author: {__typename: "Bot"}}]},
+      commits: {totalCount: 1, nodes: [{commit: {oid: "h2", committedDate: t("10:10")}}]},
+      reviews: {totalCount: 4, nodes: [
+        {submittedAt: t("09:30"), author: {__typename: "User", login: "someone"}},
+        {submittedAt: t("09:40"), author: {__typename: "Bot", login: "reviewer"}},
+        {submittedAt: t("10:30"), author: {__typename: "Bot", login: "reviewer"}},
+        {submittedAt: t("10:35"), author: {__typename: "Bot", login: "lane-app"}}]},
       timelineItems: {pageInfo: {hasNextPage: false}, nodes: [
         {__typename: "HeadRefForcePushedEvent", createdAt: t("10:20"), beforeCommit: {oid: "b1"}},
         {__typename: "AutoMergeEnabledEvent", createdAt: t("10:26")},
@@ -92,6 +100,15 @@ status_history() { # PAIRS
 HISTORY_B1="10:05:success"
 HISTORY_H2="10:25:success"
 
+# The head branch's activity log, newest first as the REST endpoint lists it:
+# `when:type` pairs.
+activity_log() { # PAIRS
+  jq -cn --arg pairs "$1" '[$pairs | split(" ")[] | select(. != "") | split(":") as $p
+    | {timestamp: "2026-09-20T\($p[0]):\($p[1]):00Z", activity_type: $p[2]}]'
+}
+ACTIVITY="11:21:branch_deletion 10:20:force_push 10:12:push 09:50:push 09:05:branch_creation 08:30:branch_deletion 08:00:branch_creation"
+ACTIVITY_PATH="api-repos/owner/repo/activity?ref=refs%2Fheads%2Ffeature&per_page=100"
+
 # The pages past the first, staged by the paging cases; every other case
 # stages none. The PR response is staged under a selector its query alone
 # carries, so a page the code asks for in such a case is refused rather than
@@ -107,15 +124,16 @@ run() { # EDIT [ARGS...]
   stage_pages
   gh_stub_answer "api-repos/owner/repo/commits/b1/statuses?per_page=100" "$(status_history "$HISTORY_B1")"
   gh_stub_answer "api-repos/owner/repo/commits/h2/statuses?per_page=100" "$(status_history "$HISTORY_H2")"
+  gh_stub_answer "$ACTIVITY_PATH" "$(activity_log "$ACTIVITY")"
   (cd "$TMP_ROOT/repo" && PATH="$TMP_ROOT/bin:$PATH" env -u GH_TOKEN -u GITHUB_TOKEN -u GH_BOT_TOKEN -u GH_REPO -u REVIEW_GATE_CONTEXT \
     bash "$BIN" 42 "$@" >"$TMP_ROOT/stdout" 2>"$TMP_ROOT/stderr") || rc=$?
   printf 'rc=%s' "$rc"
 }
 
 echo "=== the stamps and wall times of a merged PR ==="
-WANT='{"pr":42,"repo":"owner/repo","state":"MERGED","head":"h2","merge_commit":"m1","stamps":{"first_commit":"2026-09-20T09:00:00Z","created":"2026-09-20T09:10:00Z","last_push":"2026-09-20T10:20:00Z","first_bot_review":"2026-09-20T09:40:00Z","first_gate_met":"2026-09-20T10:05:00Z","gate_met":"2026-09-20T10:25:00Z","ci_green":"2026-09-20T10:45:00Z","armed":"2026-09-20T10:50:00Z","queued":"2026-09-20T10:55:00Z","merged":"2026-09-20T11:20:00Z"},"ci_head_secs":1500,"ci_merge_group_secs":900,"open_secs":7800,"bot_reviews":2}'
+WANT='{"pr":42,"repo":"owner/repo","state":"MERGED","head":"h2","merge_commit":"m1","stamps":{"first_commit":"2026-09-20T09:00:00Z","created":"2026-09-20T09:10:00Z","last_push":"2026-09-20T10:20:00Z","first_bot_review":"2026-09-20T09:40:00Z","first_gate_met":"2026-09-20T10:05:00Z","gate_met":"2026-09-20T10:25:00Z","ci_green":"2026-09-20T10:45:00Z","armed":"2026-09-20T10:50:00Z","queued":"2026-09-20T10:55:00Z","merged":"2026-09-20T11:20:00Z"},"ci_head_secs":1500,"ci_merge_group_secs":900,"open_secs":7800,"bot_reviews":2,"push_times":["2026-09-20T09:05:00Z","2026-09-20T09:50:00Z","2026-09-20T10:12:00Z","2026-09-20T10:20:00Z"],"bot_review_times":["2026-09-20T09:40:00Z","2026-09-20T10:30:00Z"]}'
 assert_eq "$(run .) $(cat "$TMP_ROOT/stdout")" "rc=0 $WANT" \
-  "the force-pushed-over head's gate is the first pass, and the merge group's runs stay out of the head's CI"
+  "the force-pushed-over head's gate is the first pass, the merge group's runs stay out of the head's CI, the author's own review is no bot's, and the pushes are the branch log's for this life of the name"
 
 echo "=== each stamp a PR did not reach is null ==="
 while IFS='@' read -r label edit want; do
@@ -126,9 +144,35 @@ done <<'ROWS'
 an open PR has no merge, merge-group CI or open time@.data.repository.pullRequest |= (.mergedAt = null | .mergeCommit = null)@[.stamps.merged, .merge_commit, .ci_merge_group_secs, .open_secs] == [null, null, null, null]
 a failing head run leaves CI never green, its wall time still read@.data.repository.pullRequest.headCommit.nodes[0].commit.checkSuites.nodes[0].checkRuns.nodes[1].conclusion = "FAILURE"@[.stamps.ci_green, .ci_head_secs] == [null, 1500]
 a pending gate is not met@.data.repository.pullRequest.headCommit.nodes[0].commit.status.context.state = "PENDING"@.stamps.gate_met == null
-no Bot review leaves the first one null and the count zero@.data.repository.pullRequest.reviews.nodes |= map(.author.__typename = "User")@[.stamps.first_bot_review, .bot_reviews] == [null, 0]
+no Bot review leaves the first one null, the count zero and the times empty@.data.repository.pullRequest.reviews.nodes |= map(.author.__typename = "User")@[.stamps.first_bot_review, .bot_reviews, .bot_review_times] == [null, 0, []]
+a PR whose author GitHub no longer names counts every Bot review@.data.repository.pullRequest.author = null@[.bot_reviews, .bot_review_times[-1]] == [3, "2026-09-20T10:35:00Z"]
 no force push leaves the head's commit date the last push@.data.repository.pullRequest.timelineItems.nodes |= map(select(.__typename != "HeadRefForcePushedEvent"))@[.stamps.last_push, .stamps.first_gate_met] == ["2026-09-20T10:10:00Z", "2026-09-20T10:25:00Z"]
 ROWS
+
+echo "=== the pushes are read from the head branch's activity log ==="
+while IFS='|' read -r label log edit want; do
+  [[ -n "$label" ]] || continue
+  ACTIVITY="$log"
+  run "$edit" >/dev/null
+  assert_eq "$(jq -c '.push_times' "$TMP_ROOT/stdout")" "$want" "$label"
+done <<'ROWS'
+a log with no deletion yet reads the whole life|10:12:push 09:05:branch_creation|.|["2026-09-20T09:05:00Z","2026-09-20T10:12:00Z"]
+a log holding no push of this life leaves the pushes null|11:21:branch_deletion 08:30:branch_deletion 08:00:branch_creation|.|null
+a PR whose head repository is gone leaves the pushes null|10:12:push|.data.repository.pullRequest.headRepository = null|null
+ROWS
+ACTIVITY="11:21:branch_deletion 10:20:force_push 10:12:push 09:50:push 09:05:branch_creation 08:30:branch_deletion 08:00:branch_creation"
+run . >/dev/null
+assert_eq "$(gh_stub_calls | grep -c 'activity?ref=refs%2Fheads%2Ffeature&per_page=100 --paginate')" "1" \
+  "the log is read once, for the head ref, through every page"
+gh_stub_reset
+gh_stub_answer "api-graphql:pullRequest(number" "$(response .)"
+gh_stub_answer "api-repos/owner/repo/commits/b1/statuses?per_page=100" "$(status_history "$HISTORY_B1")"
+gh_stub_answer "api-repos/owner/repo/commits/h2/statuses?per_page=100" "$(status_history "$HISTORY_H2")"
+gh_stub_fail "$ACTIVITY_PATH" 1 'HTTP 500'
+rc=0
+(cd "$TMP_ROOT/repo" && PATH="$TMP_ROOT/bin:$PATH" env -u GH_TOKEN -u GITHUB_TOKEN -u GH_BOT_TOKEN -u GH_REPO -u REVIEW_GATE_CONTEXT \
+  bash "$BIN" 42 >"$TMP_ROOT/stdout" 2>"$TMP_ROOT/stderr") || rc=$?
+assert_eq "rc=$rc out=$(cat "$TMP_ROOT/stdout")" "rc=1 out=" "an activity log that does not read prints nothing"
 
 echo "=== the first gate pass is read from each head's status history ==="
 while IFS='|' read -r label b1 h2 want; do
@@ -386,6 +430,20 @@ stage_pages() { open_suite_pages 19; }
 assert_eq "$(run "$FIFTY_SUITES") pages=$(gh_stub_calls | grep -c 'api graphql') $(jq -c .pr "$TMP_ROOT/stdout")" \
   "rc=0 pages=21 42" "control: without the cap the walk reads the twenty-first page and prints"
 stage_pages() { :; }
+
+# The branch log read without the bound of this life: the earlier life's
+# creation counts as a push.
+mutate '| select(($from == null or .timestamp > $from) and ($to == null or .timestamp <= $to))' '| select(true)'
+run . >/dev/null
+assert_eq "$(jq -c '.push_times[0]' "$TMP_ROOT/stdout")" '"2026-09-20T08:00:00Z"' \
+  "control: without the life's bounds an earlier branch of the same name lends its pushes"
+
+# The Bot reviews read without the author test: the PR author's own reply
+# counts as a bot's review of the PR.
+mutate '      and .author.login != $p.author.login)] as $bot' '      )] as $bot'
+run . >/dev/null
+assert_eq "$(jq -c '[.bot_reviews, .bot_review_times[-1]]' "$TMP_ROOT/stdout")" '[3,"2026-09-20T10:35:00Z"]' \
+  "control: without the author test the PR author's own review is counted and timed"
 BIN="$PR_TIMELINE"
 
 echo
