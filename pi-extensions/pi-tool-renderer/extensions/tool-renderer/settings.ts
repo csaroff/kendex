@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
@@ -50,6 +50,7 @@ export function recordProjectTrust(ctx: { cwd?: string; isProjectTrusted?: () =>
 	const registry = projectTrustRegistry();
 	if (!registry.projectSettings) registry.projectSettings = new Map();
 	registry.projectSettings.set(projectSettingsPath(ctx.cwd), trusted);
+	clearPackageConfigCache();
 }
 
 function projectSettingsTrusted(settingsPath: string): boolean {
@@ -70,21 +71,27 @@ function piSettingsPaths(cwd = process.cwd()): string[] {
 	return projectSettingsTrusted(project) ? [user, project] : [user];
 }
 
-let cachedPackageConfig: { packageId: string; fingerprint: string; merged: Record<string, unknown> } | undefined;
+/** How long a merged config is served before the settings files are read again.
+ * Renderers read settings many times per frame; going to the disk on each read
+ * kept a long session's render loop busy. */
+export const SETTINGS_RECHECK_MS = 1000;
 
-/** Per candidate: path + stat stamp, so two roots can never share a cache entry. */
-function settingsFingerprint(packageId: string, settingsPaths: string[]): string {
-	return JSON.stringify([packageId, ...settingsPaths.map((settingsPath) => {
-		try { const { mtimeMs, size } = statSync(settingsPath); return [settingsPath, mtimeMs, size]; } catch { return [settingsPath, "missing"]; }
-	})]);
+/** Keyed by package id and cwd. `readAt` is `performance.now()`, a monotonic
+ * clock, so a backward wall-clock step cannot hold an entry past its window. */
+const packageConfigCache = new Map<string, { readAt: number; merged: Record<string, unknown> }>();
+
+/** Drops memoized configs so the next read goes back to disk. */
+export function clearPackageConfigCache(): void {
+	packageConfigCache.clear();
 }
 
-export function readPackageConfig(packageId: string, cwd?: string): Record<string, unknown> {
-	const settingsPaths = piSettingsPaths(cwd);
-	const fingerprint = settingsFingerprint(packageId, settingsPaths);
-	if (cachedPackageConfig && cachedPackageConfig.packageId === packageId && cachedPackageConfig.fingerprint === fingerprint) return cachedPackageConfig.merged;
+export function readPackageConfig(packageId: string, cwd = process.cwd()): Record<string, unknown> {
+	const cacheKey = `${packageId}\0${cwd}`;
+	const cached = packageConfigCache.get(cacheKey);
+	const now = performance.now();
+	if (cached && now - cached.readAt < SETTINGS_RECHECK_MS) return cached.merged;
 	const merged: Record<string, unknown> = {};
-	for (const settingsPath of settingsPaths) {
+	for (const settingsPath of piSettingsPaths(cwd)) {
 		if (!existsSync(settingsPath)) continue;
 		try {
 			const parsed = JSON.parse(readFileSync(settingsPath, "utf8"));
@@ -94,7 +101,7 @@ export function readPackageConfig(packageId: string, cwd?: string): Record<strin
 			// Ignore malformed optional manager config.
 		}
 	}
-	cachedPackageConfig = { packageId, fingerprint, merged };
+	packageConfigCache.set(cacheKey, { readAt: now, merged });
 	return merged;
 }
 
