@@ -1409,6 +1409,20 @@ stop_at "$TRANSCRIPT" false $(overseer_env)
 assert_eq "RC=$RC first=$(first_line) argv=$(judge_argv | tail -n 1) reason=$(grep -c 'home-unnamed' "$ERR_FILE")" \
   "RC=2 first=lane-mail-check: transcript-unowned=$TRANSCRIPT argv=--check-marks --harness claude reason=1" \
   "a record naming no launch home cannot bind the transcript, so context is unmeasured and the account mark decides" "$ERR_FILE"
+# That turn end still writes the overseer's context record, with no figure and
+# the gate's reason as its gap, so the record advances at every turn end and
+# oversee-watch can report why it carries no reading.
+gap_record() { jq -r '"\(.tokens) \(.gap) \(.pane_key)"' "$LANE/tmp/lane-mail/overseer/context.json" 2>/dev/null || echo none; }
+assert_eq "$(gap_record)" "null home-unnamed $OVERSEER_SERVER $OVERSEER_PANE" \
+  "and the context record is written with no reading, the gate's reason as its gap and this pane's key" "$ERR_FILE"
+variant no-gap-record -e '/^      \[ -z "\$READ_GAP" \] || overseer_gap_record "\$READ_GAP"$/d'
+install_hook "$VARIANT_PATH" "$LANE/.claude/hooks/lane-mail-check.sh"
+rm -f -- "${LANE:?}/tmp/lane-mail/overseer/context.json"
+# shellcheck disable=SC2046
+stop_at "$TRANSCRIPT" false $(overseer_env)
+assert_eq "$(gap_record)" "none" \
+  "control: a hook that writes no gap record leaves an unowned turn end recording nothing"
+install_hook "$HOOK" "$LANE/.claude/hooks/lane-mail-check.sh"
 # A Pi install states no transcript shape, so its overseer binds nothing and
 # reads the payload's own window as a Pi lane does; nothing is reported.
 new_overseer overseer_pi
@@ -1437,6 +1451,106 @@ stop $(overseer_env)
 assert_eq "argv=$(judge_argv | tail -n 1) unowned=$(grep -c '^lane-mail-check: transcript-unowned' "$ERR_FILE")" \
   "argv=--check-marks unowned=0" \
   "an overseer payload naming no transcript is read as unread, not reported unowned" "$ERR_FILE"
+assert_eq "$(gap_record)" "null transcript-unnamed $OVERSEER_SERVER $OVERSEER_PANE" \
+  "and its context record is written with the gap transcript-unnamed" "$ERR_FILE"
+# Every other overseer turn end that takes no reading writes the record too,
+# with the reader's word for why, and a usage object the adapter does not read
+# is reported under its own key as a lane's is: one row per word.
+overseer_gap_word() { # NAME TRANSCRIPT_LINE|- [INSTALL_DIR]
+  local cop_transcript="$TMP_ROOT/session-state/s1/events.jsonl"
+  new_overseer "$1"
+  printf '%s\n' "$2" > "$TRANSCRIPT"
+  if [ -n "${3:-}" ]; then
+    mkdir -p "$LANE/$3"
+    ln -s "$LANE/.claude/skills/orch" "$LANE/$3/skills"
+    install_hook "$HOOK" "$LANE/$3/hooks/lane-mail-check.sh"
+  fi
+  judge_says "$HEADROOM_MARK_LINE"
+  if [ "${3:-}" = .github ]; then
+    # Copilot's own agentStop, the lead's: its transcript sits in the
+    # directory named for the session.
+    # A TRANSCRIPT_LINE of `-` is an agentStop naming no transcript at all.
+    mkdir -p "${cop_transcript%/*}"
+    printf '%s\n' "$2" > "$cop_transcript"
+    [ "$2" != - ] || cop_transcript=""
+    # shellcheck disable=SC2046
+    run_payload "$(jq -nc --arg p "$cop_transcript" \
+      '{sessionId:"s1", timestamp:1, cwd:"/w", stopReason:"end_turn", stop_hook_active:false}
+        + (if $p == "" then {} else {transcriptPath:$p} end)')" \
+      $(overseer_env)
+  else
+    # shellcheck disable=SC2046
+    stop_at "$TRANSCRIPT" false $(overseer_env)
+  fi
+  printf 'record=%s unread=%s unlisted=%s' "$(gap_record)" \
+    "$(grep -cFx -- "lane-mail-check: usage-unread=$TRANSCRIPT" "$ERR_FILE")" \
+    "$(grep -c '^lane-mail-check: harness-unlisted=' "$ERR_FILE")"
+}
+assert_eq "$(overseer_gap_word overseer_usage_absent '{"type":"user"}')" \
+  "record=null usage-absent $OVERSEER_SERVER $OVERSEER_PANE unread=0 unlisted=0" \
+  "an overseer transcript holding no usage line writes the gap usage-absent" "$ERR_FILE"
+assert_eq "$(overseer_gap_word overseer_usage_unread "$(usage_line unread 900000)")" \
+  "record=null usage-unread $OVERSEER_SERVER $OVERSEER_PANE unread=1 unlisted=0" \
+  "a usage object the adapter does not read writes the gap usage-unread and is reported under its own key" "$ERR_FILE"
+# An install whose harness no adapter reads, one naming none and Copilot's,
+# reports that under harness-unlisted and writes no gap: its context is never
+# read, so a gap would stand at every turn end for the session's life.
+# The harness is decided before the payload's transcript, so an agentStop
+# naming none writes no gap either, and says nothing: there is no transcript
+# to go unread.
+while IFS='|' read -r name install line expected what; do
+  assert_eq "$(overseer_gap_word "$name" "$line" "$install")" "$expected" \
+    "$what writes no gap record" "$ERR_FILE"
+done <<INSTALLS
+overseer_unlisted_other|.other|$(usage_line claude 600000)|record=none unread=0 unlisted=1|an install naming no harness reports harness-unlisted and
+overseer_unlisted_github|.github|$(usage_line claude 600000)|record=none unread=0 unlisted=1|a Copilot install reports harness-unlisted and
+overseer_unlisted_untranscribed|.github|-|record=none unread=0 unlisted=0|a Copilot agentStop naming no transcript
+INSTALLS
+variant unlisted-late -e '/^  if \[ -z "\$HARNESS" \] || \[ "\$HARNESS" = copilot \]; then$/,/^  fi$/d'
+HOOK_SAVED="$HOOK"
+HOOK="$VARIANT_PATH"
+assert_eq "$(overseer_gap_word control_unlisted_late - .github)" \
+  "record=null transcript-unnamed $OVERSEER_SERVER $OVERSEER_PANE unread=0 unlisted=0" \
+  "control: a hook that decides the harness after the transcript names a gap for Copilot at every turn end"
+HOOK="$HOOK_SAVED"
+variant no-overseer-unread -e 's/^          "\$LANE_CONTEXT_UNREAD") message usage-unread "\$TRANSCRIPT" ;;$/          "$LANE_CONTEXT_UNREAD") ;;/'
+HOOK_SAVED="$HOOK"
+HOOK="$VARIANT_PATH"
+assert_eq "$(overseer_gap_word control_overseer_unread "$(usage_line unread 900000)")" \
+  "record=null usage-unread $OVERSEER_SERVER $OVERSEER_PANE unread=0 unlisted=0" \
+  "control: an overseer arm that drops the usage-unread report leaves the unread figure silent on stderr"
+HOOK="$HOOK_SAVED"
+write_transcript "$TRANSCRIPT" "${OVERSEER_CONTEXT%%:*}"
+# A gap record that cannot be written is reported under its own key, which
+# says no reading was taken, and the record keeps its earlier entry.
+FAIL_MV_BIN="$TMP_ROOT/fail-mv-bin"; mkdir -p "$FAIL_MV_BIN"
+cat > "$FAIL_MV_BIN/mv" <<FAILMV
+#!/usr/bin/env bash
+case "\${!#}" in
+  */context.json) printf '%s\n' 'fixture context write failed' >&2; exit 1 ;;
+esac
+exec "$(command -v mv)" "\$@"
+FAILMV
+chmod +x "$FAIL_MV_BIN/mv"
+gap_unwritten() {
+  new_overseer "$1"
+  (cd "$LANE" && "$REPO_ROOT/skills/orch/scripts/workflow-state" set oversee overseer \
+    "$(jq -nc --arg s "$OVERSEER_SERVER" --arg p "$OVERSEER_PANE" '{server:$s,pane:$p,window:"@7"}')" >/dev/null)
+  judge_says "$HEADROOM_MARK_LINE"
+  # shellcheck disable=SC2046
+  stop_at "$TRANSCRIPT" false $(overseer_env) "PATH=$FAIL_MV_BIN:$TMUX_BIN:$PATH"
+  printf 'key=%s cause=%s record=%s' \
+    "$(grep -cFx -- "lane-mail-check: context-gap-unrecorded=$LANE/tmp/lane-mail/overseer/context.json" "$ERR_FILE")" \
+    "$(grep -cFx 'fixture context write failed' "$ERR_FILE")" "$(gap_record)"
+}
+assert_eq "$(gap_unwritten overseer_gap_unwritten)" "key=1 cause=1 record=none" \
+  "a gap record that cannot be written is reported under its own key with the cause below it" "$ERR_FILE"
+variant gap-key-shared -e 's/^    message context-gap-unrecorded /    message context-unrecorded /'
+HOOK_SAVED="$HOOK"
+HOOK="$VARIANT_PATH"
+assert_eq "$(gap_unwritten control_gap_unwritten)" "key=0 cause=1 record=none" \
+  "control: a gap write failure reported under the reading's key says a reading was taken"
+HOOK="$HOOK_SAVED"
 # Control: with the ownership gate gone the predecessor's foreign file is read
 # and its reading handed to the judge, the very thing the gate prevents.
 new_overseer overseer_binding_control
@@ -1615,6 +1729,73 @@ expect 0 - "a session outside tmux has no pane to be the overseer's"
 stop_at "$TRANSCRIPT" false $(overseer_env)
 assert_eq "RC=$RC first=$(first_line) judged=$(judge_calls)" "RC=0 first=- judged=0" \
   "a fleet state recording no overseer names nobody, so nobody is judged"
+
+# The overseer the fleet record lost: the record names another pane, while the
+# overseer's context record names this one, which only its own turn ends
+# write. Its turn end is judged on no mark, reports the gap under its own key
+# with the recorded pane key under it, and still writes the context record,
+# with no figure and the gap `pane-unrecorded`, turn after turn. A session in
+# a third pane the context record does not name is an ordinary one and writes
+# nothing over it.
+new_overseer overseer_unrecorded
+judge_says "$HEADROOM_MARK_LINE"
+# shellcheck disable=SC2046
+stop_at "$TRANSCRIPT" false $(overseer_env)
+record_overseer %4 "$OVERSEER_SERVER"
+unrecorded_rows() { # CALLER_PANE
+  # shellcheck disable=SC2046
+  stop_at "$TRANSCRIPT" false $(overseer_env "$1")
+  printf 'RC=%s first=%s recorded=%s judged=%s record=%s' "$RC" "$(first_line)" \
+    "$(grep -cFx -- "$OVERSEER_SERVER %4" "$ERR_FILE")" "$(judge_calls)" "$(gap_record)"
+}
+assert_eq "$(unrecorded_rows "$OVERSEER_PANE")" \
+  "RC=0 first=lane-mail-check: pane-unrecorded=$OVERSEER_SERVER $OVERSEER_PANE recorded=1 judged=1 record=null pane-unrecorded $OVERSEER_SERVER $OVERSEER_PANE" \
+  "a session whose own reading the context record holds, and the fleet record no longer names, reports it and writes the gap" "$ERR_FILE"
+assert_eq "$(unrecorded_rows "$OVERSEER_PANE")" \
+  "RC=0 first=lane-mail-check: pane-unrecorded=$OVERSEER_SERVER $OVERSEER_PANE recorded=1 judged=1 record=null pane-unrecorded $OVERSEER_SERVER $OVERSEER_PANE" \
+  "and does so again at its next turn end, over its own gap record" "$ERR_FILE"
+assert_eq "$(unrecorded_rows %3)" \
+  "RC=0 first=- recorded=0 judged=1 record=null pane-unrecorded $OVERSEER_SERVER $OVERSEER_PANE" \
+  "a session in a pane neither record names is ordinary and writes nothing over the overseer's record" "$ERR_FILE"
+variant any-pane-unrecorded -e '/^  \[ "\$LANE_CTX_PANE_KEY" = "\$CALLER_KEY" \] || return 0$/d'
+install_hook "$VARIANT_PATH" "$LANE/.claude/hooks/lane-mail-check.sh"
+assert_eq "$(unrecorded_rows %3)" \
+  "RC=0 first=lane-mail-check: pane-unrecorded=$OVERSEER_SERVER %3 recorded=1 judged=1 record=null pane-unrecorded $OVERSEER_SERVER %3" \
+  "control: without the pane test an ordinary session overwrites the overseer's record"
+variant no-unrecorded -e 's/^      overseer_unrecorded$/      :/'
+install_hook "$VARIANT_PATH" "$LANE/.claude/hooks/lane-mail-check.sh"
+record_overseer "$OVERSEER_PANE" "$OVERSEER_SERVER"
+# shellcheck disable=SC2046
+stop_at "$TRANSCRIPT" false $(overseer_env)
+record_overseer %4 "$OVERSEER_SERVER"
+assert_eq "$(unrecorded_rows "$OVERSEER_PANE")" \
+  "RC=0 first=- recorded=0 judged=2 record=600000 null $OVERSEER_SERVER $OVERSEER_PANE" \
+  "control: a hook that skips the lost overseer leaves its record standing, stale and silent"
+install_hook "$HOOK" "$LANE/.claude/hooks/lane-mail-check.sh"
+# A fleet state that cannot be read names no pane at all: the session whose
+# reading the context record holds is not taken for the overseer the record
+# lost, and its record stands as it was.
+state_unread() { # NAME
+  new_overseer "$1"
+  judge_says "$HEADROOM_MARK_LINE"
+  # shellcheck disable=SC2046
+  stop_at "$TRANSCRIPT" false $(overseer_env)
+  plant_install workflow-state
+  printf '#!/bin/sh\ncase "$1" in\n  path) echo "%s/tmp/workflow-state-oversee.json" ;;\n  *) echo "workflow-state: lock-failed lock-file=x" >&2; exit 3 ;;\nesac\n' "$LANE" \
+    > "$LANE/.claude/skills/orch/scripts/workflow-state"
+  chmod +x "$LANE/.claude/skills/orch/scripts/workflow-state"
+  # shellcheck disable=SC2046
+  stop_at "$TRANSCRIPT" false $(overseer_env)
+  printf 'RC=%s first=%s record=%s' "$RC" "$(first_line)" "$(gap_record)"
+}
+assert_eq "$(state_unread overseer_state_unread)" "RC=0 first=- record=600000 null $OVERSEER_SERVER $OVERSEER_PANE" \
+  "a fleet state that cannot be read writes no pane-unrecorded gap over the overseer's reading" "$ERR_FILE"
+variant ungated-unrecorded -e '/^  \[ "\$OVERSEER_UNRECORDED" -eq 1 \] || return 0$/d'
+HOOK_SAVED="$HOOK"
+HOOK="$VARIANT_PATH"
+assert_eq "$(state_unread control_state_unread | cut -d' ' -f1)" "RC=1" \
+  "control: without the unrecorded gate a fleet state that cannot be read reaches the lost-overseer path"
+HOOK="$HOOK_SAVED"
 
 # The mailbox rules are untouched: an overseer's checkout carries the fleet's
 # own mailbox directory, and its branch names no mailbox in it.
@@ -2360,7 +2541,7 @@ assert_eq "unowned=$(grep -c '^lane-mail-check: transcript-unowned' "$ERR_FILE")
 # The overseer identification's control: the pane comparison removed, so any
 # session with no lane is taken for the overseer. An ordinary session in a
 # fleet checkout is then held at its own turn end on marks nobody set for it.
-mutant any-session-overseer -e 's@^  \[ "\$RECORDED_KEY" = "\$CALLER_KEY" \] || return 1$@  :@'
+mutant any-session-overseer -e 's@^  if \[ "\$RECORDED_KEY" != "\$CALLER_KEY" \]; then$@  if false; then@'
 new_overseer control_any_session
 install_hook "$MUTANT_PATH" "$LANE/.claude/hooks/lane-mail-check.sh"
 judge_says "$CONTEXT_MARK_LINE"
