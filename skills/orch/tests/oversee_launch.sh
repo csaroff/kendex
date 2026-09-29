@@ -4,8 +4,9 @@
 # record for a session a person opened by hand. Run over a real tmux server at
 # the person's default socket under a private TMUX_TMPDIR, so a run with no
 # $TMUX and ORCH_TMUX_SESSION set reaches it the way lib/tmux-server.sh says a
-# verb outside tmux reaches the person's own server. claude and kendex are
-# stubs on PATH, and `lanes pick` answers from the lanes-fixture usage bodies.
+# verb outside tmux reaches the person's own server. claude, codex and
+# copilot are stubs on PATH, and `lanes pick` answers from the lanes-fixture
+# usage bodies.
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib/git-env.sh"
 # shellcheck source=lib/lanes-fixture.sh
@@ -61,16 +62,6 @@ if [ -f "$TMP_ROOT/row" ]; then
 fi
 exec sleep 100000
 STUB
-cat > "$BIN/kendex" <<'STUB'
-#!/bin/sh
-case "$1:$2:$3" in
-  tier-model:claude:1) echo fable ;;
-  tier-model:claude:3) echo claude-sonnet-4-6 ;;
-  tier-model:codex:1) echo gpt-6-astra ;;
-  tier-model:codex:2) echo gpt-5.6-sol ;;
-  *) exit 1 ;;
-esac
-STUB
 # The codex harness, recording its home and argv as the claude stub does.
 cat > "$BIN/codex" <<STUB
 #!/bin/sh
@@ -78,7 +69,7 @@ cat > "$BIN/codex" <<STUB
 echo 'esc to interrupt'
 exec sleep 100000
 STUB
-chmod +x "$BIN/claude" "$BIN/codex" "$BIN/kendex"
+chmod +x "$BIN/claude" "$BIN/codex"
 # A pane whose foreground process names claude, for `register` to read the
 # harness off: a copy of sleep, since a script or a shell named for the
 # harness can reset the process name tmux reads.
@@ -105,10 +96,10 @@ TMUX_ADDR="$(tm display-message -p '#{socket_path},#{pid},0')"
 # run_oversee ENV=VAL... -- ARGS... — the script under an explicit, whole
 # environment with no $TMUX, from the work directory workflow-state resolves
 # `tmp` under, or from RUN_DIR where a row sets it. ORCH_OVERSEER_PREFERENCE is
-# claude:1:high, or LAUNCH_PREF where a row sets it, `unset` exporting none.
+# claude:fable:high, or LAUNCH_PREF where a row sets it, `unset` exporting none.
 # Sets OUT (both streams) and RC.
 run_oversee() {
-  local env_args=() pref=(ORCH_OVERSEER_PREFERENCE="${LAUNCH_PREF:-claude:1:high}")
+  local env_args=() pref=(ORCH_OVERSEER_PREFERENCE="${LAUNCH_PREF:-claude:fable:high}")
   [[ "${LAUNCH_PREF:-}" != unset ]] || pref=()
   while [[ $# -gt 0 && "$1" != -- ]]; do env_args+=("$1"); shift; done
   shift
@@ -266,8 +257,8 @@ assert_eq "$RC|$(keyed overseer-not-working "$OUT" | sed -n 1p | sed 's/session=
 for row in \
   "ORCH_OVERSEER_PREFERENCE=|preference-empty setting=ORCH_OVERSEER_PREFERENCE|an empty preference" \
   "ORCH_OVERSEER_PREFERENCE=claude:Opus:high|invalid-preference entry=claude:Opus:high|an entry outside the shape" \
-  "ORCH_OVERSEER_PREFERENCE=codex:gpt-5.6-sl:high|model-failed entry=codex:gpt-5.6-sl:high|a codex model name the tier ladder does not name" \
-  "ORCH_OVERSEER_PREFERENCE=claude:3:high|model-window-unknown entry=claude:3:high model=claude-sonnet-4-6|a claude model the adapter names no window for" \
+  "ORCH_OVERSEER_PREFERENCE=claude:1:high|invalid-preference entry=claude:1:high|an entry naming no model, a tier rank" \
+  "ORCH_OVERSEER_PREFERENCE=claude:claude-sonnet-4-6:high|model-window-unknown entry=claude:claude-sonnet-4-6:high model=claude-sonnet-4-6|a claude model the adapter names no window for" \
   "ORCH_TMUX_SESSION=|session-unresolved consulted=--session,ORCH_TMUX_SESSION|no session named" \
   "ORCH_TMUX_SESSION=fleetz|tmux-session-missing session=fleetz server=$SOCKET|a session tmux does not hold" \
   "ORCH_OVERSEER_HOST=$TMP_ROOT/other|runtime-unsupported host=$TMP_ROOT/other|a runtime other than tmux" \
@@ -429,7 +420,7 @@ assert_eq "$RC|$(recorded_argv)" \
 tm kill-window -t "$(recorded window)"
 
 # A fleet whose settings name no preference: the first launch walks the default
-# ladder and opens on its Fable rung, a model name the tier ladder knows.
+# ladder and opens on its Fable rung.
 LAUNCH_PREF=unset run_oversee -- launch --wait-secs 20
 assert_eq "$RC|$(recorded model)|$(recorded_argv)" \
   "0|fable|lane=$H/.claude;-n;overseer;--model;fable;--effort;high;$BYPASS;$COMPACT;$QUESTION_OFF;$BRIEF;" \
@@ -440,7 +431,7 @@ tm kill-window -t "$(recorded window)"
 # permission word to open pi unattended, so the first launch skips it before
 # its pick and opens on the claude entry.
 pi_first_row() { # [OVERSEE_BIN]
-  OVERSEE_BIN="${1:-}" LAUNCH_PREF='pi:openai/gpt-5:high,claude:1:high' run_oversee -- launch --wait-secs 20
+  OVERSEE_BIN="${1:-}" LAUNCH_PREF='pi:openai/gpt-5:high,claude:fable:high' run_oversee -- launch --wait-secs 20
 }
 pi_first_row
 assert_eq "$RC|$(keyed entry-permission-unwritable "$OUT" | sed -n 1p)|$(recorded harness)|$(recorded model)" \
@@ -453,6 +444,44 @@ mutate_file "$PIFIRSTCTL/lib/overseer-launch.sh" '    launch_choice_permission_w
 pi_first_row "$PIFIRSTCTL/oversee"
 assert_eq "$RC|$(sed -n 1p <<<"$OUT" | awk '{print $2, $3}')|$(overseers)" "1|launch-choice-failed entry=pi:openai/gpt-5:high|0" \
   "control: a first launch that chooses the pi entry refuses and opens nothing"
+
+# A first launch on a copilot entry: `lanes pick --harness copilot` judges a
+# Copilot account on its monthly pool, so the overseer opens on the account
+# the pick names, under COPILOT_HOME, with the model and effort the entry
+# names and copilot's full-bypass word. The account's status line writes the
+# session record the overseer's context is read from.
+cat > "$BIN/copilot" <<STUB
+#!/bin/sh
+{ printf 'home=%s\n' "\${COPILOT_HOME:-}"; printf '%s\n' "\$@"; } > "$TMP_ROOT/argv.copilot"
+echo 'esc to interrupt'
+exec sleep 100000
+STUB
+chmod +x "$BIN/copilot"
+COP_SL="$TMP_ROOT/sl/copilot-statusline"
+mkdir -p "$TMP_ROOT/sl" "$H/.1copilot"
+printf '#!/bin/sh\n' > "$COP_SL"
+chmod +x "$COP_SL"
+printf '{"copilot_tokens":"gho_fixture"}\n' > "$H/.1copilot/config.json"
+printf '{"statusLine":{"type":"command","command":"%s","refreshInterval":30}}\n' "$COP_SL" > "$H/.1copilot/settings.json"
+printf '%s\n' '{"quota_snapshots":{"premium_interactions":{"entitlement":1000,"remaining":900}}}' > "$FIXTURE_DIR/.1copilot.json"
+copilot_first_row() { # [OVERSEE_BIN]
+  OVERSEE_BIN="${1:-}" LAUNCH_PREF='copilot:gpt-5.3-codex:high' \
+    run_oversee ORCH_LANE_DIRS="$H/.claude:$H/.eclaude:$H/.1copilot" -- launch --wait-secs 20
+}
+copilot_first_row
+assert_eq "$RC|$(recorded harness)|$(recorded account)|$(recorded model)|$(recorded effort)|$(sed -n 1p "$TMP_ROOT/argv.copilot" 2>/dev/null)|$(grep -cx -e --model -e gpt-5.3-codex -e --reasoning-effort -e high -e "$(launch_choice_permission_write copilot)" "$TMP_ROOT/argv.copilot" 2>/dev/null)" \
+  "0|copilot|$H/.1copilot|gpt-5.3-codex|high|home=$H/.1copilot|5" \
+  "a first launch on a copilot entry opens on the picked copilot account with its model and effort"
+tm kill-window -t "$(recorded window)"
+# Its control: a preference parse naming no copilot refuses the entry and
+# opens nothing.
+COPILOTFIRSTCTL="$(mutant_scripts copilotfirstctl lib/overseer-launch.sh)" || exit 1
+mutate_file "$COPILOTFIRSTCTL/lib/overseer-launch.sh" \
+  '    [[ "$entry" =~ ^(claude|codex|copilot):[a-z][a-z0-9.-]*:[a-z]+$ \' \
+  '    [[ "$entry" =~ ^(claude|codex):[a-z][a-z0-9.-]*:[a-z]+$ \'
+copilot_first_row "$COPILOTFIRSTCTL/oversee"
+assert_eq "$RC|$(sed -n 1p <<<"$OUT" | awk '{print $2, $3}')|$(overseers)" "1|invalid-preference entry=copilot:gpt-5.3-codex:high|0" \
+  "control: a preference parse naming no copilot refuses the copilot entry and opens nothing"
 
 # The writer's control: a record write that leaves the launch identity out,
 # over a fleet with no prior record, records a session nothing says the
@@ -812,7 +841,7 @@ codex_usage() { # USED_PCT
     > "$FIXTURE_DIR/.codex.json"
 }
 codex_usage 20
-LAUNCH_PREF=codex:2:high run_oversee ORCH_LANE_DIRS="$H/.claude:$H/.eclaude:$H/.codex" -- launch --wait-secs 20
+LAUNCH_PREF=codex:gpt-5.6-sol:high run_oversee ORCH_LANE_DIRS="$H/.claude:$H/.eclaude:$H/.codex" -- launch --wait-secs 20
 codex_words() { # the table's words for a codex launch, one per line
   printf '%s\n' -m gpt-5.6-sol -c model_reasoning_effort=high
   eval "printf '%s\n' $(launch_choice_permission_write codex)"

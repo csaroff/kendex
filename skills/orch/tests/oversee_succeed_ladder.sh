@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Tests for the model ladder oversee-succeed's successor walk takes: each
-# ORCH_OVERSEER_PREFERENCE entry names the model its successor runs, the pick
-# is judged on the bucket that walls that model, and an unset setting walks
-# lib/overseer-launch.sh's default ladder. Run over a real tmux server on a
-# private socket, as oversee_succeed.sh is; claude, codex, pi and kendex are stubs
-# on PATH, and `lanes pick` answers from the lanes-fixture usage bodies. The
+# ORCH_OVERSEER_PREFERENCE entry names the model its successor runs, on
+# claude, codex, copilot or pi, the pick is judged on the bucket that walls
+# that model, the walk takes the setting's order and no other, and an unset
+# setting walks lib/overseer-launch.sh's default. Run over a real tmux server
+# on a private socket, as oversee_succeed.sh is; claude, codex, copilot and pi
+# are stubs on PATH, and `lanes pick` answers from the lanes-fixture usage
+# bodies. The
 # caller's own account is walled for the model it runs in every row, so every
 # row reaches the headroom mark, or is the wall recovery, and walks.
 set -euo pipefail
@@ -45,9 +47,10 @@ mkdir -p "$BIN" "$TMP_ROOT/work/tmp"
 # A harness stub records its lane and argv and draws the hint a running turn
 # shows, so the successor reads as working. A pi successor runs on claude's
 # account variable, the one the pi-claude bridge reads.
-for harness in claude codex pi; do
+for harness in claude codex copilot pi; do
   lane_var=CLAUDE_CONFIG_DIR
   [[ "$harness" != codex ]] || lane_var=CODEX_HOME
+  [[ "$harness" != copilot ]] || lane_var=COPILOT_HOME
   cat > "$BIN/$harness" <<STUB
 #!/bin/sh
 { printf 'lane=%s\n' "\${$lane_var:-}"; printf '%s\n' "\$@"; } > "$TMP_ROOT/argv.$harness"
@@ -55,23 +58,7 @@ echo 'esc to interrupt'
 exec sleep 100000
 STUB
 done
-# The tier ladder as `kendex tier-model` answers it, four ranks on each
-# harness and a refusal past the fourth.
-cat > "$BIN/kendex" <<'STUB'
-#!/bin/sh
-case "$1:$2:$3" in
-  tier-model:claude:1) echo fable ;;
-  tier-model:claude:2) echo opus ;;
-  tier-model:claude:3) echo sonnet ;;
-  tier-model:claude:4) echo haiku ;;
-  tier-model:codex:1) echo gpt-6-astra ;;
-  tier-model:codex:2) echo gpt-5.6-sol ;;
-  tier-model:codex:3) echo gpt-5.6-terra ;;
-  tier-model:codex:4) echo gpt-5.6-luna ;;
-  *) exit 1 ;;
-esac
-STUB
-chmod +x "$BIN/claude" "$BIN/codex" "$BIN/pi" "$BIN/kendex"
+chmod +x "$BIN/claude" "$BIN/codex" "$BIN/copilot" "$BIN/pi"
 # A caller whose foreground process names claude: a copy of sleep, since a
 # script or a shell named for the harness can reset the name tmux reads.
 cp "$(command -v sleep)" "$BIN/hclaude"
@@ -148,7 +135,8 @@ new_caller() {
 # environment from the caller pane, ARGS ahead of its flags. The caller runs
 # under full bypass on .claude, the one permission posture a successor of the
 # other harness takes, unless CALLER_LANE names its account variable and
-# CALLER_FLAGS its flags. PREFERENCE `unset` exports no
+# CALLER_FLAGS its flags. The fleet is the claude and codex accounts, or
+# LANE_DIRS where a row sets it. PREFERENCE `unset` exports no
 # ORCH_OVERSEER_PREFERENCE. Sets OUT (both streams) and RC.
 CALLER_FLAGS=("$BYPASS")
 run_succeed() {
@@ -159,7 +147,7 @@ run_succeed() {
   OUT="$(cd "$TMP_ROOT/work" && env -i HOME="$H" PATH="$BIN:$PATH" TMUX="$TMUX_ADDR" TMUX_PANE="$CALLER_PANE" \
     LANES_HOME="$H" FIXTURE_DIR="$FIXTURE_DIR" OVERSEE_WATCH_STATE_DIR="$TMP_ROOT/state-$row" \
     "$lane" ORCH_LANES_FETCH_CMD="$FETCHER" \
-    ORCH_LANE_DIRS="$H/.claude:$H/.eclaude:$H/.fclaude:$H/.codex:$H/.dcodex" ORCH_LANES_USAGE_TTL=0 \
+    ORCH_LANE_DIRS="${LANE_DIRS:-$H/.claude:$H/.eclaude:$H/.fclaude:$H/.codex:$H/.dcodex}" ORCH_LANES_USAGE_TTL=0 \
     ORCH_OVERSEER_WALL_MINUTES=0 ORCH_OVERSEER_SUCCESSOR_ACCOUNTS=0 ORCH_QUESTION_TOOL=overseer \
     ${pref[@]+"${pref[@]}"} "${SUCCEED_BIN:-$SUCCEED}" --wait-secs 20 "$@" -- "${CALLER_FLAGS[@]}" 2>&1)" || RC=$?
 }
@@ -238,22 +226,33 @@ assert_eq "$RC|$(keyed successor-lane-spent | awk '{print $2, $4}')|$(caller_ope
   "control: a walled pick that keeps the walled account drops the Opus entry"
 seat claude 10 99 99
 
-# The issue's control on the same fleet: a ladder with no model dimension walks
-# Fable alone and then the caller's own harness on the model it already runs,
-# so the walk refuses with a seat that has Opus room standing.
+# An entry naming no model, a bare tier rank or an empty field, is a setting
+# to fix: refused with a keyed line before any pick, on a fleet with Opus room.
+for entry in 'claude:1:high' 'claude::high' 'codex:high' 'copilot:2:high'; do
+  new_caller
+  run_succeed nomodelentry "$entry"
+  assert_eq "$RC|$(keyed invalid-preference | awk '{print $2, $3}')|$(caller_open)|$(launched claude)" \
+    "1|invalid-preference entry=$entry|yes|none" \
+    "an entry naming no model, $entry, refuses invalid-preference"
+done
+# Its control: a parse that reads a bare number as a model admits the rank
+# entry, which then fails somewhere other than the parse.
+RANKCTL="$(mutant_scripts rankctl lib/overseer-launch.sh)" || exit 1
+mutate_file "$RANKCTL/lib/overseer-launch.sh" \
+  '    [[ "$entry" =~ ^(claude|codex|copilot):[a-z][a-z0-9.-]*:[a-z]+$ \' \
+  '    [[ "$entry" =~ ^(claude|codex|copilot):([1-9][0-9]*|[a-z][a-z0-9.-]*):[a-z]+$ \'
 new_caller
-run_succeed rankonly 'claude:1:high'
-assert_eq "$RC|$(first_key)|$(caller_open)|$(launched claude)" \
-  "3|no-lane-qualifies|yes|none" \
-  "a ladder with no model dimension refuses no-lane-qualifies on a fleet with Opus room"
+SUCCEED_BIN="$RANKCTL/oversee-succeed" run_succeed rankctl 'claude:1:high'
+assert_eq "$(keyed invalid-preference)" "none" \
+  "control: a parse that reads a bare number as a model admits the rank entry"
 
 # The ladder's must-fail control: a walk that reads an entry's model name as no
 # model judges each seat on its binding bucket, the Fable window, and refuses
 # the same fleet the default ladder succeeds on.
 NOMODEL="$(mutant_scripts nomodel lib/overseer-launch.sh)" || exit 1
 mutate_file "$NOMODEL/lib/overseer-launch.sh" \
-  '      "codex:$known"|"claude:"*"$known"*) return 0 ;;' \
-  '      "codex:$known"|"claude:"*"$known"*) OL_ENTRY_MODEL=""; return 0 ;;'
+  '  IFS=: read -r OL_ENTRY_HARNESS OL_ENTRY_MODEL OL_ENTRY_EFFORT <<<"$1"' \
+  '  IFS=: read -r OL_ENTRY_HARNESS _ OL_ENTRY_EFFORT <<<"$1"; OL_ENTRY_MODEL=""'
 new_caller
 SUCCEED_BIN="$NOMODEL/oversee-succeed" run_succeed nomodel unset
 assert_eq "$RC|$(first_key)|$(caller_open)|$(launched claude)" \
@@ -284,34 +283,71 @@ assert_eq "$RC|$(launched claude)" \
   "0|$H/.eclaude claude-opus-5-5" \
   "the same fleet with no claim takes the first seat"
 
-# Every claude seat walled for every model: the ladder reaches codex on
-# GPT-5.6 Sol.
+# Every claude seat walled for every model: the default reaches codex on
+# GPT-6 Astra, the owner's third entry, ahead of GPT-5.6 Sol.
 seat eclaude 99 99 10
 seat fclaude 99 99 10
 codex_seat codex 20
 new_caller
 run_succeed codex unset
 assert_eq "$RC|$(caller_open)|$(launched claude)|$(launched codex | awk '{print $2}')|$(grep -cx 'model_reasoning_effort=high' "$TMP_ROOT/argv.codex")" \
-  "0|no|none|gpt-5.6-sol|1" \
-  "every claude entry walled: the ladder reaches codex on GPT-5.6 Sol"
+  "0|no|none|gpt-6-astra|1" \
+  "every claude entry walled: the default reaches codex on GPT-6 Astra"
 
-# A model name the tier ladder does not know is a setting to fix, refused
-# before any pick as a rank past the ladder is, on a fleet whose codex seat
-# has room: the misspelling never reaches a launch line.
+# The setting is the one list of models: a codex model no tier ladder and no
+# script names launches as the setting writes it.
 new_caller
-run_succeed misspelled 'codex:gpt-5.6-sl:high'
-assert_eq "$RC|$(first_key) $(sed -n 1p <<<"$OUT" | awk '{print $3}')|$(caller_open)|$(launched codex)" \
-  "1|model-failed entry=codex:gpt-5.6-sl:high|yes|none" \
-  "a codex model name the tier ladder does not name refuses model-failed"
-# Its control: an entry reader that takes every name as written launches the
-# misspelled model.
-NAMECTL="$(mutant_scripts namectl lib/overseer-launch.sh)" || exit 1
-mutate_file "$NAMECTL/lib/overseer-launch.sh" \
-  "  # Every rank until \`kendex tier-model\` refuses one past the ladder's end." '  return 0'
-new_caller
-SUCCEED_BIN="$NAMECTL/oversee-succeed" run_succeed namectl 'codex:gpt-5.6-sl:high'
-assert_eq "$RC|$(launched codex | awk '{print $2}')" "0|gpt-5.6-sl" \
-  "control: an entry reader that skips the name check launches the misspelled model"
+run_succeed unlisted 'codex:gpt-7-nova:high'
+assert_eq "$RC|$(launched codex | awk '{print $2}')" "0|gpt-7-nova" \
+  "a codex model no list names launches as the setting writes it"
+
+# The order is the setting's alone: an edited order, codex first, opens on
+# codex although a claude seat has Fable room, with no code change.
+seat fclaude 10 10 10
+order_row() { # [SUCCEED_BIN]
+  new_caller
+  SUCCEED_BIN="${1:-}" run_succeed "order${1:+ctl}" 'codex:gpt-5.6-sol:high,claude:fable:high'
+}
+order_row
+assert_eq "$RC|$(launched claude)|$(launched codex | awk '{print $2}')" "0|none|gpt-5.6-sol" \
+  "an edited order is walked in the setting's order"
+# Its control: a walk that reads a built-in order in place of the setting
+# opens on Fable, the built-in first entry, and ignores the edit.
+ORDERCTL="$(mutant_scripts orderctl lib/overseer-launch.sh)" || exit 1
+mutate_file "$ORDERCTL/lib/overseer-launch.sh" \
+  '"${ORCH_OVERSEER_PREFERENCE-$OL_DEFAULT_PREFERENCE}"' '"$OL_DEFAULT_PREFERENCE"'
+order_row "$ORDERCTL/oversee-succeed"
+assert_eq "$RC|$(launched claude | awk '{print $2}')|$(launched codex)" "0|fable|none" \
+  "control: a walk on a built-in order ignores the edited setting"
+
+# A copilot entry: `lanes pick --harness copilot` judges a Copilot account on
+# its monthly pool, so the entry opens on the account the pick names, its
+# status line writing the session record the successor's context is read
+# from, with the model and effort the entry names and the full-bypass word
+# copilot's row writes for the claude caller's.
+COP_SL="$TMP_ROOT/sl/copilot-statusline"
+mkdir -p "$TMP_ROOT/sl" "$H/.1copilot"
+printf '#!/bin/sh\n' > "$COP_SL"
+chmod +x "$COP_SL"
+printf '{"copilot_tokens":"gho_fixture"}\n' > "$H/.1copilot/config.json"
+printf '{"statusLine":{"type":"command","command":"%s","refreshInterval":30}}\n' "$COP_SL" > "$H/.1copilot/settings.json"
+printf '%s\n' '{"quota_snapshots":{"premium_interactions":{"entitlement":1000,"remaining":900}}}' > "$FIXTURE_DIR/.1copilot.json"
+copilot_row() { # [SUCCEED_BIN]
+  new_caller
+  LANE_DIRS="$H/.claude:$H/.eclaude:$H/.fclaude:$H/.codex:$H/.dcodex:$H/.1copilot" \
+    SUCCEED_BIN="${1:-}" run_succeed "copilot${1:+ctl}" 'copilot:gpt-5.3-codex:high'
+}
+copilot_row
+assert_eq "$RC|$(caller_open)|$(launched copilot)|$(grep -cx -e --reasoning-effort -e high -e "$(launch_choice_permission_write copilot)" "$TMP_ROOT/argv.copilot")" \
+  "0|no|$H/.1copilot gpt-5.3-codex|3" \
+  "a copilot entry opens on the picked copilot account with its model and effort"
+# Its control: with `lanes` judging no copilot pick, the copilot entry has no
+# account to open on, and the walk refuses and opens nothing.
+COPILOTCTL="$(mutant_scripts copilotctl lib/lane-launch.sh)" || exit 1
+mutate_file "$COPILOTCTL/lib/lane-launch.sh" '    claude | codex | copilot) printf' '    claude | codex) printf'
+copilot_row "$COPILOTCTL/oversee-succeed"
+assert_eq "$RC|$(first_key)|$(launched copilot)" "1|lanes-failed|none" \
+  "control: with lanes judging no copilot pick the copilot entry refuses and opens nothing"
 
 # A codex overseer under a permission posture no claude word matches, the
 # setting unset: the ladder's claude entries are skipped before their picks,
@@ -324,7 +360,7 @@ new_caller codex
 CALLER_FLAGS=(-m gpt-5.6-sol -c model_reasoning_effort=high -a never)
 CALLER_LANE="CODEX_HOME=$H/.codex" run_succeed codexcaller unset
 assert_eq "$RC|$(keyed entry-permission-untransferable)|$(launched claude)|$(launched codex | sed "s|^$H/.dcodex[^ ]* |dcodex |")|$(grep -cx never "$TMP_ROOT/argv.codex")" \
-  "0|oversee-succeed: entry-permission-untransferable entry=claude:fable:high source=codex target=claude|none|dcodex gpt-5.6-sol|1" \
+  "0|oversee-succeed: entry-permission-untransferable entry=claude:fable:high source=codex target=claude|none|dcodex gpt-6-astra|1" \
   "a codex caller whose permission words cannot cross skips the claude entries and succeeds on codex"
 # Its control: a walk that chooses the claude entry anyway refuses after it,
 # launching nothing.
@@ -393,13 +429,29 @@ run_succeed pinomodel 'pi:fable:high' --walled-pane "$CALLER_PANE" --harness pi
 assert_eq "$RC|$(keyed invalid-preference | awk '{print $2, $3}')|$(caller_open)|$(launched pi)" \
   "1|invalid-preference entry=pi:fable:high|yes|none" \
   "a pi entry with no provider/id model refuses invalid-preference"
-# A pi-claude model the claude ladder does not name is a setting to fix,
-# refused before any pick as a misspelled claude name is.
-new_pi_caller
-run_succeed pibogus 'pi:pi-claude/claude-bogus:high' --walled-pane "$CALLER_PANE" --harness pi
-assert_eq "$RC|$(keyed model-failed | awk '{print $2, $3}')|$(caller_open)|$(launched pi)" \
-  "1|model-failed entry=pi:pi-claude/claude-bogus:high|yes|none" \
-  "a pi-claude entry naming a model the claude ladder does not know refuses model-failed"
+# A pi caller whose model is split across --provider and --model, handed to a
+# pi entry on another provider: the successor line is the entry's alone, its
+# model naming its own provider and no --provider word of the caller's beside
+# it, which would move the successor onto the caller's provider.
+CALLER_FLAGS=(--provider pi-claude --model claude-fable-5-1 --thinking high)
+pi_provider_row() { # [SUCCEED_BIN]
+  new_pi_caller
+  SUCCEED_BIN="${1:-}" run_succeed "piprovider${1:+ctl}" 'pi:openai-codex/gpt-5.6-terra:high' \
+    --walled-pane "$CALLER_PANE" --harness pi
+}
+pi_provider_row
+assert_eq "$RC|$(launched pi)|$(grep -cx -e --provider "$TMP_ROOT/argv.pi")" \
+  "0| openai-codex/gpt-5.6-terra|0" \
+  "a split --provider pi caller's successor on another provider carries no --provider word"
+# Its control: a strip that leaves the provider word keeps the caller's.
+PIPROVCTL="$(mutant_scripts piprovctl lib/lane-launch.sh)" || exit 1
+mutate_file "$PIPROVCTL/lib/lane-launch.sh" \
+  '  words="$(launch_choice_model_spellings "$1") $(launch_choice_provider_spelling "$1")"' \
+  '  words="$(launch_choice_model_spellings "$1")"'
+pi_provider_row "$PIPROVCTL/oversee-succeed"
+assert_eq "$RC|$(grep -cx -e --provider "$TMP_ROOT/argv.pi")" "0|1" \
+  "control: a strip that leaves the provider word hands the successor the caller's"
+CALLER_FLAGS=(--model pi-claude/claude-fable-5-1 --thinking high)
 
 # A pi-claude overseer nothing recorded, at its context mark with Fable room
 # on its own account: its --model word names the provider, so its successor

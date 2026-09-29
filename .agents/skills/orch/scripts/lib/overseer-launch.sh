@@ -11,11 +11,11 @@
 # and ol_session_inspect. What is shared is here:
 #
 #   ol_preference          the ORCH_OVERSEER_PREFERENCE value, its default
-#                          ladder where the setting is unset
+#                          where the setting is unset
 #   ol_preference_entries  the ORCH_OVERSEER_PREFERENCE parse
 #   ol_account             the account a session spends, as `lanes` judges it
 #   ol_pi_model            a pi session's model, out of the sources naming it
-#   ol_entry_model         one entry's harness, model and effort
+#   ol_entry_model         one entry's harness, model and effort, as written
 #   ol_lanes               `lanes` on this machine's copy of each account
 #   ol_pick_record         one `lanes pick --json` record, for a caller's
 #                          own counts
@@ -92,24 +92,29 @@ ol_runtime_supported() {
   [[ "$OL_RUNTIME" == tmux ]] || { OL_REASON=runtime-unsupported; return 1; }
 }
 
-# The ladder a fleet walks where no settings file names
-# ORCH_OVERSEER_PREFERENCE: Fable, then Opus 5.5, then GPT-5.6 Sol on codex,
-# each at high effort, so a Fable wall moves the overseer onto another model
-# rather than leaving it with no successor, at a mark and at the wall alike.
-# Set to empty, the setting names no entries, which is a caller's own rule to
-# read.
-OL_DEFAULT_PREFERENCE="claude:fable:high,claude:claude-opus-5-5:high,codex:gpt-5.6-sol:high"
+# ORCH_OVERSEER_PREFERENCE where no settings file names it: the owner's order,
+# Fable, then Opus 5.5 on claude, then GPT-6 Astra, then GPT-5.6 Sol on
+# codex, each at high effort, so a Fable wall moves the overseer onto the next
+# model with room, at a mark and at the wall alike. This value is the
+# setting's default and the only model order any script holds: the walk reads
+# the setting and nothing else, so a new or retired model is an edit to the
+# setting and never to a script. Set to empty, the setting names no entries,
+# which is a caller's own rule to read.
+OL_DEFAULT_PREFERENCE="claude:fable:high,claude:claude-opus-5-5:high,codex:gpt-6-astra:high,codex:gpt-5.6-sol:high"
 ol_preference() {
   printf '%s\n' "${ORCH_OVERSEER_PREFERENCE-$OL_DEFAULT_PREFERENCE}"
 }
 
 # ol_preference_entries VALUE — VALUE, ORCH_OVERSEER_PREFERENCE's
 # comma-separated `harness:model:effort` entries, into OL_ENTRIES, with
-# OL_NAMED the count. `model` is a model name or a kendex tier ladder rank,
-# which is digits alone and which no model name is. A pi entry's model is pi's
-# own `provider/id`, and never a rank: the tier ladder names no pi model. An
-# entry outside the shape returns 1 with it in OL_BAD_ENTRY. An empty VALUE is
-# no entries and no refusal.
+# OL_NAMED the count. `harness` is claude, codex, copilot or pi; `model` is
+# the model the harness's `--model` word takes, on pi its own `provider/id`;
+# `effort` is the level as that harness spells it, on pi its thinking level.
+# The characters each field may hold are the two patterns below, which
+# kendex.settings.toml.example § Fleet states for the operator: a model
+# starts with a letter, so an entry naming no model, an empty field or a bare
+# number, is outside the shape. An entry outside the shape returns 1 with it in OL_BAD_ENTRY. An
+# empty VALUE is no entries and no refusal.
 OL_ENTRIES=()
 OL_NAMED=0
 OL_BAD_ENTRY=""
@@ -122,7 +127,7 @@ ol_preference_entries() { # VALUE
   while [[ -n "$rest" ]]; do
     entry="${rest%%,*}"
     rest="${rest#*,}"
-    [[ "$entry" =~ ^(claude|codex):([1-9][0-9]*|[a-z][a-z0-9.-]*):[a-z]+$ \
+    [[ "$entry" =~ ^(claude|codex|copilot):[a-z][a-z0-9.-]*:[a-z]+$ \
        || "$entry" =~ ^pi:[a-z][a-z0-9.-]*/[a-z0-9][a-z0-9._/-]*:[a-z]+$ ]] || { OL_BAD_ENTRY="$entry"; return 1; }
     OL_ENTRIES+=("$entry")
     OL_NAMED=$((OL_NAMED + 1))
@@ -172,39 +177,14 @@ ol_pi_model() { # MODEL...
 }
 
 # ol_entry_model ENTRY — one entry ol_preference_entries admitted, split into
-# OL_ENTRY_HARNESS, OL_ENTRY_MODEL and OL_ENTRY_EFFORT: a rank as `kendex
-# tier-model` names it, a name as written once the tier ladder is shown to
-# know it. A codex name is known where it IS a model the ladder names for
-# codex; a claude name where it carries one, since the claude ladder names
-# model families (`opus`) that a full id (`claude-opus-5-5`) spells inside it.
-# A pi name on the pi-claude provider runs a claude model and is held to the
-# claude ladder the same way (ol_account); a pi name on any other provider is
-# taken as written, the ladder naming none.
-# Returns 1 for a rank the ladder cannot answer and for a name it does not
-# know, which the walk refuses rather than skips: either is a setting to fix,
-# and a misspelled name would otherwise reach the pick, which then drops
-# every model-scoped window, and the launch line as written.
+# OL_ENTRY_HARNESS, OL_ENTRY_MODEL and OL_ENTRY_EFFORT, each as written. The
+# setting is the one source of which models the walk tries and in what order,
+# so nothing here holds a model list to check a name against: the launch line
+# carries the model the entry names, and a name its harness does not know is
+# the setting's to fix.
 OL_ENTRY_HARNESS="" OL_ENTRY_MODEL="" OL_ENTRY_EFFORT=""
 ol_entry_model() { # ENTRY
-  local rank=1 known harness name
   IFS=: read -r OL_ENTRY_HARNESS OL_ENTRY_MODEL OL_ENTRY_EFFORT <<<"$1"
-  harness="$OL_ENTRY_HARNESS" name="$OL_ENTRY_MODEL"
-  if [[ "$harness" == pi ]]; then
-    ol_account pi "$name"
-    [[ "$OL_ACCOUNT_HARNESS" == claude ]] || return 0
-    harness=claude name="$OL_ACCOUNT_MODEL"
-  elif [[ "$name" =~ ^[0-9]+$ ]]; then
-    OL_ENTRY_MODEL="$(kendex tier-model "$OL_ENTRY_HARNESS" "$OL_ENTRY_MODEL" 2>"$DEP_ERR")" && [[ -n "$OL_ENTRY_MODEL" ]]
-    return
-  fi
-  # Every rank until `kendex tier-model` refuses one past the ladder's end.
-  while known="$(kendex tier-model "$harness" "$rank" 2>"$DEP_ERR")" && [[ -n "$known" ]]; do
-    case "$harness:$name" in
-      "codex:$known"|"claude:"*"$known"*) return 0 ;;
-    esac
-    rank=$((rank + 1))
-  done
-  return 1
 }
 
 # ol_lanes ARGS... — `lanes` as every overseer read of an account asks it,
@@ -299,11 +279,11 @@ ol_account_id() { # DIR
 # launch takes, a first launch and a succession alike: ENTRY... in order, the
 # first that names a lane into OL_CHOSEN, with OL_HARNESS, OL_MODEL,
 # OL_EFFORT and OL_LANE_DIR beside it and OL_PICK_MODEL the model its pick was
-# judged on. A named entry's model is resolved before its lane
-# (ol_entry_model), so the pick is judged on the bucket that walls the model
-# the entry passes; ol_pick_lane picks at TRIGGER, leaving EXCLUDE_DIR out,
-# and its exit 3 skips the entry. An entry spending no account `lanes`
-# measures takes no pick and no lane (ol_pick_lane).
+# judged on. A named entry's pick is judged on the bucket that walls the model
+# the entry names (ol_entry_model), the model its launch passes; ol_pick_lane
+# picks at TRIGGER, leaving EXCLUDE_DIR out, and its exit 3 skips the entry.
+# An entry spending no account `lanes` measures takes no pick and no lane
+# (ol_pick_lane).
 #
 # The entry `caller` is a predecessor's own, as OL_WALK_CALLER_* describe it:
 # its harness, its lane, the model and effort its record pairs, empty where
@@ -335,8 +315,8 @@ ol_account_id() { # DIR
 #
 # Returns 0 with an entry chosen, 3 where none qualifies, the counts in
 # OL_WALKED_WALLED and OL_WALKED_UNMEASURED, and 1 with OL_REASON
-# model-failed, lanes-failed or pi-account-unknown and its fields in
-# OL_FIELDS, the dependency's words in DEP_ERR.
+# lanes-failed or pi-account-unknown and its fields in OL_FIELDS, the
+# dependency's words in DEP_ERR.
 OL_WALK_CALLER_HARNESS="" OL_WALK_CALLER_LANE="" OL_WALK_CALLER_MODEL="" OL_WALK_CALLER_EFFORT=""
 OL_WALK_CALLER_PICK_MODEL="" OL_WALK_CALLER_KEEP=0
 OL_WALK_SOURCE_HARNESS="" OL_WALK_SOURCE_FLAGS="" OL_WALK_SOURCE_ROWS=0 OL_WALK_REFUSE_ID="" OL_WALK_SUCCESSOR_BOUND=0
@@ -360,7 +340,7 @@ ol_walk() { # TRIGGER EXCLUDE_DIR ENTRY...
         return 0
       fi
     else
-      ol_entry_model "$entry" || { OL_REASON=model-failed OL_FIELDS=("entry=$entry"); return 1; }
+      ol_entry_model "$entry"
       OL_HARNESS="$OL_ENTRY_HARNESS" OL_MODEL="$OL_ENTRY_MODEL" OL_EFFORT="$OL_ENTRY_EFFORT"
       OL_PICK_MODEL="$OL_ENTRY_MODEL"
       ol_entry_permitted "$entry" || continue
@@ -504,8 +484,9 @@ ol_launch_flags() { # [--question-off] HARNESS MODEL EFFORT PICK_MODEL SOURCE [F
 # open-terminal's pi lane brief does. The account variable is
 # lib/lane-launch.sh § lane_env_prefix's for the harness and the model FLAG...
 # names: pi's is claude's, which the pi-claude bridge reads, and
-# PI_CODING_AGENT_DIR on the Copilot pool. An empty LANE_DIR, a pi model on a
-# provider no lane measures (ol_pick_lane), launches the command bare.
+# PI_CODING_AGENT_DIR on the Copilot pool. An empty LANE_DIR, which ol_walk
+# hands on for a pi model on a provider no lane measures (ol_pick_lane),
+# launches the command bare.
 #
 # A codex session reads folder trust for LAUNCH_DIR before it reads its own
 # arguments, and the pane it opens in has nobody at it, so the entry is made
