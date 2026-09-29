@@ -1002,6 +1002,7 @@
   ".agents/skills/orch/tests/lib/sealed-bin.sh",
   ".agents/skills/orch/tests/lib/shared-skill-libs.sh",
   ".agents/skills/orch/tests/lib/virtual-clock.sh",
+  ".agents/skills/orch/tests/merge-pr-restack-wiring.test.sh",
   ".agents/skills/orch/tests/open-terminal-brief-file.sh",
   ".agents/skills/orch/tests/open-terminal-cap.sh",
   ".agents/skills/orch/tests/open-terminal-claude-handoff.sh",
