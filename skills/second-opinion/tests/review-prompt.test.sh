@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# The review prompt: its lens list, the output schema, and the repository's
+# The review prompt: its lens list, the output schema, the diff embedded for a
+# target whose SECOND_OPINION_<NAME>_INLINE_DIFF is 1 and for no other, and the repository's
 # own instruction files appended to it, chosen by the setting's globs (the
 # default set, a custom list, the empty list), with the nested AGENTS.md
 # files governing the changed paths after their parents, symlinks and
@@ -14,6 +15,9 @@
 # A row is `label|world|argv|rc|out|err|state`; the world's words are the stub
 # world's (lib/stub-cli-world.bash) plus:
 #   layout:<full|evil|dash|botrender>  the reviewed repository's instruction files
+#   committed                a committed file, the world's edit left uncommitted
+#   bigdiff                  a staged file whose diff runs past the inline cap
+#   bigdel                   bigdiff, and a committed file deleted after it
 #   settings:<globs>         the project settings' SECOND_OPINION_REVIEW_INSTRUCTIONS
 #   bsd                      sed, head, stat, cat, basename and dirname refusing `--`
 # The state adds:
@@ -26,6 +30,10 @@
 #   miss=<glob,...|->  the patterns reported as matching no file, in order
 #   none=<N|->  the pattern count the no-instructions report names
 #   head=<head|->  the artifact's reviewed head
+#   diff=<line,...|->  the added lines of the embedded diff, `-` when none is
+#   paged=<mode>:<line,...>  when the embedded diff was cut, the mode and the
+#     removed lines of the whole-diff file its marker names, as the reviewer
+#     read it mid-run
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib/stub-cli-world.bash"
 . "$(dirname "${BASH_SOURCE[0]}")/lib/install.bash"
@@ -99,6 +107,30 @@ suite_word() {
       mkdir -p "$WORK/.github/instructions"
       printf 'RULE-GOLF: rendered review rule\n' >"$WORK/.github/instructions/code-review.md"
       ;;
+    # a committed change a range can name, beside the world's own uncommitted
+    # edit, so the range's diff and the working tree's differ
+    committed)
+      printf 'committed\n' >"$WORK/pinned.txt"
+      git -C "$WORK" add pinned.txt
+      git -C "$WORK" -c commit.gpgsign=false commit -q -m pinned
+      HEAD_SHA="$(git -C "$WORK" rev-parse HEAD)"
+      ;;
+    # a diff past the inline cap: an added line, one line long enough to cross
+    # the cap, and a line after it
+    bigdiff)
+      { printf 'first\n'; head -c 140000 /dev/zero | tr '\0' x; printf '\nlast\n'; } >"$WORK/zbig.txt"
+      git -C "$WORK" add zbig.txt
+      ;;
+    # a deletion past the cap: a committed file the working tree removes,
+    # sorted after the long file
+    bigdel)
+      printf 'gone\n' >"$WORK/zgone.txt"
+      git -C "$WORK" add zgone.txt
+      git -C "$WORK" -c commit.gpgsign=false commit -q -m gone
+      HEAD_SHA="$(git -C "$WORK" rev-parse HEAD)"
+      suite_word bigdiff
+      rm "$WORK/zgone.txt"
+      ;;
     settings:*) printf '[env]\nSECOND_OPINION_REVIEW_INSTRUCTIONS = "%s"\n' "${1#settings:}" >"$PROJ/kendex.settings.toml" ;;
     bsd) W_ENV+=("PATH=$BSDBIN:$TMP_ROOT/psbin:$TMP_ROOT/bin:$PATH") ;;
     *) echo "UNKNOWN-WORD: $1" >&2; exit 2 ;;
@@ -167,11 +199,28 @@ reports() {
   printf 'miss=%s none=%s' "${miss:--}" "${none:--}"
 }
 
+# The embedded diff: its added lines, `+++` headers aside, and its truncation
+# marker, the whole diff's file under <work> with its mktemp suffix as `*`.
+inline_diff() {
+  local added
+  added="$(sed -n '/^--- begin diff ---$/,/^--- end diff ---$/{/^+[^+]/p;/^\[diff truncated/p;}' "$1" \
+    | sed -e "s|$WORK|<work>|g" -e 's/-diff\.[A-Za-z0-9]\{6\}\]$/-diff.*]/' | paste -s -d ',' -)"
+  printf '%s' "${added:--}"
+}
+
+# The whole-diff file the stub paged: its mode and removed lines.
+paged() {
+  local removed
+  [[ -f "$ROW/prompts/paged-1.txt" ]] || return 0
+  removed="$(sed -n '/^-[^-]/p' "$ROW/prompts/paged-1.txt" | paste -s -d ',' -)"
+  printf ' paged=%s:%s' "$(cat "$ROW/prompts/paged-1.mode")" "${removed:--}"
+}
+
 extra_state() {
   local p="$ROW/prompts/prompt-1.txt" head
   head="$(jq -r '.qa_metadata.reviewed_head // "-"' "$OUT" 2>/dev/null | alias_text)"
   [[ -f "$p" ]] || { printf ' prompt=- %s head=%s' "$(reports)" "${head:--}"; return; }
-  printf ' lenses=%s skip=%s schema=%s instr=%s %s head=%s' "$(lenses "$p")" "$(skip_line "$p")" "$(schema_line "$p")" "$(instructions "$p")" "$(reports)" "${head:--}"
+  printf ' lenses=%s skip=%s schema=%s instr=%s %s head=%s diff=%s%s' "$(lenses "$p")" "$(skip_line "$p")" "$(schema_line "$p")" "$(instructions "$p")" "$(reports)" "${head:--}" "$(inline_diff "$p")" "$(paged)"
 }
 
 L="Correctness,Security and fail-open behavior,Adversarial inputs,Portability,Repo-rule adherence,Docs-vs-code drift,Test adequacy+bash3.2"
@@ -181,18 +230,22 @@ FULL="AGENTS.md(RULE-AGENTS),review-bots.md(RULE-ALPHA),.github/instructions/she
 OK="0|<out>|header:review written|calls=1 files=out=review:external-claude:Clean home=absent tmp=0 dirty=-"
 ALLMISS="AGENTS.md,review-bots.md,.github/instructions/code-review.md,.github/instructions/*.instructions.md,.github/copilot-instructions.md"
 run_table "the review prompt" "capture" "\
-the default globs: every matching file in the setting's order, the nested AGENTS.md files over a changed path parents first, the non-matching file left out, the unmatched default pattern reported|layout:full|review|$OK lenses=$L skip=$SKIP schema=$SCHEMA instr=$FULL miss=.github/instructions/code-review.md none=- head=<head>
-no instruction files: no block, every default pattern and the empty prompt reported, the lenses and the schema still|-|review|$OK lenses=$L skip=$SKIP schema=$SCHEMA instr=- miss=$ALLMISS none=5 head=<head>
-the default globs collect the bot-instructions render alone|layout:botrender|review|$OK lenses=$L skip=$SKIP schema=$SCHEMA instr=.github/instructions/code-review.md(RULE-GOLF) miss=AGENTS.md,review-bots.md,.github/instructions/*.instructions.md,.github/copilot-instructions.md none=- head=<head>
-a custom glob list replaces the defaults|layout:full env:SECOND_OPINION_REVIEW_INSTRUCTIONS=docs/rules/*.md|review|$OK lenses=$L skip=$SKIP schema=$SCHEMA instr=docs/rules/custom.md(RULE-DELTA) miss=- none=- head=<head>
-a pattern naming a missing file is reported and the review still runs|layout:full env:SECOND_OPINION_REVIEW_INSTRUCTIONS=docs/missing.md|review|$OK lenses=$L skip=$SKIP schema=$SCHEMA instr=- miss=docs/missing.md none=1 head=<head>
-a missing pattern beside a matching one is reported, the matching file still appended|layout:full env:SECOND_OPINION_REVIEW_INSTRUCTIONS=review-bots.md,docs/missing.md|review|$OK lenses=$L skip=$SKIP schema=$SCHEMA instr=review-bots.md(RULE-ALPHA) miss=docs/missing.md none=- head=<head>
-a directory-only pattern beside a matching one is reported, the matching file still appended|layout:full env:SECOND_OPINION_REVIEW_INSTRUCTIONS=review-bots.md,docs/rules|review|$OK lenses=$L skip=$SKIP schema=$SCHEMA instr=review-bots.md(RULE-ALPHA) miss=docs/rules none=- head=<head>
-an empty setting drops the block and reports nothing|layout:full env:SECOND_OPINION_REVIEW_INSTRUCTIONS=|review|$OK lenses=$L skip=$SKIP schema=$SCHEMA instr=- miss=- none=- head=<head>
-the project settings' globs reach the run|layout:full settings:review-bots.md|review|$OK lenses=$L skip=$SKIP schema=$SCHEMA instr=review-bots.md(RULE-ALPHA) miss=- none=- head=<head>
-the caller's empty setting beats the project's|layout:full settings:review-bots.md env:SECOND_OPINION_REVIEW_INSTRUCTIONS=|review|$OK lenses=$L skip=$SKIP schema=$SCHEMA instr=- miss=- none=- head=<head>
-a symlinked file and a file through a symlinked directory are refused by name, the regular file beside them appended|layout:evil|review|0|<out>|header:review skip-link:review-bots.md skip-outside:.github/instructions/leak.instructions.md written|calls=1 files=out=review:external-claude:Clean home=absent tmp=0 dirty=- lenses=$L skip=$SKIP schema=$SCHEMA instr=.github/copilot-instructions.md(RULE-ECHO) miss=AGENTS.md,.github/instructions/code-review.md none=- head=<head>
-a changed path under a dash-leading directory finds its AGENTS.md|layout:dash|review|$OK lenses=$L skip=$SKIP schema=$SCHEMA instr=-svc/AGENTS.md(RULE-DASHDIR) miss=$ALLMISS none=- head=<head>
-BSD utilities that refuse -- still build the whole prompt|layout:full bsd|review|$OK lenses=$L skip=$SKIP schema=$SCHEMA instr=$FULL miss=.github/instructions/code-review.md none=- head=<head>
+the default globs: every matching file in the setting's order, the nested AGENTS.md files over a changed path parents first, the non-matching file left out, the unmatched default pattern reported|layout:full|review|$OK lenses=$L skip=$SKIP schema=$SCHEMA instr=$FULL miss=.github/instructions/code-review.md none=- head=<head> diff=-
+no instruction files: no block, every default pattern and the empty prompt reported, the lenses and the schema still|-|review|$OK lenses=$L skip=$SKIP schema=$SCHEMA instr=- miss=$ALLMISS none=5 head=<head> diff=-
+the default globs collect the bot-instructions render alone|layout:botrender|review|$OK lenses=$L skip=$SKIP schema=$SCHEMA instr=.github/instructions/code-review.md(RULE-GOLF) miss=AGENTS.md,review-bots.md,.github/instructions/*.instructions.md,.github/copilot-instructions.md none=- head=<head> diff=-
+a custom glob list replaces the defaults|layout:full env:SECOND_OPINION_REVIEW_INSTRUCTIONS=docs/rules/*.md|review|$OK lenses=$L skip=$SKIP schema=$SCHEMA instr=docs/rules/custom.md(RULE-DELTA) miss=- none=- head=<head> diff=-
+a pattern naming a missing file is reported and the review still runs|layout:full env:SECOND_OPINION_REVIEW_INSTRUCTIONS=docs/missing.md|review|$OK lenses=$L skip=$SKIP schema=$SCHEMA instr=- miss=docs/missing.md none=1 head=<head> diff=-
+a missing pattern beside a matching one is reported, the matching file still appended|layout:full env:SECOND_OPINION_REVIEW_INSTRUCTIONS=review-bots.md,docs/missing.md|review|$OK lenses=$L skip=$SKIP schema=$SCHEMA instr=review-bots.md(RULE-ALPHA) miss=docs/missing.md none=- head=<head> diff=-
+a directory-only pattern beside a matching one is reported, the matching file still appended|layout:full env:SECOND_OPINION_REVIEW_INSTRUCTIONS=review-bots.md,docs/rules|review|$OK lenses=$L skip=$SKIP schema=$SCHEMA instr=review-bots.md(RULE-ALPHA) miss=docs/rules none=- head=<head> diff=-
+an empty setting drops the block and reports nothing|layout:full env:SECOND_OPINION_REVIEW_INSTRUCTIONS=|review|$OK lenses=$L skip=$SKIP schema=$SCHEMA instr=- miss=- none=- head=<head> diff=-
+the project settings' globs reach the run|layout:full settings:review-bots.md|review|$OK lenses=$L skip=$SKIP schema=$SCHEMA instr=review-bots.md(RULE-ALPHA) miss=- none=- head=<head> diff=-
+the caller's empty setting beats the project's|layout:full settings:review-bots.md env:SECOND_OPINION_REVIEW_INSTRUCTIONS=|review|$OK lenses=$L skip=$SKIP schema=$SCHEMA instr=- miss=- none=- head=<head> diff=-
+a symlinked file and a file through a symlinked directory are refused by name, the regular file beside them appended|layout:evil|review|0|<out>|header:review skip-link:review-bots.md skip-outside:.github/instructions/leak.instructions.md written|calls=1 files=out=review:external-claude:Clean home=absent tmp=0 dirty=- lenses=$L skip=$SKIP schema=$SCHEMA instr=.github/copilot-instructions.md(RULE-ECHO) miss=AGENTS.md,.github/instructions/code-review.md none=- head=<head> diff=-
+a changed path under a dash-leading directory finds its AGENTS.md|layout:dash|review|$OK lenses=$L skip=$SKIP schema=$SCHEMA instr=-svc/AGENTS.md(RULE-DASHDIR) miss=$ALLMISS none=- head=<head> diff=-
+a target set to inline its diff gets the pinned range's diff in its scope block, not the working tree's, the prompt otherwise the same|committed env:SECOND_OPINION_CLAUDE_INLINE_DIFF=1|review --range HEAD~1...HEAD|$OK lenses=$L skip=$SKIP schema=$SCHEMA instr=- miss=$ALLMISS none=5 head=<head> diff=+committed
+a diff past the cap is cut at its last whole line inside it and ends with a marker naming what was omitted and the whole diff's file, gone from the artifact home once the run ends|bigdiff env:SECOND_OPINION_CLAUDE_INLINE_DIFF=1|review|0|<out>|header:review written|calls=1 files=out=review:external-claude:Clean home=mode=700,ignore=* tmp=0 dirty=- lenses=$L skip=$SKIP schema=$SCHEMA instr=- miss=$ALLMISS none=5 head=<head> diff=+world,+first,[diff truncated at the 131072-byte cap: the remaining 140008 of its 140258 bytes are omitted; page them with your read tools from the whole diff, kept until this review ends at: <work>/tmp/second-opinion/review-claude-diff.*] paged=-rw-------:-
+a deletion past the cap is in the owner-only file the marker names, readable while the review runs|bigdel env:SECOND_OPINION_CLAUDE_INLINE_DIFF=1|review|0|<out>|header:review written|calls=1 files=out=review:external-claude:Clean home=mode=700,ignore=* tmp=0 dirty=- lenses=$L skip=$SKIP schema=$SCHEMA instr=- miss=$ALLMISS none=5 head=<head> diff=+world,+first,[diff truncated at the 131072-byte cap: the remaining 140141 of its 140391 bytes are omitted; page them with your read tools from the whole diff, kept until this review ends at: <work>/tmp/second-opinion/review-claude-diff.*] paged=-rw-------:-gone
+another target's setting leaves this target's prompt without the diff|env:SECOND_OPINION_CODEX_INLINE_DIFF=1|review|$OK lenses=$L skip=$SKIP schema=$SCHEMA instr=- miss=$ALLMISS none=5 head=<head> diff=-
+BSD utilities that refuse -- still build the whole prompt|layout:full bsd|review|$OK lenses=$L skip=$SKIP schema=$SCHEMA instr=$FULL miss=.github/instructions/code-review.md none=- head=<head> diff=-
 "
 finish

@@ -16,6 +16,8 @@
 
 set -euo pipefail
 
+. "$(dirname "${BASH_SOURCE[0]}")/git-env.bash"
+
 # The harness running this suite must not be visible to the script: its markers
 # are unset here, its process tree is hidden by the row's `ps`, and the settings
 # the roster reads are unset so only the row's world supplies them.
@@ -29,7 +31,12 @@ unset SECOND_OPINION_MODELS SECOND_OPINION_COUNT SECOND_OPINION_TARGET \
       SECOND_OPINION_MY_MODEL_MODEL SECOND_OPINION_COPILOT_CMD \
       SECOND_OPINION_COPILOT_MODEL SECOND_OPINION_REVIEW_TARGETS \
       SECOND_OPINION_ARTIFACT_DIR SECOND_OPINION_TIMEOUT \
-      SECOND_OPINION_FOREGROUND_CAP SECOND_OPINION_REVIEW_INSTRUCTIONS
+      SECOND_OPINION_FOREGROUND_CAP SECOND_OPINION_REVIEW_INSTRUCTIONS \
+      SECOND_OPINION_CLAUDE_ROOM_CMD SECOND_OPINION_CODEX_ROOM_CMD \
+      SECOND_OPINION_COPILOT_ROOM_CMD SECOND_OPINION_MY_MODEL_ROOM_CMD \
+      SECOND_OPINION_CLAUDE_INLINE_DIFF SECOND_OPINION_CODEX_INLINE_DIFF \
+      SECOND_OPINION_COPILOT_INLINE_DIFF SECOND_OPINION_MY_MODEL_INLINE_DIFF \
+      SO_TEST_SEAT
 
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SKILL_DIR="$(cd "$TEST_DIR/.." && pwd)"
@@ -135,6 +142,11 @@ word() {
     cmd:*) W_ENV+=("$(so_var "${1#cmd:}" CMD)=$ROW/bin/lane-${1##*=}") ;;
     # a target's declared identity: model:<name>=<id>
     model:*) W_ENV+=("$(so_var "${1#model:}" MODEL)=$(unpad "${1##*=}")") ;;
+    # a target's room check: room:<name>=<kind> runs a stub judging its
+    # account, room-rel: the same stub named by a path relative to the project
+    # root
+    room:*) room_word "${1#room:}" "$ROW/bin" "$ROW/bin/" ;;
+    room-rel:*) room_word "${1#room-rel:}" "$PROJ" ./ ;;
     marker:*) W_ENV+=("${1#marker:}") ;;
     proj:*) project_file "${1#proj:}" ;;
     claude:*) W_RESP_CLAUDE="${1#claude:}" ;;
@@ -159,10 +171,60 @@ set -euo pipefail
 cat >/dev/null
 n=\$(cat "$ROW/count-$1" 2>/dev/null || echo 0)
 printf '%s' \$((n + 1)) >"$ROW/count-$1"
+printf '%s' "\${SO_TEST_SEAT:--}" >"$ROW/seat-$1"
 [[ -f "$ROW/resp-$1" ]] || exit 1
 cat "$ROW/resp-$1"
 SH
   chmod +x "$ROW/bin/lane-$1"
+}
+
+# A room check for target NAME, as `lanes pick` answers one, written into DIR as
+# room-<kind>-<name>: `room` exits 0 printing the account's env prefix,
+# `walled` exits 3 with its reason on stderr and `unmeasured` 5 with two
+# stderr lines, both passed through, `json` prints
+# a record instead of a prefix, `bare` exits 0 printing nothing, `drain` reads
+# its stdin before answering as `room`. Each run is counted per name.
+make_room_stub() { # NAME=KIND DIR
+  local name="${1%%=*}" kind="${1##*=}" answer
+  case "$kind" in
+    room) answer="printf 'SO_TEST_SEAT=%s-seat\\n' '$name'" ;;
+    walled) answer="echo 'room-check $name: walled' >&2; exit 3" ;;
+    unmeasured) answer="echo 'room-check $name: unmeasured' >&2; echo 'room-check $name: detail' >&2; exit 5" ;;
+    json) answer="printf '{\"config_dir\":\"/seat\"}\\n'" ;;
+    bare) answer=":" ;;
+    drain) answer="cat >/dev/null; printf 'SO_TEST_SEAT=%s-seat\\n' '$name'" ;;
+    *) echo "UNKNOWN-ROOM-KIND: $kind" >&2; exit 2 ;;
+  esac
+  cat >"$2/room-$kind-$name" <<SH
+#!/usr/bin/env bash
+set -euo pipefail
+n=\$(cat "$ROW/rooms-$name" 2>/dev/null || echo 0)
+printf '%s' \$((n + 1)) >"$ROW/rooms-$name"
+$answer
+SH
+  chmod +x "$2/room-$kind-$name"
+}
+
+# A room:<name>=<kind> word: the stub in DIR, its target's ROOM_CMD set to the
+# stub by the path PREFIX names it through.
+room_word() { # NAME=KIND DIR PREFIX
+  make_room_stub "$1" "$2"
+  W_ENV+=("$(so_var "$1" ROOM_CMD)=$3room-${1##*=}-${1%%=*}")
+}
+
+# The account each lane stub ran under, and each room check's run count, the
+# suffix a room-check row appends: seat=<lane>:<seat>,... rooms=<name>:<n>,...
+room_state() {
+  local f seats="" rooms=""
+  for f in claude codex extra; do
+    seats="$seats,$f:$(cat "$ROW/seat-$f" 2>/dev/null || printf 'none')"
+  done
+  for f in "$ROW"/rooms-*; do
+    [[ -e "$f" ]] || continue
+    rooms="$rooms,${f##*/rooms-}:$(cat "$f")"
+  done
+  printf 'seat=%s rooms=%s' "${seats#,}" "${rooms:+${rooms#,}}"
+  [[ -n "$rooms" ]] || printf -- '-'
 }
 
 # A `ps` that answers the detection walk: one ancestor named W_PS at a pid
@@ -361,6 +423,12 @@ err_word() {
     selected:*) printf '→ skipping %s: model %s already selected' "$a" "$b" ;;
     nocli:*) printf '→ skipping %s: CLI not found — install it or configure SECOND_OPINION_%s_CMD' "$a" "$b" ;;
     nocmd:*) printf '→ skipping %s: no command — %s has no built-in command; set SECOND_OPINION_%s_CMD to the command it runs, one you have checked cannot write' "$a" "$a" "$b" ;;
+    # roomrefused:<name>:<NAME>:<exit>, roomsaid:<name>:<kind>, room:<name>:<NAME>:<seat | ->,
+    # noassign:<name>:<NAME>
+    roomrefused:*) printf "→ skipping %s: room check refused — SECOND_OPINION_%s_ROOM_CMD exited %s; its own reason is on stderr above, and running SECOND_OPINION_%s_ROOM_CMD's command prints it again" "$a" "$b" "$c" "$b" ;;
+    roomsaid:*) printf 'room-check %s: %s' "$a" "$b" ;;
+    room:*) printf '→ room: %s has room by SECOND_OPINION_%s_ROOM_CMD%s' "$a" "$b" "$([[ "$c" == - ]] || printf '; runs under SO_TEST_SEAT=%s' "$c")" ;;
+    noassign:*) printf '→ skipping %s: room check printed a line that is no NAME=value assignment: {"config_dir":"/seat"} — SECOND_OPINION_%s_ROOM_CMD prints the env prefix of the account it judged and nothing else' "$a" "$b" ;;
     target-undeclared:*) printf '→ skipping %s: model undeclared — %s fronts a selectable model; set SECOND_OPINION_%s_MODEL to the model id it runs' "$a" "$a" "$b" ;;
     roster-empty) printf '→ skipping roster: SECOND_OPINION_MODELS is set but empty — no targets to consider' ;;
     shortfall:*) printf '→ requested %s opinions, selected %s — the roster has no further eligible model (coverage degraded)' "$a" "$b" ;;
@@ -384,9 +452,11 @@ declared_in() {
   esac
 }
 
-# run_table TITLE DEFAULTS ROWS: every row's world is DEFAULTS then its own words.
+# run_table TITLE DEFAULTS ROWS [SUFFIX]: every row's world is DEFAULTS then its
+# own words; SUFFIX, a function, renders more of the row's world after the run,
+# and the row's last field asserts it too.
 run_table() {
-  local title="$1" defaults="$2" rows="$3" n=0 label world command rc out err want got row field
+  local title="$1" defaults="$2" rows="$3" suffix="${4:-}" n=0 label world command rc out err want got row field
   echo "=== $title ==="
   while IFS= read -r row; do
     [[ -n "$row" ]] || continue
@@ -398,6 +468,7 @@ run_table() {
     # shellcheck disable=SC2086
     build "row-$n" $defaults $world
     got="$(run "$command")"
+    [[ -z "$suffix" ]] || got="$got $("$suffix")"
     # A rendering aid for writing rows; the run is refused after the loop.
     if [[ "${SECOND_OPINION_TABLE_PROBE:-}" == 1 ]]; then
       printf '%s => %s\n' "$label" "$got"

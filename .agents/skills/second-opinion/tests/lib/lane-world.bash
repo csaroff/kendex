@@ -17,9 +17,7 @@
 
 set -euo pipefail
 
-# A pre-commit hook exports GIT_DIR and GIT_INDEX_FILE, which would point every
-# git call at the real repository instead of the row's.
-unset GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE GIT_INDEX_FILE
+. "$(dirname "${BASH_SOURCE[0]}")/git-env.bash"
 unset CLAUDECODE CLAUDE_CODE CLAUDE_PROJECT_DIR CODEX_SANDBOX \
       CODEX_SANDBOX_NETWORK_DISABLED PI_CODING_AGENT_DIR OPENCODE \
       CURSOR_AGENT CURSOR_TRACE_ID
@@ -577,9 +575,14 @@ run() {
   esac
   [[ -z "$W_SHIM" ]] || path="$TMP_ROOT/shimbin:$path"
   # LC_ALL=C: the parent's cleanup relays rm's own lines
+  # The script runs in place, so this repository's settings and the caller's
+  # reach it: a lane's room check and inline diff are cleared, set but empty,
+  # which outranks both.
   env_args=(LC_ALL=C PATH="$path" TMPDIR="$SCRATCH" FIXED_SCRATCH="$ROW/fixed-scratch" SECOND_OPINION_CURRENT_MODEL=none
     SECOND_OPINION_MODELS="codex claude" SECOND_OPINION_COUNT=2
-    SECOND_OPINION_CLAUDE_CMD="$(lane_cmd claude "$W_CLAUDE")" SECOND_OPINION_CODEX_CMD="$(lane_cmd codex "$W_CODEX")")
+    SECOND_OPINION_CLAUDE_CMD="$(lane_cmd claude "$W_CLAUDE")" SECOND_OPINION_CODEX_CMD="$(lane_cmd codex "$W_CODEX")"
+    SECOND_OPINION_CLAUDE_ROOM_CMD= SECOND_OPINION_CODEX_ROOM_CMD=
+    SECOND_OPINION_CLAUDE_INLINE_DIFF= SECOND_OPINION_CODEX_INLINE_DIFF=)
   [[ -z "$W_SINGLE" ]] || env_args+=(SECOND_OPINION_MODELS=codex SECOND_OPINION_COUNT=1)
   [[ "$W_HOME" != ro ]] || env_args+=(SECOND_OPINION_ARTIFACT_DIR="$ROW/ro-home")
   (cd "$cwd" && umask 022 && env "${env_args[@]}" ${W_ENV[@]+"${W_ENV[@]}"} "$SECOND_OPINION" "${argv[@]}" >"$ROW/stdout" 2>"$ROW/stderr") || rc=$?

@@ -23,9 +23,7 @@
 
 set -euo pipefail
 
-# A pre-commit hook exports GIT_DIR and GIT_INDEX_FILE, which would point every
-# git call at the real repository instead of the row's.
-unset GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE GIT_INDEX_FILE
+. "$(dirname "${BASH_SOURCE[0]}")/git-env.bash"
 unset CLAUDECODE CLAUDE_CODE CLAUDE_PROJECT_DIR CODEX_SANDBOX \
       CODEX_SANDBOX_NETWORK_DISABLED PI_CODING_AGENT_DIR OPENCODE \
       CURSOR_AGENT CURSOR_TRACE_ID
@@ -96,8 +94,9 @@ fi
 
 # The fake CLI: STUB_RC, STUB_STDOUT, STUB_STDERR, STUB_SLEEP, STUB_STDOUT2
 # (what the second call prints instead), STUB_PROMPT_DIR (each call's prompt
-# kept as prompt-N.txt; both single-lane only, since the counter is shared
-# across lanes), STUB_SIGNAL (the signal it dies to after its last words, an
+# kept as prompt-N.txt, and the whole diff a truncated inline diff names kept
+# as paged-N.txt, its mode in paged-N.mode; both single-lane only, since the
+# counter is shared across lanes), STUB_SIGNAL (the signal it dies to after its last words, an
 # external killer as seen from inside the CLI's own process group), and two
 # mid-run side effects (a directory locked
 # read-only once the script's own temp files exist; an entry planted at a
@@ -110,6 +109,13 @@ cat >"$STUB" <<'SH'
 printf 'call\n' >>"$STUB_COUNTER"
 n=$(wc -l <"$STUB_COUNTER" | tr -d ' ')
 if [[ -n "${STUB_PROMPT_DIR:-}" ]]; then cat >"$STUB_PROMPT_DIR/prompt-$n.txt"; else cat >/dev/null; fi
+# A truncated inline diff names the whole diff's file: page it, as a reviewer
+# with read tools would, and keep its mode.
+paged="$(sed -n 's/^\[diff truncated at .* kept until this review ends at: \(.*\)\]$/\1/p' "${STUB_PROMPT_DIR:-/dev/null}/prompt-$n.txt" 2>/dev/null)"
+if [[ -n "$paged" ]]; then
+  cp "$paged" "$STUB_PROMPT_DIR/paged-$n.txt" || printf 'unreadable\n' >"$STUB_PROMPT_DIR/paged-$n.txt"
+  ls -l "$paged" | cut -c1-10 >"$STUB_PROMPT_DIR/paged-$n.mode"
+fi
 [[ "$n" -lt 2 || -z "${STUB_STDOUT2:-}" ]] || STUB_STDOUT="$STUB_STDOUT2"
 [[ -n "${STUB_LOCK_DIR:-}" ]] && chmod 0500 "$STUB_LOCK_DIR"
 [[ -n "${STUB_PLANT_DIR:-}" ]] && mkdir -p "$STUB_PLANT_DIR"
@@ -295,7 +301,11 @@ word() {
     # applied once the output path is known
     plant:*|prepare:*) W_PLANTS+=("$1") ;;
     models:*) a="${1#models:}"; W_ENV+=("SECOND_OPINION_MODELS=${a//+/ }") ;;
-    lane:*) W_ENV+=("$(printf 'SECOND_OPINION_%s_CMD' "$(printf '%s' "${1#lane:}" | tr '[:lower:]-' '[:upper:]_')")=$STUB") ;;
+    # a roster entry running the stub, its room check and inline diff cleared
+    lane:*)
+      a="SECOND_OPINION_$(printf '%s' "${1#lane:}" | tr '[:lower:]-' '[:upper:]_')"
+      W_ENV+=("${a}_CMD=$STUB" "${a}_ROOM_CMD=" "${a}_INLINE_DIFF=")
+      ;;
     count:*) W_ENV+=("SECOND_OPINION_COUNT=${1#count:}") ;;
     current:*) W_ENV+=("SECOND_OPINION_CURRENT_MODEL=${1#current:}") ;;
     # SECOND_OPINION_TARGET: claude unless the row says target:- (unset)
@@ -533,8 +543,12 @@ run() {
   local -a argv env_args
   [[ -z "$W_DASHTMP" ]] || mkdir -p "$ROW/dashrun/-dashtmp"
   while IFS= read -r line; do argv+=("$line"); done < <(argv_for "$1")
-  # LC_ALL=C: the script's own errors quote coreutils messages
+  # LC_ALL=C: the script's own errors quote coreutils messages. The script
+  # runs in place, so this repository's settings and the caller's reach it:
+  # the stub target's per-target keys are cleared, set but empty, which
+  # outranks both.
   env_args=(LC_ALL=C PATH="$path" TMPDIR="$tmpdir" STUB_COUNTER="$ROW/counter" SECOND_OPINION_CURRENT_MODEL=none SECOND_OPINION_CLAUDE_CMD="$STUB"
+    SECOND_OPINION_CLAUDE_ROOM_CMD= SECOND_OPINION_CLAUDE_INLINE_DIFF=
     STUB_RC="$W_RC" STUB_STDOUT="$(stdout_of "$W_STDOUT")" STUB_STDERR="$W_STDERR" STUB_SLEEP="$W_SLEEP")
   [[ -z "$W_TARGET" ]] || env_args+=(SECOND_OPINION_TARGET="$W_TARGET")
   [[ -z "$W_STDOUT2" ]] || env_args+=(STUB_STDOUT2="$(stdout_of "$W_STDOUT2")")

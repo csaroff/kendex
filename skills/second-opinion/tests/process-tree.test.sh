@@ -17,6 +17,7 @@
 set -euo pipefail
 
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$TEST_DIR/lib/git-env.bash"
 REPO_ROOT="$(cd "$TEST_DIR/../../.." && pwd)"
 . "$TEST_DIR/lib/install.bash"
 TMP_ROOT="$(mktemp -d)"
