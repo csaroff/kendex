@@ -40,6 +40,16 @@ RETRIES = 3
 TIMEOUT_SECONDS = 30
 AUTH_FIX = "fix=set a live SLACK_BOT_TOKEN and restart the relay"
 COPY_BYTES = 64 * 1024
+# The cap chat.postMessage and chat.update put on `markdown_text`.
+MARKDOWN_LIMIT = 12000
+
+
+def markdown_checked(text: str, what: str) -> None:
+    """Refuses a `markdown_text` body, the argument Slack renders as
+    standard Markdown, past MARKDOWN_LIMIT characters: `text-too-long`
+    naming `what`, before any call."""
+    if len(text) > MARKDOWN_LIMIT:
+        raise Refusal("text-too-long", f"{what} chars={len(text)} limit={MARKDOWN_LIMIT}")
 
 
 class Slack:
