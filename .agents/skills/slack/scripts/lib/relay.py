@@ -3,8 +3,16 @@
 Each poll, per root: re-resolve the owners when the setting moved, read the
 channel's history since the journal's position, follow every parent whose
 replies moved, read every open ask's thread, every tenth poll read the other
-bound threads younger than SLACK_THREAD_DAYS, then read the mailbox's events
-and post every owner-bound envelope not yet carried.
+bound threads younger than SLACK_THREAD_DAYS, mark every delivered directive
+the journal holds no mark for, swap the receipt mark of every directive the
+overseer has read since, then read the mailbox's events and post every
+owner-bound envelope not yet carried.
+
+A directive's Slack message carries a receipt mark, a reaction and never a
+message: SEEN once it lands in the mailbox, READ once the overseer's
+to-lane.cursor passes it. Each mark is judged from the journal on every
+poll, never from the step that delivered the directive, so a stop between
+the delivery and its mark leaves the mark to the next poll.
 
 A start with no journal seeds both positions before it reads anything: Slack
 from the binding moment, so a channel's earlier history is never delivered,
@@ -32,11 +40,14 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from api import Slack
 from mailbox import LaneMail
+from markup import plain
 from refusals import Refusal, keyed, print_refusal
 from secret import check as secret_check
 from secret import checked_file
 from settings import MASTER, Settings
 from store import (
+    READ,
+    SEEN,
     Binding,
     Journal,
     RelayLock,
@@ -49,6 +60,7 @@ from store import (
     read_binding,
     read_journal,
     read_status,
+    save_file,
     write_binding,
     write_status,
 )
@@ -56,9 +68,12 @@ from store import (
 ROUTED_SUBTYPES = {None, "file_share"}
 OTHER_THREADS_EVERY = 10
 NOT_OWNER = "Only the channel's owners steer this session; this message is not routed."
-NO_TEXT = "Only text is routed; a file alone is not."
+NO_TEXT = "Only text and files are routed; this message has neither."
 RECORDED = "Recorded as your answer."
 ALREADY = "This question was already answered; delivered as a directive instead."
+# Slack's answer when the reaction is already as the call would leave it, or
+# its message is gone: nothing is left to mark.
+MARK_SETTLED = {"already_reacted", "no_reaction", "message_not_found"}
 
 
 def at_epoch(at: str) -> float:
@@ -129,6 +144,7 @@ class RootRelay:
         self.skipped: set = set()
         self.last_ok: Optional[float] = None
         self.post_failed: Optional[Refusal] = None
+        self.names: Dict[str, str] = {}
         # The status record carries the poll count and the compaction day
         # across restarts; the journal holds deliveries and positions alone.
         record = read_status(path) or {}
@@ -172,6 +188,8 @@ class RootRelay:
             self.seed()
         self.read_history(bot_user)
         self.read_threads(bot_user)
+        self.mark_seen()
+        self.mark_read()
         now = self.clock()
         touched = self.master_touched()
         if touched is not None and now - touched < self.settings.master_max_age:
@@ -244,11 +262,13 @@ class RootRelay:
             self.api.post("chat.postMessage", channel=self.channel, thread_ts=thread_ts, text=NOT_OWNER)
             self.journal.append(t="in", channel=self.channel, ts=ts, kind="ignored", reason="not-owner")
             return
-        text = (message.get("text") or "").strip()
-        if not text:
+        text = plain((message.get("text") or "").strip(), self.user_name)
+        lines = ([text] if text else []) + self.fetch_files(message)
+        if not lines:
             self.api.post("chat.postMessage", channel=self.channel, thread_ts=thread_ts, text=NO_TEXT)
             self.journal.append(t="in", channel=self.channel, ts=ts, kind="ignored", reason="no-text")
             return
+        text = "\n".join(lines)
         delivery = f"{self.channel}:{ts}"
         thread = self.state.threads.get(thread_ts) if thread_ts != ts else None
         # The mailbox judges whether an ask is still open; the journal's own
@@ -263,6 +283,91 @@ class RootRelay:
             self.api.post("chat.postMessage", channel=self.channel, thread_ts=thread_ts, text=ALREADY)
         envelope = self.mail.send_directive(text, delivery)
         self.journal.append(t="in", channel=self.channel, ts=ts, kind="directive", id=envelope, thread=thread_ts)
+
+    def react(self, method: str, ts: str, name: str) -> bool:
+        """One reaction on the message at `ts`; False when Slack refused it,
+        the refusal printed and the mark left to the next poll. A mark is a
+        courtesy: its failure fails no poll and holds no delivery back, and a
+        dead token still stops the relay."""
+        try:
+            self.api.post(method, channel=self.channel, timestamp=ts, name=name)
+        except Refusal as err:
+            if err.key == "slack-auth-failed":
+                raise
+            if err.error not in MARK_SETTLED:
+                print_refusal(err)
+                return False
+        return True
+
+    def mark_seen(self) -> None:
+        """Mark SEEN every delivered directive no mark line names: one this
+        poll delivered, one whose mark Slack refused, and one a stop left
+        unmarked. A stop after Slack took the reaction and before its line
+        is answered already_reacted, which settles it."""
+        for ts in sorted(self.state.directives.difference(self.state.marks), key=float):
+            if self.react("reactions.add", ts, SEEN):
+                self.journal.append(t="mark", ts=ts, name=SEEN)
+
+    def mark_read(self) -> None:
+        """Swap SEEN for READ on every directive the overseer has read. A
+        swap Slack refused, or a receipts read lane-mail refused, is made
+        again on the next poll."""
+        seen = [ts for ts, name in self.state.marks.items() if name == SEEN]
+        if not seen:
+            return
+        try:
+            read = self.mail.read_directives()
+        except Refusal as err:
+            print_refusal(err)
+            return
+        for ts in seen:
+            if self.state.delivered.get(ts) not in read:
+                continue
+            if self.react("reactions.remove", ts, SEEN) and self.react("reactions.add", ts, READ):
+                self.journal.append(t="mark", ts=ts, name=READ)
+
+    def user_name(self, user_id: str) -> str:
+        """The name Slack shows for a user a message mentions, asked once
+        per relay; the id itself when Slack refuses to say."""
+        if user_id not in self.names:
+            try:
+                user = self.api.get("users.info", user=user_id)["user"]
+            except Refusal as err:
+                if err.key == "slack-auth-failed":
+                    raise
+                print_refusal(err)
+                return user_id
+            profile = user.get("profile") or {}
+            self.names[user_id] = str(profile.get("display_name") or profile.get("real_name") or user.get("name") or user_id)
+        return self.names[user_id]
+
+    def fetch_files(self, message: Dict) -> List[str]:
+        """One line per file of an owner's message: the path it was saved
+        to, or `file <id> not fetched: <why>`, so the message lands whether
+        or not its files do."""
+        lines = []
+        for item in message.get("files") or []:
+            file_id = str(item.get("id", ""))
+            # Slack sends a file hidden by the plan's limit, or deleted, with
+            # no download url.
+            url = str(item.get("url_private_download") or "")
+            if not url:
+                lines.append(f"file {file_id} not fetched: no download url")
+                continue
+            given = item.get("size")
+            size = given if isinstance(given, int) else None
+            try:
+                saved = save_file(
+                    self.path, file_id, str(item.get("name") or ""), lambda out: self.api.download(url, size, out)
+                )
+            except Refusal as err:
+                lines.append(f"file {file_id} not fetched: {err.value}")
+                continue
+            except OSError as err:
+                lines.append(f"file {file_id} not fetched: {err.strerror or err}")
+                continue
+            lines.append(str(saved))
+        return lines
 
     # -- outbound: the mailbox to Slack --------------------------------------
 

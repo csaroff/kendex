@@ -59,7 +59,7 @@ EXPLAIN = {
         " its open asks, which post again as new threads: answer the"
         " re-posted one, because replies under the relay's earlier posts are"
         " no longer read. Replies under an owner's own earlier message are"
-        " read as directives. Every non-owner or file-only message since the"
+        " read as directives. Every non-owner or empty message since the"
         " binding is answered once more."
     ),
     "slack-auth-failed": (
@@ -134,8 +134,10 @@ EXPLAIN = {
         " the setting is emptied; owner messages are still delivered."
     ),
     "lane-mail-failed": (
-        "lane-mail refused a write the relay needed; the value is its first"
-        " line. The Slack message is read again on the next poll."
+        "lane-mail refused a call the relay needed; the value is its first"
+        " line. After a refused write the Slack message is read again on the"
+        " next poll; after a refused receipts read each :eyes: mark waits for"
+        " the next poll, and the poll goes on."
     ),
     "unit-unwritable": "The systemd unit file could not be written at the path named.",
     "systemctl-missing": (

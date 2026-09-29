@@ -1,21 +1,25 @@
 """What one checkout keeps under tmp/slack/: the binding, the journal, the
-status record and the relay lock.
+status record, the relay lock, and the files owners sent.
 
 The journal is a transport ledger of identifiers, one JSON object per line,
 replayed into `State` at start and appended to as the relay works. Its line
-shapes are schemas/journal.md. Nothing here holds a message body.
+shapes are schemas/journal.md. Nothing here but an owner's file holds a
+message body.
 """
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import errno
 import fcntl
 import json
 import os
+import re
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import BinaryIO, Callable, Dict, List, Optional, Set
 
 from refusals import Refusal
 
@@ -24,7 +28,14 @@ BINDING = "binding.json"
 JOURNAL = "journal.jsonl"
 STATUS = "status.json"
 LOCK = "listen.lock"
-LINE_KINDS = {"seen", "start", "hold", "resume", "in", "out", "resolved", "bound", "thread"}
+FILES = "files"
+# `<id>-<name>` is cut to this many characters, each ASCII once substituted,
+# so it stays inside the 255 bytes a file name may take.
+NAME_CHARS = 200
+LINE_KINDS = {"seen", "start", "hold", "resume", "in", "out", "resolved", "bound", "thread", "mark"}
+# A directive's receipt marks, the reaction names its `mark` lines carry.
+SEEN = "eyes"
+READ = "white_check_mark"
 AT_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 
@@ -92,6 +103,28 @@ def write_binding(root: Path, binding: Binding) -> None:
     os.replace(tmp, path)
 
 
+def save_file(root: Path, file_id: str, name: str, fill: Callable[[BinaryIO], None]) -> Path:
+    """An owner's file at tmp/slack/files/<id>-<name>, the directory 700 and
+    the file 600. Every character outside [A-Za-z0-9._-] becomes `_`, so the
+    name is one path component, cut to NAME_CHARS. `fill` writes a temporary
+    beside it, renamed only once `fill` returns, so the path never names part
+    of a file: `fill` raises on a download that ended short."""
+    directory = root_dir(root) / FILES
+    directory.mkdir(parents=True, exist_ok=True)
+    os.chmod(directory, 0o700)
+    target = directory / re.sub(r"[^A-Za-z0-9._-]", "_", f"{file_id}-{name}")[:NAME_CHARS]
+    fd, tmp = tempfile.mkstemp(dir=str(directory), prefix=".part-")
+    try:
+        with os.fdopen(fd, "wb") as out:
+            fill(out)
+        os.replace(tmp, target)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
+        raise
+    return target
+
+
 @dataclass
 class Thread:
     """One bound Slack thread: the parent's ts and the envelope it carries."""
@@ -130,6 +163,8 @@ class State:
     pending_files: Dict[str, str] = field(default_factory=dict)
     refused: Dict[str, str] = field(default_factory=dict)
     ignored: Set[str] = field(default_factory=set)
+    directives: Set[str] = field(default_factory=set)
+    marks: Dict[str, str] = field(default_factory=dict)
 
     def apply(self, line: Dict) -> None:
         kind = line.get("t")
@@ -151,6 +186,8 @@ class State:
                 return
             self.delivered[ts] = str(line["id"])
             self.carried.add(str(line["id"]))
+            if line["kind"] == "directive":
+                self.directives.add(ts)
             thread_ts = str(line["thread"])
             if thread_ts not in self.threads:
                 self.threads[thread_ts] = Thread(ts=thread_ts, envelope=str(line["id"]), kind=line["kind"])
@@ -188,6 +225,8 @@ class State:
             thread = self.threads.get(str(line["ts"]))
             if thread is not None:
                 thread.seen = str(line["seen"])
+        elif kind == "mark":
+            self.marks[str(line["ts"])] = str(line["name"])
         else:
             raise KeyError(kind)
 
@@ -230,12 +269,15 @@ class Journal:
 
 def compact(root: Path, cutoff_ts: float) -> int:
     """Drop resolved and ignored lines older than the cutoff, every report
-    upload older than it, every history position but the last, every hold
-    line but a standing one, and every resume line whose end is older than
-    the cutoff; keep every open thread. Returns the lines dropped. An `out`
-    line and a `resume` line are judged by the `at` they journal, the age
-    `post_events` never posts past, so what they name can never post
-    again."""
+    upload and receipt mark older than it, every history position but the
+    last, every hold line but a standing one, and every resume line whose
+    end is older than the cutoff; keep every open thread, and the `in` and
+    `mark` lines of a directive not yet marked READ, whatever its age: one
+    with no mark, which the relay marks SEEN on its next poll, and one
+    marked SEEN, which it swaps for READ once the overseer reads it.
+    Returns the lines dropped. An `out` line and a `resume` line are judged
+    by the `at` they journal, the age `post_events` never posts past, so
+    what they name can never post again."""
     path = root_dir(root) / JOURNAL
     state = read_journal(root)
     if not path.is_file():
@@ -251,6 +293,7 @@ def compact(root: Path, cutoff_ts: float) -> int:
         kind = line.get("t")
         old = "ts" in line and _ts_float(str(line["ts"])) < cutoff_ts
         aged = kind in ("out", "resume") and parse_at(str(line["at"])) < cutoff_ts
+        pending = kind in ("in", "mark") and str(line["ts"]) in state.directives and state.marks.get(str(line["ts"])) != READ
         drop = False
         if kind == "seen":
             drop = index != last_seen
@@ -260,7 +303,7 @@ def compact(root: Path, cutoff_ts: float) -> int:
             drop = aged
         elif kind == "in" and old:
             thread = state.threads.get(str(line.get("thread", "")))
-            drop = line["kind"] == "ignored" or thread is None or not thread.open
+            drop = line["kind"] == "ignored" or not (pending or thread is not None and thread.open)
         elif aged and line["state"] == "file":
             drop = True
         elif aged and line["state"] in ("open", "resolved"):
@@ -272,6 +315,8 @@ def compact(root: Path, cutoff_ts: float) -> int:
         elif kind in ("bound", "thread") and old:
             thread = state.threads.get(str(line["ts"]))
             drop = thread is None or not thread.open
+        elif kind == "mark" and old:
+            drop = not pending
         if drop:
             dropped += 1
         else:

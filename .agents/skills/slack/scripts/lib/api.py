@@ -13,17 +13,25 @@ from the response phase, after the request was written: Slack may have acted
 on it, so the call is `slack-response-lost`. The relay journals an envelope
 post lost this way as unknown and never repeats it; a read is made again on
 the next poll.
+
+A file download is no API method: Slack answers it with the file, an HTTP
+status, or, when the app lacks `files:read`, its sign-in page with 200. A
+body that ends short of its Content-Length reads as a clean end in
+http.client, so the download counts the bytes itself. A chunked body cut
+short raises http.client's own `HTTPException`, which the download alone
+refuses as `file-not-fetched`; every other call leaves it uncaught.
 """
 
 from __future__ import annotations
 
+import http.client
 import json
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections import deque
-from typing import Callable, Deque, Dict, Optional
+from typing import BinaryIO, Callable, Deque, Dict, Optional
 
 from refusals import Refusal
 
@@ -31,6 +39,7 @@ AUTH_ERRORS = {"invalid_auth", "not_authed", "account_inactive", "token_revoked"
 RETRIES = 3
 TIMEOUT_SECONDS = 30
 AUTH_FIX = "fix=set a live SLACK_BOT_TOKEN and restart the relay"
+COPY_BYTES = 64 * 1024
 
 
 class Slack:
@@ -53,13 +62,14 @@ class Slack:
             self.calls.popleft()
         return len(self.calls)
 
-    def _open(self, req: urllib.request.Request, label: str) -> bytes:
-        """One counted exchange and its body. `HTTPError` is the caller's to
-        judge; a network failure takes its key by the rule above."""
+    def _open(self, req: urllib.request.Request, label: str, read: Callable = lambda resp: resp.read()):
+        """One counted exchange, its response handed to `read`, the body
+        whole by default. `HTTPError` is the caller's to judge; a network
+        failure takes its key by the rule above."""
         self.calls.append(self.clock())
         try:
             with urllib.request.urlopen(req, timeout=TIMEOUT_SECONDS) as resp:
-                return resp.read()
+                return read(resp)
         except urllib.error.HTTPError:
             raise
         except urllib.error.URLError as err:
@@ -116,6 +126,41 @@ class Slack:
             cursor = (answer.get("response_metadata") or {}).get("next_cursor") or None
             if not cursor:
                 return
+
+    def download(self, url: str, size: Optional[int], out: BinaryIO) -> None:
+        """A message's file from its `url_private_download`, streamed into
+        `out`; `size` is the byte count the message's `files[]` entry gives,
+        None when it gives none. Refused `file-not-fetched` with the HTTP
+        status, with the bytes of a body that ended short of its
+        Content-Length, with http.client's error on a chunked body cut
+        short, or with the sign-in page Slack sends in place of the file: an
+        HTML answer of any length but `size`, so an HTML file the owner sent
+        is saved whatever its type, and one of unknown size is not. The key
+        has no EXPLAIN entry: `Relay.fetch_files` writes its value into the
+        message and never prints it."""
+
+        def copy(resp) -> None:
+            declared = resp.headers.get("Content-Length")
+            copied = 0
+            while True:
+                chunk = resp.read(COPY_BYTES)
+                if not chunk:
+                    break
+                out.write(chunk)
+                copied += len(chunk)
+            if declared is not None and declared.strip().isdigit() and copied != int(declared):
+                raise Refusal("file-not-fetched", f"truncated {copied} of {declared.strip()} bytes")
+            if resp.headers.get_content_type() == "text/html" and copied != size:
+                raise Refusal("file-not-fetched", f"HTTP {resp.status} sign-in page, the app needs files:read")
+
+        req = urllib.request.Request(url)
+        req.add_header("Authorization", f"Bearer {self.token}")
+        try:
+            self._open(req, "download", copy)
+        except urllib.error.HTTPError as err:
+            raise Refusal("file-not-fetched", f"HTTP {err.code}") from err
+        except http.client.HTTPException as err:
+            raise Refusal("file-not-fetched", f"download ({err})") from err
 
     def upload(self, filename: str, data: bytes, channel: str, comment: str, thread_ts: Optional[str]) -> str:
         """The three-step external upload; returns the file id."""

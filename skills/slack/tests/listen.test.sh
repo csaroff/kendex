@@ -3,29 +3,45 @@
 # the real lane-mail and a fake Slack API paged two messages at a time. The
 # rows: a directive with its delivery id, an ask posted with the mention and
 # answered once in its thread, the second reply as a directive, a chat answer
-# and a deadline default shown in the thread, a notice threaded on its ref,
-# a notice on an owner's reply threaded under that reply's parent,
-# a report uploaded and its thread bound from the share, a non-owner and a
-# file alone answered once and not routed, catch-up over pages, the crash
-# between the mailbox append and the journal mark, the second relay refused
-# by the lock, two roots bound to one channel refused at start, a reply
-# under a thread past SLACK_THREAD_DAYS left unrouted,
-# a secret value refused, a 429 honoured, a post Slack refuses failing the
-# poll and made again, a post whose response was lost journaled unknown, a
-# refused history read failing the poll, a first start reading Slack from
-# the binding moment and posting nothing from the mailbox's past but open
-# asks, an envelope past the horizon never posted across the daily
-# compaction, a journal reset re-posting open asks alone, owners re-resolved
-# from the setting, a report whose file matches the pattern or is gone
-# refused, and a notice under an owner message past the horizon posted once
-# across compaction. The controls at the end plant one mutant per rule: the
-# delivery id dropped, the ask thread no longer resolved, the lock no longer
-# exclusive, two roots on one channel accepted, the thread-age horizon
-# removed, the owner gate open, the no-text gate open, the outbound text
-# and the report bytes unchecked, the post failure swallowed, the envelope
-# horizon removed, the start horizon removed, the history seed at zero, a
-# posted line aged by its thread, and a refused connection read as a lost
-# response.
+# and a deadline default shown in the thread, a notice threaded on its ref, a
+# notice on an owner's reply threaded under that reply's parent, a report
+# uploaded and its thread bound from the share, a non-owner and an empty
+# message answered once and not routed, an owner's files saved and named in
+# the envelope, an HTML file saved, a long name cut to 200 characters, a
+# refused download, Slack's sign-in page in place of a PNG and of an HTML
+# file, a file with no download url and a
+# body cut short under its Content-Length or inside a chunk each named by file
+# id, a whole chunked body with no Content-Length saved, a directive's eyes
+# mark swapped for a check once the cursor passes it, a refused mark printed
+# without failing the poll and made on the next, a stop after the delivery
+# or after its mark landed marked and swapped after the restart, a refused
+# swap completed on the next poll, each
+# Slack answer a swap counts as settled, a receipts read lane-mail refuses
+# printed without failing the poll, each form of Slack's escapes and tokens
+# read back as typed, catch-up over pages, the crash between the mailbox
+# append and the journal mark, the second relay refused by the lock, two roots
+# bound to one channel refused at start, a reply under a thread past
+# SLACK_THREAD_DAYS left unrouted, a secret value refused, a 429 honoured, a
+# post Slack refuses failing the poll and made again, a post whose response
+# was lost journaled unknown, a refused history read failing the poll, a first
+# start reading Slack from the binding moment and posting nothing from the
+# mailbox's past but open asks, an envelope past the horizon never posted
+# across the daily compaction, a journal reset re-posting open asks alone,
+# owners re-resolved from the setting, a report whose file matches the pattern
+# or is gone refused, and a notice under an owner message past the horizon
+# posted once across compaction. The controls at the end plant one mutant per
+# rule: the delivery id dropped, the ask thread no longer resolved, the lock
+# no longer exclusive, two roots on one channel accepted, the thread-age
+# horizon removed, the owner gate open, the no-text gate open, the files
+# unread, the sign-in check gone, the file name kept whole, the files
+# directory mode unset, the file's size unread, the name uncut, the length
+# unchecked, a missing length read as zero, http.client's own error uncaught
+# in the download, the seen mark gone, the cursor unread, a refused mark
+# raised, each settled Slack answer unsettled, a refused receipts read raised,
+# the markup unread, &amp; unescaped first, the outbound text and the report
+# bytes unchecked, the post failure swallowed, the envelope horizon removed,
+# the start horizon removed, the history seed at zero, a posted line aged by
+# its thread, and a refused connection read as a lost response.
 set -uo pipefail
 . "$(dirname "$0")/lib/harness.sh"
 
@@ -134,19 +150,70 @@ R4="$(sk_inject C001 U001 'good report' "$SHARE_TS")"
 sk_polls "$ROOT" 10
 assert_has "$(directives "$ROOT")" "C001:$R4 good report" "a reply under the report is a directive"
 
-# --- a non-owner and a file alone: one reply each, nothing routed ------------------
+# --- a non-owner and an empty message: one reply each, nothing routed -------------
 N1="$(sk_inject C001 U999 'let me in')"
-F1="$(sk_inject C001 U001 '' '' '"files": [{"id": "F777"}]')"
+F1="$(sk_inject C001 U001 '')"
 sk_poll "$ROOT"
 sk_poll "$ROOT"
 assert_has "$(posts C001)" "$N1 | Only the channel's owners steer this session; this message is not routed." "a non-owner gets one reply"
-assert_has "$(posts C001)" "$F1 | Only text is routed; a file alone is not." "a file alone gets one reply"
+assert_has "$(posts C001)" "$F1 | Only text and files are routed; this message has neither." "a message with no text and no file gets one reply"
 assert_eq "$(sk_state '[.messages.C001[] | select(.text | startswith("Only"))] | length')" "2" "each is answered once"
 assert_lacks "$(directives "$ROOT")" "$N1" "the non-owner's message is not routed"
-assert_lacks "$(directives "$ROOT")" "$F1" "the file alone is not routed"
+assert_lacks "$(directives "$ROOT")" "$F1" "the empty message is not routed"
 B1="$(sk_inject C001 U001 'broadcast' "$ASK_TS" '"subtype": "thread_broadcast"')"
 sk_poll "$ROOT"
 assert_lacks "$(directives "$ROOT")" "$B1" "a thread broadcast is ignored"
+
+# --- an owner's files: saved under tmp/slack/files, each named in the envelope -------
+text_of() { jq -r --arg d "$2" 'select(.delivery_id == $d) | .text' "$(sk_box "$1")/to-lane.jsonl"; } # ROOT DELIVERY_ID
+FILES_DIR="$ROOT/tmp/slack/files"
+FM1="$(sk_inject C001 U001 'get this error, why' '' "\"files\": [$(sk_file F901 'shots/shot one.png' image/png 'png bytes one'), $(sk_file F902 err.log text/plain 'log line two')]")"
+sk_poll "$ROOT"
+assert_eq "$RC=$(text_of "$ROOT" "C001:$FM1")" "0=get this error, why
+$FILES_DIR/F901-shots_shot_one.png
+$FILES_DIR/F902-err.log" "an owner's message lands with the saved path of each file, one line each, the name made one path component"
+assert_eq "$(cat "$FILES_DIR/F901-shots_shot_one.png")|$(cat "$FILES_DIR/F902-err.log")" "png bytes one|log line two" \
+  "each saved file holds the bytes Slack served"
+assert_eq "$(sk_mode "$FILES_DIR") $(sk_mode "$FILES_DIR/F901-shots_shot_one.png")" "700 600" "the directory is 700 and each file 600"
+sk_ctl /_test/fault '{"method": "download", "status": 403}' >/dev/null
+sk_ctl /_test/fault '{"method": "download", "signin": true, "times": 2}' >/dev/null
+FM2="$(sk_inject C001 U001 'and this one' '' "\"files\": [$(sk_file F903 a.png image/png 'x')]")"
+FM3="$(sk_inject C001 U001 '' '' "\"files\": [$(sk_file F904 b.png image/png 'y')]")"
+FM4="$(sk_inject C001 U001 '' '' '"files": [{"id": "F777"}]')"
+FM9="$(sk_inject C001 U001 '' '' "\"files\": [$(sk_file F910 own.html text/html '<p>own</p>')]")"
+sk_poll "$ROOT"
+assert_eq "$RC=$(text_of "$ROOT" "C001:$FM2")" "0=and this one
+file F903 not fetched: HTTP 403" "a refused download lands the message with the file id and the HTTP status"
+assert_eq "$(text_of "$ROOT" "C001:$FM3")" "file F904 not fetched: HTTP 200 sign-in page, the app needs files:read" \
+  "Slack's sign-in page in place of a file names files:read, and a file with no text lands"
+assert_eq "$(text_of "$ROOT" "C001:$FM4")" "file F777 not fetched: no download url" "a file Slack sends with no download url lands as its id"
+assert_eq "$(text_of "$ROOT" "C001:$FM9")" "file F910 not fetched: HTTP 200 sign-in page, the app needs files:read" \
+  "the sign-in page in place of an HTML file is refused by its size, not its type"
+FM5="$(sk_inject C001 U001 '' '' "\"files\": [$(sk_file F905 page.html text/html '<p>owner page</p>')]")"
+FM6="$(sk_inject C001 U001 '' '' "\"files\": [$(sk_file F906 "$(python3 -c 'print("n" * 300 + ".txt")')" text/plain 'long')]")"
+sk_poll "$ROOT"
+assert_eq "$(text_of "$ROOT" "C001:$FM5")|$(cat "$FILES_DIR/F905-page.html")" "$FILES_DIR/F905-page.html|<p>owner page</p>" \
+  "an HTML file the owner sent is saved, not read as the sign-in page"
+LONG_SAVED="$(text_of "$ROOT" "C001:$FM6")"
+LONG_BASE="${LONG_SAVED##*/}"
+assert_eq "${LONG_SAVED%/*}|${#LONG_BASE}|${LONG_BASE:0:8}|$(cat "$LONG_SAVED")" "$FILES_DIR|200|F906-nnn|long" \
+  "a name past the file-name limit is cut to 200 characters, the file id first"
+sk_ctl /_test/fault '{"method": "download", "cut": "length"}' >/dev/null
+sk_ctl /_test/fault '{"method": "download", "cut": "chunked"}' >/dev/null
+FM7="$(sk_inject C001 U001 'cut short' '' "\"files\": [$(sk_file F907 g.png image/png 'cut bytes one'), $(sk_file F908 h.png image/png 'cut bytes two')]")"
+sk_poll "$ROOT"
+FM7_TEXT="$(text_of "$ROOT" "C001:$FM7")"
+assert_eq "$RC=$(sed -n '1,2p' <<<"$FM7_TEXT")" "0=cut short
+file F907 not fetched: truncated 6 of 13 bytes" "a body short of its Content-Length is not saved, and its line counts the bytes"
+assert_has "$(sed -n '3p' <<<"$FM7_TEXT")" "file F908 not fetched: download (IncompleteRead(" \
+  "a chunked body cut short is not saved, and the relay goes on"
+sk_ctl /_test/fault '{"method": "download", "chunked": true}' >/dev/null
+FM8="$(sk_inject C001 U001 '' '' "\"files\": [$(sk_file F909 k.png image/png 'chunked bytes')]")"
+sk_poll "$ROOT"
+assert_eq "$RC=$(text_of "$ROOT" "C001:$FM8")|$(cat "$FILES_DIR/F909-k.png")" "0=$FILES_DIR/F909-k.png|chunked bytes" \
+  "a whole chunked body with no Content-Length is saved with the bytes Slack served"
+assert_eq "$(ls -A "$FILES_DIR" | sed 's/^F906-n*$/F906-long/' | tr '\n' ' ')" "F901-shots_shot_one.png F902-err.log F905-page.html F906-long F909-k.png " \
+  "a download that failed or was cut leaves no file behind"
 
 # --- catch-up over pages -------------------------------------------------------------
 for n in 1 2 3 4 5; do sk_inject C001 U001 "note $n" >/dev/null; done
@@ -356,6 +423,140 @@ assert_eq "$RC=$ERR1" "2=slack: channel-shared=$PAIR_CH roots=$PAIR_A,$PAIR_B fi
 assert_eq "$([ -e "$(sk_journal "$PAIR_A")" ] || [ -e "$(sk_journal "$PAIR_B")" ] && echo polled || echo untouched)" "untouched" \
   "the refusal comes before any poll"
 
+# --- receipt marks: eyes once a directive lands, a check once the overseer reads it ---
+IOTA="$(sk_new_root iota)"
+sk_bind "$IOTA"
+IOTA_CH="$(sk_channel "$IOTA")"
+M1="$(sk_inject "$IOTA_CH" U001 'first note')"
+M2="$(sk_inject "$IOTA_CH" U001 'second note')"
+sk_poll "$IOTA"
+assert_eq "$RC $(sk_reactions "$IOTA_CH" "$M1") $(sk_reactions "$IOTA_CH" "$M2")" "0 eyes eyes" "each directive's message is marked eyes in the poll that lands it"
+sk_lm "$IOTA" inbox --item overseer --ack 1 >/dev/null
+sk_poll "$IOTA"
+assert_eq "$(sk_reactions "$IOTA_CH" "$M1") $(sk_reactions "$IOTA_CH" "$M2")" "white_check_mark eyes" \
+  "the directive the cursor passed swaps eyes for a check; the unread one keeps eyes"
+sk_lm "$IOTA" inbox --item overseer >/dev/null
+sk_poll "$IOTA"
+assert_eq "$(sk_reactions "$IOTA_CH" "$M2")" "white_check_mark" "an inbox read swaps the rest"
+sk_ctl /_test/fault '{"method": "reactions.add", "error": "missing_scope"}' >/dev/null
+M3="$(sk_inject "$IOTA_CH" U001 'third note')"
+sk_poll "$IOTA"
+assert_eq "$RC=$ERR1" "0=slack: slack-api-failed=reactions.add error=missing_scope" "a mark Slack refuses is printed and fails no poll"
+assert_eq "$(text_of "$IOTA" "$IOTA_CH:$M3")|$(sk_reactions "$IOTA_CH" "$M3")|$(jq -r "select(.t == \"mark\" and .ts == \"$M3\") | .name" "$(sk_journal "$IOTA")")" \
+  "third note||" "the directive lands unmarked and no mark is journaled"
+sk_poll "$IOTA"
+assert_eq "$RC $(sk_reactions "$IOTA_CH" "$M3")" "0 eyes" "the next poll makes the mark Slack refused"
+sk_lm "$IOTA" inbox --item overseer >/dev/null
+M4="$(sk_inject "$IOTA_CH" U001 'fourth note')"
+sk_poll "$IOTA"
+sk_lm "$IOTA" inbox --item overseer >/dev/null
+sk_ctl /_test/fault '{"method": "reactions.add", "error": "internal_error"}' >/dev/null
+sk_poll "$IOTA"
+assert_eq "$RC $(sk_reactions "$IOTA_CH" "$M4")" "0 " "a swap whose check Slack refused leaves the message unmarked for that poll"
+sk_poll "$IOTA"
+assert_eq "$(sk_reactions "$IOTA_CH" "$M4")" "white_check_mark" "the next poll completes the swap"
+assert_eq "$(sk_state "[.messages.${IOTA_CH}[] | select(.user == \"UBOT\")] | length")" "0" "no mark posts a message"
+sk_ctl /_test/calls-reset >/dev/null
+sk_poll "$IOTA"
+assert_eq "$(sk_state '[.calls[] | select(startswith("reactions."))] | length')" "0" "a completed swap is not made again"
+settle_rows() { # SLACK ERROR<TAB>THE REACTIONS METHODS THAT ANSWER IT, one line per MARK_SETTLED member
+  printf '%s\t%s\n' \
+    no_reaction reactions.remove \
+    already_reacted reactions.add \
+    message_not_found 'reactions.remove reactions.add'
+}
+swap_due() { # ROOT CHANNEL TEXT — a directive landed and read, its swap due on the next poll; prints its ts
+  local ts
+  ts="$(sk_inject "$2" U001 "$3")"
+  sk_poll "$1"
+  sk_lm "$1" inbox --item overseer >/dev/null
+  printf '%s' "$ts"
+}
+mark_of() { jq -r --arg ts "$2" 'select(.t == "mark" and .ts == $ts) | .name' "$(sk_journal "$1")" | tail -n 1; } # ROOT TS — its last journaled mark
+while IFS=$'\t' read -r error methods <&3; do
+  MS="$(swap_due "$IOTA" "$IOTA_CH" "settle $error")"
+  for method in $methods; do sk_ctl /_test/fault "{\"method\": \"$method\", \"error\": \"$error\"}" >/dev/null; done
+  sk_poll "$IOTA"
+  assert_eq "$RC=$ERR|$(mark_of "$IOTA" "$MS")" "0=|white_check_mark" "a swap Slack answers $error on is settled: no line, the check journaled"
+  sk_ctl /_test/calls-reset >/dev/null
+  sk_poll "$IOTA"
+  assert_eq "$(sk_state '[.calls[] | select(startswith("reactions."))] | length')" "0" "a swap settled by $error is not made again"
+done 3<<<"$(settle_rows)"
+stop_rows() { # NAME<TAB>THE LINE A STOP FOLLOWS OR REPLACES<TAB>ITS REPLACEMENT<TAB>REACTIONS AT THE STOP, one line per point
+  printf '%s\t%s\t%s\t%s\n' \
+    after-in 'self\.journal\.append\(t="in", channel=self\.channel, ts=ts, kind="directive", id=envelope, thread=thread_ts\)' '\g<0>; os._exit(9)' '' \
+    after-react 'self\.journal\.append\(t="mark", ts=ts, name=SEEN\)' 'os._exit(9)' eyes
+}
+while IFS=$'\t' read -r stop pattern repl before <&3; do
+  sk_mutant "stop-$stop" relay.py "$pattern" "$repl"
+  MX="$(sk_inject "$IOTA_CH" U001 "stopped $stop")"
+  sk_poll "$IOTA"
+  STOPPED="$RC|$(sk_reactions "$IOTA_CH" "$MX")|$(mark_of "$IOTA" "$MX")"
+  sk_bin_reset
+  sk_poll "$IOTA"
+  RESTARTED="$RC|$(sk_reactions "$IOTA_CH" "$MX")|$(mark_of "$IOTA" "$MX")"
+  sk_lm "$IOTA" inbox --item overseer >/dev/null
+  sk_poll "$IOTA"
+  assert_eq "$STOPPED/$(text_of "$IOTA" "$IOTA_CH:$MX")/$RESTARTED/$(sk_reactions "$IOTA_CH" "$MX")" \
+    "9|$before|/stopped $stop/0|eyes|eyes/white_check_mark" "a stop $stop: the directive landed, the restart marks it, the read swaps it"
+done 3<<<"$(stop_rows)"
+
+# --- a receipts read lane-mail refuses: printed, the mark waits, the poll goes on -------
+MU="$(sk_new_root mu)"
+rm -- "${MU:?}/.agents/skills/orch/scripts"
+mkdir -p "$MU/.agents/skills/orch/scripts"
+cat > "$MU/.agents/skills/orch/scripts/lane-mail" <<EOF
+#!/usr/bin/env bash
+if [ -e "$MU/tmp/drain-refused" ]; then
+  case " \$* " in *" --receipts "*) echo 'lane-mail: drain-refused' >&2; exit 2 ;; esac
+fi
+exec "$SK_LANE_MAIL" "\$@"
+EOF
+chmod +x "$MU/.agents/skills/orch/scripts/lane-mail"
+sk_bind "$MU"
+MU_CH="$(sk_channel "$MU")"
+MU1="$(swap_due "$MU" "$MU_CH" 'read me')"
+touch "$MU/tmp/drain-refused"
+sk_lm "$MU" notice --item overseer --to owner --file "$(sk_text n20 'Still posting.')" >/dev/null
+sk_poll "$MU"
+assert_eq "$RC=$ERR1" "0=slack: lane-mail-failed=lane-mail: drain-refused" "a receipts read lane-mail refuses is printed and fails no poll"
+assert_eq "$(asks "$MU_CH" 'Still posting.')|$(sk_reactions "$MU_CH" "$MU1")" "1|eyes" "the notice still posts and the mark waits"
+rm -- "${MU:?}/tmp/drain-refused"
+sk_poll "$MU"
+assert_eq "$(sk_reactions "$MU_CH" "$MU1")" "white_check_mark" "the next poll makes the swap"
+
+# --- text as the owner typed it: Slack's escapes and tokens read back, one row per form ---
+markup_rows() { # SENT<TAB>DELIVERED, one line per form
+  printf '%s\t%s\n' \
+    'a &amp; b &lt;c&gt;' 'a & b <c>' \
+    'see <https://example.test/a?x=1&amp;y=2|the docs>' 'see the docs (https://example.test/a?x=1&y=2)' \
+    'open <https://example.test/b>' 'open https://example.test/b' \
+    'ask <@U002> first' 'ask @ann first' \
+    'ask <@U404> too' 'ask @U404 too' \
+    'ask <@U002|annie> now' 'ask @annie now' \
+    '<!here> ship it :rocket:' '@here ship it :rocket:' \
+    '<!channel> stop' '@channel stop' \
+    '<!subteam^S1|@team> look' '@team look' \
+    '<!subteam^S1> look' '@subteam look' \
+    'due <!date^1392734382^{date}|Feb 18, 2014> then' 'due Feb 18, 2014 then' \
+    'in <#C123|general>' 'in #general' \
+    'in <#C123>' 'in #C123' \
+    'in <#C124|>' 'in #C124' \
+    'typed &amp;lt; as is' 'typed &lt; as is'
+}
+LAMBDA="$(sk_new_root lambda)"
+sk_bind "$LAMBDA"
+LAMBDA_CH="$(sk_channel "$LAMBDA")"
+MARKUP_TS=()
+while IFS=$'\t' read -r sent _; do MARKUP_TS+=("$(sk_inject "$LAMBDA_CH" U001 "$sent")"); done <<<"$(markup_rows)"
+sk_poll "$LAMBDA"
+assert_eq "$RC=$ERR1" "0=slack: slack-api-failed=users.info error=user_not_found" "a mention Slack will not name is printed and fails no poll"
+n=0
+while IFS=$'\t' read -r sent want; do
+  assert_eq "$(text_of "$LAMBDA" "$LAMBDA_CH:${MARKUP_TS[$n]}")" "$want" "Slack's text [$sent] lands as [$want]"
+  n=$((n + 1))
+done <<<"$(markup_rows)"
+
 # --- controls, one mutant per rule ------------------------------------------------------------
 sk_mutant delivery mailbox.py '"--delivery-id", delivery_id, "--file"' '"--delivery-id", delivery_id + "." + str(os.getpid()), "--file"'
 DELTA="$(sk_new_root delta)"
@@ -407,10 +608,125 @@ sk_poll "$ZETA"
 assert_has "$(directives "$ZETA")" "$N2 not an owner" "control: the owner gate open, a non-owner's message is routed"
 sk_bin_reset
 
-sk_mutant notext relay.py 'if not text:' 'if not text and False:'
-F2="$(sk_inject "$ZETA_CH" U001 '' '' '"files": [{"id": "F778"}]')"
+sk_mutant notext relay.py 'if not lines:' 'if not lines and False:'
+F2="$(sk_inject "$ZETA_CH" U001 '')"
 sk_poll "$ZETA"
-assert_lacks "$(posts "$ZETA_CH")" "$F2 | Only text is routed" "control: the no-text gate open, a file alone gets no reply"
+assert_lacks "$(posts "$ZETA_CH")" "$F2 | Only text and files are routed" "control: the no-text gate open, an empty message gets no reply"
+sk_bin_reset
+
+ZETA_FILES="$ZETA/tmp/slack/files"
+sk_mutant files-dropped relay.py 'lines = \(\[text\] if text else \[\]\) \+ self\.fetch_files\(message\)' 'lines = [text] if text else []'
+FC1="$(sk_inject "$ZETA_CH" U001 'see file' '' "\"files\": [$(sk_file F911 c.png image/png 'c')]")"
+sk_poll "$ZETA"
+assert_eq "$(text_of "$ZETA" "$ZETA_CH:$FC1")" "see file" "control: the files unread, the envelope names no file"
+sk_bin_reset
+
+sk_mutant signin api.py 'if resp\.headers\.get_content_type\(\) == "text/html" and copied != size:' 'if False:'
+sk_ctl /_test/fault '{"method": "download", "signin": true}' >/dev/null
+FC2="$(sk_inject "$ZETA_CH" U001 '' '' "\"files\": [$(sk_file F912 d.png image/png 'd')]")"
+sk_poll "$ZETA"
+assert_eq "$(text_of "$ZETA" "$ZETA_CH:$FC2")" "$ZETA_FILES/F912-d.png" "control: the sign-in check gone, the sign-in page is saved as the file"
+sk_bin_reset
+
+sk_mutant name store.py 're\.sub\(r"\[\^A-Za-z0-9\._-\]", "_", f"\{file_id\}-\{name\}"\)' 'f"{file_id}-{name}"'
+FC3="$(sk_inject "$ZETA_CH" U001 '' '' "\"files\": [$(sk_file F913 'shots/e.png' image/png 'e')]")"
+sk_poll "$ZETA"
+assert_has "$(text_of "$ZETA" "$ZETA_CH:$FC3")" "file F913 not fetched: " "control: the name kept whole, a slash in it leaves the file unsaved"
+sk_bin_reset
+
+sk_mutant file-mode store.py 'os\.chmod\(directory, 0o700\)' 'os.chmod(directory, 0o755)'
+sk_inject "$ZETA_CH" U001 '' '' "\"files\": [$(sk_file F914 f.png image/png 'f')]" >/dev/null
+sk_poll "$ZETA"
+assert_eq "$(sk_mode "$ZETA_FILES")" "755" "control: the directory mode unset, the files directory is readable by others"
+sk_bin_reset
+
+sk_mutant html-size relay.py 'size = given if isinstance\(given, int\) else None' 'size = None'
+FC4="$(sk_inject "$ZETA_CH" U001 '' '' "\"files\": [$(sk_file F915 page.html text/html '<p>page</p>')]")"
+sk_poll "$ZETA"
+assert_eq "$(text_of "$ZETA" "$ZETA_CH:$FC4")" "file F915 not fetched: HTTP 200 sign-in page, the app needs files:read" \
+  "control: the file's size unread, an HTML file is refused as the sign-in page"
+sk_bin_reset
+
+sk_mutant name-cut store.py '\[:NAME_CHARS\]' ''
+FC5="$(sk_inject "$ZETA_CH" U001 '' '' "\"files\": [$(sk_file F916 "$(python3 -c 'print("n" * 300)')" text/plain 'long')]")"
+sk_poll "$ZETA"
+assert_has "$(text_of "$ZETA" "$ZETA_CH:$FC5")" "file F916 not fetched: " "control: the name uncut, a long name leaves the file unsaved"
+sk_bin_reset
+
+sk_mutant length api.py 'if declared is not None and declared\.strip\(\)\.isdigit\(\) and copied != int\(declared\):' 'if False:'
+sk_ctl /_test/fault '{"method": "download", "cut": "length"}' >/dev/null
+FC6="$(sk_inject "$ZETA_CH" U001 '' '' "\"files\": [$(sk_file F917 i.png image/png 'cut bytes')]")"
+sk_poll "$ZETA"
+assert_eq "$(text_of "$ZETA" "$ZETA_CH:$FC6")|$(cat "$ZETA_FILES/F917-i.png")" "$ZETA_FILES/F917-i.png|cut " \
+  "control: the length unchecked, a body cut short is saved as the file"
+sk_bin_reset
+
+sk_mutant no-length api.py 'declared = resp\.headers\.get\("Content-Length"\)' 'declared = resp.headers.get("Content-Length", "0")'
+sk_ctl /_test/fault '{"method": "download", "chunked": true}' >/dev/null
+FC8="$(sk_inject "$ZETA_CH" U001 '' '' "\"files\": [$(sk_file F919 l.png image/png 'chunked bytes')]")"
+sk_poll "$ZETA"
+assert_eq "$(text_of "$ZETA" "$ZETA_CH:$FC8")" "file F919 not fetched: truncated 13 of 0 bytes" \
+  "control: a missing Content-Length read as zero, a whole chunked body is refused"
+sk_bin_reset
+
+sk_mutant http-exception api.py 'except http\.client\.HTTPException as err:' 'except LookupError as err:'
+sk_ctl /_test/fault '{"method": "download", "cut": "chunked"}' >/dev/null
+FC7="$(sk_inject "$ZETA_CH" U001 'chunks' '' "\"files\": [$(sk_file F918 j.png image/png 'cut bytes')]")"
+sk_poll "$ZETA"
+assert_eq "$RC $(text_of "$ZETA" "$ZETA_CH:$FC7")" "1 " "control: http.client's own error uncaught, a cut chunked body stops the poll"
+sk_bin_reset
+
+sk_mutant mark-seen relay.py 'if self\.react\("reactions\.add", ts, SEEN\):' 'if False and self.react("reactions.add", ts, SEEN):'
+MC1="$(sk_inject "$ZETA_CH" U001 'mark me')"
+sk_poll "$ZETA"
+assert_eq "$(sk_reactions "$ZETA_CH" "$MC1")" "" "control: the seen mark gone, a delivered directive carries no reaction"
+sk_bin_reset
+
+sk_mutant mark-cursor relay.py 'if self\.state\.delivered\.get\(ts\) not in read:' 'if False:'
+MC2="$(sk_inject "$ZETA_CH" U001 'unread')"
+sk_poll "$ZETA"
+assert_eq "$(sk_reactions "$ZETA_CH" "$MC2")" "white_check_mark" "control: the cursor unread, an unread directive is marked read"
+sk_bin_reset
+
+sk_mutant mark-fatal relay.py 'print_refusal\(err\)\n                return False' 'raise err'
+sk_ctl /_test/fault '{"method": "reactions.add", "error": "missing_scope"}' >/dev/null
+sk_inject "$ZETA_CH" U001 'scope missing' >/dev/null
+sk_poll "$ZETA"
+assert_eq "$RC" "1" "control: a refused mark raised, the poll fails"
+sk_bin_reset
+
+while IFS=$'\t' read -r error methods <&3; do
+  sk_mutant "settled-$error" relay.py "\"$error\"(, )?" ''
+  SR="$(sk_new_root "settle-$error")"
+  sk_bind "$SR"
+  SR_CH="$(sk_channel "$SR")"
+  MS="$(swap_due "$SR" "$SR_CH" 'settle me')"
+  for method in $methods; do sk_ctl /_test/fault "{\"method\": \"$method\", \"error\": \"$error\"}" >/dev/null; done
+  sk_poll "$SR"
+  assert_eq "$ERR1|$(mark_of "$SR" "$MS")" "slack: slack-api-failed=${methods%% *} error=$error|eyes" \
+    "control: $error no longer settled, the swap is printed as refused and no check is journaled"
+  sk_bin_reset
+done 3<<<"$(settle_rows)"
+
+sk_mutant mark-read-refused relay.py '        try:\n            read = self\.mail\.read_directives\(\)\n        except Refusal as err:\n            print_refusal\(err\)\n            return\n' '        read = self.mail.read_directives()\n'
+sk_inject "$MU_CH" U001 'refused read' >/dev/null
+touch "$MU/tmp/drain-refused"
+sk_lm "$MU" notice --item overseer --to owner --file "$(sk_text n21 'Held back.')" >/dev/null
+sk_poll "$MU"
+assert_eq "$RC $(asks "$MU_CH" 'Held back.')" "1 0" "control: a refused receipts read raised, the poll fails and the notice waits"
+rm -- "${MU:?}/tmp/drain-refused"
+sk_bin_reset
+
+sk_mutant markup-skipped relay.py 'text = plain\(\(message\.get\("text"\) or ""\)\.strip\(\), self\.user_name\)' 'text = (message.get("text") or "").strip()'
+MK1="$(sk_inject "$ZETA_CH" U001 'a &amp; b')"
+sk_poll "$ZETA"
+assert_eq "$(text_of "$ZETA" "$ZETA_CH:$MK1")" "a &amp; b" "control: the markup unread, Slack's escape lands as sent"
+sk_bin_reset
+
+sk_mutant markup-order markup.py 'return text\.replace\("&lt;", "<"\)\.replace\("&gt;", ">"\)\.replace\("&amp;", "&"\)' 'return text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")'
+MK2="$(sk_inject "$ZETA_CH" U001 'typed &amp;lt;')"
+sk_poll "$ZETA"
+assert_eq "$(text_of "$ZETA" "$ZETA_CH:$MK2")" "typed <" "control: &amp; unescaped first, a typed &lt; lands as <"
 sk_bin_reset
 
 sk_mutant text-check relay.py 'secret_check\(text\.encode\(\), f"id=\{env_id\}"\)' 'secret_check(b"", f"id={env_id}")'

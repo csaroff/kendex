@@ -4,12 +4,19 @@ in-memory workspace, and a control surface under /_test/ the suites drive.
 
     fake_slack.py --port-file PATH --token TOKEN [--user EMAIL=ID]... [--page N]
 
-Control: POST /_test/message injects a message and answers its ts; GET
+Control: POST /_test/message injects a message and answers its ts; POST
+/_test/file holds `content` as file `id`, which GET /_files/<id> serves to the
+bot token as Slack's url_private_download does, typed `type` when given and
+application/octet-stream when not; GET
 /_test/state dumps messages, calls, uploads and posts; POST /_test/fault
 makes the next `times` calls of `method` answer `error`, HTTP `status`, or
 with `drop` close the connection after reading the request and before any
 response, or with `refuse` redirect to a port nothing listens on, which the
-client meets as a refused connection before its request is written.
+client meets as a refused connection before its request is written, or with
+`signin` Slack's sign-in page, or with `cut` a body the connection closes
+halfway through: `length` under its full Content-Length, `chunked` inside
+its first chunk, or with `chunked: true` the whole file in two chunks and
+no Content-Length. A download's method is `download`.
 """
 
 from __future__ import annotations
@@ -27,6 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BOT = "UBOT"
 BOT_ID = "B01"
+SIGNIN = b"<!DOCTYPE html><html><head><title>Slack</title></head><body>Sign in to Slack</body></html>"
 
 
 class Workspace:
@@ -37,6 +45,7 @@ class Workspace:
         self.channels: dict = {}  # id -> {id, name, members, is_private}
         self.messages: dict = {}  # channel -> [message]
         self.uploads: dict = {}  # file id -> bytes
+        self.files: dict = {}  # file id -> (bytes, content type) a download serves
         self.calls: list = []
         self.faults: list = []
         self.counter = 0
@@ -93,14 +102,47 @@ class Handler(BaseHTTPRequestHandler):
         return
 
     def send_json(self, body: dict, status: int = 200, headers: dict = None) -> None:
-        data = json.dumps(body).encode()
+        self.send_bytes(json.dumps(body).encode(), "application/json", status, headers)
+
+    def send_bytes(self, data: bytes, content_type: str, status: int = 200, headers: dict = None) -> None:
         self.send_response(status)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", content_type)
         for key, value in (headers or {}).items():
             self.send_header(key, value)
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    def send_cut(self, how: str, data: bytes) -> None:
+        """Half of `data`, then the connection closed: a response Slack's
+        side cut short."""
+        half = data[: len(data) // 2]
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        if how == "length":
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(half)
+        elif how == "chunked":
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            self.wfile.write(b"%x\r\n" % len(data) + half)
+        else:
+            raise ValueError(f"cut={how}")
+        self.wfile.flush()
+        self.close_connection = True
+
+    def send_chunked(self, data: bytes, content_type: str) -> None:
+        """`data` whole in two chunks, with no Content-Length."""
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        half = len(data) // 2
+        for part in (data[:half], data[half:]):
+            if part:
+                self.wfile.write(b"%x\r\n%s\r\n" % (len(part), part))
+        self.wfile.write(b"0\r\n\r\n")
 
     def body(self) -> bytes:
         length = int(self.headers.get("Content-Length", "0") or 0)
@@ -126,7 +168,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({"ok": True})
             if raw and self.headers.get("Content-Type", "").startswith("application/json"):
                 params.update(json.loads(raw))
-            method = path.lstrip("/")
+            method = "download" if path.startswith("/_files/") else path.lstrip("/")
             self.ws.calls.append(method)
             for fault in list(self.ws.faults):
                 if fault["method"] == method and fault["times"] > 0:
@@ -136,12 +178,23 @@ class Handler(BaseHTTPRequestHandler):
                         return None
                     if fault.get("refuse"):
                         return self.send_json({}, 302, {"Location": f"http://127.0.0.1:{self.ws.dead_port}/{method}"})
+                    if fault.get("signin"):
+                        return self.send_bytes(SIGNIN, "text/html; charset=utf-8")
+                    if fault.get("cut"):
+                        return self.send_cut(fault["cut"], self.ws.files[path[len("/_files/") :]][0])
+                    if fault.get("chunked"):
+                        return self.send_chunked(*self.ws.files[path[len("/_files/") :]])
                     if fault.get("status"):
                         return self.send_json({"ok": False}, fault["status"], {"Retry-After": str(fault.get("retry_after", 0))})
                     return self.send_json({"ok": False, "error": fault["error"]})
             auth = self.headers.get("Authorization", "")
             if auth != f"Bearer {self.ws.token}":
                 return self.send_json({"ok": False, "error": "invalid_auth"})
+            if method == "download":
+                served = self.ws.files.get(path[len("/_files/") :])
+                if served is None:
+                    return self.send_json({"ok": False}, 404)
+                return self.send_bytes(*served)
             handler = getattr(self, "m_" + method.replace(".", "_"), None)
             if handler is None:
                 return self.send_json({"ok": False, "error": "unknown_method"})
@@ -175,6 +228,9 @@ class Handler(BaseHTTPRequestHandler):
             body.setdefault("times", 1)
             ws.faults.append(body)
             return self.send_json({"ok": True})
+        if path == "/_test/file":
+            ws.files[body["id"]] = (body["content"].encode(), body.get("type") or "application/octet-stream")
+            return self.send_json({"ok": True})
         if path == "/_test/calls-reset":
             ws.calls.clear()
             return self.send_json({"ok": True})
@@ -190,6 +246,15 @@ class Handler(BaseHTTPRequestHandler):
         if user is None:
             return self.send_json({"ok": False, "error": "users_not_found"})
         self.send_json({"ok": True, "user": {"id": user, "profile": {"email": params["email"]}}})
+
+    def m_users_info(self, params):
+        """A user's display name is the local part of the address the suite
+        gave it."""
+        for email, user in self.ws.users.items():
+            if user == params.get("user"):
+                name = email.split("@")[0]
+                return self.send_json({"ok": True, "user": {"id": user, "name": name, "profile": {"display_name": name}}})
+        self.send_json({"ok": False, "error": "user_not_found"})
 
     def m_conversations_list(self, params):
         channels = [dict(c, is_member=BOT in c["members"]) for c in self.ws.channels.values() if BOT in c["members"]]
@@ -242,6 +307,32 @@ class Handler(BaseHTTPRequestHandler):
                 message["edited"] = {"ts": self.ws.next_ts()}
                 return self.send_json({"ok": True, "ts": params["ts"]})
         self.send_json({"ok": False, "error": "message_not_found"})
+
+    def reacted(self, params):
+        """The message a reactions call names and its reaction names, or
+        None when the channel holds no such message."""
+        for message in self.ws.messages.get(params["channel"], []):
+            if message["ts"] == params["timestamp"]:
+                return message, [r["name"] for r in message.setdefault("reactions", [])]
+        return None, []
+
+    def m_reactions_add(self, params):
+        message, names = self.reacted(params)
+        if message is None:
+            return self.send_json({"ok": False, "error": "message_not_found"})
+        if params["name"] in names:
+            return self.send_json({"ok": False, "error": "already_reacted"})
+        message["reactions"].append({"name": params["name"], "users": [BOT], "count": 1})
+        self.send_json({"ok": True})
+
+    def m_reactions_remove(self, params):
+        message, names = self.reacted(params)
+        if message is None:
+            return self.send_json({"ok": False, "error": "message_not_found"})
+        if params["name"] not in names:
+            return self.send_json({"ok": False, "error": "no_reaction"})
+        message["reactions"] = [r for r in message["reactions"] if r["name"] != params["name"]]
+        self.send_json({"ok": True})
 
     def m_files_getUploadURLExternal(self, params):
         file_id = f"F{len(self.ws.uploads) + 1:03d}"
