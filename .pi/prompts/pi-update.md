@@ -37,8 +37,8 @@ State lives in `pi-extensions/pi-update.state.json` (committed source; not a dis
 
 1. Read the marker. **In scope = every released version header `> lastVersion`** (semver) across all sources, newest processed last. If the top released version equals `lastVersion`, there is nothing to do — say so, still refresh the `lastRun`/`lastRunHead` timestamp, commit the marker, and stop.
 2. **First run (marker absent):** do not silently process the entire history. Detect a candidate baseline (most recent Pi version referenced in `git log`, else the version bundled at `pi-extensions/pi-claude-bridge/node_modules/@earendil-works/pi-coding-agent/CHANGELOG.md`), then use the `question` tool to confirm the baseline version with the user before doing any work. Seed the marker at the confirmed baseline; only versions strictly greater are processed.
-3. **Override:** a pasted changelog is the authoritative item list and skips fetching. An explicit version or range after the command only constrains which version headers are in scope; every source is still fetched. Either way the marker advances to the highest version covered.
-4. **Update on success (even a no-op):** after the audit — whether or not any fix shipped — rewrite the marker with the newest processed version/date, a fresh `lastRun`, and the run-start `lastRunHead`, and commit it. The marker commit records "audited through vX.Y.Z" so the next run does not re-audit.
+3. **Override:** a pasted changelog is the authoritative item list and skips fetching. An explicit version or range after the command only constrains which version headers are in scope; every source is still fetched. Either way the marker advances to the highest version covered, under a `roll` verdict (§ Audit record).
+4. **Update on success (even a no-op):** after the audit — whether or not any fix shipped — rewrite the marker with a fresh `lastRun` and the run-start `lastRunHead`, and commit it. Under a `roll` verdict it also takes the newest processed version/date, and the marker commit records "audited through vX.Y.Z" so the next run does not re-audit. Under `hold`, `lastVersion` and `lastDate` stay at the last cleared release, so the next run audits the held releases again.
 
 ## Hard rules
 
@@ -71,6 +71,11 @@ State lives in `pi-extensions/pi-update.state.json` (committed source; not a dis
    - For a changed event, lifecycle or provider-input contract, feed our code what the installed Pi produces: load the extension into a real `createAgentSession` with a faux provider, as `pi-extensions/pi-hooks/tests/lane-mail-wake.test.ts` does, or pass it Pi's own normalized value. Package suites run on fake hosts and older pinned Pi versions, so they pass across such a change.
    - Decide: ship now, defer, or skip. Record reasoning.
 5. **For Non-impact items:** one-line justification each — enough that re-reading the audit later confirms it was considered.
+6. **Blocking entries.** Read `pi-extensions/pi-hooks/pi-contract.json`. Check every `### Breaking Changes` entry in scope, from every source, against the events and calls it lists; the rule for an entry that names one is in `pi-extensions/AGENTS.md`. List each Breaking Changes entry read in the record's `## Verdict` table with the listed names it carries.
+
+## Audit record
+
+Overwrite `pi-extensions/pi-update.audit.md` with this run's record: the ``Marker `<old>` → `<new>`.`` line, the sources fetched, every classified entry, and a `## Verdict` section whose first line is ``Verdict: `roll`.`` or ``Verdict: `hold`.``. `<old>` is `lastVersion` at run start and `<new>` the newest release processed. The record clears `<new>` under `roll` and `<old>` under `hold`, and `lastVersion` is set to the release it clears. `pi-extensions/package-policy.test.mjs` parses the Marker and Verdict lines, refuses a record whose cleared release is not `lastVersion`, and refuses a Pi peer floor above the cleared release. The change that lands the pi-hooks fix for a held release sets the verdict to `roll`, names its commit in the table, and advances `lastVersion` and `lastDate` to `<new>`.
 
 ## Apply fixes
 
@@ -90,6 +95,7 @@ Produce a structured summary:
 
 - **Releases covered:** `lastVersion` → newest processed version, with dates, and the source keys that carried new entries.
 - **Classified entries:** count per bucket (Required / Optional / Non-impact).
+- **Verdict:** `roll` or `hold`, with each blocking Breaking Changes entry and the pi-hooks change it waits for.
 - **Shipped:** commit hash + one-line subject for each commit; affected extensions; tests run with pass count.
 - **Deferred / skipped (with reason):** Optional items not taken, plus the reasoning (e.g. "Pi exposes unified `details.patch` string; our renderer needs `StructuredDiff` tokens for split view, no net simplification").
 - **Non-impact log:** bulleted list of entries with one-line justification.
