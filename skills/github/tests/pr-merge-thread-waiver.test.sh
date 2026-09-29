@@ -4,6 +4,8 @@
 # else's, the policy answers that refuse rather than waive, and the merge
 # route resolving each waived thread — one reply, one resolve, under the
 # merge's token and on the head the class was measured at — before it arms.
+# And the admin request, refused on the queue-only class the same classifier
+# prints for the same range.
 # The row format and the world words are lib/pr-merge-world.sh's.
 set -euo pipefail
 
@@ -57,6 +59,8 @@ done
 # or the classifier fell back to standard. review-policy reads it and refuses
 # an answer marked unmeasured, so a row can turn a waiver into a refusal
 # without changing the class on stdout.
+# The queue-only line, where the row names one; pr-merge's --admin reads it.
+[[ -z "${STUB_QUEUE_LINE:-}" ]] || printf 'queue-only: %s\n' "$STUB_QUEUE_LINE" >&2
 if [[ "${STUB_MARKER:-yes}" == yes ]]; then
   printf 'class: class=%s measured=%s cause=stub\n' "$STUB_CLASS" "${STUB_MEASURED:-true}" >&2
 fi
@@ -73,6 +77,19 @@ mkdir -p "$NO_RULE/skills/harness-ci/scripts"
 cp -- "$MIRROR/skills/harness-ci/scripts/change-class" "$NO_RULE/skills/harness-ci/scripts/change-class"
 NO_RULE_PR_MERGE="$NO_RULE/skills/github/scripts/commands/pr-merge.sh"
 [[ -f "$NO_RULE_PR_MERGE" && ! -e "$NO_RULE/skills/review-gate/scripts/lib/waiver.sh" ]] || { echo "the no-rule mirror is malformed" >&2; exit 2; }
+
+# A github skill installed without harness-ci, run on this PATH less every
+# directory holding a change-class, with the world's stub bin ahead of it:
+# no classifier is found beside the scripts tree or on PATH.
+CLASSLESS="$TMPDIR/classless-tree"
+mirror_tree "$CLASSLESS" github
+CLASSLESS_PR_MERGE="$CLASSLESS/skills/github/scripts/commands/pr-merge.sh"
+[[ -f "$CLASSLESS_PR_MERGE" && ! -e "$CLASSLESS/skills/harness-ci" ]] || { echo "the classless mirror is malformed" >&2; exit 2; }
+CLASSLESS_PATH="$TMPDIR/bin"
+IFS=: read -r -a path_dirs <<<"$PATH"
+for path_dir in "${path_dirs[@]}"; do
+  [[ -x "$path_dir/change-class" ]] || CLASSLESS_PATH+=":$path_dir"
+done
 
 
 # The out field's fixed texts; the err field spells the same ones as macros.
@@ -138,6 +155,19 @@ the immediate merge runs beside a review gate with no waiver rule when no thread
 a head that moved after the class was measured blocks before any thread is touched|checks:ci-required threads:bot class-policy:trivial head-moved:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb post-entry|auto-classified|1|-|Warnings:;⚠ {waived:1};BLOCKED PR #123 — the class policy waived its bot threads at $RANGE_HEAD, not at the head being merged (bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)|calls=$MERGE_PRE auth=<unset>
 a failed reply blocks with nothing armed, and names the thread|checks:ci-required threads:two-bots class-policy:trivial reply:fail post-entry|auto-classified|1|-|Warnings:;⚠ {waived:2};BLOCKED PR #123 — the reply on waived bot thread PRRT_bot_a failed;{\"error\":\"reply refused\"}|calls=$MERGE_PRE,graphql:reply(PRRT_bot_a:trivial$AT) auth=<unset>
 a failed resolve blocks with nothing armed, and names the thread|checks:ci-required threads:bot class-policy:trivial resolve:fail post-entry|auto-classified|1|-|Warnings:;⚠ {waived:1};BLOCKED PR #123 — resolving waived bot thread PRRT_post_merge_bot failed;{\"error\":\"resolve refused\"};{\"success\":false,\"resolved\":[],\"failed\":[\"PRRT_post_merge_bot\"]}|calls=$MERGE_PRE,graphql:reply(PRRT_post_merge_bot:trivial$AT),graphql:resolve(PRRT_post_merge_bot) auth=<unset>
+"
+
+# --admin reads the queue-only class off the classifier and refuses, naming
+# it: a queue-only PR, and a class nothing could read, keep the queue; every
+# other PR meets the retired admin route. The not-queue-only row is the
+# inverse of the queue-only one. No row reaches a merge call.
+run_table "the admin request" "\
+a queue-only PR refuses --admin, naming the class and the path that made it|route:true|admin-classified|1|-|pr-merge: admin-refused class=queue-only pr=123;$QUEUE_TRUE;{admin-queue}|calls=view:policy-range auth=<unset>
+any other PR meets the retired admin route, its class named|route:false|admin-classified|1|-|pr-merge: admin-retired class=not-queue-only pr=123;$QUEUE_FALSE;{admin-retired}|calls=view:policy-range auth=<unset>
+a classifier that prints no queue-only line reads queue-only, its stderr replayed|route:-|admin-classified|1|-|pr-merge: admin-refused class=queue-only pr=123;cause=classifier-unreadable;class: class=standard measured=true cause=stub;{admin-queue}|calls=view:policy-range auth=<unset>
+a classifier that fails reads queue-only|route:fail|admin-classified|1|-|pr-merge: admin-refused class=queue-only pr=123;cause=classifier-exit-1;{admin-queue}|calls=view:policy-range auth=<unset>
+an unreadable pull request range reads queue-only, gh's words replayed|route:range-fail|admin-classified|1|-|pr-merge: admin-refused class=queue-only pr=123;cause=range-unreadable;could not read the pull request endpoints;{admin-queue}|calls=view:policy-range auth=<unset>
+no classifier beside the scripts tree or on PATH reads queue-only, before any gh call|-|admin-classless|1|-|pr-merge: admin-refused class=queue-only pr=123;cause=classifier-absent;{admin-queue}|calls=- auth=-
 "
 
 echo

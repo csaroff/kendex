@@ -47,6 +47,9 @@ Options:
                    set the CI gate uses. The arm right after a PR opens passes
                    the review gate's context, so nothing merges before review.
   --dry-run        Show what would happen without merging
+  --admin          Ask for the admin route. It is never taken: the PR's
+                   queue-only class is read and the request refused, naming
+                   it. See Merge route below.
 
 Modes:
   (default)        Run checks, block if critical issues, merge if pass
@@ -70,6 +73,13 @@ Merge-mode exit codes:
        rules read that failed, which proves no gate.
   1    CLOSED (not merged) PR #N
        The PR is closed unmerged. Nothing was attempted.
+  1    pr-merge: admin-refused class=queue-only pr=<N>
+       --admin on a queue-only PR, or on one whose class could not be read.
+       The next line is the classifier's queue-only line or the cause it was
+       not read. Nothing was merged or armed.
+  1    pr-merge: admin-retired class=not-queue-only pr=<N>
+       --admin on any other PR: the admin route is retired (D003). Nothing
+       was merged or armed.
   1    pr-merge: retired-setting key=<NAME>
        A retired merge setting is set. Every mode, --check included, refuses
        before any pull-request read or merge call; see Retired settings below.
@@ -91,6 +101,17 @@ Merge route:
   requires one. No mode passes --admin to GitHub, so GitHub enrolls the PR
   in the queue (exit 75) rather than merging past it, under whatever token the
   auth ladder selected: in a lane sandbox, the lanes app's installation token.
+
+  Every PR arms --auto and takes the queue while kendex decision D003
+  stands, whatever its class. Only --admin reads the PR's queue-only
+  class, and refuses on both values, naming the class: admin-refused
+  class=queue-only or admin-retired class=not-queue-only. It is read from
+  <skills>/harness-ci/scripts/change-class, else change-class on PATH, over
+  the PR's base and head, fetched as the class policy's range is (see
+  Review-thread gate). Its stderr `queue-only: queue_only=true|false` line
+  is the class, and change-class --help states when it reads true. No
+  classifier, an unreadable range, a failed classifier and a missing line
+  all read queue-only.
 
 Retired settings:
   ORCH_ADMIN_MERGE_GH_CONFIG_DIR, ORCH_ADMIN_MERGE_CLASSES and
@@ -168,11 +189,11 @@ Review-thread gate:
   answered and resolved again is theirs and no longer a waiver.
 
   An unreadable policy or review-bot list, or an endpoint still missing after
-  the fetch, blocks with review_policy_unreadable in every mode, --auto
-  included, and is never a waiver; the child's own diagnostics reach stderr
-  so the cause is named. Conflicts, required contexts, the exact-head guard
-  and the base branch's own conversation-resolution rule are untouched by
-  every answer.
+  the fetch, blocks with review_policy_unreadable in --check, the immediate
+  merge and --auto alike, and is never a waiver; the child's own diagnostics
+  reach stderr so the cause is named. Conflicts, required contexts, the
+  exact-head guard and the base branch's own conversation-resolution rule are
+  untouched by every answer.
 
   The gate is policy, not mechanism. It applies only through pr-merge. A raw
   gh pr merge call or the GitHub UI Merge button bypasses it.
@@ -373,27 +394,62 @@ required_contexts() {
 }
 
 # Every child this command runs out of the checkout — the review gate's
-# class-policy owner, asked for its state and for one pull request's policy —
+# class-policy owner, asked for its state and for one pull request's policy,
+# and harness-ci's classifier, asked for one pull request's queue-only class —
 # goes through here, so the two promises those calls share are made once.
 # First, GH_CONFIG_DIR is dropped: a GH_CONFIG_DIR the caller exported is a
 # credential of theirs that checkout code has no business reading. Second, the
 # child's stderr is held and replayed only when it fails, so a refusal names
 # its own cause instead of reading the same for a malformed policy, a missing
-# classifier, an unauthenticated gh and an unfetched base. Its stdout is this
-# function's.
-run_checkout_child() { # DIR ARGV...
+# classifier, an unauthenticated gh and an unfetched base. With --stderr-to,
+# the stderr goes to the caller's FILE whatever the exit, replayed by no one
+# here: that caller reads its answer off the stderr and replays it itself.
+# Its stdout is this function's.
+run_checkout_child() { # [--stderr-to FILE] DIR ARGV...
+    local kept=""
+    if [ "$1" = --stderr-to ]; then
+        kept="$2"
+        shift 2
+    fi
     local dir="$1"
     shift
     local err out status=0
-    if ! err=$(mktemp "${TMPDIR:-/tmp}/pr-merge-child.XXXXXX"); then
+    if [ -n "$kept" ]; then
+        err="$kept"
+    elif ! err=$(mktemp "${TMPDIR:-/tmp}/pr-merge-child.XXXXXX"); then
         echo "pr-merge: could not create a temporary file for a checkout child's diagnostics" >&2
         return 1
     fi
     out=$(cd -- "$dir" && env -u GH_CONFIG_DIR "$@" 2>"$err") || status=$?
-    [ "$status" -eq 0 ] || cat -- "$err" >&2
-    rm -f -- "${err:?}"
+    if [ -z "$kept" ]; then
+        [ "$status" -eq 0 ] || cat -- "$err" >&2
+        rm -f -- "${err:?}"
+    fi
     [ "$status" -eq 0 ] || return "$status"
     printf '%s' "$out"
+}
+
+# The checkout this command runs in: its repository root, else the working
+# directory. Every checkout child runs there, and the pull request's two
+# commits are fetched into it.
+checkout_root() {
+    git rev-parse --show-toplevel 2>/dev/null || pwd
+}
+
+# The pull request's range as GitHub reports it: the base branch's current
+# tip and the head, blank-separated. Non-zero where it cannot be read, with
+# gh's own words, or the missing end, on stderr for the caller to keep or
+# drop.
+pr_range() { # PR
+    local range_json base_sha head_sha
+    range_json=$(gh pr view "$1" --json baseRefOid,headRefOid) || return 1
+    base_sha=$(jq -r '.baseRefOid // ""' <<<"$range_json") || return 1
+    head_sha=$(jq -r '.headRefOid // ""' <<<"$range_json") || return 1
+    if [ -z "$base_sha" ] || [ -z "$head_sha" ]; then
+        echo "pr-merge: pull request #$1 reports no base or head commit" >&2
+        return 1
+    fi
+    printf '%s %s' "$base_sha" "$head_sha"
 }
 
 # The range, as this checkout can read it: both ends present AND an ancestor
@@ -420,7 +476,7 @@ policy_range_materialize() { # ROOT BASE HEAD
     policy_range_present "$root" "$base_sha" "$head_sha" && return 0
     if ! err=$(git -C "$root" fetch --quiet --no-tags --no-write-fetch-head \
         origin "$base_sha" "$head_sha" 2>&1); then
-        echo "pr-merge: the class-policy range is not in this checkout and the fetch of its two commits from origin failed:" >&2
+        echo "pr-merge: the pull request's range is not in this checkout and the fetch of its two commits from origin failed:" >&2
         printf '%s\n' "$err" >&2
     fi
     policy_range_present "$root" "$base_sha" "$head_sha"
@@ -440,17 +496,18 @@ policy_range_materialize() { # ROOT BASE HEAD
 # caller refuses: an unreadable policy must never resolve to a waiver, and it
 # must not silently hold a pull request either.
 # active, inactive, or non-zero when the owner cannot say.
-# The review-policy owner: the review-gate sibling of this scripts tree, else
-# one on PATH, else nothing.
-review_policy_owner() {
-    local owner="$SCRIPT_DIR/../../../review-gate/scripts/review-policy"
-    [ -x "$owner" ] || owner=$(command -v review-policy 2>/dev/null) || owner=""
-    printf '%s' "$owner"
+# A sibling skill's script: <skills>/SKILL/scripts/NAME beside this scripts
+# tree, else NAME on PATH, else nothing. The review-policy owner and the
+# queue-only classifier are both found here.
+sibling_script() { # SKILL NAME
+    local path="$SCRIPT_DIR/../../../$1/scripts/$2"
+    [ -x "$path" ] || path=$(command -v "$2" 2>/dev/null) || path=""
+    printf '%s' "$path"
 }
 
 review_policy_state() { # ROOT
     local owner state
-    owner=$(review_policy_owner) || return 1
+    owner=$(sibling_script review-gate review-policy) || return 1
     # No owner script is no class policy: the term is absent, not defaulted.
     if [ -z "$owner" ]; then
         printf 'inactive'
@@ -469,14 +526,14 @@ review_policy_state() { # ROOT
 review_policy_evidence() {
     local pr_num="$1"
     local owner root state record
-    local range_json base_sha head_sha class evidence
-    root=$(git rev-parse --show-toplevel 2>/dev/null) || root=$(pwd) || return 1
+    local range base_sha head_sha class evidence
+    root=$(checkout_root) || return 1
     state=$(review_policy_state "$root") || return 1
     if [ "$state" = inactive ]; then
         printf 'current'
         return 0
     fi
-    owner=$(review_policy_owner) || return 1
+    owner=$(sibling_script review-gate review-policy) || return 1
     [ -n "$owner" ] || return 1
     # An active policy answers for one pull request, so the endpoints are read
     # HERE — no repository without a class policy pays for a call it has no
@@ -484,12 +541,9 @@ review_policy_evidence() {
     # never as a waiver. The merge itself is still pinned by
     # --match-head-commit and by the caller's --expected-head; this range only
     # names the diff the policy is asked about.
-    range_json=$(gh pr view "$pr_num" --json baseRefOid,headRefOid 2>/dev/null) || return 1
-    base_sha=$(jq -r '.baseRefOid // ""' <<<"$range_json") || return 1
-    head_sha=$(jq -r '.headRefOid // ""' <<<"$range_json") || return 1
-    if [ -z "$base_sha" ] || [ -z "$head_sha" ]; then
-        return 1
-    fi
+    range=$(pr_range "$pr_num" 2>/dev/null) || return 1
+    base_sha="${range% *}"
+    head_sha="${range#* }"
     policy_range_materialize "$root" "$base_sha" "$head_sha" || return 1
     # `--repo .` is the checkout this command runs in, which is where the two
     # SHAs resolve.
@@ -524,7 +578,7 @@ WAIVER_LOADED=""
 load_waiver_rule() {
     local owner lib
     [ -z "$WAIVER_LOADED" ] || return 0
-    owner=$(review_policy_owner) || return 1
+    owner=$(sibling_script review-gate review-policy) || return 1
     if [ -z "$owner" ]; then
         WAIVER_LOADED=absent
         return 0
@@ -543,9 +597,9 @@ load_waiver_rule() {
 # list; asked only once the policy answered none. Non-zero when it cannot say.
 review_bots_json() {
     local owner root record
-    owner=$(review_policy_owner) || return 1
+    owner=$(sibling_script review-gate review-policy) || return 1
     [ -n "$owner" ] || return 1
-    root=$(git rev-parse --show-toplevel 2>/dev/null) || root=$(pwd) || return 1
+    root=$(checkout_root) || return 1
     record=$(run_checkout_child "$root" "$owner" --review-bots) || return 1
     case "$record" in
     *$'\n'* | *[!A-Za-z0-9=,._-]*) return 1 ;;
@@ -1056,8 +1110,83 @@ refuse_retired_settings() {
     exit 1
 }
 
+# The merge-route class of one pull request, from harness-ci's change-class
+# beside this scripts tree, else change-class on PATH: asked about the pull
+# request's own range, it prints `queue-only: queue_only=true|false cause=...`
+# on stderr. This command asks; it never matches a path itself. Sets
+# QUEUE_ONLY to true or false, QUEUE_ONLY_DETAIL to the classifier's line or
+# the reason it was not read, and QUEUE_ONLY_NOTES to the diagnostics of a
+# read that failed: gh's, git's or the classifier's own. Anything short of a
+# readable line is queue-only: the queue is the route that runs the change in
+# a merge group before it lands.
+QUEUE_ONLY=""
+QUEUE_ONLY_DETAIL=""
+QUEUE_ONLY_NOTES=""
+read_queue_only() { # PR
+    local pr_num="$1" classifier root notes range base_sha head_sha line status=0
+    QUEUE_ONLY=true
+    QUEUE_ONLY_NOTES=""
+    classifier=$(sibling_script harness-ci change-class) || classifier=""
+    if [ -z "$classifier" ]; then
+        QUEUE_ONLY_DETAIL="cause=classifier-absent"
+        return 0
+    fi
+    if ! root=$(checkout_root); then
+        QUEUE_ONLY_DETAIL="cause=checkout-unreadable"
+        return 0
+    fi
+    if ! notes=$(mktemp "${TMPDIR:-/tmp}/pr-merge-class.XXXXXX"); then
+        QUEUE_ONLY_DETAIL="cause=scratch-unavailable"
+        return 0
+    fi
+    if ! range=$(pr_range "$pr_num" 2>"$notes"); then
+        QUEUE_ONLY_DETAIL="cause=range-unreadable"
+    else
+        base_sha="${range% *}"
+        head_sha="${range#* }"
+        if ! policy_range_materialize "$root" "$base_sha" "$head_sha" 2>"$notes"; then
+            QUEUE_ONLY_DETAIL="cause=range-absent base=$base_sha head=$head_sha"
+        else
+            run_checkout_child --stderr-to "$notes" "$root" "$classifier" --event pull_request \
+                --base "$base_sha" --head "$head_sha" --repo . >/dev/null || status=$?
+            line=$(sed -n 's/^queue-only: //p' "$notes" | tail -1) || line=""
+            case "$status:$line" in
+            "0:queue_only=true "*) QUEUE_ONLY_DETAIL="$line" ;;
+            "0:queue_only=false "*) QUEUE_ONLY=false; QUEUE_ONLY_DETAIL="$line" ;;
+            0:*) QUEUE_ONLY_DETAIL="cause=classifier-unreadable" ;;
+            *) QUEUE_ONLY_DETAIL="cause=classifier-exit-$status" ;;
+            esac
+        fi
+    fi
+    case "$QUEUE_ONLY_DETAIL" in
+    queue_only=*) ;;
+    *) QUEUE_ONLY_NOTES=$(cat -- "$notes") || QUEUE_ONLY_NOTES="" ;;
+    esac
+    rm -f -- "${notes:?}"
+}
+
+# --admin asks for the admin route, which this command does not take: it reads
+# the pull request's queue-only class and refuses, naming the class. A
+# queue-only change must run in a merge group; every other change meets the
+# retirement of the admin route (kendex decision D003). Nothing is merged or
+# armed either way.
+refuse_admin_route() { # PR
+    read_queue_only "$1"
+    if [ "$QUEUE_ONLY" = true ]; then
+        echo "pr-merge: admin-refused class=queue-only pr=$1" >&2
+        echo "  $QUEUE_ONLY_DETAIL" >&2
+        [ -z "$QUEUE_ONLY_NOTES" ] || printf '%s\n' "$QUEUE_ONLY_NOTES" >&2
+        echo "  A queue-only change runs in a merge group before it lands: arm it with --auto and wait in the queue. Nothing was merged or armed." >&2
+    else
+        echo "pr-merge: admin-retired class=not-queue-only pr=$1" >&2
+        echo "  $QUEUE_ONLY_DETAIL" >&2
+        echo "  The admin route is retired (kendex decision D003): every merge goes through the merge queue, armed with --auto. Nothing was merged or armed." >&2
+    fi
+    exit 1
+}
+
 main() {
-    local pr_num="" method="--squash" delete_branch=true
+    local pr_num="" method="--squash" delete_branch=true admin=false
     local check_only=false dry_run=false auto=false supplied_head="" require_context=""
 
     while [ $# -gt 0 ]; do
@@ -1088,6 +1217,10 @@ main() {
             ;;
         --auto)
             auto=true
+            shift
+            ;;
+        --admin)
+            admin=true
             shift
             ;;
         --expected-head) supplied_head="${2:-}"; shift 2 ;;
@@ -1131,6 +1264,7 @@ main() {
     if [ -n "$require_context" ] && [ "$auto" != true ]; then
         echo "Error: --require-context gates the --auto arm and needs --auto" >&2; exit 1
     fi
+    [ "$admin" = false ] || refuse_admin_route "$pr_num"
 
     if [ "$check_only" = true ]; then
         local check_json
