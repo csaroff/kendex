@@ -6,7 +6,7 @@
 # sourcing suite to have set it, which is also what every suite here sets.
 set -euo pipefail
 
-unset GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE GIT_INDEX_FILE GITHUB_OUTPUT
+unset GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE GIT_INDEX_FILE GITHUB_OUTPUT HARNESS_CI_LOCK_KENDEX
 
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[1]}")" && pwd)"
 HARNESS_ONLY="${HARNESS_ONLY_UNDER_TEST:-$(cd "$TEST_DIR/../scripts" && pwd)/harness-only}"
@@ -108,6 +108,45 @@ assert_class() { # LABEL EXPECTED ARGS...
     status=$?
   fi
   assert_eq "$label" "change_class=$expected exit 0" "$out exit $status"
+}
+
+# The orch package beside harness-ci, which the measured classes source. A
+# suite that never plants a package runs where it is absent.
+ORCH_PACKAGE="$(cd "$(dirname "$CHANGE_CLASS")/../.." && pwd)/orch"
+
+# A package laid out as the real one, with the script under test swapped for
+# a planted copy.
+plant() { # ROOT SCRIPT PLANTED -> prints the planted change-class path
+  mkdir -p "$1/harness-ci/scripts"
+  cp "$(dirname "$CHANGE_CLASS")/harness-only" "$(dirname "$CHANGE_CLASS")/change-class" \
+    "$1/harness-ci/scripts/"
+  ln -s "$ORCH_PACKAGE" "$1/orch"
+  cp "$3" "$1/harness-ci/scripts/$2"
+  chmod +x "$1/harness-ci/scripts/"*
+  printf '%s' "$1/harness-ci/scripts/change-class"
+}
+
+# A copy of the package's SCRIPT with each exact LINE replaced by
+# REPLACEMENT, `-` deleting it, planted beside the real scripts. Each LINE
+# has to occur exactly once in the copy, or the control is not an edit.
+mutant() { # NAME SCRIPT LINE REPLACEMENT [LINE REPLACEMENT]...
+  local name="$1" script="$2" copy
+  shift 2
+  copy="$SANDBOX/$name.$script"
+  cp "$(dirname "$CHANGE_CLASS")/$script" "$copy"
+  while [ "$#" -ge 2 ]; do
+    if ! LINE="$1" WITH="$2" awk '
+      $0 == ENVIRON["LINE"] { hits++; if (ENVIRON["WITH"] != "-") print ENVIRON["WITH"]; next }
+      { print }
+      END { exit hits == 1 ? 0 : 3 }
+    ' "$copy" >"$copy.next"; then
+      echo "FAIL: control $name: '$1' does not occur once in $script" >&2
+      exit 1
+    fi
+    mv "$copy.next" "$copy"
+    shift 2
+  done
+  plant "$SANDBOX/$name" "$script" "$copy"
 }
 
 report() { # SUITE

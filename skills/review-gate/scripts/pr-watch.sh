@@ -95,7 +95,11 @@ Attention kinds:
                      disagree, in either mismatch direction — the writer
                      has not converged (event missed, cron slipped). With
                      --heal, one writer dispatch per invocation self-heals
-                     it
+                     it. On kendex/lock, the rolling branch kendex's
+                     lock-record tool opens for the install record alone,
+                     an approved verdict over a gate that is not success
+                     also names a second possible cause: the writer's lock
+                     kendex lagging the kendex that recorded the record
   disarmed           gate open (success) on an un-queued PR with auto-merge
                      NOT armed — mergeable, but nothing will merge it (the
                      known eviction-disarm failure mode). The line also
@@ -350,6 +354,22 @@ stale_gate() { # pr, head, why
   heal "$1" "$2"
 }
 WITHDRAWAL_WHY="threads are open but the newest '$GATE_CONTEXT' row is success — the writer has not converged the withdrawal"
+
+# Why the writer has not written success over an approved verdict. kendex's
+# tools/lock-record opens its rolling pull request on LOCK_RECORD_BRANCH with
+# the install record alone, recorded by a kendex built from the default
+# branch's tree. The writer proves that record's class with a kendex that can
+# lag the tree, so there the pair has a second possible cause beside a writer
+# that has not converged. This script reads only the verdict and the newest
+# gate row, and cannot tell the two apart.
+LOCK_RECORD_BRANCH="kendex/lock"
+approved_stale_why() { # head_ref
+  if [ "$1" = "$LOCK_RECORD_BRANCH" ]; then
+    printf '%s' "the writer has not converged (on $LOCK_RECORD_BRANCH this can also be the writer's lock kendex lagging the recording tree's kendex)"
+  else
+    printf '%s' "the writer has not converged"
+  fi
+}
 
 read_gate_state() { # pr, head — sets gate_state; returns 1 after emitting an error
   # Gate context's NEWEST row (list endpoint, newest-first — the same
@@ -801,7 +821,7 @@ for number in $pr_numbers; do
     approved)
       if [ "$gate_state" != "success" ]; then
         attention=1
-        stale_gate "$number" "$head" "predicate says approved but the newest '$GATE_CONTEXT' row is $gate_state — the writer has not converged"
+        stale_gate "$number" "$head" "predicate says approved but the newest '$GATE_CONTEXT' row is $gate_state — $(approved_stale_why "$head_ref")"
       fi
       ;;
     awaiting)
