@@ -85,11 +85,12 @@ export default function piHooks(pi: ExtensionAPI): void {
 	let steeredThisRun = false;
 
 	/**
-	 * Releases the dispatches that steered, once a settle their steers caused
-	 * has been dispatched. Pi starts the steered run without awaiting it, and
-	 * print mode disposes the runtime as soon as the `agent_settled` emit it
-	 * awaits returns: a dispatch returning before its follow-on leaves that
-	 * dispatch a ctx whose getters throw, and the agent's answer unprinted.
+	 * Releases the dispatches that wait on their steer, once a settle their
+	 * steers caused has been dispatched. Only a Pi that started the steered run
+	 * before `sendMessage` returned is waited on: there print mode disposes the
+	 * runtime as soon as the `agent_settled` emit it awaits returns, and a
+	 * dispatch returning before its follow-on leaves that dispatch a ctx whose
+	 * getters throw and the agent's answer unprinted.
 	 *
 	 * A set, because settles can overlap and each may steer. A settle releases
 	 * every waiter armed before it began; one armed after it began is left to
@@ -310,13 +311,23 @@ export default function piHooks(pi: ExtensionAPI): void {
 		//
 		// `display: false` leaves interactive rendering to the notification
 		// beside it, which a headless session never sees.
+		//
+		// Whether to wait for the run a steer starts is read from the session
+		// right after the send. Pi from 0.80.4, where `agent_settled` arrived,
+		// through 0.86 starts that run before the send returns, so the session
+		// is no longer idle and the dispatch waits for the run's own settle.
+		// Pi 0.87.0 defers the run until every settled handler has returned and
+		// finishes it before the session reads idle; a dispatch that waited
+		// there would hold the settle open for good, and every later prompt and
+		// triggered message with it. The probe goes when the peer floor
+		// reaches 0.87.0.
 		let steered: Promise<void> | undefined;
 		const say = (content: string) => {
 			if (!stopHookActive) steeredThisRun = true;
 			pi.sendMessage({ customType: "kendex-hook", content, display: false }, { triggerTurn: !stopHookActive });
 			// Armed only once the steer went out: a send that threw starts
 			// no run, and a wait on a settle that never comes hangs Pi.
-			if (!stopHookActive) steered ??= new Promise<void>((resolve) => steerers.add(resolve));
+			if (!stopHookActive && !ctx.isIdle()) steered ??= new Promise<void>((resolve) => steerers.add(resolve));
 			if (ctx.hasUI) ctx.ui.notify(content, "warning");
 		};
 

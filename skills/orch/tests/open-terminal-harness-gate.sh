@@ -37,7 +37,20 @@ printf '#!/usr/bin/env bash\nexit 1\n' > "$BIN/gh"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$BIN/worktree-stub"
 # A lane host that answers nothing: the gate is judged before it is asked.
 printf '#!/usr/bin/env bash\nexit 1\n' > "$BIN/provider"
-chmod +x "$BIN/term" "$BIN/gh" "$BIN/worktree-stub" "$BIN/provider"
+# The worktree CLI of a launch that goes on to open its window, for the rows
+# that read the command the terminal runs: a fresh repository per item.
+cat > "$BIN/worktree-make" <<STUB
+#!/usr/bin/env bash
+d="$TMP_ROOT/wt/\${2:-unknown}"
+case "\${1:-}" in
+  exists) echo false ;;
+  merged) exit 1 ;;
+  path) printf '%s\n' "\$d" ;;
+  create) mkdir -p "\$d"; git init -q "\$d"; git -C "\$d" config gc.auto 0; git -C "\$d" config maintenance.auto false; printf '%s\n' "\$d" ;;
+  *) exit 1 ;;
+esac
+STUB
+chmod +x "$BIN/term" "$BIN/gh" "$BIN/worktree-stub" "$BIN/worktree-make" "$BIN/provider"
 
 # stage DIR — a copy of the orch scripts in a git repo of its own, so the
 # project root, and the project .pi/settings.json the Pi rule reads, are the
@@ -52,28 +65,37 @@ REPO="$TMP_ROOT/repo"
 stage "$REPO"
 PI_AGENT="$TMP_ROOT/pi-agent"
 mkdir -p "$PI_AGENT"
-# The pi-hooks carrier Pi loads, sending the window on its Stop payload or not.
-pi_carrier() { # sends|old|none
+# The pi-hooks carrier Pi loads, sending the window on its Stop payload or not,
+# and listing the lane mail wake among its extensions or not.
+PI_WAKE_MANIFEST='{"pi":{"extensions":["./extensions/hooks.ts","./extensions/lane-mail-wake.ts"]}}'
+pi_carrier() { # sends|old|nowake|none
   rm -rf -- "${PI_AGENT:?}/packages"
   [[ "$1" != none ]] || return 0
   mkdir -p "$PI_AGENT/packages/@vanillagreen/pi-hooks/extensions"
-  if [[ "$1" == sends ]]; then
-    printf 'export const f = { context_window: 1 };\n' > "$PI_AGENT/packages/@vanillagreen/pi-hooks/extensions/vocab.ts"
-  else
+  if [[ "$1" == old ]]; then
     printf 'export const f = { session_id: 1 };\n' > "$PI_AGENT/packages/@vanillagreen/pi-hooks/extensions/vocab.ts"
+  else
+    printf 'export const f = { context_window: 1 };\n' > "$PI_AGENT/packages/@vanillagreen/pi-hooks/extensions/vocab.ts"
+  fi
+  if [[ "$1" == nowake ]]; then
+    printf '{"version":"0.12.0","pi":{"extensions":["./extensions/hooks.ts"]}}\n' > "$PI_AGENT/packages/@vanillagreen/pi-hooks/package.json"
+  else
+    printf '%s\n' "$PI_WAKE_MANIFEST" > "$PI_AGENT/packages/@vanillagreen/pi-hooks/package.json"
   fi
 }
 
 # The launch-choice refusals that run ahead of the gate are read too, so a row
 # refused before the gate cannot read as one the gate passed.
-GATE_KEYS='unsupported-for-oversee|compaction-on|launch-window-unknown|launch-compaction-missing|pi-settings-unreadable|launch-question-tool-missing|launch-model-missing|launch-effort-missing'
+GATE_KEYS='unsupported-for-oversee|compaction-on|launch-window-unknown|launch-compaction-missing|pi-settings-unreadable|launch-question-tool-missing|launch-model-missing|launch-effort-missing|launch-unattended-missing'
 # launch NAME ARGS... — the gate's line open-terminal wrote, or `passed` where it
-# wrote none, for a GUI launch of CC-1 under ARGS; OT names another copy. Its
-# stdout is kept in $TMP_ROOT/NAME.out.
+# wrote none, for a GUI launch of CC-1 under ARGS; OT names another copy, and
+# WT_CLI a worktree CLI other than the one that stops the launch before its
+# window. Its stdout is kept in $TMP_ROOT/NAME.out, and the command its
+# terminal ran in $TMP_ROOT/NAME.term.
 launch() { # NAME ARGS...
   local name="$1" rc=0 line
   shift
-  ( cd "$REPO" && PATH="$BIN:$PATH" ORCH_STATE_DIR="$TMP_ROOT/$name.state" WORKTREE_CLI="$BIN/worktree-stub" \
+  ( cd "$REPO" && PATH="$BIN:$PATH" ORCH_STATE_DIR="$TMP_ROOT/$name.state" WORKTREE_CLI="${WT_CLI:-$BIN/worktree-stub}" \
     OT_TERM_LOG="$TMP_ROOT/$name.term" TERMINAL=term TMUX= PI_CODING_AGENT_DIR="$PI_AGENT" \
     "${OT:-$REPO/scripts/open-terminal}" --ghostty "$@" CC-1 ) \
     >"$TMP_ROOT/$name.out" 2>"$TMP_ROOT/$name.err" || rc=$?
@@ -135,6 +157,7 @@ compaction off with a carrier that sends the window passes|sends|{"compaction":{
 a project turning compaction back on is refused, naming the project file|sends|{"compaction":{"enabled":false}}|{"compaction":{"enabled":true}}|${FLEET[*]} --harness pi|open-terminal: compaction-on harness=pi file=$REPO/.pi/settings.json
 a carrier that sends no window is refused|old|{"compaction":{"enabled":false}}|-|${FLEET[*]} --harness pi|open-terminal: unsupported-for-oversee harness=pi reason=no-window-read
 no carrier installed is refused|none|{"compaction":{"enabled":false}}|-|${FLEET[*]} --harness pi|open-terminal: unsupported-for-oversee harness=pi reason=no-window-read
+a carrier that lists no lane mail wake passes|nowake|{"compaction":{"enabled":false}}|-|${FLEET[*]} --harness pi|passed
 a settings file jq cannot read is named|sends|not json|-|${FLEET[*]} --harness pi|open-terminal: pi-settings-unreadable @FILE@
 a hosted Pi fleet lane is not judged on this machine's settings or carrier, which are its host's to hold|none|{"compaction":{"enabled":true}}|-|${FLEET[*]} --harness pi --host $BIN/provider|passed
 no fleet passes whatever its settings|none|-|-|--harness pi|passed
@@ -142,6 +165,27 @@ ROWS
 rm -f -- "$PI_AGENT/settings.json" "$REPO/.pi/settings.json"
 assert_eq "$(grep -c 'jq: error\|parse error' "$TMP_ROOT/pi.err" || true)" "0" \
   "the last row's run carries no jq words; the unreadable row's did, under its key"
+
+echo "=== a local Pi fleet lane's carrier decides its brief's arm line, never the launch ==="
+# With the lane mail wake the brief the terminal runs carries no arm line; a
+# carrier without it launches all the same, its brief carrying the
+# watch-delivery.md arm line and the launch naming the carrier's version.
+printf '{"compaction":{"enabled":false}}\n' > "$PI_AGENT/settings.json"
+# The brief carries Pi's unattended words, read from lib/lane-launch.sh, the
+# table open-terminal judges them from, so the launch reaches the carrier.
+PI_UNATTENDED_TEXT="$(bash -c 'source "$1" && launch_choice_unattended pi' _ "$SCRIPTS_DIR/lib/lane-launch.sh")"
+[[ -n "$PI_UNATTENDED_TEXT" ]] || { echo "lib/lane-launch.sh named no pi unattended text" >&2; exit 1; }
+printf 'Work the item.\n%s\n' "$PI_UNATTENDED_TEXT" > "$TMP_ROOT/pi-brief.txt"
+PI_BRIEF_CMD='pi --exclude-tools question --model m --thinking high {brief}'
+for row in "sends|0|0" "nowake|1|1"; do
+  IFS='|' read -r carrier want_arm want_notice <<<"$row"
+  pi_carrier "$carrier"
+  answer="$(WT_CLI="$BIN/worktree-make" launch "brief-$carrier" "${FLEET[@]}" --harness pi --cmd "$PI_BRIEF_CMD" --brief-file "$TMP_ROOT/pi-brief.txt")"
+  assert_eq "$answer arm=$(grep -cF 'arm the mailbox monitor `lane-mail watch --item CC-1`' "$TMP_ROOT/brief-$carrier.term" || true) notice=$(grep -c '^open-terminal: pi-mail-wake-missing harness=pi version=0.12.0$' "$TMP_ROOT/brief-$carrier.out" || true)" \
+    "passed arm=$want_arm notice=$want_notice" \
+    "a Pi fleet lane on a $carrier carrier launches, its brief carrying the arm line only where the carrier lists no mail wake"
+done
+rm -f -- "$PI_AGENT/settings.json"
 
 echo "=== a local Pi fleet launch on a Copilot model is judged on the Pi root its lane leaves ==="
 # Such a launch's gate waits for its lane. A lane `lanes pick` chose from
@@ -154,6 +198,7 @@ echo "=== a local Pi fleet launch on a Copilot model is judged on the Pi root it
 POOL_ROOT="$TMP_ROOT/pool-root"
 mkdir -p "$POOL_ROOT/packages/@vanillagreen/pi-hooks/extensions"
 printf 'export const f = { context_window: 1 };\n' > "$POOL_ROOT/packages/@vanillagreen/pi-hooks/extensions/vocab.ts"
+printf '%s\n' "$PI_WAKE_MANIFEST" > "$POOL_ROOT/packages/@vanillagreen/pi-hooks/package.json"
 pi_carrier sends
 POOL_FLAGS='--model github-copilot/claude-sonnet-5 --thinking high'
 # One measured Claude account for the `auto:claude` pick, under a home of the
@@ -224,6 +269,10 @@ pi_carrier old
 control window-read-ctrl '"$CLAIM_ROOT" || { ot_message unsupported-for-oversee "harness=pi" "reason=no-window-read" >&2; return 1; }' '"$CLAIM_ROOT" || :'
 assert_eq "$(OT="$CTRL_OT" launch window-read-ctrl "${FLEET[@]}" --harness pi)" passed \
   "control: without its refusal a Pi fleet lane whose carrier sends no window passes"
+pi_carrier nowake
+control mail-wake-ctrl '  pi_mail_wake_read "$wakes" "$LANE_ADAPTER_PI_CARRIER_VERSION"' '  ot_message unsupported-for-oversee "harness=pi" "reason=no-mail-wake" >&2; return 1'
+assert_eq "$(OT="$CTRL_OT" launch mail-wake-ctrl "${FLEET[@]}" --harness pi)" "open-terminal: unsupported-for-oversee harness=pi reason=no-mail-wake" \
+  "control: a refusal planted on the absent wake stops the launch the rows above pass"
 rm -f -- "$PI_AGENT/settings.json"
 pi_carrier sends
 printf '{"compaction":{"enabled":true}}\n' > "$PI_AGENT/settings.json"
