@@ -43,7 +43,9 @@ pub enum Foreign {
 
 /// The shape of the document `kendex verify --json` prints. A reader pins
 /// this number: a change to a row's fields or to what a state means bumps
-/// it.
+/// it. A new [`State`] value is additive and keeps it, so a reader treats
+/// a state it does not know as not ok. `clean` does not imply every row is
+/// `ok`: a `warning` row leaves the run clean.
 pub const DOCUMENT_VERSION: u32 = 1;
 
 /// What one verify row concluded.
@@ -54,6 +56,9 @@ pub enum State {
     Ok,
     /// Not as kendex would write it; the row's detail says how.
     Failed,
+    /// A finding that leaves the run clean unless it was asked to fail on
+    /// warnings; the row's detail says what was found.
+    Warning,
     /// Declared by the scope and held by no record entry, so nothing was
     /// checked: the positions are where a render would land.
     Unrecorded,
