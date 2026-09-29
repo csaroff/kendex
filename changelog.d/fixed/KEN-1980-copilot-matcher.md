@@ -1,0 +1,1 @@
+- A hook matcher installed for Copilot names every tool its hooks are matched against, so a hook on `Write`, `Read`, `Edit` or `Bash` fires on `create`, `view`, `apply_patch` and `powershell` too.

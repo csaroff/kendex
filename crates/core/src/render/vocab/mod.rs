@@ -91,6 +91,37 @@ pub fn copilot_tool_name(tool: &str) -> String {
         .unwrap_or_else(|| tool.trim().to_owned())
 }
 
+/// Copilot's runtime tool names, the ones a hook matcher is tested against,
+/// as its hooks reference lists them
+/// ([hooks reference](https://docs.github.com/en/copilot/reference/hooks-reference),
+/// § Tool names for hook matching and the Claude tool-name table beside the
+/// PascalCase matchers). They are not the custom-agent allowlist names
+/// [`copilot_tool`] holds: a file write runs as `create` and a read as
+/// `view`, so `write` or `read` in a hook matcher never fires. One Claude
+/// name can stand for several runtime tools, as `Edit` does for `edit`,
+/// `str_replace_editor` and `apply_patch`, each of which the matcher has to
+/// name, since Copilot anchors it as `^(?:PATTERN)$`. `skill` is the tool a
+/// skill load runs as, which the reference does not list: it is what Copilot
+/// CLI 1.0.88 names in `toolName` for a load. A name with no runtime tool is
+/// left alone.
+fn copilot_hook_tools(tool: &str) -> Option<&'static [&'static str]> {
+    Some(match normalize(tool).as_str() {
+        "bash" | "shell" => &["bash", "powershell"],
+        "write" => &["create"],
+        "edit" | "multiedit" => &["edit", "str_replace_editor", "apply_patch"],
+        "read" => &["view"],
+        "grep" => &["grep", "rg"],
+        "glob" | "find" => &["glob"],
+        "task" | "agent" | "subagent" | "spawnagent" => &["task"],
+        "webfetch" => &["web_fetch"],
+        "websearch" => &["web_search"],
+        "question" | "askuserquestion" => &["ask_user"],
+        "todowrite" => &["update_todo"],
+        "skill" => &["skill"],
+        _ => return None,
+    })
+}
+
 /// Antigravity's own tool names, as the CLI's `init` event lists them
 /// (`agy -p --output-format stream-json`; <https://antigravity.google/docs/subagents>). A name of its own passes through unchanged, so an
 /// author may write either vocabulary.
@@ -129,39 +160,49 @@ pub fn antigravity_tool_name(tool: &str) -> Option<&'static str> {
 /// reported, because a matcher that never matches is a protection that
 /// never runs.
 pub fn hook_matcher(matcher: &str, harness: HarnessId) -> (String, bool) {
-    let name = match harness {
-        HarnessId::Gemini => gemini_tool_name,
-        HarnessId::Copilot => copilot_tool_name,
+    let name: fn(&str) -> Vec<String> = match harness {
+        HarnessId::Gemini => |tool: &str| vec![gemini_tool_name(tool)],
+        HarnessId::Copilot => |tool: &str| match copilot_hook_tools(tool) {
+            Some(tools) => tools.iter().map(|t| (*t).to_owned()).collect(),
+            None => vec![tool.trim().to_owned()],
+        },
         // A matcher is a regex, and an alternative it cannot say leaves
         // the pattern narrower, never wider, so here the name stands.
         HarnessId::Antigravity => |tool: &str| {
-            antigravity_tool(tool)
-                .map(str::to_owned)
-                .unwrap_or_else(|| tool.trim().to_owned())
+            vec![
+                antigravity_tool(tool)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| tool.trim().to_owned()),
+            ]
         },
         // Claude's own names are what a matcher is authored in; codex and
         // cursor read the same spelling, and the rest register no matcher.
         _ => return (matcher.to_owned(), true),
     };
     let mut said = true;
-    let pattern: Vec<String> = matcher
-        .split('|')
-        .map(|token| {
-            let alphanumeric = token.chars().any(|c| c.is_ascii_alphanumeric());
-            let plain = token
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-            match (alphanumeric, plain) {
-                (true, true) => name(token),
-                // Pure syntax — `.*` names no tool and needs no translation.
-                (false, _) => token.to_owned(),
-                (true, false) => {
-                    said = false;
-                    token.to_owned()
-                }
+    let mut pattern: Vec<String> = Vec::new();
+    for token in matcher.split('|') {
+        let alphanumeric = token.chars().any(|c| c.is_ascii_alphanumeric());
+        let plain = token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        let restated = match (alphanumeric, plain) {
+            (true, true) => name(token),
+            // Pure syntax — `.*` names no tool and needs no translation.
+            (false, _) => vec![token.to_owned()],
+            (true, false) => {
+                said = false;
+                vec![token.to_owned()]
             }
-        })
-        .collect();
+        };
+        // Two authored names can land on one tool, as `Edit` and
+        // `MultiEdit` do on Copilot's `edit`; each alternative is said once.
+        for alternative in restated {
+            if !pattern.contains(&alternative) {
+                pattern.push(alternative);
+            }
+        }
+    }
     (pattern.join("|"), said)
 }
 
