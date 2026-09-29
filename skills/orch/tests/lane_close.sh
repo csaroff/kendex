@@ -217,6 +217,23 @@ printf '{"state":"%s","state_type":"%s"}\n' \
 EOF
 chmod +x "$FIXTURE/skills/linear/scripts/linear.sh"
 
+# worktree merged, the merge judge a close asks where the record carries no
+# cycle: LANE_CLOSE_WORKTREE_MERGED is its exit, 0 merged, 1 not merged, and
+# any other a lookup that did not answer; each call lands in the call log.
+export LANE_CLOSE_WORKTREE_CALLS="$TMP_ROOT/worktree-calls"
+mkdir -p "$FIXTURE/skills/worktree/scripts"
+cat >"$FIXTURE/skills/worktree/scripts/worktree" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$LANE_CLOSE_WORKTREE_CALLS"
+case "${LANE_CLOSE_WORKTREE_MERGED:-1}" in
+  0) printf 'abc123\n' ;;
+  1) printf 'worktree: unmerged ken-1\n' >&2 ;;
+  *) printf 'worktree: merge-unverified ken-1\n' >&2 ;;
+esac
+exit "${LANE_CLOSE_WORKTREE_MERGED:-1}"
+EOF
+chmod +x "$FIXTURE/skills/worktree/scripts/worktree"
+
 cat >"$BIN/pgrep" <<'EOF'
 #!/usr/bin/env bash
 exit 1
@@ -297,10 +314,12 @@ case "$1 $2" in
     [[ "${LANE_CLOSE_PR_QUEUE_STATUS:-0}" -eq 0 ]] || { printf 'gh: graphql: Something went wrong\n' >&2; exit "$LANE_CLOSE_PR_QUEUE_STATUS"; }
     queue='{"data":{"repository":{"pullRequest":{"isInMergeQueue":false,"mergeQueueEntry":null}}}}'
     printf '%s\n' "${LANE_CLOSE_PR_QUEUE-$queue}" ;;
-  *) printf '%s\n' "${LANE_CLOSE_GITHUB_STATE:-CLOSED}" ;;
+  *) printf '%s\n' "${LANE_CLOSE_GITHUB_STATE:-CLOSED COMPLETED}" ;;
 esac
 EOF
 chmod +x "$BIN/gh"
+# The issue read a GitHub lane's close makes, as the gh stub logs it.
+GH_ISSUE_READ='issue view 1 --repo owner/repo --json state,stateReason --jq .state + " " + (.stateReason // "")'
 
 # MAIL_ROOT is the lane's worktree as the record names it: a path on the host
 # for a hosted lane, and for a local lane the directory its harness runs in.
@@ -421,6 +440,7 @@ lib_mutant() { # NAME OLD NEW [APPEND]
     ln -s "$SCRIPTS/$sibling" "$dir/skills/orch/scripts/$sibling"
   done
   ln -s "$FIXTURE/skills/linear/scripts/linear.sh" "$dir/skills/linear/scripts/linear.sh"
+  ln -s "$FIXTURE/skills/worktree" "$dir/skills/worktree"
   ln -s "$SCRIPTS/lib/lane-host-slots.sh" "$dir/skills/orch/scripts/lib/lane-host-slots.sh"
   python3 - "$SCRIPTS/lib/lane-state.sh" "$dir/skills/orch/scripts/lib/lane-state.sh" "$old" "$new" "${4:-}" <<'MUTPY'
 import pathlib, sys
@@ -520,6 +540,64 @@ LANE_CLOSE_REMOVE_STATUS=0 run_close "$SCRIPT" --state-dir "$FLEET_DIR"
 unset LANE_CLOSE_HOST_MARKER
 assert_eq "rc=$RC remove=$(grep -c -x -- "--state-dir $FLEET_DIR remove KEN-1" "$STATE_CALLS" || true) close=$(close_call_count) status=$(jq -r '.lanes[0].status' "$STATE")" 'rc=0 remove=1 close=1 status=done' \
   'a second close after a failed removal removes the files, closes the host and records done'
+
+echo '=== a full close after the merge passes --merged to the host close ==='
+# An exited hosted lane, or a parked record, whose record carries the cycle of
+# pull request CYCLE's merge, or none for -, closed by SCRIPT with worktree
+# merged exiting WT_STATUS and the tracker as TRACKER_ENV sets it. MERGED reads
+# the host close with and without the flag, the worktree asks, the
+# merged-unjudged notice and the worktree words relayed. A TRACKER_ENV setting
+# the GitHub state closes the GitHub lane issue-1.
+merged_row() { # SCRIPT STATUS CYCLE WT_STATUS TRACKER_ENV
+  local item=KEN-1 tracker=linear
+  if [[ "$5" == LANE_CLOSE_GITHUB_STATE=* ]]; then item=issue-1 tracker=github; fi
+  write_state "$2" pi /host "$tracker" owner/repo; write_panes bash; printf '\n' >"$SCREEN"
+  if [[ "$3" != - ]]; then
+    jq --argjson pr "$3" '.lanes[0].cycle = {pr: $pr}' "$STATE" >"$STATE.next" && mv -- "$STATE.next" "$STATE"
+  fi
+  : >"$LANE_CLOSE_WORKTREE_CALLS"
+  export "$5"
+  LANE_CLOSE_WORKTREE_MERGED="$4" run_close "$1" --state-dir "$FLEET_DIR"
+  unset "${5%%=*}"
+  MERGED="rc=$RC merged=$(grep -c -x "close --item $item --merged host=/host" "$HOST_CALLS" || true) plain=$(grep -c -x "close --item $item host=/host" "$HOST_CALLS" || true) asked=$(grep -c -x "merged $item" "$LANE_CLOSE_WORKTREE_CALLS" || true) unjudged=$(sed -n "s/^lane-close: merged-unjudged item=$item //p" <<<"$OUT") relay=$(grep -c '^worktree: ' <<<"$ERR" || true)"
+}
+# label|record status|cycle|worktree merged exit|tracker env|expected
+MERGED_ROWS=(
+  "a finished item whose record carries its merge's cycle closes with --merged, asking worktree nothing|running|7|1|LANE_CLOSE_NONE=1|rc=0 merged=1 plain=0 asked=0 unjudged= relay=0"
+  "worktree merged proves a merge the record carries no cycle of|running|-|0|LANE_CLOSE_NONE=1|rc=0 merged=1 plain=0 asked=1 unjudged= relay=0"
+  "a finished item neither reading shows merged closes without the flag, its worktree answer kept quiet|running|-|1|LANE_CLOSE_NONE=1|rc=0 merged=0 plain=1 asked=1 unjudged= relay=0"
+  "a cycle an earlier merge left passes no flag while the tracker holds the item open|running|7|0|LANE_CLOSE_TRACKER_STATE_TYPE=started|rc=0 merged=0 plain=1 asked=0 unjudged= relay=0"
+  "a tracker that does not answer passes no flag|running|7|0|LANE_CLOSE_TRACKER_FAIL=1|rc=0 merged=0 plain=1 asked=0 unjudged= relay=0"
+  "a canceled item whose record carries an earlier merge's cycle closes without the flag|running|7|0|LANE_CLOSE_TRACKER_STATE_TYPE=canceled|rc=0 merged=0 plain=1 asked=0 unjudged= relay=0"
+  "a GitHub issue closed as completed after its merge closes with --merged|running|7|1|LANE_CLOSE_GITHUB_STATE=CLOSED COMPLETED|rc=0 merged=1 plain=0 asked=0 unjudged= relay=0"
+  "a GitHub issue closed as not planned closes without the flag|running|7|0|LANE_CLOSE_GITHUB_STATE=CLOSED NOT_PLANNED|rc=0 merged=0 plain=1 asked=0 unjudged= relay=0"
+  "a merge worktree merged cannot judge closes without the flag, named with its words|running|-|2|LANE_CLOSE_NONE=1|rc=0 merged=0 plain=1 asked=1 unjudged=status=2 relay=1"
+  "a parked record's close after its merge passes --merged|parked|7|1|LANE_CLOSE_NONE=1|rc=0 merged=1 plain=0 asked=0 unjudged= relay=0"
+)
+for row in "${MERGED_ROWS[@]}"; do
+  IFS='|' read -r label status cycle wt_status tracker_env want <<<"$row"
+  merged_row "$SCRIPT" "$status" "$cycle" "$wt_status" "$tracker_env"
+  assert_eq "$MERGED" "$want" "$label"
+done
+# One control per rule of the flag: the cycle as evidence, worktree merged's
+# exit 1 as not merged, the finished item, the completed item, and GitHub's
+# COMPLETED reason as completed. Each mutant turns its row red.
+# The fields are split on ^, since the replaced code holds a pipe.
+# label^old^new^status^cycle^worktree merged exit^tracker env^expected
+MERGED_CONTROLS=(
+  "control: without the cycle reading a recorded merge closes without the flag^  jq -e '.cycle.pr? | numbers' <<<\"\$record\" >/dev/null 2>&1 && return 0^  :^running^7^1^LANE_CLOSE_NONE=1^merged=0"
+  "control: worktree merged's exit 1 read as merged passes the flag for an unmerged item^    1) return 1 ;;^    1) return 0 ;;^running^-^1^LANE_CLOSE_NONE=1^merged=1"
+  "control: without the finished gate a stale cycle passes the flag for an open item^  if [[ \"\$ITEM_END\" == completed ]] && item_merged; then^  if item_merged; then^running^7^0^LANE_CLOSE_TRACKER_STATE_TYPE=started^merged=1"
+  "control: a gate on any terminal state passes the flag for a canceled item^  if [[ \"\$ITEM_END\" == completed ]] && item_merged; then^  if [[ -n \"\$ITEM_END\" ]] && item_merged; then^running^7^0^LANE_CLOSE_TRACKER_STATE_TYPE=canceled^merged=1"
+  "control: any GitHub close reason read as completed passes the flag for an issue not planned^      if [[ \"\$reason\" == COMPLETED ]]; then^      if [[ -n \"\$reason\" ]]; then^running^7^0^LANE_CLOSE_GITHUB_STATE=CLOSED NOT_PLANNED^merged=1"
+)
+n=0
+for row in "${MERGED_CONTROLS[@]}"; do
+  IFS='^' read -r label old new status cycle wt_status tracker_env want <<<"$row"
+  n=$((n + 1))
+  merged_row "$(mutant "lane-close-merged-$n" "$old" "$new")" "$status" "$cycle" "$wt_status" "$tracker_env"
+  assert_eq "$(grep -o 'merged=[0-9]*' <<<"$MERGED")" "$want" "$label"
+done
 
 echo '=== a local lane ends the validations its worktree still runs ==='
 validate_calls() { awk 'END { print NR + 0 }' "$LANE_CLOSE_VALIDATE_CALLS"; }
@@ -848,7 +926,7 @@ assert_eq "rc=$RC read=$(grep -c '^lane-close: tracker-read-failed item=issue-1 
 
 write_legacy_state running /host issue-1; write_panes claude; claude_screen
 run_close "$SCRIPT" --tracker github --repo owner/repo
-assert_eq "rc=$RC status=$(jq -r '.lanes[0].status' "$STATE") gh=$(grep -c '^issue view 1 --repo owner/repo --json state --jq .state$' "$GH_CALLS" || true)" \
+assert_eq "rc=$RC status=$(jq -r '.lanes[0].status' "$STATE") gh=$(grep -c -F -x -- "$GH_ISSUE_READ" "$GH_CALLS" || true)" \
   'rc=0 status=done gh=1' 'the same legacy issue-N record closes once --tracker and --repo name the lane'
 
 # A supplied value stands against the pane, and against the item key. Each row
@@ -879,7 +957,7 @@ for spelling in space equals; do
     space) run_close "$SCRIPT" --harness claude --tracker github --repo owner/repo ;;
     equals) run_close "$SCRIPT" --harness=claude --tracker=github --repo=owner/repo ;;
   esac
-  assert_eq "rc=$RC status=$(jq -r '.lanes[0].status' "$STATE") gh=$(grep -c '^issue view 1 --repo owner/repo --json state --jq .state$' "$GH_CALLS" || true)" \
+  assert_eq "rc=$RC status=$(jq -r '.lanes[0].status' "$STATE") gh=$(grep -c -F -x -- "$GH_ISSUE_READ" "$GH_CALLS" || true)" \
     'rc=0 status=done gh=1' "a legacy GitHub record closes through its $spelling options and the repository reaches gh"
 done
 
