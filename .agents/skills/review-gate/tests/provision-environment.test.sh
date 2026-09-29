@@ -30,14 +30,20 @@ cp -R "$SKILL_DIR/scripts" "$SKILL/scripts"
 cat >"$SKILL/standard.json" <<'JSON'
 {
   "ci_context": "CI",
-  "gate_context": "Review gate",
-  "app": "lanes-app",
-  "environment": "kendex",
-  "environment_secrets": ["APP_ID", "APP_KEY"]
+  "gate_context": "Review gate"
 }
 JSON
 cp "$TEST_DIR/lib/gh-shim.sh" "$BIN/gh"
 chmod +x "$BIN/gh"
+# The owner's checkouts the script runs from: `full` declares the
+# organization's values in its kendex.settings.toml, `none` declares none,
+# and `shell` names a secret that bash holds as a shell variable only.
+mkdir -p "$TMP/consumer-full" "$TMP/consumer-none" "$TMP/consumer-shell"
+printf '%s\n' '[env]' 'REVIEW_GATE_STANDARD_APP = "lanes-app"' 'REVIEW_GATE_STANDARD_ENVIRONMENT = "kendex"' \
+  'REVIEW_GATE_STANDARD_SECRETS = "APP_ID;APP_KEY"' >"$TMP/consumer-full/kendex.settings.toml"
+sed 's/"APP_ID;APP_KEY"/"APP_ID;BASH_VERSION"/' "$TMP/consumer-full/kendex.settings.toml" >"$TMP/consumer-shell/kendex.settings.toml"
+grep -qF '"APP_ID;BASH_VERSION"' "$TMP/consumer-shell/kendex.settings.toml" || { echo "provision-environment.test: consumer-shell=edit-missed" >&2; exit 1; }
+printf '[env]\n' >"$TMP/consumer-none/kendex.settings.toml"
 
 cat >"$BASE/installations.json" <<'JSON'
 {"installations": [{"app_slug": "other-app", "repository_selection": "selected"}, {"app_slug": "lanes-app", "repository_selection": "all"}]}
@@ -59,9 +65,9 @@ printf '{"branch_policies": [{"id": 1, "name": "main", "type": "branch"}]}\n' >"
 printf '{"secrets": [{"name": "APP_ID"}, {"name": "APP_KEY"}, {"name": "OTHER"}]}\n' >"$DONE/environment-secrets-kendex.json"
 printf '{"environments": []}\n' >"$BASE/repos/acme/fresh/environments.json"
 
-KEY='-----BEGIN RSA PRIVATE KEY-----
-line two
------END RSA PRIVATE KEY-----'
+# The trailing newline is part of the value: the create block pins that
+# the script and the shim carry it through byte-exact.
+KEY=$'-----BEGIN RSA PRIVATE KEY-----\nline two\n-----END RSA PRIVATE KEY-----\n'
 # Copies BASE to DIR and applies each jq EDIT to the FILE beside it, FILES
 # comma-separated under DIR/PREFIX and EDITS `^`-separated in the same order.
 world() { # DIR PREFIX FILES EDITS
@@ -85,7 +91,7 @@ run() { # FIXTURES SHIM_FAIL SECRETS ARGS...
   shift 3
   RC=0
   rm -f -- "$fixtures/.writes.log"
-  RAW="$(env -i PATH="$BIN:/usr/bin:/bin" HOME="$TMP" GH_SHIM_FIXTURES="$fixtures" GH_SHIM_FAIL="$fail" \
+  RAW="$(cd "$TMP/consumer-full" && env -i PATH="$BIN:/usr/bin:/bin" HOME="$TMP" GH_SHIM_FIXTURES="$fixtures" GH_SHIM_FAIL="$fail" \
     ${secrets:+APP_ID=4242} ${secrets:+"APP_KEY=$KEY"} "$SKILL/scripts/provision-environment.sh" "$@" 2>&1)" || RC=$?
   REPORT="$(grep -E '^(provision(-total)? |  step=)' <<<"$RAW" || true)"
   WRITES=""
@@ -229,22 +235,28 @@ NOJQ="$TMP/nojq"
 mkdir -p "$NOJQ"
 ln -s "$(command -v bash)" "$NOJQ/bash"
 ln -s "$(command -v dirname)" "$NOJQ/dirname"
-# name ~ shim failure ~ fixture files ~ jq edits ~ secret values (yes or
-# no) ~ PATH ~ arguments (space-separated) ~ first error line
-while IFS='~' read -r name fail files edits values path args key; do
+# name ~ shim failure ~ fixture files ~ jq edits ~ secret values (yes, no,
+# or empty-id: APP_ID exported empty) ~ PATH ~ arguments (space-separated) ~
+# first error line ~ consumer (empty: full) ~ its value (empty: not compared)
+while IFS='~' read -r name fail files edits values path args key consumer value; do
   [ -n "$name" ] || continue
   dir="$TMP/refuse-$name"
   world "$dir" "" "$files" "$edits"
-  secrets=""
-  [ "$values" != yes ] || secrets=1
+  case "$values" in
+    yes) secrets=1 app_id=4242 ;;
+    empty-id) secrets=1 app_id="" ;;
+    no) secrets="" app_id="" ;;
+    *) echo "provision-environment.test: row=$name values=$values" >&2; exit 1 ;;
+  esac
   RC=0
   rm -f -- "$dir/.writes.log"
   # shellcheck disable=SC2086
-  RAW="$(env -i PATH="${path:-$BIN:/usr/bin:/bin}" HOME="$TMP" GH_SHIM_FIXTURES="$dir" GH_SHIM_FAIL="$fail" \
-    ${secrets:+APP_ID=4242} ${secrets:+"APP_KEY=$KEY"} "$SKILL/scripts/provision-environment.sh" $args 2>&1)" || RC=$?
+  RAW="$(cd "$TMP/consumer-${consumer:-full}" && env -i PATH="${path:-$BIN:/usr/bin:/bin}" HOME="$TMP" GH_SHIM_FIXTURES="$dir" GH_SHIM_FAIL="$fail" \
+    ${secrets:+"APP_ID=$app_id"} ${secrets:+"APP_KEY=$KEY"} "$SKILL/scripts/provision-environment.sh" $args 2>&1)" || RC=$?
   first="${RAW%%
 *}"
-  if [ "$RC" -eq 2 ] && [ "${first%% value=*}" = "$key" ] && [ ! -e "$dir/.writes.log" ] && ! grep -qE '^provision(-total)? ' <<<"$RAW"; then
+  if [ "$RC" -eq 2 ] && [ "${first%% value=*}" = "$key" ] && { [ -z "$value" ] || [ "${first#* value=}" = "$value" ]; } &&
+    [ ! -e "$dir/.writes.log" ] && ! grep -qE '^provision(-total)? ' <<<"$RAW"; then
     ok "$name"
   else
     bad "$name (rc=$RC)" "$RAW"
@@ -253,6 +265,9 @@ done <<ROWS
 no organization~~~~yes~~--dry-run~review-gate-error=org-missing
 an unknown argument~~~~yes~~--org acme --repo acme/done~review-gate-error=unknown-argument
 a secret value unset~~~~no~~--org acme~review-gate-error=secret-value-missing
+a secret value exported empty~~~~empty-id~~--org acme~review-gate-error=secret-value-missing~~APP_ID
+a secret named for a shell variable the environment lacks~~~~yes~~--org acme~review-gate-error=secret-value-missing~shell~BASH_VERSION
+an owner checkout that declares nothing~~~~yes~~--org acme --dry-run~review-gate-error=standard-setting-missing~none~REVIEW_GATE_STANDARD_APP\,REVIEW_GATE_STANDARD_ENVIRONMENT\,REVIEW_GATE_STANDARD_SECRETS
 no jq~~~~yes~$NOJQ~--org acme --dry-run~review-gate-error=jq-missing
 the app on selected repositories~~installations.json~.installations[1].repository_selection = "selected"~yes~~--org acme~review-gate-error=app-selection
 the app not installed~~installations.json~.installations |= [.[0]]~yes~~--org acme~review-gate-error=app-absent
@@ -263,6 +278,26 @@ a repository the credential cannot see~~organization.json~.total_private_repos =
 repositories unreadable~organization-repositories~~~yes~~--org acme~review-gate-error=repositories-read
 every repository archived~~organization-repositories.json~map(.archived = true)~yes~~--org acme~review-gate-error=repositories-none
 ROWS
+
+# The secret reader's control reads the copy's value from the shell
+# namespace, as the former indirect lookup did: BASH_VERSION, a shell
+# variable the environment lacks, then reads as set, the run no longer
+# refuses, and the shell's own value is written as the secret.
+. "$TEST_DIR/lib/workflow-edit.sh"
+cp "$SKILL/scripts/lib/standard.sh" "$TMP/standard-lib.keep"
+file_edit "$SKILL" scripts/lib/standard.sh 1 'printenv -- "\$1"' 's/printenv -- "\$1"/echo "${!1:-}"/'
+dir="$TMP/control-secret-value"
+world "$dir" "" "" ""
+RC=0
+RAW="$(cd "$TMP/consumer-shell" && env -i PATH="$BIN:/usr/bin:/bin" HOME="$TMP" GH_SHIM_FIXTURES="$dir" GH_SHIM_FAIL="" \
+  APP_ID=4242 "$SKILL/scripts/provision-environment.sh" --org acme 2>&1)" || RC=$?
+if [ "$RC" -ne 2 ] && ! grep -q '^review-gate-error=secret-value-missing ' <<<"$RAW" &&
+  grep -q '^secret-set repo=acme/done env=kendex name=BASH_VERSION ' "$dir/.writes.log" 2>/dev/null; then
+  ok 'control: a reader of shell variables writes BASH_VERSION as a secret'
+else
+  bad "control: secret value reader (rc=$RC)" "$RAW"
+fi
+cp "$TMP/standard-lib.keep" "$SKILL/scripts/lib/standard.sh"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
