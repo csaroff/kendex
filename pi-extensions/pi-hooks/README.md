@@ -36,7 +36,7 @@ The other hook events cannot stop anything in Pi, so the extension delivers what
 | Hook event | Pi listener | What happens with the hook's output |
 | --- | --- | --- |
 | `PostToolUse` | `tool_result` | Appended to the tool result the agent reads. |
-| `Stop`, `TaskCompleted` | `turn_end`, read once per response on `agent_settled` | Sent to the agent once as a message that starts the next turn. A hook's answer to that message runs the hooks again with `stop_hook_active: true` and is not sent back, so a response runs them at most twice. |
+| `Stop`, `TaskCompleted` | `turn_end`, read once per response on `agent_before_settle` | Added to the session, and Pi runs one more model request inside the same run so the agent answers it. At the end of that request the hooks run again with `stop_hook_active: true`, and what they say then is recorded without another request, so a response runs them at most twice. |
 | `SessionStart` | `session_start` | Added to the session's opening context. |
 
 - Every hook whose matcher fits runs on those three events.
@@ -44,6 +44,7 @@ The other hook events cannot stop anything in Pi, so the extension delivers what
 - Any other exit status is reported to the agent as a hook that reached no verdict; a hook that ran out of time, or whose script is missing, is reported as one that did not run.
 - A `PostToolUse` matcher is matched against the tool's name, and a `SessionStart` matcher against why the session started: `startup`, `resume` or `clear`.
 - `Stop` and `TaskCompleted` hooks take no matcher, so both always run.
+- `Stop` and `TaskCompleted` hooks need Pi 0.87.0 or later. On an older Pi they do not run, and each fresh session starts with a `hook-host-unsupported=pi <version>` message that says so, and a session with a UI also gets it as a notification.
 
 ## Lane mail wake
 
