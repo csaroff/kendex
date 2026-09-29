@@ -79,6 +79,23 @@ export function getBuiltInTool(agent: any, cwd: string, toolName: BuiltInToolNam
 	return tools[toolName];
 }
 
+/**
+ * Four fields of the wrapped AgentTool that Pi's agent loop reads, which a
+ * replacement definition carries unchanged. `description`, `parameters` and
+ * `constrainedSampling` are the tool as declared to the model, the last being
+ * Pi's schema-sampling choice, strict-prefer on read, bash, edit and write.
+ * `prepareArguments` runs before arguments validate against `parameters`, so
+ * without it the shapes Pi's own tool accepts fail before `execute` delegates.
+ */
+function piToolContract(original: any) {
+	return {
+		description: original.description,
+		parameters: original.parameters,
+		constrainedSampling: original.constrainedSampling,
+		prepareArguments: original.prepareArguments,
+	};
+}
+
 export function contextCwd(context: any, fallback: string): string {
 	return context?.cwd ?? fallback;
 }
@@ -138,8 +155,7 @@ export function registerRead(pi: ExtensionAPI, agent: any, cwd: string): void {
 		renderShell: "self",
 		name: "read",
 		label: "read",
-		description: original.description,
-		parameters: original.parameters,
+		...piToolContract(original),
 		async execute(id: string, params: any, signal: AbortSignal | undefined, onUpdate: unknown, context: any) {
 			return getBuiltInTool(agent, contextCwd(context, cwd), "read").execute(id, params, signal, onUpdate, context);
 		},
@@ -177,8 +193,7 @@ export function registerBash(pi: ExtensionAPI, agent: any, cwd: string): void {
 		renderShell: "self",
 		name: "bash",
 		label: "bash",
-		description: original.description,
-		parameters: original.parameters,
+		...piToolContract(original),
 		async execute(id: string, params: any, signal: AbortSignal | undefined, onUpdate: unknown, context: any) {
 			return getBuiltInTool(agent, contextCwd(context, cwd), "bash").execute(id, params, signal, onUpdate, context);
 		},
@@ -254,12 +269,7 @@ export function registerEdit(pi: ExtensionAPI, agent: any, cwd: string): void {
 		renderShell: "self",
 		name: "edit",
 		label: "edit",
-		description: original.description,
-		parameters: original.parameters,
-		// Pi's agent loop prepares arguments before schema validation; the
-		// replacement definition has to carry the hook or the shapes Pi's own
-		// tool accepts fail validation before execute() can delegate.
-		prepareArguments: original.prepareArguments,
+		...piToolContract(original),
 		async execute(id: string, params: any, signal: AbortSignal | undefined, onUpdate: unknown, context: any) {
 			const effectiveCwd = contextCwd(context, cwd);
 			const targetPath = params?.path ?? params?.file_path;
@@ -304,8 +314,7 @@ export function registerWrite(pi: ExtensionAPI, agent: any, cwd: string): void {
 		renderShell: "self",
 		name: "write",
 		label: "write",
-		description: original.description,
-		parameters: original.parameters,
+		...piToolContract(original),
 		async execute(id: string, params: any, signal: AbortSignal | undefined, onUpdate: unknown, context: any) {
 			const effectiveCwd = contextCwd(context, cwd);
 			const targetPath = params?.path ?? params?.file_path;
@@ -355,8 +364,7 @@ export function registerReadOnly(pi: ExtensionAPI, agent: any, cwd: string, tool
 		renderShell: "self",
 		name: toolName,
 		label: toolName,
-		description: original.description,
-		parameters: original.parameters,
+		...piToolContract(original),
 		async execute(id: string, params: any, signal: AbortSignal | undefined, onUpdate: unknown, context: any) {
 			return getBuiltInTool(agent, contextCwd(context, cwd), toolName).execute(id, params, signal, onUpdate, context);
 		},
