@@ -24,7 +24,7 @@ BINDING = "binding.json"
 JOURNAL = "journal.jsonl"
 STATUS = "status.json"
 LOCK = "listen.lock"
-LINE_KINDS = {"seen", "start", "in", "out", "resolved", "bound", "thread"}
+LINE_KINDS = {"seen", "start", "hold", "resume", "in", "out", "resolved", "bound", "thread"}
 AT_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 
@@ -33,6 +33,11 @@ def parse_at(at: str) -> float:
     seconds; ValueError when it is not one."""
     stamp = datetime.datetime.strptime(at, AT_FORMAT)
     return stamp.replace(tzinfo=datetime.timezone.utc).timestamp()
+
+
+def format_at(epoch: float) -> str:
+    """Epoch seconds as the UTC second lane-mail would stamp them."""
+    return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).strftime(AT_FORMAT)
 
 
 def root_dir(root: Path) -> Path:
@@ -99,12 +104,24 @@ class Thread:
 
 
 @dataclass
+class Window:
+    """One closed master hold: from the second of SLACK_MASTER_FILE's mtime
+    its first poll read, to the second the hold ended."""
+
+    from_at: str
+    at: str
+
+
+@dataclass
 class State:
     """The journal replayed: what was carried, what is bound, where to read."""
 
     seen_ts: str = "0"
     start_at: str = ""
     start_ids: Set[str] = field(default_factory=set)
+    held: bool = False
+    hold_at: str = ""
+    holds: List[Window] = field(default_factory=list)
     carried: Set[str] = field(default_factory=set)
     delivered: Dict[str, str] = field(default_factory=dict)
     threads: Dict[str, Thread] = field(default_factory=dict)
@@ -121,6 +138,12 @@ class State:
         elif kind == "start":
             self.start_at = str(line["at"])
             self.start_ids = {str(i) for i in line["ids"]}
+        elif kind == "hold":
+            self.held = True
+            self.hold_at = str(line["at"])
+        elif kind == "resume":
+            self.held = False
+            self.holds.append(Window(str(line["from_at"]), str(line["at"])))
         elif kind == "in":
             ts = str(line["ts"])
             if line["kind"] == "ignored":
@@ -207,10 +230,12 @@ class Journal:
 
 def compact(root: Path, cutoff_ts: float) -> int:
     """Drop resolved and ignored lines older than the cutoff, every report
-    upload older than it, and every history position but the last; keep
-    every open thread. Returns the lines dropped. An `out` line is judged by
-    its envelope's `at`, the age `post_events` never posts past, so its
-    envelope can never post again."""
+    upload older than it, every history position but the last, every hold
+    line but a standing one, and every resume line whose end is older than
+    the cutoff; keep every open thread. Returns the lines dropped. An `out`
+    line and a `resume` line are judged by the `at` they journal, the age
+    `post_events` never posts past, so what they name can never post
+    again."""
     path = root_dir(root) / JOURNAL
     state = read_journal(root)
     if not path.is_file():
@@ -219,15 +244,20 @@ def compact(root: Path, cutoff_ts: float) -> int:
         raws = [raw for raw in handle if raw.strip()]
     lines = [json.loads(raw) for raw in raws]
     last_seen = max((i for i, line in enumerate(lines) if line.get("t") == "seen"), default=-1)
+    last_hold = max((i for i, line in enumerate(lines) if line.get("t") in ("hold", "resume")), default=-1)
     kept: List[str] = []
     dropped = 0
     for index, (raw, line) in enumerate(zip(raws, lines)):
         kind = line.get("t")
         old = "ts" in line and _ts_float(str(line["ts"])) < cutoff_ts
-        aged = kind == "out" and parse_at(str(line["at"])) < cutoff_ts
+        aged = kind in ("out", "resume") and parse_at(str(line["at"])) < cutoff_ts
         drop = False
         if kind == "seen":
             drop = index != last_seen
+        elif kind == "hold":
+            drop = index != last_hold
+        elif kind == "resume":
+            drop = aged
         elif kind == "in" and old:
             thread = state.threads.get(str(line.get("thread", "")))
             drop = line["kind"] == "ignored" or thread is None or not thread.open
