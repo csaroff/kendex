@@ -21,9 +21,17 @@
 // completing it. Changing it is a behavior change for every bridge user and belongs in
 // its own change, not in per-directory override parity.
 //
+// The <piUserDir> fallback is skipped when the query loads Claude user settings
+// (settingSources includes "user"). The subprocess then loads Claude's own user
+// level (user CLAUDE.md, output style), and that level is the only source of
+// global instructions for the session: the bridge compares no text with it and
+// has no setting to forward the Pi agent-dir file as well. The cwd-ancestor file
+// is forwarded either way.
+//
 // In isolated mode (CLAUDE_BRIDGE_ISOLATED=1), all AGENTS.md discovery is
 // disabled. Embedding hosts provide their instruction surface explicitly.
 
+import type { SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import { lstatSync, readFileSync, statSync } from "fs";
 import { dirname, join, resolve } from "path";
 import { isolatedFromEnv, piUserDir } from "./config.js";
@@ -61,10 +69,12 @@ function contextFileInDir(dir: string): string | undefined {
 	return undefined;
 }
 
-export function resolveAgentsMdPath(): string | undefined {
+/** `settingSources` is the list the query passes the Claude Code subprocess. */
+export function resolveAgentsMdPath(settingSources?: readonly SettingSource[]): string | undefined {
 	if (isolatedFromEnv()) return undefined;
 	const fromCwd = findAgentsMdInParents(process.cwd());
 	if (fromCwd) return fromCwd;
+	if (settingSources?.includes("user")) return undefined;
 	return contextFileInDir(piUserDir());
 }
 
@@ -80,8 +90,8 @@ export function findAgentsMdInParents(startDir: string): string | undefined {
 	return undefined;
 }
 
-export function extractAgentsAppend(): string | undefined {
-	const agentsPath = resolveAgentsMdPath();
+export function extractAgentsAppend(settingSources?: readonly SettingSource[]): string | undefined {
+	const agentsPath = resolveAgentsMdPath(settingSources);
 	if (!agentsPath) return undefined;
 	try {
 		const content = readFileSync(agentsPath, "utf-8").trim();

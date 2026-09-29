@@ -2,6 +2,10 @@
 
 ## Consumer-impacting changes
 
+### 4.0.5
+
+- A connectors session that loads Claude user settings (the default; the README's Connectors section says how `provider.settingSources` changes that) no longer forwards the Pi agent-dir `AGENTS.md` (`~/.pi/agent/AGENTS.md`, or the file under `PI_CODING_AGENT_DIR`) when no `AGENTS.md` is found from the working directory up. Global instructions for such a session belong in Claude's user level: `~/.claude/CLAUDE.md`, the `CLAUDE.md` in the account's Claude config directory, or a Claude output style. Instructions kept only in the Pi agent-dir file no longer reach it outside a repository. Other sessions, and a repository `AGENTS.md`, are unchanged.
+
 ### 4.0.4
 
 - **Requires Pi 0.86.0 or later**, reported at startup: a host below the floor gets one message naming the version instead of a provider that registers and then cannot bridge a tool. Pi 0.86 moved the system prompt and the tool declarations out of the provider's `Context` fields and into `system` entries of the message transcript. The bridge read the retired fields, so on Pi 0.86 and 0.87 a `pi-claude` session reached the model with no file or shell tools at all: Pi's tools were never bridged onto the `custom-tools` MCP server, while Claude Code's own built-ins stayed disabled. Pi's skills block and forwarded prompt context were dropped from the child's prompt the same way. Both are now read from the transcript, off the host namespace rather than as named imports, so an older host still loads the extension and is told to upgrade. The declared Pi peer range names 0.86.0 as its floor (kendex#2749).
