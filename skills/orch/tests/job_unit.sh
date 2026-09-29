@@ -37,8 +37,8 @@ run() { # SCRIPT ARG...
 }
 
 # A copy of the executable with one literal substitution applied, for the
-# controls: one per subcommand that has one, name, launch and stop, and one for
-# the kill_sites reading below. The counts are the edit's proof.
+# controls: one per rule a row below pins, the kill_sites reading among them.
+# The counts are the edit's proof.
 MUTANT=""
 mutant() { # NAME OLD NEW
   MUTANT="$TMP_ROOT/$1.sh"
@@ -89,6 +89,56 @@ done
 mutant no-sanitize "| LC_ALL=C tr -c 'A-Za-z0-9_.-' '_'" ''
 run "$MUTANT" name 'watch a b/c' 7
 assert_eq "$OUT" "orch-watch a b/c-7" "control: unsanitized, the name's spaces and slash reach the unit name"
+
+# --- The slice a launch names for its unit ----------------------------------------
+# The cgroup file each row plants is one the kernel writes: a pane under the
+# agent warden's placement, a lane in a nested slice, a tmux service, a login
+# session outside the user manager, a process under another user's manager, a
+# cgroup v1 host, a hybrid v1 and v2 host, and macOS, which has no /proc.
+# cgroup file lines (\n between them), or `none` for no file|slice|label
+while IFS='|' read -r lines want label; do
+  file="$TMP_ROOT/cgroup.$RANDOM"
+  [[ "$lines" == none ]] || printf '%b\n' "${lines//UID/$UID}" > "$file"
+  # shellcheck source=/dev/null # the library under test, sourced for one function
+  assert_eq "$(source "$JOB_UNIT"; job_unit_slice "$file")" "$want" "$label"
+done <<ROWS
+0::/user.slice/user-UID.slice/user@UID.service/agents.slice/agent-confine-1-a.scope|agents.slice|a process in an agents.slice scope names agents.slice
+0::/user.slice/user-UID.slice/user@UID.service/agents.slice/agents-lane.slice/x.scope|agents-lane.slice|a process in a nested slice names the innermost one
+0::/user.slice/user-UID.slice/user@UID.service/app.slice/tmux.service|app.slice|a process in a service names that service's slice
+0::/user.slice/user-UID.slice/session-4.scope||a login session scope, outside the user manager, names no slice
+0::/user.slice/user-UID.slice/user@9UID.service/agents.slice/x.scope||a process under another user's manager names no slice
+1:name=systemd:/user.slice/user-UID.slice/user@UID.service/agents.slice/x.scope||a cgroup v1 line names no slice
+12:pids:/user.slice\n0::/user.slice/user-UID.slice/user@UID.service/agents.slice/x.scope|agents.slice|a hybrid file names the slice on its cgroup v2 line
+none||no cgroup file names no slice
+ROWS
+printf '0::/user.slice/user-%s.slice/session-4.scope\n' "$UID" > "$TMP_ROOT/session.cgroup"
+mutant no-manager-check '[[ "$path" == */user@"$UID".service/* ]] || return 0' ':'
+# shellcheck source=/dev/null # the control's copy of that library
+assert_eq "$(source "$MUTANT"; job_unit_slice "$TMP_ROOT/session.cgroup")" "user-$UID.slice" \
+  "control: without the manager check a login session names the system's user slice"
+
+# --- The task and memory caps a launch copies from its own cgroup -------------------
+# Each row plants one cgroup v2 limit file as the kernel writes it: a number, or
+# `max` for no limit, or no file where the cgroup lacks that controller.
+# file|content, or `none` for no file|printed cap|label
+while IFS='|' read -r limit content want label; do
+  dir="$TMP_ROOT/cgroup-dir.$RANDOM"
+  mkdir -p -- "$dir"
+  [[ "$content" == none ]] || printf '%s\n' "$content" > "$dir/$limit"
+  # shellcheck source=/dev/null # the library under test, sourced for one function
+  assert_eq "$(source "$JOB_UNIT"; job_unit_cgroup_cap "$dir" "$limit")" "$want" "$label"
+done <<ROWS
+pids.max|8192|8192|a task cap the cgroup holds is copied
+memory.high|68719476736|68719476736|a memory soft cap the cgroup holds is copied
+pids.max|max||a cgroup with no task cap gives none
+memory.high|none||a cgroup with no memory controller gives no memory soft cap
+ROWS
+mkdir -p -- "$TMP_ROOT/uncapped"
+printf 'max\n' > "$TMP_ROOT/uncapped/pids.max"
+mutant no-number-check '[[ "$value" =~ ^[0-9]+$ ]] || return 0' ':'
+# shellcheck source=/dev/null # the control's copy of that library
+assert_eq "$(source "$MUTANT"; job_unit_cgroup_cap "$TMP_ROOT/uncapped" pids.max)" "max" \
+  "control: without the number check an uncapped cgroup's max reaches the unit, which systemd refuses"
 
 # --- A launch where no systemd-run is installed ------------------------------------
 # A PATH holding what the setsid launch and its job call, and no systemd-run.
@@ -301,6 +351,51 @@ ROWS
 --memory-max 512|0 536870912|a launch with --memory-max 512 sets MemoryMax=536870912
 |0 infinity|a launch with no --memory-max sets no MemoryMax
 ROWS
+
+  # A unit starts in the user-manager slice its launch runs in, so a job an
+  # agent starts stays under that agent's slice, and takes that launch's own
+  # task cap and memory soft cap, so one job cannot take the slice's whole
+  # pool. The launch runs from a scope with a planted TasksMax and MemoryHigh
+  # in a slice this row plants; each control's unit misses what it removes.
+  PLANTED_SLICE="jobunittest$$.slice" PLANTED_TASKS=321 PLANTED_HIGH=67108864
+  launched_from_scope() { # SCRIPT [OPTION...] — the unit's Slice, TasksMax and MemoryHigh, each planted or what else it is
+    local script="$1" rec="$TMP_ROOT/slice.record" u slice tasks high
+    shift
+    rm -f -- "${rec:?}"
+    systemd-run --user --scope --quiet --slice="$PLANTED_SLICE" \
+      -p "TasksMax=$PLANTED_TASKS" -p "MemoryHigh=$PLANTED_HIGH" \
+      -- "$script" launch validate-slice "$rec" --cap 60 "$@" -- sleep 30 </dev/null >/dev/null 2>&1 || true
+    u="$(sed -n 's/^unit=//p' "$rec" 2>/dev/null)"
+    slice="$(systemctl --user show -p Slice --value -- "${u:-none}.service" 2>/dev/null || true)"
+    tasks="$(systemctl --user show -p TasksMax --value -- "${u:-none}.service" 2>/dev/null || true)"
+    high="$(systemctl --user show -p MemoryHigh --value -- "${u:-none}.service" 2>/dev/null || true)"
+    case "$slice" in
+      "$PLANTED_SLICE") slice=planted ;;
+      "") slice=none ;;
+      *) slice=other ;;
+    esac
+    [[ "$tasks" != "$PLANTED_TASKS" ]] || tasks=planted
+    [[ "$tasks" == planted ]] || tasks=other
+    [[ "$high" != "$PLANTED_HIGH" ]] || high=planted
+    printf '%s %s %s' "$slice" "$tasks" "$high"
+    [[ -z "$u" ]] || "$JOB_UNIT" stop "$u" >/dev/null 2>&1 || true
+  }
+  assert_eq "$(launched_from_scope "$JOB_UNIT")" "planted planted planted" \
+    "a unit starts in the slice its launch runs in, with that launch's task cap and memory soft cap"
+  assert_eq "$(launched_from_scope "$JOB_UNIT" --memory-max 512)" "planted planted infinity" \
+    "a launch with --memory-max takes no memory soft cap from its caller"
+  # control;old text;new text;launch option;unit;label
+  while IFS=';' read -r name old new option want label; do
+    mutant "$name" "$old" "$new"
+    # shellcheck disable=SC2086 # the option column is words
+    assert_eq "$(launched_from_scope "$MUTANT" $option)" "$want" "$label"
+  done <<'ROWS'
+no-slice;unit_props+=(--slice="$slice");:;;other planted planted;control: without the slice pass-through the unit starts in another slice
+no-tasks-max;unit_props+=(-p "TasksMax=$cap");:;;planted other planted;control: without the task cap pass-through the unit takes the manager's default
+no-memory-high;unit_props+=(-p "MemoryHigh=$cap");:;;planted planted infinity;control: without the memory soft cap pass-through the unit has none
+memory-high-over-max;[[ -z "$memory_max" ]] && cap=;cap=;--memory-max 512;planted planted planted;control: without the --memory-max check the caller's soft cap rides beside it
+ROWS
+  systemctl --user stop -- "$PLANTED_SLICE" >/dev/null 2>&1 || true
 
   # A service ignores SIGPIPE by default; a unit job takes it at its default,
   # as a job the caller starts does. SigIgn bit 13 is SIGPIPE.
