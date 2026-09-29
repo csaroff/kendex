@@ -79,7 +79,8 @@ pub enum SkillText {
     Repaired,
 }
 
-/// The rendered skill: every file of the source tree — read through the
+/// The rendered skill: every file of the source tree but the top-level
+/// entries no consumer reads ([`crate::source_read::NOT_RENDERED`]) — read through the
 /// sealed source, so a hostile catalog cannot smuggle host files in — with
 /// `[skill-instructions]` injected into SKILL.md. Returned as
 /// (relative path, bytes) so apply can materialize it transactionally,
@@ -107,7 +108,9 @@ fn with_instructions(
     source_dir: &Path,
     instructions: Option<&str>,
 ) -> Result<(Rendered, SkillText)> {
-    let mut files = sealed.collect_skill_tree(source_dir)?;
+    let mut files = sealed
+        .rendered_item(crate::model::ItemKind::Skill, source_dir)?
+        .into_files();
     let mut read_as = SkillText::Exact;
     for (rel, bytes) in &mut files {
         if rel == Path::new(SKILL_FILE) {
@@ -254,6 +257,10 @@ mod tests {
         std::fs::create_dir_all(src.join("scripts")).unwrap();
         std::fs::write(src.join("SKILL.md"), SKILL).unwrap();
         std::fs::write(src.join("scripts/run.sh"), "#!/bin/sh\n").unwrap();
+        // What no consumer reads stays out of the render.
+        std::fs::create_dir_all(src.join("tests")).unwrap();
+        std::fs::write(src.join("tests/run.test.sh"), "#!/bin/sh\n").unwrap();
+        std::fs::write(src.join("DEVELOPMENT.md"), "# notes\n").unwrap();
 
         let mut manifest = Manifest {
             schema: MANIFEST_SCHEMA,
@@ -280,5 +287,14 @@ mod tests {
             .find(|(p, _)| p.ends_with("run.sh"))
             .unwrap();
         assert_eq!(script.1, b"#!/bin/sh\n");
+        // The catalog records the item by the tree a render carries, so the
+        // publisher's own render reads as the catalog's bytes unchanged.
+        let authored = render_authored(&sealed, &src).unwrap();
+        assert_eq!(
+            crate::hash::hash_files(&authored),
+            sealed
+                .catalog_hash(crate::model::ItemKind::Skill, &src)
+                .unwrap()
+        );
     }
 }

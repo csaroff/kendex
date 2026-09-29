@@ -15,6 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::error::{CoreError, Result};
+use crate::model::ItemKind;
 
 const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_TREE_DEPTH: usize = 16;
@@ -67,6 +68,56 @@ pub struct SealedSource {
 /// ideas of what a package contains.
 pub const NOT_CONTENT: [&str; 6] = [".git", "node_modules", "target", "dist", "build", ".venv"];
 const TOOL_STATE: &str = ".git node_modules __pycache__ .pytest_cache .venv";
+
+/// The entries at a skill's own top level that a render leaves out: the
+/// package's test suites, its evaluation sets and its maintainer notes. An
+/// agent never reads them at run time, and a consumer never runs a
+/// package's tests. Only the top level: a template or an example deeper in
+/// the tree that carries one of these names is content. `tools/guard`'s
+/// render rule owes no render for the same names, and
+/// `guard_not_rendered_is_the_render_list` holds its copy to this one.
+pub const NOT_RENDERED: [&str; 3] = ["tests", "evals", "DEVELOPMENT.md"];
+
+/// One catalog item's bytes: a directory's files by relative path, or one
+/// file's bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ItemBytes {
+    File(Vec<u8>),
+    Tree(Vec<(PathBuf, Vec<u8>)>),
+}
+
+impl ItemBytes {
+    /// The content hash a lock records for these bytes.
+    pub fn hash(&self) -> String {
+        match self {
+            ItemBytes::File(bytes) => crate::hash::hash_bytes(bytes),
+            ItemBytes::Tree(files) => crate::hash::hash_files(files),
+        }
+    }
+
+    /// The bytes as (relative path, bytes) rows, a file as one row under
+    /// the empty path, which hashes as the file's own bytes do.
+    pub fn into_files(self) -> Vec<(PathBuf, Vec<u8>)> {
+        match self {
+            ItemBytes::File(bytes) => vec![(PathBuf::new(), bytes)],
+            ItemBytes::Tree(files) => files,
+        }
+    }
+}
+
+/// What a tree walk leaves out: `skip` names at every depth, `top` names
+/// only among the walked directory's own entries.
+#[derive(Clone, Copy)]
+struct Prune<'a> {
+    skip: &'a [&'a str],
+    top: &'a [&'a str],
+}
+
+impl Prune<'_> {
+    fn drops(&self, name: &str, depth: usize) -> bool {
+        self.skip.contains(&name) || (depth == 0 && self.top.contains(&name))
+    }
+}
 
 impl SealedSource {
     pub fn open(root: &Path) -> Result<SealedSource> {
@@ -242,15 +293,43 @@ impl SealedSource {
     /// behind skill trees and package copies. `skip` prunes directory names
     /// that are never content (dependency trees, VCS internals).
     pub fn collect_tree(&self, dir: &Path, skip: &[&str]) -> Result<Vec<(PathBuf, Vec<u8>)>> {
-        let mut files = Vec::new();
-        let mut total: u64 = 0;
-        self.collect_into(dir, Path::new(""), skip, 0, &mut total, &mut files)?;
-        files.sort_by(|a, b| a.0.cmp(&b.0));
-        Ok(files)
+        self.walk(dir, Prune { skip, top: &[] })
     }
 
-    /// All skill trees exclude `TOOL_STATE`. Only repository-root skills also exclude `NOT_CONTENT`.
+    /// A skill's whole authored tree, what a copy of the package keeps. All
+    /// skill trees exclude `TOOL_STATE`. Only repository-root skills also
+    /// exclude `NOT_CONTENT`.
     pub fn collect_skill_tree(&self, dir: &Path) -> Result<Vec<(PathBuf, Vec<u8>)>> {
+        self.skill_tree(dir, &[])
+    }
+
+    /// The catalog item at `path` as an install holds it: a skill
+    /// directory as its render carries it, [`Self::collect_skill_tree`]
+    /// without the top-level [`NOT_RENDERED`] entries, which the walk never
+    /// reads; any other directory whole; a file as its own bytes. The one
+    /// answer to which files make up an item a consumer holds: the render,
+    /// the installation and catalog hashes, the catalog check, the browse
+    /// preview, the package page, the package diff and the import wizard's
+    /// edited-copy test all read it, so none of them picks a walk of its
+    /// own. A copy of the package (detach, templates, the bytes an import
+    /// writes) reads the whole tree instead.
+    pub fn rendered_item(&self, kind: ItemKind, path: &Path) -> Result<ItemBytes> {
+        if !self.is_dir(path) {
+            return Ok(ItemBytes::File(self.read(path)?));
+        }
+        let files = match kind {
+            ItemKind::Skill => self.skill_tree(path, &NOT_RENDERED)?,
+            ItemKind::Agent
+            | ItemKind::Hook
+            | ItemKind::Command
+            | ItemKind::McpServer
+            | ItemKind::Plugin
+            | ItemKind::PiExtension => self.collect_tree(path, &[])?,
+        };
+        Ok(ItemBytes::Tree(files))
+    }
+
+    fn skill_tree(&self, dir: &Path, top: &[&str]) -> Result<Vec<(PathBuf, Vec<u8>)>> {
         // Either spelling of the root is the root: the repo-root exclusions
         // must hold however the caller reached it.
         let skip: &[&str] = match dir == self.root || dir == self.given {
@@ -258,14 +337,22 @@ impl SealedSource {
             false => &[],
         };
         let skip: Vec<_> = skip.iter().copied().chain(TOOL_STATE.split(' ')).collect();
-        self.collect_tree(dir, &skip)
+        self.walk(dir, Prune { skip: &skip, top })
+    }
+
+    fn walk(&self, dir: &Path, prune: Prune<'_>) -> Result<Vec<(PathBuf, Vec<u8>)>> {
+        let mut files = Vec::new();
+        let mut total: u64 = 0;
+        self.collect_into(dir, Path::new(""), prune, 0, &mut total, &mut files)?;
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(files)
     }
 
     fn collect_into(
         &self,
         dir: &Path,
         rel: &Path,
-        skip: &[&str],
+        prune: Prune<'_>,
         depth: usize,
         total: &mut u64,
         files: &mut Vec<(PathBuf, Vec<u8>)>,
@@ -280,7 +367,7 @@ impl SealedSource {
             let Some(name) = path.file_name() else {
                 continue;
             };
-            if skip.contains(&name.to_string_lossy().as_ref()) {
+            if prune.drops(&name.to_string_lossy(), depth) {
                 continue;
             }
             let rel = rel.join(name);
@@ -293,7 +380,7 @@ impl SealedSource {
                 });
             }
             if meta.is_dir() {
-                self.collect_into(&path, &rel, skip, depth + 1, total, files)?;
+                self.collect_into(&path, &rel, prune, depth + 1, total, files)?;
             } else {
                 let bytes = self.read(&path)?;
                 *total += bytes.len() as u64;
@@ -312,14 +399,11 @@ impl SealedSource {
         Ok(())
     }
 
-    /// The hash a catalog item is recorded by: its skill tree for a
-    /// directory, its own bytes for a file. What a rendering is compared
-    /// against to say whether it is the catalog's bytes unchanged.
-    pub fn catalog_hash(&self, path: &Path) -> Result<String> {
-        if self.is_dir(path) {
-            return Ok(crate::hash::hash_files(&self.collect_skill_tree(path)?));
-        }
-        Ok(crate::hash::hash_bytes(&self.read(path)?))
+    /// The hash a catalog item is recorded by: the hash of
+    /// [`Self::rendered_item`]. What a rendering is compared against to say
+    /// whether it is the catalog's bytes unchanged.
+    pub fn catalog_hash(&self, kind: ItemKind, path: &Path) -> Result<String> {
+        Ok(self.rendered_item(kind, path)?.hash())
     }
 
     /// Content hash of a catalog file or tree, matching `hash::hash_tree`'s

@@ -42,7 +42,7 @@ Two greens do NOT mean a review happened. `REVIEW_GATE_MODE = "off"` evaluates n
 | `suppressed-findings` | `failure` | A review body at the commit the gate relies on — the head, or the carry base once carry supplies the evidence — carries a `Suppressed comments (N)` or `Previously missed (N)` block: findings that never became threads. Either title counts, written as a markdown heading or as a `<details>` summary. The status names the count and the file:line list. It has no dedicated settings key. A class policy `none` decision skips it. `REVIEW_GATE_MODE = "off"` skips it for an inactive or `current` class policy. An entry clears when the PR author answers it in an issue comment carrying a line `Dispositions at <sha>` that names this head, plus a line per entry opening with the entry's own `file:line` token — bare as the status prints it, or bold or backticked as the review body does — followed by `Fixed in <sha>`, `Declined: <reason>` or `Tracked: <ID>`. That marker is the only thing that binds the comment to the head. The whole term clears when that commit carries no such block. |
 | (exit 2, no verdict) | *unchanged* | A read failed or config is invalid. Take NO action; retry next pass. |
 
-Pending text names the head; which sources open the gate is [references/settings.md](references/settings.md) § Reading the pending status. How the reply-parsing failure verdicts read a reply is `DEVELOPMENT.md` § Tracking-claim parsing and § Decline parsing, and how `suppressed-findings` reads a body is § Suppressed-finding parsing; what to write instead is orch's `references/finding-disposition.md`.
+Pending text names the head; which sources open the gate is [references/settings.md](references/settings.md) § Reading the pending status. How the reply-parsing failure verdicts read a reply is [DEVELOPMENT.md § Tracking-claim parsing](https://github.com/vanillagreencom/kendex/blob/main/skills/review-gate/DEVELOPMENT.md#tracking-claim-parsing) and [§ Decline parsing](https://github.com/vanillagreencom/kendex/blob/main/skills/review-gate/DEVELOPMENT.md#decline-parsing), and how `suppressed-findings` reads a body is [§ Suppressed-finding parsing](https://github.com/vanillagreencom/kendex/blob/main/skills/review-gate/DEVELOPMENT.md#suppressed-finding-parsing); what to write instead is orch's `references/finding-disposition.md`.
 
 `REVIEW_GATE_CLASS_POLICY`, active by default, applies the [README class policy](README.md#class-policy) before this decision table, and that table states the scope a `none` row waives. `scripts/review-policy` is the one owner of the answer, and every other consumer reads it from there rather than re-deriving it.
 
@@ -126,7 +126,7 @@ Evidence for the CURRENT head is any of:
 3. A trusted comment-form pass bound to this head's SHA.
 4. A trusted operator override with a reason, for missing evidence only.
 
-Carry-forward never creates evidence or bypasses a fail-closed term. Objections and unresolved threads fail closed; an evidence-read failure exits 2 with no verdict. Evidence, trust, relay, and writer mechanics: [DEVELOPMENT.md](DEVELOPMENT.md) § Predicate evidence and trust.
+Carry-forward never creates evidence or bypasses a fail-closed term. Objections and unresolved threads fail closed; an evidence-read failure exits 2 with no verdict. Evidence, trust, relay, and writer mechanics: [DEVELOPMENT.md § Predicate evidence and trust](https://github.com/vanillagreencom/kendex/blob/main/skills/review-gate/DEVELOPMENT.md#predicate-evidence-and-trust).
 
 ## Scripts
 
@@ -143,4 +143,4 @@ Carry-forward never creates evidence or bypasses a fail-closed term. Objections 
 - `scripts/review-writer.sh`: `workflow_dispatch` and `schedule` evaluate and converge every open PR; `merge_group` posts one queue success, while `WRITER_READ_ONLY=1` is a no-op. Its header documents the workflow-only contract.
 - `scripts/pr-watch.sh`: reduce open PRs to attention lines read from GitHub's review state. `--help`
 
-Engine selftests run in kendex CI ([DEVELOPMENT.md](DEVELOPMENT.md)). Re-vendor PRs: [references/vendored-paths.md](references/vendored-paths.md).
+Engine selftests run in kendex CI ([DEVELOPMENT.md](https://github.com/vanillagreencom/kendex/blob/main/skills/review-gate/DEVELOPMENT.md)). Re-vendor PRs: [references/vendored-paths.md](references/vendored-paths.md).
