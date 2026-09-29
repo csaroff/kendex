@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 # pr-timeline: the stamps and CI wall times it reads from one GraphQL
 # response, the check-suite and check-run pages it reads past that
-# response's first, and its refusal of a connection longer than the page it
-# read or still open at its page cap.
+# response's first, the review and fix rounds it reads from the reviews and
+# pushes, and its refusal of a connection longer than the page it read or
+# still open at its page cap.
 #
 # Each case stages one response through the shared gh fake and asserts the
 # output whole. The world is one merged PR:
 #   commits      the first authored at 09:00; the final head committed 10:10
-#   force push   10:20, over a head whose gate had passed at 10:05
-#   reviews      a user's at 09:30, then a Bot's at 09:40 and 10:30, and the
-#                PR author's own, an app's, answering a thread at 10:35
+#   pushes       b1 at 09:20, the first check suite on it; h2 at 10:20
+#   force push   10:20, over b1, whose gate had passed at 10:05
+#   reviews      a user's at 09:30 and a Bot's at 09:40 on b1, a Bot's at
+#                10:30 on h2, and the PR author's own, an app's, answering a
+#                thread on h2 at 10:35
 #   gate         the final head's success at 10:25
 #   head CI      a pull_request suite 10:20-10:40 and an app suite with no
 #                workflow run 10:22-10:45; the merge commit's merge_group
@@ -64,6 +67,7 @@ response() {
                                        workflow: {name: "ci-\($event)"}} end),
                                checkRuns: {pageInfo: {hasNextPage: false}, nodes: $runs}};
     def gate($state; $hm): {status: {context: {state: $state, createdAt: t($hm)}}};
+    def pushed($oid; $hm): {oid: $oid, firstSuite: {nodes: [{createdAt: t($hm)}]}};
     {data: {repository: {pullRequest: {
       number: 42, state: "MERGED", createdAt: t("09:10"), mergedAt: t("11:20"), author: {login: "lane-app"},
       headRefName: "feature", headRepository: {nameWithOwner: "owner/repo"},
@@ -74,14 +78,14 @@ response() {
         + {checkSuites: {pageInfo: {hasNextPage: false}, nodes: [
             suite("pull_request"; [run("lint"; "10:20"; "10:30"), run("test"; "10:21"; "10:40")]),
             suite(null; [run("scan"; "10:22"; "10:45")])]}})}]},
-      commits: {totalCount: 1, nodes: [{commit: {oid: "h2", committedDate: t("10:10")}}]},
+      commits: {totalCount: 1, nodes: [{commit: (pushed("h2"; "10:20") + {committedDate: t("10:10")})}]},
       reviews: {totalCount: 4, nodes: [
-        {submittedAt: t("09:30"), author: {__typename: "User", login: "someone"}},
-        {submittedAt: t("09:40"), author: {__typename: "Bot", login: "reviewer"}},
-        {submittedAt: t("10:30"), author: {__typename: "Bot", login: "reviewer"}},
-        {submittedAt: t("10:35"), author: {__typename: "Bot", login: "lane-app"}}]},
+        {submittedAt: t("09:30"), author: {__typename: "User", login: "someone"}, commit: pushed("b1"; "09:20")},
+        {submittedAt: t("09:40"), author: {__typename: "Bot", login: "reviewer"}, commit: pushed("b1"; "09:20")},
+        {submittedAt: t("10:30"), author: {__typename: "Bot", login: "reviewer"}, commit: pushed("h2"; "10:20")},
+        {submittedAt: t("10:35"), author: {__typename: "Bot", login: "lane-app"}, commit: pushed("h2"; "10:20")}]},
       timelineItems: {pageInfo: {hasNextPage: false}, nodes: [
-        {__typename: "HeadRefForcePushedEvent", createdAt: t("10:20"), beforeCommit: {oid: "b1"}},
+        {__typename: "HeadRefForcePushedEvent", createdAt: t("10:20"), beforeCommit: pushed("b1"; "09:20")},
         {__typename: "AutoMergeEnabledEvent", createdAt: t("10:26")},
         {__typename: "AutoMergeEnabledEvent", createdAt: t("10:50")},
         {__typename: "AddedToMergeQueueEvent", createdAt: t("10:55")}]}
@@ -124,6 +128,7 @@ run() { # EDIT [ARGS...]
   stage_pages
   gh_stub_answer "api-repos/owner/repo/commits/b1/statuses?per_page=100" "$(status_history "$HISTORY_B1")"
   gh_stub_answer "api-repos/owner/repo/commits/h2/statuses?per_page=100" "$(status_history "$HISTORY_H2")"
+  gh_stub_answer "api-repos/owner/repo/commits/b2/statuses?per_page=100" "$(status_history "")"
   gh_stub_answer "$ACTIVITY_PATH" "$(activity_log "$ACTIVITY")"
   (cd "$TMP_ROOT/repo" && PATH="$TMP_ROOT/bin:$PATH" env -u GH_TOKEN -u GITHUB_TOKEN -u GH_BOT_TOKEN -u GH_REPO -u REVIEW_GATE_CONTEXT \
     bash "$BIN" 42 "$@" >"$TMP_ROOT/stdout" 2>"$TMP_ROOT/stderr") || rc=$?
@@ -131,7 +136,7 @@ run() { # EDIT [ARGS...]
 }
 
 echo "=== the stamps and wall times of a merged PR ==="
-WANT='{"pr":42,"repo":"owner/repo","state":"MERGED","head":"h2","merge_commit":"m1","stamps":{"first_commit":"2026-09-20T09:00:00Z","created":"2026-09-20T09:10:00Z","last_push":"2026-09-20T10:20:00Z","first_bot_review":"2026-09-20T09:40:00Z","first_gate_met":"2026-09-20T10:05:00Z","gate_met":"2026-09-20T10:25:00Z","ci_green":"2026-09-20T10:45:00Z","armed":"2026-09-20T10:50:00Z","queued":"2026-09-20T10:55:00Z","merged":"2026-09-20T11:20:00Z"},"ci_head_secs":1500,"ci_merge_group_secs":900,"open_secs":7800,"bot_reviews":2,"push_times":["2026-09-20T09:05:00Z","2026-09-20T09:50:00Z","2026-09-20T10:12:00Z","2026-09-20T10:20:00Z"],"bot_review_times":["2026-09-20T09:40:00Z","2026-09-20T10:30:00Z"]}'
+WANT='{"pr":42,"repo":"owner/repo","state":"MERGED","head":"h2","merge_commit":"m1","stamps":{"first_commit":"2026-09-20T09:00:00Z","created":"2026-09-20T09:10:00Z","last_push":"2026-09-20T10:20:00Z","first_bot_review":"2026-09-20T09:40:00Z","first_gate_met":"2026-09-20T10:05:00Z","gate_met":"2026-09-20T10:25:00Z","ci_green":"2026-09-20T10:45:00Z","armed":"2026-09-20T10:50:00Z","queued":"2026-09-20T10:55:00Z","merged":"2026-09-20T11:20:00Z"},"ci_head_secs":1500,"ci_merge_group_secs":900,"open_secs":7800,"bot_reviews":2,"push_times":["2026-09-20T09:05:00Z","2026-09-20T09:50:00Z","2026-09-20T10:12:00Z","2026-09-20T10:20:00Z"],"bot_review_times":["2026-09-20T09:40:00Z","2026-09-20T10:30:00Z"],"rounds":[{"kind":"review","head":"b1","start":"2026-09-20T09:20:00Z","end":"2026-09-20T09:30:00Z","secs":600},{"kind":"fix","head":"b1","start":"2026-09-20T09:30:00Z","end":"2026-09-20T10:20:00Z","secs":3000},{"kind":"review","head":"h2","start":"2026-09-20T10:20:00Z","end":"2026-09-20T10:30:00Z","secs":600}]}'
 assert_eq "$(run .) $(cat "$TMP_ROOT/stdout")" "rc=0 $WANT" \
   "the force-pushed-over head's gate is the first pass, the merge group's runs stay out of the head's CI, the author's own review is no bot's, and the pushes are the branch log's for this life of the name"
 
@@ -146,7 +151,8 @@ a failing head run leaves CI never green, its wall time still read@.data.reposit
 a pending gate is not met@.data.repository.pullRequest.headCommit.nodes[0].commit.status.context.state = "PENDING"@.stamps.gate_met == null
 no Bot review leaves the first one null, the count zero and the times empty@.data.repository.pullRequest.reviews.nodes |= map(.author.__typename = "User")@[.stamps.first_bot_review, .bot_reviews, .bot_review_times] == [null, 0, []]
 a PR whose author GitHub no longer names counts every Bot review@.data.repository.pullRequest.author = null@[.bot_reviews, .bot_review_times[-1]] == [3, "2026-09-20T10:35:00Z"]
-no force push leaves the head's commit date the last push@.data.repository.pullRequest.timelineItems.nodes |= map(select(.__typename != "HeadRefForcePushedEvent"))@[.stamps.last_push, .stamps.first_gate_met] == ["2026-09-20T10:10:00Z", "2026-09-20T10:25:00Z"]
+no force push leaves the head's push, its first check suite, the last push@.data.repository.pullRequest.timelineItems.nodes |= map(select(.__typename != "HeadRefForcePushedEvent"))@[.stamps.last_push, .stamps.first_gate_met] == ["2026-09-20T10:20:00Z", "2026-09-20T10:25:00Z"]
+a final head with no check suite and no force push falls back to its commit date@.data.repository.pullRequest |= (.timelineItems.nodes |= map(select(.__typename != "HeadRefForcePushedEvent")) | (.commits.nodes[0], .reviews.nodes[2,3]).commit.firstSuite.nodes = [])@[.stamps.last_push, .stamps.first_gate_met] == ["2026-09-20T10:10:00Z", "2026-09-20T10:25:00Z"]
 ROWS
 
 echo "=== the pushes are read from the head branch's activity log ==="
@@ -173,6 +179,38 @@ rc=0
 (cd "$TMP_ROOT/repo" && PATH="$TMP_ROOT/bin:$PATH" env -u GH_TOKEN -u GITHUB_TOKEN -u GH_BOT_TOKEN -u GH_REPO -u REVIEW_GATE_CONTEXT \
   bash "$BIN" 42 >"$TMP_ROOT/stdout" 2>"$TMP_ROOT/stderr") || rc=$?
 assert_eq "rc=$rc out=$(cat "$TMP_ROOT/stdout")" "rc=1 out=" "an activity log that does not read prints nothing"
+
+echo "=== the review and fix rounds ==="
+# Each row asserts the rounds as [kind, head, start, end, secs], each stamp
+# as its hours and minutes.
+REPLY='.data.repository.pullRequest.reviews.nodes += [{submittedAt: "2026-09-20T10:22:00Z", author: {__typename: "Bot", login: "lane-app"}, commit: .data.repository.pullRequest.commits.nodes[0].commit}]'
+# h2 force-pushed over b2, pushed at 09:50 after the b1 review and reviewed
+# by nobody, so beforeCommit alone names it.
+B2='.data.repository.pullRequest.timelineItems.nodes[0].beforeCommit = pushed("b2"; "09:50")'
+# The viewer's own pending review, which GitHub returns unsubmitted, and a
+# review whose commit the schema leaves null.
+PENDING='.data.repository.pullRequest.reviews.nodes += [{submittedAt: null, author: {__typename: "User", login: "someone"}, commit: pushed("b1"; "09:20")}]'
+NO_COMMIT='.data.repository.pullRequest.reviews.nodes += [{submittedAt: t("09:25"), author: {__typename: "User", login: "someone"}, commit: null}]'
+ROUNDS='[["review","b1","09:20","09:30",600],["fix","b1","09:30","10:20",3000],["review","h2","10:20","10:30",600]]'
+# b1's reviews submitted at 10:32, after h2's review: a stale review on an
+# older head, whose round starts before h2's.
+STALE_REVIEW='.data.repository.pullRequest.reviews.nodes[0,1].submittedAt = t("10:32")'
+STALE_ROUNDS='[["review","b1","09:20","10:32",4320],["review","h2","10:20","10:30",600]]'
+NO_START='.data.repository.pullRequest |= (.timelineItems.nodes[0].beforeCommit.firstSuite.nodes = [] | .reviews.nodes[0,1].commit.firstSuite.nodes = [])'
+NO_START_ROUNDS='[["review","b1","-","09:30",null],["fix","b1","09:30","10:20",3000],["review","h2","10:20","10:30",600]]'
+while IFS='@' read -r label edit want; do
+  [[ -n "$label" ]] || continue
+  run "$edit" >/dev/null
+  assert_eq "$(jq -c '[.rounds[] | [.kind, .head, (.start | if . == null then "-" else .[11:16] end), (.end | .[11:16]), .secs]]' "$TMP_ROOT/stdout")" "$want" "$label"
+done <<ROWS
+the PR author's thread reply on the new head ends no round@$REPLY@$ROUNDS
+a fix round ends at the first push after its review, an unreviewed force-pushed-over head's included@$B2@[["review","b1","09:20","09:30",600],["fix","b1","09:30","09:50",1200],["review","h2","10:20","10:30",600]]
+a pending review ends no round@$PENDING@$ROUNDS
+a review on no commit ends no round@$NO_COMMIT@$ROUNDS
+a head with no check suite is no push, so its round has no start and sorts by its end, before its fix@$NO_START@$NO_START_ROUNDS
+a stale review on an older head sorts by its round's start@$STALE_REVIEW@$STALE_ROUNDS
+a PR nobody reviewed has no round@.data.repository.pullRequest.reviews.nodes = []@[]
+ROWS
 
 echo "=== the first gate pass is read from each head's status history ==="
 while IFS='|' read -r label b1 h2 want; do
@@ -335,7 +373,7 @@ fragments_per_query() {
     END { flush() }'
 }
 assert_eq "$(fragments_per_query | sort | tr '\n' ';')" \
-  "pullRequest defined: gate runPage suitePage suites spread: gate runPage suitePage suites;runsPage defined: runPage spread: runPage;suitesPage defined: runPage suitePage spread: runPage suitePage;" \
+  "pullRequest defined: gate pushed runPage suitePage suites spread: gate pushed runPage suitePage suites;runsPage defined: runPage spread: runPage;suitesPage defined: runPage suitePage spread: runPage suitePage;" \
   "each query defines the fragments it spreads and no other"
 
 echo "=== a page that cannot be followed refuses ==="
@@ -422,6 +460,49 @@ mutate "head_checks=\$(jq -c '._checks.head' <<<\"\$result\" | scope_current_run
 run "$STALE_HEAD" >/dev/null
 assert_eq "$(jq -c '[.stamps.ci_green, .ci_head_secs]' "$TMP_ROOT/stdout")" '[null,2400]' \
   "control: without scope_current_run the superseded failed run is read and timed"
+
+# The rounds without the author filter: the author's own thread reply on
+# the new head ends its review round.
+mutate 'select($p.author == null or .author.login != $p.author.login)' 'select(true)'
+run "$REPLY" >/dev/null
+assert_eq "$(jq -c '.rounds[-1].end' "$TMP_ROOT/stdout")" '"2026-09-20T10:22:00Z"' \
+  "control: without the author filter the author's reply ends the review round"
+
+# The fix round ending at the last push after its review, not the first.
+mutate 'select(. > $r.submittedAt)] | min)' 'select(. > $r.submittedAt)] | max)'
+run "$B2" >/dev/null
+assert_eq "$(jq -c '.rounds[1].end' "$TMP_ROOT/stdout")" '"2026-09-20T10:20:00Z"' \
+  "control: the last push after a review ends its fix round in place of the first"
+
+# The pushes without the force-pushed-over heads: b2's push is never known.
+mutate '($pushes[] | .beforeCommit // empty), ' ''
+run "$B2" >/dev/null
+assert_eq "$(jq -c '.rounds[1].end' "$TMP_ROOT/stdout")" '"2026-09-20T10:20:00Z"' \
+  "control: without the force-pushed-over heads the unreviewed b2 push ends no fix round"
+
+# The rounds read a pending review.
+mutate 'select(.submittedAt != null and .commit != null)' 'select(.commit != null)'
+run "$PENDING" >/dev/null
+assert_eq "$(jq -c '.rounds[0].end' "$TMP_ROOT/stdout")" 'null' \
+  "control: without the submitted filter a pending review ends the b1 review round with no time"
+
+# The rounds read a review on no commit.
+mutate 'select(.submittedAt != null and .commit != null)' 'select(.submittedAt != null)'
+assert_eq "$(run "$NO_COMMIT") $(tail -n 1 "$TMP_ROOT/stderr")" 'rc=1 {"error":"pr-timeline: unreadable response"}' \
+  "control: without the commit filter a review on no commit fails the read"
+
+# The rounds ordered by their ends: a stale review orders its round by its
+# submission.
+mutate 'sort_by([.start // .end, ' 'sort_by([.end, '
+run "$STALE_REVIEW" >/dev/null
+assert_eq "$(jq -c '[.rounds[].head]' "$TMP_ROOT/stdout")" '["h2","b1"]' \
+  "control: ordered by end a stale review's round follows the newer head's"
+
+# The rounds sorting a fix before a review at one time.
+mutate '(if .kind == "review" then 0 else 1 end)' '(if .kind == "review" then 1 else 0 end)'
+run "$NO_START" >/dev/null
+assert_eq "$(jq -c '[.rounds[0,1].kind]' "$TMP_ROOT/stdout")" '["fix","review"]' \
+  "control: with fix ranked first a startless review follows the fix that starts at its end"
 
 # The page walk without its cap: the one page past the cap, which closes the
 # connection, is read, and the PR prints.
