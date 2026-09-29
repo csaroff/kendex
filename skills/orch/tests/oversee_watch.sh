@@ -41,7 +41,17 @@
 #       noise on success does not break the JSON parse; a PR merged in a
 #       non-first --repo fires, the fork rejection holding per repo; a merged
 #       item still in --item is reported once across runs while a further PR
-#       on its branch is news
+#       on its branch is news; a parked record's own merge prints
+#       parked-merged and closes nothing, its must-fail control being the
+#       close restored, the heartbeat names it again while the record still
+#       reads parked, its control being that repeat removed, a failed read
+#       of its merged row there exits 2 naming the row, its control being
+#       the read's return removed, two parked records both merged are each
+#       handed on at the merge and at the heartbeat, their controls being
+#       each loop cut to its first record, and another
+#       merge on its branch, or none yet, hands nothing on at the merge or
+#       the heartbeat, its control being the heartbeat's membership test
+#       removed
 #   2b. handoff: an --item whose state carries `.handoff` with no
 #       `.resumed_at` fires once, with the record, read from the checkout's
 #       state directory even when the item has a worktree; a state
@@ -1141,21 +1151,19 @@ assert_eq "$(grep '^oversee-watch: fleet-read ' "$err")" "oversee-watch: fleet-r
 
 # A parked record: lane-close --park stopped its sandbox with the disk kept
 # while its pull request waited for the queue. The watch carries it for the
-# merged check alone, never reads its stopped disk, and closes it in the pass
-# that reports the merge of the pull request its record names, in that
-# repository. A failed close drops the parked key alone from the row and
-# commits it at once, so the next pass reports that merge again and retries;
-# a refused close is committed.
+# merged check alone, never reads its stopped disk, and on the merge of the
+# pull request its record names, in that repository, prints parked-merged for
+# the overseer's relaunch and closes nothing.
 parked_record() { # ITEM HOST MAIL_ROOT PR [REPO]
   lane_record "$1" "" "$2" "$3" parked | jq -c --argjson pr "$4" --arg repo "${5:-owner/repo}" '.parked = {pr: $pr, head: "abc123", repo: $repo, at: "2026-09-20T00:00:00Z"}'
 }
 # The fleet: one running lane with a window and one parked lane whose pull
-# request 2 on branch issue-2 is the park's; PARKED_EXTRA adds records.
+# request 2 on branch issue-2 is the park's.
 parked_fleet() { # NAME
   new_case "$1"
   printf 'gh-1\n' > "$STUB_DIR/windows.txt"
   write_state "$STUB_DIR/state.json" "$(lane_record issue-1 gh-1 '' /w/issue-1 running)" \
-    "$(parked_record issue-2 /srv/provider /srv/lane/issue-2 2)" ${PARKED_EXTRA[@]+"${PARKED_EXTRA[@]}"}
+    "$(parked_record issue-2 /srv/provider /srv/lane/issue-2 2)"
   err="$TMP_ROOT/e-$1"
 }
 parked_run() { # [ENV=VAL...] -- [ARGS...]
@@ -1163,8 +1171,8 @@ parked_run() { # [ENV=VAL...] -- [ARGS...]
     --since 2026-09-19T00:00:00Z --state "$STUB_DIR/state.json" 2>"$err" </dev/null)" && rc=0 || rc=$?
   EVENTS="$(awk '/^EVENT / { printf "%s%s", sep, $2 " " $3; sep = "," }' <<<"$out")"
   HOST_VERBS="$(awk '{ printf "%s%s", sep, $1 " " $3; sep = "," }' "$STUB_DIR/host.log" 2>/dev/null || true)"
+  CLOSES="$(grep -c . "$STUB_DIR/lane-close.args" 2>/dev/null || true)"
 }
-PARKED_EXTRA=()
 parked_case() { # NAME [ENV=VAL...]
   local name="$1"
   shift
@@ -1173,90 +1181,156 @@ parked_case() { # NAME [ENV=VAL...]
   parked_run "$@" --
 }
 parked_case parked_merged
-assert_eq "rc=$rc events=$EVENTS host=$HOST_VERBS close=$(grep -c '^--state-dir .* issue-2$' "$STUB_DIR/lane-close.args" || true)" \
-  "rc=0 events=merged 2,lane-closed issue-2 host=close issue-2,delete issue-2 close=1" \
-  "a parked record's merge is reported and closes its sandbox in the same pass, with no read of the stopped disk" "$err"
+assert_eq "rc=$rc events=$EVENTS host=$HOST_VERBS closes=${CLOSES:-0} status=$(jq -r '.lanes[] | select(.item == "issue-2") | .status' "$STUB_DIR/state.json")" \
+  "rc=0 events=merged 2,parked-merged issue-2 host= closes=0 status=parked" \
+  "a parked record's merge is reported and handed on, with no close, no read of the stopped disk and the record left parked" "$err"
+assert_eq "$(grep '^EVENT parked-merged ' <<<"$out")" "EVENT parked-merged issue-2 pr=2 repo=owner/repo" \
+  "the hand names the item, the pull request and the repository" "$err"
 assert_contains "$(cat "$err")" "oversee-watch: fleet-read items=1 windows=1 hosted=0 parked=1 dropped=1" \
   "the parked record is carried as parked, not as a running item" "$err"
-assert_eq "$(grep -c '^kept=' <<<"$out")" "1" "the provider's kept line follows the close" "$err"
-# The same pass again: the merged row is committed, so nothing repeats.
-out="$(run_watch ORCH_LANE_HOST="$FIXTURE_HOST" LANE_HOST_STUB_LOG="$STUB_DIR/host.log" \
-  -- --since 2026-09-19T00:00:00Z --state "$STUB_DIR/state.json" 2>"$err" </dev/null)" && rc=0 || rc=$?
-assert_eq "merged=$(grep -c '^EVENT merged 2' <<<"$out" || true) closes=$(grep -c '^close ' "$STUB_DIR/host.log" || true)" "merged=0 closes=1" \
-  "a closed parked lane's merge is not reported again and the close runs once" "$err"
+# The same pass again: the merged row is committed, so the merge is not news
+# again, but the record still reads parked, so the next heartbeat hands it on
+# again: a relaunch refused, or an overseer gone after the first hand, is
+# named until the relaunch rewrites the record.
+parked_run --
+assert_eq "events=$EVENTS closes=${CLOSES:-0}" "events=parked-merged issue-2,heartbeat loops=2 closes=0" \
+  "a record still parked over its already-handed merge is named again at the heartbeat, and the merge is not reported again" "$err"
+assert_eq "$(grep '^EVENT parked-merged ' <<<"$out")" "EVENT parked-merged issue-2 pr=2 repo=owner/repo" \
+  "the repeated hand is spelled as the first" "$err"
+# The must-fail control for the repeat: the heartbeat's hand removed.
+HAND_MUTANT_DIR="$TMP_ROOT/parked-hand-mutant"
+HAND_MUTANT="$(mutant_scripts parked-hand-mutant/orch oversee-watch)/oversee-watch" || exit 1
+ln -s "$REPO_ROOT/skills/github" "$HAND_MUTANT_DIR/github"
+mutate_file "$HAND_MUTANT" "  [[ -z \"\$hands\" ]] || printf '%s\\n' \"\$hands\"" '  :'
+WATCH_BIN="$HAND_MUTANT" parked_run --
+assert_eq "events=$EVENTS" "events=heartbeat loops=2" \
+  "control: with the heartbeat's hand removed the record left parked over its merge is silent" "$err"
+# A row read that fails at the heartbeat ends the run naming the merged row,
+# never a heartbeat with the hand dropped. The plant fails the read; its
+# must-fail control is the same plant with the read's own return removed.
+owed_read_mutant() { # NAME NEW, sets OWED_READ_BIN
+  OWED_READ_BIN="$(mutant_scripts "$1/orch" oversee-watch)/oversee-watch" || exit 1
+  ln -s "$REPO_ROOT/skills/github" "$TMP_ROOT/$1/github"
+  mutate_file "$OWED_READ_BIN" '    row="$(lane_row_get merged "$1" "${PARKED_ITEMS[$i]}")" || return 1' "$2"
+}
+owed_read_mutant parked-owed-read-fail '    row="$(exit 1)" || return 1'
+WATCH_BIN="$OWED_READ_BIN" parked_run --
+assert_eq "rc=$rc events=$EVENTS note=$(grep -c "^oversee-watch: state-read-failed path=.* row=merged\$" "$err" || true)" "rc=2 events= note=1" \
+  "a failed merged-row read at the heartbeat exits 2 naming the row, with no parked-merged line" "$err"
+owed_read_mutant parked-owed-read-open '    row="$(exit 1)"'
+WATCH_BIN="$OWED_READ_BIN" parked_run --
+assert_eq "rc=$rc events=$EVENTS" "rc=0 events=heartbeat loops=2" \
+  "control: with the read's return removed the failed read drops the hand and the heartbeat exits 0" "$err"
+# The relaunch rewrites the record stopped and drops `parked`: the repeat ends.
+jq '(.lanes[] | select(.item == "issue-2")) |= (.status = "stopped" | del(.parked))' "$STUB_DIR/state.json" > "$STUB_DIR/state.next" && mv -- "$STUB_DIR/state.next" "$STUB_DIR/state.json"
+parked_run --
+assert_eq "events=$EVENTS" "events=heartbeat loops=2" \
+  "a record the relaunch rewrote stopped is handed on no more" "$err"
+# The must-fail control: the close restored where the hand is printed.
+PARKED_MUTANT_DIR="$TMP_ROOT/parked-mutant"
+PARKED_MUTANT="$(mutant_scripts parked-mutant/orch oversee-watch)/oversee-watch" || exit 1
+ln -s "$REPO_ROOT/skills/github" "$PARKED_MUTANT_DIR/github"
+mutate_file "$PARKED_MUTANT" '    parked_merged_line "$item" "$PARKED_KEY"' '    close_hosted_lane "$item"'
+parked_fleet parked_merged_mutant
+printf '[{"number": 2, "headRefName": "issue-2", "mergedAt": "2026-09-20T00:00:00Z"}]\n' > "$STUB_DIR/merged.json"
+WATCH_BIN="$PARKED_MUTANT" parked_run --
+assert_eq "events=$EVENTS closes=${CLOSES:-0}" "events=merged 2,lane-closed issue-2 closes=1" \
+  "control: with the close restored the parked merge runs lane-close and prints no parked-merged" "$err"
 
-# The running lane's pane holds a question: the failing close leaves the pass
-# running, so the lane checks after the merged check still report it.
-parked_fleet parked_close_failed
-printf '[{"number": 2, "headRefName": "issue-2", "mergedAt": "2026-09-20T00:00:00Z"}, {"number": 4, "headRefName": "issue-2", "mergedAt": "2026-09-20T00:00:00Z"}]\n' > "$STUB_DIR/merged.json"
-printf 'Do you want to proceed?\n   ❯ 1. Yes\n     2. No\n' > "$STUB_DIR/pane-gh-1.txt"
-parked_run LANE_HOST_STUB_CLOSE_STATUS=1 --
-assert_eq "rc=$rc events=$EVENTS failed=$(grep -c '^oversee-watch: lane-close-failed item=issue-2 exit=1$' "$err" || true)" \
-  "rc=2 events=merged 2,merged 4,lane-asking gh-1 failed=1" \
-  "a parked close that fails is reported on stderr and fails the pass, whose remaining checks still run and report the running lane" "$err"
-out="$(run_watch ORCH_LANE_HOST="$FIXTURE_HOST" LANE_HOST_STUB_LOG="$STUB_DIR/host.log" LANE_HOST_STUB_CLOSE_STATUS=1 \
-  -- --since 2026-09-19T00:00:00Z --state "$STUB_DIR/state.json" 2>"$err" </dev/null)" && rc=0 || rc=$?
-assert_eq "merged=$(grep -c '^EVENT merged 2 issue-2' <<<"$out" || true) other=$(grep -c '^EVENT merged 4' <<<"$out" || true) closes=$(grep -c '^close ' "$STUB_DIR/host.log" || true)" "merged=1 other=0 closes=2" \
-  "the next pass reports the parked merge again and retries the close, and the other merge of the failed pass stays delivered" "$err"
+# Two parked records whose recorded pull requests both merged: each is handed
+# on at the merge and again at the heartbeat, not the first record alone.
+parked_pair_case() { # NAME [ENV=VAL...]
+  local name="$1" pair
+  shift
+  parked_fleet "$name"
+  pair="$(parked_record issue-4 /srv/provider /srv/lane/issue-4 4)" || exit 1
+  jq --argjson rec "$pair" '.lanes += [$rec]' "$STUB_DIR/state.json" > "$STUB_DIR/state.next" && mv -- "$STUB_DIR/state.next" "$STUB_DIR/state.json"
+  printf '[{"number": 2, "headRefName": "issue-2", "mergedAt": "2026-09-20T00:00:00Z"}, {"number": 4, "headRefName": "issue-4", "mergedAt": "2026-09-20T00:00:00Z"}]\n' > "$STUB_DIR/merged.json"
+  parked_run "$@" --
+}
+pair_hands() { awk '/^EVENT parked-merged / { printf "%s%s", sep, $0; sep = "," }' <<<"$out"; }
+PAIR_BOTH="EVENT parked-merged issue-2 pr=2 repo=owner/repo,EVENT parked-merged issue-4 pr=4 repo=owner/repo"
+parked_pair_case parked_merged_pair
+assert_eq "rc=$rc events=$EVENTS hands=$(pair_hands)" "rc=0 events=merged 2,parked-merged issue-2,merged 4,parked-merged issue-4 hands=$PAIR_BOTH" \
+  "two parked records whose pull requests both merged are each handed on at the merge" "$err"
+parked_run --
+assert_eq "events=$EVENTS hands=$(pair_hands)" "events=parked-merged issue-2,parked-merged issue-4,heartbeat loops=2 hands=$PAIR_BOTH" \
+  "two records still parked over their handed merges are each named again at the heartbeat" "$err"
+# The must-fail controls: each loop cut to the first parked record.
+FIRST_MUTANT="$(mutant_scripts parked-first-mutant/orch oversee-watch)/oversee-watch" || exit 1
+ln -s "$REPO_ROOT/skills/github" "$TMP_ROOT/parked-first-mutant/github"
+mutate_file "$FIRST_MUTANT" '    [[ "${PARKED_ITEMS[$i]}" != "$1" ]] || { PARKED_KEY="${PARKED_KEYS[$i]}"; return 0; }' \
+  '    [[ "${PARKED_ITEMS[0]}" != "$1" ]] || { PARKED_KEY="${PARKED_KEYS[0]}"; return 0; }'
+WATCH_BIN="$FIRST_MUTANT" parked_pair_case parked_merged_pair_first
+assert_eq "events=$EVENTS" "events=merged 2,parked-merged issue-2,merged 4" \
+  "control: with the parked lookup cut to the first record the second record's merge hands nothing on" "$err"
+owed_read_mutant parked-owed-first '    row="$(lane_row_get merged "$1" "${PARKED_ITEMS[0]}")" || return 1'
+parked_pair_case parked_merged_pair_owed_first
+WATCH_BIN="$OWED_READ_BIN" parked_run --
+assert_eq "events=$EVENTS" "events=parked-merged issue-2,heartbeat loops=2" \
+  "control: with the heartbeat's row read cut to the first record the second record is not named again" "$err"
 
 # --item naming a lane the state records as parked: the record wins, as a
 # running record does, so the item is carried once, for the merged check alone.
 parked_fleet parked_item_given
 printf '[{"number": 2, "headRefName": "issue-2", "mergedAt": "2026-09-20T00:00:00Z"}]\n' > "$STUB_DIR/merged.json"
-parked_run LANE_HOST_STUB_CLOSE_STATUS=1 -- --item issue-2
-assert_eq "rc=$rc merged=$(grep -c '^EVENT merged 2 issue-2' <<<"$out" || true) closes=$(grep -c '^close --item issue-2 ' "$STUB_DIR/host.log" || true)" "rc=2 merged=1 closes=1" \
-  "a hand-passed item the state records as parked is read once per pass, so a failing close reports the merge and runs the close once" "$err"
+parked_run -- --item issue-2
+assert_eq "rc=$rc events=$EVENTS" "rc=0 events=merged 2,parked-merged issue-2" \
+  "a hand-passed item the state records as parked is read once per pass, so its merge and its hand print once" "$err"
 assert_contains "$(cat "$err")" "oversee-watch: fleet-read items=1 windows=1 hosted=0 parked=1" \
   "the parked record wins over the --item entry and is carried as parked, not as a running item" "$err"
 
-# The close is owed to the pull request the park judged and to no other on
+# The hand is owed to the pull request the park judged and to no other on
 # the branch's name: another number, or the same number in another
-# repository, is reported as any item's merge is and closes nothing.
+# repository, is reported as any item's merge is and hands nothing on.
 parked_fleet parked_other_pr
 printf '[{"number": 3, "headRefName": "issue-2", "mergedAt": "2026-09-20T00:00:00Z"}]\n' > "$STUB_DIR/merged.json"
 parked_run --
 assert_eq "rc=$rc events=$EVENTS host=$HOST_VERBS note=$(grep -c '^oversee-watch: parked-merge-unmatched item=issue-2 recorded=owner/repo#2 seen=owner/repo#3$' "$err" || true)" "rc=0 events=merged 3 host= note=1" \
-  "another pull request merged on the parked branch's name is reported, named as not the record's, and closes nothing" "$err"
+  "another pull request merged on the parked branch's name is reported, named as not the record's, and hands nothing on" "$err"
+# The heartbeat hands on only a record whose own key is in the merged row:
+# another number committed there is owed nothing.
+parked_run --
+assert_eq "events=$EVENTS" "events=heartbeat loops=2" \
+  "a record still parked with another pull request's merge committed on its branch is not handed on at the heartbeat" "$err"
+# The must-fail control: the heartbeat's membership test removed.
+OWED_MUTANT_DIR="$TMP_ROOT/parked-owed-mutant"
+OWED_MUTANT="$(mutant_scripts parked-owed-mutant/orch oversee-watch)/oversee-watch" || exit 1
+ln -s "$REPO_ROOT/skills/github" "$OWED_MUTANT_DIR/github"
+mutate_file "$OWED_MUTANT" '    [[ " $row " == *" ${PARKED_KEYS[$i]} "* ]] || continue' '    :'
+WATCH_BIN="$OWED_MUTANT" parked_run --
+assert_eq "events=$EVENTS" "events=parked-merged issue-2,heartbeat loops=2" \
+  "control: with the membership test removed another number's merge hands the parked record on at the heartbeat" "$err"
 # The record carries the repository as gh repo view spells it; the watch's
 # --repo set is lowercased on entry, and GitHub reads both the same.
 parked_fleet parked_mixed_case_repo
 jq '(.lanes[] | select(.item == "issue-2")).parked.repo = "Owner/Repo"' "$STUB_DIR/state.json" > "$STUB_DIR/state.next" && mv -- "$STUB_DIR/state.next" "$STUB_DIR/state.json"
 printf '[{"number": 2, "headRefName": "issue-2", "mergedAt": "2026-09-20T00:00:00Z"}]\n' > "$STUB_DIR/merged.json"
 parked_run -- --repo owner/repo
-assert_eq "rc=$rc events=$EVENTS host=$HOST_VERBS" "rc=0 events=merged 2,lane-closed issue-2 host=close issue-2,delete issue-2" \
-  "a record spelling the repository Owner/Repo closes on the merge the watch lists under owner/repo" "$err"
+assert_eq "rc=$rc events=$EVENTS" "rc=0 events=merged 2,parked-merged issue-2" \
+  "a record spelling the repository Owner/Repo is handed on at the merge the watch lists under owner/repo" "$err"
 parked_fleet parked_other_repo
 printf '[]\n' > "$STUB_DIR/merged.json"
 printf '[{"number": 2, "headRefName": "issue-2", "mergedAt": "2026-09-20T00:00:00Z"}]\n' > "$STUB_DIR/merged.other_repo.json"
 parked_run -- --repo owner/repo --repo other/repo
 assert_eq "rc=$rc events=$EVENTS host=$HOST_VERBS" "rc=0 events=merged 2 host=" \
-  "the same pull request number merged in another repository is reported and closes nothing" "$err"
-
-# A failed close's restored row is committed before the next item is read, so
-# a pass that dies on that item's list still leaves the retry owed: the next
-# pass reports the merge again and closes both.
-PARKED_EXTRA=("$(parked_record issue-3 /srv/provider /srv/lane/issue-3 3)")
-parked_fleet parked_restore_committed
-PARKED_EXTRA=()
-printf '[{"number": 2, "headRefName": "issue-2", "mergedAt": "2026-09-20T00:00:00Z"}, {"number": 3, "headRefName": "issue-3", "mergedAt": "2026-09-20T00:00:00Z"}]\n' > "$STUB_DIR/merged.json"
-printf 'issue-3\n' > "$STUB_DIR/list-fail-head.txt"
-parked_run LANE_HOST_STUB_CLOSE_STATUS=1 LANE_HOST_STUB_CLOSE_ITEM=issue-2 --
-assert_eq "rc=$rc events=$EVENTS died=$(grep -c '^oversee-watch: pr-list-failed repo=owner/repo state=merged branch=issue-3$' "$err" || true)" \
-  "rc=2 events=merged 2 died=1" "the failed close is followed by the next item's list failing, which ends the pass" "$err"
-rm -f -- "${STUB_DIR:?}/list-fail-head.txt"
+  "the same pull request number merged in another repository is reported and hands nothing on" "$err"
+parked_run -- --repo owner/repo --repo other/repo
+assert_eq "events=$EVENTS" "events=heartbeat loops=2" \
+  "a record still parked with its number merged in another repository is not handed on at the heartbeat" "$err"
+WATCH_BIN="$OWED_MUTANT" parked_run -- --repo owner/repo --repo other/repo
+assert_eq "events=$EVENTS" "events=parked-merged issue-2,heartbeat loops=2" \
+  "control: with the membership test removed another repository's merge hands the parked record on at the heartbeat" "$err"
+# A pull request still in the queue: nothing merged, nothing handed on.
+parked_fleet parked_queued
+printf '[]\n' > "$STUB_DIR/merged.json"
 parked_run --
-assert_eq "rc=$rc events=$EVENTS closes=$(grep -c '^close ' "$STUB_DIR/host.log" || true)" \
-  "rc=0 events=merged 2,lane-closed issue-2,merged 3,lane-closed issue-3 closes=3" \
-  "the next pass reports the failed close's merge again and retries it, the restore having been committed before the pass died" "$err"
-
-parked_case parked_close_refused LANE_HOST_STUB_CLOSE_STATUS=3
-assert_eq "rc=$rc events=$EVENTS path=$(grep -c '^path=/srv/clone$' <<<"$out" || true)" \
-  "rc=0 events=merged 2,lane-close-refused issue-2 path=1" \
-  "a parked close the provider refuses is lane-close-refused with the checkout it stopped on" "$err"
-out="$(run_watch ORCH_LANE_HOST="$FIXTURE_HOST" LANE_HOST_STUB_LOG="$STUB_DIR/host.log" LANE_HOST_STUB_CLOSE_STATUS=3 \
-  -- --since 2026-09-19T00:00:00Z --state "$STUB_DIR/state.json" 2>"$err" </dev/null)" && rc=0 || rc=$?
-assert_eq "merged=$(grep -c '^EVENT merged 2' <<<"$out" || true) closes=$(grep -c '^close ' "$STUB_DIR/host.log" || true)" "merged=0 closes=1" \
-  "a refused parked close is committed and never retried" "$err"
+parked_run --
+assert_eq "events=$EVENTS" "events=heartbeat loops=2" \
+  "a record still parked while its pull request is queued is not handed on at the heartbeat" "$err"
+WATCH_BIN="$OWED_MUTANT" parked_run --
+assert_eq "events=$EVENTS" "events=parked-merged issue-2,heartbeat loops=2" \
+  "control: with the membership test removed a queued record is handed on at the heartbeat" "$err"
 
 custom_close_case() { # NAME
   local name="$1" custom
