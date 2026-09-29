@@ -173,6 +173,18 @@ The long pass's events, checked and reported in this order:
                              relaunch rewriting the record stopped ends it
   EVENT triage <item>        an item created at or after --since that is absent
                              from the first repository's persisted baseline
+  EVENT outside-contribution <repo>#<N> kind=<pr|issue> author=<login> [head=<sha>]
+                             an open pull request in any --repo, or an open
+                             issue in the first, whose author is outside the
+                             fleet: not an app or bot account, and not a
+                             login GitHub associates with the repository as
+                             OWNER, MEMBER or COLLABORATOR. A pull request
+                             carries head=, its head commit on the list.
+                             Reported once while it stays open, and a pull
+                             request again once per new head; a
+                             first-repository baseline row keeps it quiet,
+                             and closing it clears the row.
+                             ORCH_EXTERNAL_TRIAGE=off lists nothing
   EVENT lane-ready <item>    a lane open-terminal handed to a background job
                              while its host prepared it is launched: its
                              record reads running, and the watch carries it
@@ -418,8 +430,8 @@ verdicts. Lane prompts use pane and turn.
 
 A line already delivered is not delivered again by a re-run: overseer-dead,
 overseer-walled, merged, lane-asking, usage-limit, model-capacity,
-lane-exited, idle-after-return, handoff and account are keyed in that
-baseline. Mail is reported at least once and never lost: lane-question,
+lane-exited, idle-after-return, handoff, account and outside-contribution are
+keyed in that baseline. Mail is reported at least once and never lost: lane-question,
 lane-notice, directive-unread and, for a directive read after its lane is
 first watched, directive-read are keyed in the mail pass's own file beside
 it, owner-note, owner-ask-resolved and peer-note by the overseer mailbox's
@@ -428,7 +440,7 @@ twice: a repeated id is one already seen. A lane whose to-lane read
 lane-mail reports `missed` has nothing reported or moved that pass; a cursor
 below the one reported holds only its directive lines. Each repeats only when what it reports changes: another PR, a
 different wall or a reset gone by, a replacement pane, a different screen, a
-new record, another account state. An unchanged standing overseer-mark is the one keyed line that
+new record, another account state, a pull request's new head. An unchanged standing overseer-mark is the one keyed line that
 comes back on a timer: it is reported every ORCH_OVERSEER_MARK_REPEAT passes
 while it stands, so a repeat there is the interval and never a new crossing.
 A suppressed line still holds: a walled lane
@@ -647,6 +659,10 @@ Environment:
                               triage, said once, and reads the owed items from
                               open PRs; with a team a missing tracker CLI or
                               workflow-state exits 2 rather than dropping it
+  ORCH_EXTERNAL_TRIAGE        `on` (default) runs the outside-contribution
+                              check on every long pass, reading each --repo's
+                              open pull requests and the first's open issues;
+                              `off` lists nothing. Any other value exits 2
   ORCH_STATE_DIR              workflow-state directory; relative paths join
                               the project root; absolute paths stay unchanged
   ORCH_WATCH_TAIL_LINES       most lines any one event's pane payload prints,
@@ -707,12 +723,13 @@ Environment:
                               that pass, and on a host without `timeout` the
                               read runs unbounded
   OVERSEE_WATCH_STATE_DIR     one baseline file per repository — reducer,
-                              triage, lane-asking, usage-limit, handoff and
-                              account rows — the mail pass's file beside the
-                              first one, holding each lane mailbox's read
-                              position and when the last long pass started,
-                              plus claims/ and usage/, both shared across the
-                              repositories that point here
+                              triage, lane-asking, usage-limit, handoff,
+                              account and outside-contribution rows — the
+                              mail pass's file beside the first one, holding
+                              each lane mailbox's read position and when the
+                              last long pass started, plus claims/ and
+                              usage/, both shared across the repositories
+                              that point here
   ORCH_WATCH_MAIL_INTERVAL    seconds from the start of one mail pass to the
                               next, a whole number, default 20, and the most
                               --repeat waits between two runs after one that
@@ -800,6 +817,9 @@ ow_message() { # REASON FIELD=VALUE...
     repo-duplicate) text='Name each repository once.' ;;
     pr-list-failed) text='The GitHub PR list command failed.' ;;
     pr-list-invalid) text='The GitHub PR list output could not be parsed.' ;;
+    outside-list-failed) text='The GitHub list of open issues and pull requests the outside-contribution check reads failed.' ;;
+    outside-list-invalid) text='The GitHub list of open issues and pull requests carried a line the outside-contribution check cannot read: a number, a pr or issue kind, a login, and a pull request head commit.' ;;
+    external-triage-invalid) text='ORCH_EXTERNAL_TRIAGE takes on or off.' ;;
     triage-state-failed) text='The fleet triage verdict log could not be read.' ;;
     triage-item-invalid) text='The fleet triage log contains an invalid issue identifier.' ;;
     time-failed) text='The current UTC time could not be read.' ;;
