@@ -16,14 +16,15 @@
 #      publishes and the lanes ci-job-set selects are one set, compared by
 #      name, and each aggregate, on its own, holds every job it needs to the
 #      lane or event condition that job's own `if:` reads; and the changes
-#      job grants the `actions: read` the action's proof reads with.
+#      job grants the `actions: read` the action's proof reads with and
+#      calls tools/ci-job-set with --event-parity.
 #   2. the job set: each gated job's own `if:` and the shard matrix's `os:`
 #      and `shard:` expressions, read out of the workflow and EVALUATED
 #      against a selection and an event, with GitHub's implicit success() where a
 #      condition carries no status function. A merge group runs the class
 #      job set its pull request ran, less the two jobs held to the
-#      pull-request event. The macOS legs run on a pull request only where
-#      the selection says a lane source changed. A dead classifier runs every
+#      pull-request event. The macOS legs run on either event where the
+#      selection lists them. A dead classifier runs every
 #      gated job, both platform legs and the whole shard roster. A pull
 #      request's run is cancelled by its next push; no other run is. The `CI` job needs every job but the aggregators and
 #      runs on both gated events whatever its needs did. Must-fail arms plant
@@ -74,6 +75,22 @@ check "the changes job grants the proof's read and the checkout's, nothing more"
 plant "$WORKFLOW" "      actions: read" "" "$TMP/no-actions-read.yml" changes
 check "must-fail: a changes job without actions: read is named" "contents: read" \
   "$(job_permissions "$TMP/no-actions-read.yml" changes)"
+
+# The selection's one call per workflow run is where the event-parity check
+# runs: tools/ci-job-set derives the other event only when asked, so a
+# changes job calling it bare would never refuse a selection that differs by
+# event.
+job_set_calls() { # WORKFLOW — each tools/ci-job-set call in the changes job
+  awk '
+    /^  [A-Za-z0-9_-]+:/ { in_job = ($1 == "changes:"); next }
+    in_job && /^ +run: tools\/ci-job-set/ { sub(/^ +run: /, ""); print }
+  ' "$1"
+}
+check "the changes job asks tools/ci-job-set for the event-parity check" \
+  "tools/ci-job-set --event-parity" "$(job_set_calls "$WORKFLOW")"
+plant "$WORKFLOW" "run: tools/ci-job-set --event-parity" "run: tools/ci-job-set" "$TMP/no-parity.yml" changes
+check "must-fail: a changes job calling tools/ci-job-set without --event-parity is named" \
+  "tools/ci-job-set" "$(job_set_calls "$TMP/no-parity.yml")"
 
 # A shard matrix key's expression, `os` or `shard`, the `${{ }}` stripped.
 matrix_expr() { # WORKFLOW KEY
@@ -298,7 +315,7 @@ pull_request|$ORCH_CODE_ROW|bot-instructions cargo-linux cargo-macos cargo-tests
 merge_group|$ORCH_CODE_ROW|bot-instructions cargo-linux cargo-macos cargo-tests-windows skill-suites-shard
 pull_request|$standard_code|bot-instructions cargo-check-windows cargo-lint cargo-linux cargo-macos cargo-tests-windows markdown preflight skill-suites-shard
 merge_group|$standard_code|bot-instructions cargo-check-windows cargo-lint cargo-linux cargo-macos cargo-tests-windows skill-suites-shard
-merge_group|$ORCH_PROOF_ROW|skill-suites-shard
+merge_group|$ORCH_PROOF_ROW|cargo-macos cargo-tests-windows skill-suites-shard
 merge_group|$SOURCE_PROOF_ROW|
 ROWS
 [ "$job_rows" -ge 14 ] || { echo "the job table read $job_rows rows" >&2; exit 1; }
@@ -324,8 +341,8 @@ check "a dead classifier runs every gated job" "$EVERY_GATED" \
   "$(running "$WORKFLOW" "$ALL_OFF" failure)"
 
 # EVENT|RESULT|SELECTION|LEGS. The matrix expands the runner list the
-# selection published, the merge group's where ci-job-set selected for one,
-# and both legs where nothing was published.
+# selection published, on either event, and both legs where nothing was
+# published.
 leg_rows=0
 while IFS='|' read -r event result sel expected; do
   leg_rows=$((leg_rows + 1))
@@ -334,8 +351,8 @@ while IFS='|' read -r event result sel expected; do
 done <<ROWS
 pull_request|success|$ALL_ON|["ubuntu-latest","macos-latest"]
 merge_group|success|$ALL_ON|["ubuntu-latest","macos-latest"]
-pull_request|success|$ORCH_CODE_ROW|["ubuntu-latest"]
-merge_group|success|$ORCH_CODE_GROUP|["ubuntu-latest","macos-latest"]
+pull_request|success|$ORCH_CODE_ROW|["ubuntu-latest","macos-latest"]
+merge_group|success|$ORCH_CODE_ROW|["ubuntu-latest","macos-latest"]
 merge_group|success|$ORCH_PROOF_ROW|["macos-latest"]
 pull_request|success|$one_skill|["ubuntu-latest"]
 merge_group|success|$one_skill|["ubuntu-latest"]

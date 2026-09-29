@@ -9,8 +9,9 @@
 #   ROOT, JOB_SET, TMP       this checkout, the script, the suite's scratch
 #   selection CLASS DOCS PATHS
 #                            the lane lines, blank-separated, or the refusal
-#                            key; SELECT_IN, SELECT_WITH, SELECT_EVENT and
-#                            SELECT_PROOF steer it (see below)
+#                            key; SELECT_IN, SELECT_WITH, SELECT_EVENT,
+#                            SELECT_PROOF and SELECT_ARG steer it (see
+#                            below)
 #   record EVENT CLASS DOCS PATH...
 #                            a proving run's record, its lines joined with
 #                            commas
@@ -18,7 +19,7 @@
 #   ROSTER, ORCH             the whole shard roster, and orch's shards
 #   LINUX, MACOS, BOTH       the runner lists, as ci-job-set spells them
 #   ALL_ON, ALL_OFF, VERIFY_ROW, PROSE_ROW, CODE_ROW, UI_ROW,
-#   ORCH_CODE_ROW, ORCH_CODE_GROUP, ORCH_PROOF_ROW, SOURCE_PROOF_ROW
+#   ORCH_CODE_ROW, ORCH_PROOF_ROW, SOURCE_PROOF_ROW
 #                            the rows, each described where it is set
 #   queue_only_of PATH       the queue-only line harness-ci's change-class
 #                            prints for a diff touching PATH alone
@@ -43,13 +44,14 @@ check() { # DESC EXPECTED ACTUAL
 # ci-job-set reads the Rust source of the checkout it runs in: this one,
 # unless SELECT_IN names another; SELECT_WITH names a copy to run instead.
 # SELECT_EVENT is the event, pull_request unless set, and SELECT_PROOF the
-# proving run's record, none unless set.
+# proving run's record, none unless set. SELECT_ARG is the one argument
+# passed, none unless set; the workflow's changes job passes --event-parity.
 selection() { # CLASS DOCS_ONLY PATHS — the lane lines, blank-separated, or the refusal key
-  local class="$1" docs="$2" paths="$3" out="$TMP/selection" status=0
+  local class="$1" docs="$2" paths="$3" out="$TMP/selection" status=0 arg="${SELECT_ARG:-}"
   : >"$out"
   (cd "${SELECT_IN:-$ROOT}" && CHANGE_CLASS="$class" DOCS_ONLY="$docs" CHANGED_PATHS="$paths" \
     EVENT="${SELECT_EVENT-pull_request}" PROOF_RECORD="${SELECT_PROOF:-}" \
-    GITHUB_OUTPUT="$out" "${SELECT_WITH:-$JOB_SET}" 2>"$TMP/selection-err") || status=$?
+    GITHUB_OUTPUT="$out" "${SELECT_WITH:-$JOB_SET}" ${arg:+"$arg"} 2>"$TMP/selection-err") || status=$?
   if [ "$status" -ne 0 ]; then
     printf 'exit=%s %s' "$status" \
       "$(sed -n 's/^ci-job-set: cause=//p' "$TMP/selection-err" | head -1)"
@@ -119,16 +121,17 @@ measured() { # LEGS UI PLATFORM BUILD SHARDS — one measured row
   printf '%s shards=%s' "$(lanes "$1" "$2" "$3" "$4")" "$5"
 }
 # The selections tools/tests/ci-aggregate.test.sh evaluates the workflow
-# against, on a pull request unless named otherwise.
+# against, on either event.
 PROSE_ROW="$(measured none false false false '[]')"
 CODE_ROW="$(measured none false true false '[]')"
 UI_ROW="$(measured none true true false '[]')"
 ORCH_SHARDS="[$ORCH,\"guards-scans\",\"rest\"]"
-ORCH_CODE_ROW="$(measured linux false true false "$ORCH_SHARDS")"
-ORCH_CODE_GROUP="$(measured both false true false "$ORCH_SHARDS")"
+ORCH_CODE_ROW="$(measured both false true false "$ORCH_SHARDS")"
 # Two proof selections over this tree: a merge group of an orch code diff
-# whose pull request ran, and one of a lane-source diff, whose pull request
-# ran the macOS legs as well. tools/tests/ci-class-job-set.test.sh holds
-# each to what the selection must be.
-ORCH_PROOF_ROW="$(SELECT_EVENT=merge_group SELECT_PROOF="$(record pull_request micro false skills/orch/scripts/lanes | tr ',' '\n')" selection micro false skills/orch/scripts/lanes)"
+# whose proof is a pull request run over orch's prose alone, which ran the
+# Linux legs of the same shards and no platform lane, and one of a lane-source
+# diff whose pull request ran over the same paths.
+# tools/tests/ci-class-job-set.test.sh holds each to what the selection must
+# be.
+ORCH_PROOF_ROW="$(SELECT_EVENT=merge_group SELECT_PROOF="$(record pull_request micro false skills/orch/SKILL.md | tr ',' '\n')" selection micro false skills/orch/scripts/lanes)"
 SOURCE_PROOF_ROW="$(SELECT_EVENT=merge_group SELECT_PROOF="$(record pull_request micro false .github/AGENTS.md skills/orch/scripts/lanes | tr ',' '\n')" selection micro false "$(printf '%s\n' .github/AGENTS.md skills/orch/scripts/lanes)")"
