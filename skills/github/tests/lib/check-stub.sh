@@ -13,7 +13,11 @@
 # reviewDecision and latestReviews. STUB_REPLY_FAIL and STUB_RESOLVE_FAIL
 # make the review-thread reply and resolve mutations answer a GraphQL error,
 # STUB_REOPEN_FAIL the unresolve mutation,
-# and STUB_REQUIRE_TOKEN refuses either without the bot token.
+# and STUB_REQUIRE_TOKEN refuses either without the bot token. The
+# repository read answers STUB_MERGE_METHODS, STUB_DELETE_BRANCH_ON_MERGE,
+# STUB_DEFAULT_BRANCH and STUB_REPO_PUSHLESS, or fails on STUB_REPO_EXIT; the
+# branch-rule read adds STUB_QUEUE_METHOD's queue on STUB_QUEUE_BRANCH and
+# STUB_RULE_METHODS's pull_request rule; STUB_NO_REPO fails `repo view`.
 # Sourced, never run — CI's suite glob picks up skills/*/tests/*.sh only, so
 # this file lives one level down.
 #
@@ -79,6 +83,11 @@ case "${1:-}" in
         fi
         ;;
     repo)
+        # STUB_NO_REPO: a checkout gh finds no GitHub repository for.
+        if [[ "${2:-}" == "view" && "${STUB_NO_REPO:-false}" == "true" ]]; then
+            echo "none of the git remotes configured for this repository point to a known GitHub host" >&2
+            exit 1
+        fi
         if [[ "${2:-}" == "view" ]]; then
             # The bare slug: this stub does not apply gh's own --json / -q
             # filters, and the shared resolver asks for nameWithOwner.
@@ -118,11 +127,39 @@ case "${1:-}" in
                 exit 0
                 ;;
             'repos/{owner}/{repo}/rules/branches/'*/* | 'repos/{owner}/{repo}/branches/'*/*) ;;
-            'repos/{owner}/{repo}') echo "${STUB_ALLOW_AUTO_MERGE:-true}"; exit 0 ;;
+            # The repository, by gh's placeholder or by the slug `repo view`
+            # answers: the allowed merge methods are STUB_MERGE_METHODS, and
+            # STUB_REPO_PUSHLESS drops every setting GitHub withholds from a
+            # token without push access.
+            'repos/{owner}/{repo}' | 'repos/owner/repo')
+                if [[ "${STUB_REPO_EXIT:-0}" != "0" ]]; then
+                    echo "gh: Not Found (HTTP 404)" >&2
+                    exit "$STUB_REPO_EXIT"
+                fi
+                repo_json=$(jq -cn \
+                    --argjson auto "${STUB_ALLOW_AUTO_MERGE:-true}" \
+                    --arg methods "${STUB_MERGE_METHODS-squash merge rebase}" \
+                    --argjson deletes "${STUB_DELETE_BRANCH_ON_MERGE:-false}" \
+                    --arg default "${STUB_DEFAULT_BRANCH:-main}" \
+                    --argjson pushless "${STUB_REPO_PUSHLESS:-false}" \
+                    '($methods | split(" ")) as $m
+                    | {allow_auto_merge: $auto, default_branch: $default}
+                    + if $pushless then {} else {allow_squash_merge: ($m | index("squash") != null), allow_merge_commit: ($m | index("merge") != null), allow_rebase_merge: ($m | index("rebase") != null), delete_branch_on_merge: $deletes} end')
+                if [[ -n "$jq_filter" ]]; then jq -r "$jq_filter" <<<"$repo_json"; else printf '%s\n' "$repo_json"; fi
+                exit 0
+                ;;
+            # A merge queue on STUB_QUEUE_BRANCH with STUB_QUEUE_METHOD, and
+            # a pull_request rule allowing STUB_RULE_METHODS, join the rules.
             'repos/{owner}/{repo}/rules/branches/'*)
                 if [[ "${STUB_RULES_EXIT:-0}" != "0" ]]; then
                     echo "gh: Not Found (HTTP 404)" >&2
                     exit "$STUB_RULES_EXIT"
+                fi
+                if [[ -n "${STUB_QUEUE_METHOD:-}" && "${2#repos/\{owner\}/\{repo\}/rules/branches/}" == "${STUB_QUEUE_BRANCH:-main}" ]]; then
+                    rules=$(jq -c --arg m "$STUB_QUEUE_METHOD" '. + [{type: "merge_queue", parameters: {merge_method: $m}}]' <<<"$rules")
+                fi
+                if [[ -n "${STUB_RULE_METHODS:-}" ]]; then
+                    rules=$(jq -c --arg m "$STUB_RULE_METHODS" '. + [{type: "pull_request", parameters: {allowed_merge_methods: ($m | split(" "))}}]' <<<"$rules")
                 fi
                 jq -r "$jq_filter" <<<"$rules"
                 exit 0
@@ -156,6 +193,8 @@ case "${1:-}" in
                     echo "missing effective token for post-merge GraphQL" >&2
                     exit 41
                 fi
+                # isCrossRepository answers only a query that names it, as
+                # GitHub answers only the fields a query selects.
                 jq -cn \
                     --arg state "${STUB_POST_STATE:-OPEN}" \
                     --arg head "${STUB_POST_HEAD:-${STUB_HEAD:-test-head}}" \
@@ -165,7 +204,9 @@ case "${1:-}" in
                     --argjson auto "${STUB_POST_AUTO_JSON:-null}" \
                     --argjson in_queue "${STUB_POST_IN_QUEUE:-false}" \
                     --argjson queue_entry "${STUB_POST_QUEUE_ENTRY_JSON:-null}" \
-                    '{data:{repository:{pullRequest:{state:$state,headRefOid:$head,headRefName:$branch,mergeCommit:(if $commit == "" then null else {oid:$commit} end),autoMergeRequest:$auto,isInMergeQueue:$in_queue,mergeQueueEntry:$queue_entry}}}}'
+                    --argjson cross "${STUB_CROSS_REPOSITORY:-false}" \
+                    --argjson asked "$([[ "$*" == *isCrossRepository* ]] && echo true || echo false)" \
+                    '{data:{repository:{pullRequest:({state:$state,headRefOid:$head,headRefName:$branch,mergeCommit:(if $commit == "" then null else {oid:$commit} end),autoMergeRequest:$auto,isInMergeQueue:$in_queue,mergeQueueEntry:$queue_entry} + (if $asked then {isCrossRepository:$cross} else {} end))}}}'
                 exit 0
             fi
             # The thread mutations post-reply.sh and resolve-thread.sh send.
@@ -313,7 +354,7 @@ case "${1:-}" in
                         '{reviewDecision:$d,latestReviews:$l}'
                     exit 0
                 fi
-                if [[ "$*" == *"--json state,headRefOid,headRefName,mergeCommit,autoMergeRequest"* ]]; then
+                if [[ "$*" == *"--json state,headRefOid,headRefName,isCrossRepository,mergeCommit,autoMergeRequest"* ]]; then
                     if [[ "${STUB_POST_VIEW_FAIL:-false}" == "true" ]]; then
                         echo "post-merge view unavailable" >&2
                         exit 1
@@ -324,7 +365,8 @@ case "${1:-}" in
                         --arg branch "${STUB_HEAD_BRANCH:-issue-123}" \
                         --arg commit "${STUB_MERGE_COMMIT:-}" \
                         --argjson auto "${STUB_POST_AUTO_JSON:-null}" \
-                        '{state:$state,headRefOid:$head,headRefName:$branch,mergeCommit:(if $commit == "" then null else {oid:$commit} end),autoMergeRequest:$auto}'
+                        --argjson cross "${STUB_CROSS_REPOSITORY:-false}" \
+                        '{state:$state,headRefOid:$head,headRefName:$branch,isCrossRepository:$cross,mergeCommit:(if $commit == "" then null else {oid:$commit} end),autoMergeRequest:$auto}'
                     exit 0
                 fi
                 ;;
