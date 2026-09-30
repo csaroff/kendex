@@ -3,9 +3,12 @@
 # review thread, the terminal states (a merged or closed PR short-circuits
 # every mode, before and after a state lookup that failed once), the guarded
 # mutation and its post-call outcomes, the --auto arm's approval gate, the
-# retired override flags, the retired merge settings, and the admin request,
-# refused on the queue-only class harness-ci's classifier prints for the pull
-# request's range. The row format and the world words are
+# retired override flags, the retired merge settings no mode reads, the
+# immediate merge's route past a merge queue: --admin where the queue is all
+# it would skip and the PR is not queue-only, the queue otherwise, the
+# queue-only class read off harness-ci's classifier for the pull request's
+# range; and the arm at creation, which arms nothing where that route reads
+# admin. The row format and the world words are
 # lib/pr-merge-world.sh's.
 set -euo pipefail
 
@@ -135,38 +138,28 @@ GH_TOKEN alone is named with the installation it acts as, and no current-user wa
 a token whose user lookup fails any other way is named unverified, and the merge still runs|checks:ci-required post:MERGED merge-commit:merged-oid env:GH_TOKEN=ghp_REVOKED|immediate|0|-|Using GH_TOKEN as unverified;MERGED PR #123|calls=$PRE,user,merge:squash,graphql:queue auth=ghp_REVOKED
 "
 
-# No path merges past the merge queue. On a base that requires one, the lane's
-# routes pass no --admin and GitHub enrolls the PR, so the only merge they can
-# cause is the queue's own. The must-fail inverse is an unconditional --admin
-# on the command: each row's trace then names merge:admin and reds. The retired
-# settings refuse every mode before the first GitHub call; the inverse is every
-# other row in this file, which runs with all three keys unset and reaches gh.
+# On a base whose rules hold no merge_queue rule, the default world, no route
+# is read and no mode passes --admin: GitHub enrolls the PR, so the only
+# merge these rows can cause is the queue's own. The must-fail inverse is an
+# unconditional --admin on the command: each row's trace then names
+# merge:squash:admin and reds. The retired merge settings are read by no mode: a set
+# key changes nothing.
 run_table "the merge queue and the retired settings" "\
-on a queue base the immediate merge enrolls the PR and passes no --admin|checks:ci-required post-queue|immediate|75|-|{no-token};QUEUED IN MERGE QUEUE PR #123 — queueState=QUEUED;{volatile}|calls=$PRE,merge:squash,graphql:queue auth=<unset>
 on a queue base --auto enrolls the PR and passes no --admin|checks:ci-required post-queue|auto|75|-|{no-token};QUEUED IN MERGE QUEUE PR #123 — queueState=QUEUED;{volatile}|calls=$PRE,merge:squash:auto,graphql:queue auth=<unset>
 a partial post-merge answer is no outcome: the pr-view fallback decides|checks:ci-required post-graphql:partial post-auto|auto|75|-|{no-token};AUTO-MERGE ENABLED PR #123 — will fire when CI + branch protection clear;{volatile}|calls=$PRE,merge:squash:auto,graphql:queue,view:post auth=<unset>
 the admin-credential verb is gone: an unknown option, refused before any call|-|admin-credential|1|-|Error: Unknown option: --admin-credential|calls=- auth=-
---admin on a range this checkout lacks reads queue-only and refuses before any merge call|-|admin|1|-|pr-merge: admin-refused class=queue-only pr=123;cause=range-absent base=base-oid head=test-head;{fetch-no-origin};{admin-queue}|calls=view:range auth=<unset>
-the router passes --admin to the same refusal|-|router:--admin|1|-|pr-merge: admin-refused class=queue-only pr=123;cause=range-absent base=base-oid head=test-head;{fetch-no-origin};{admin-queue}|calls=view:range auth=<unset>
+the admin request is gone: an unknown option, refused before any call|-|admin|1|-|Error: Unknown option: --admin|calls=- auth=-
+the router passes --admin to the same refusal|-|router:--admin|1|-|Error: Unknown option: --admin|calls=- auth=-
 the force override is gone: an unknown option, refused before any call|-|force|1|-|Error: Unknown option: --force|calls=- auth=-
 the router passes --force to the same refusal|-|router:--force|1|-|Error: Unknown option: --force|calls=- auth=-
-a set ORCH_ADMIN_MERGE_GH_CONFIG_DIR refuses before any call|checks:ci-required post:MERGED merge-commit:merged-oid env:ORCH_ADMIN_MERGE_GH_CONFIG_DIR=/home/dev/.config/gh-admin|immediate|1|-|pr-merge: retired-setting key=ORCH_ADMIN_MERGE_GH_CONFIG_DIR;{retired:ORCH_ADMIN_MERGE_GH_CONFIG_DIR}|calls=- auth=-
-a set ORCH_ADMIN_MERGE_CLASSES refuses before any call|checks:ci-required post:MERGED merge-commit:merged-oid env:ORCH_ADMIN_MERGE_CLASSES=render|immediate|1|-|pr-merge: retired-setting key=ORCH_ADMIN_MERGE_CLASSES;{retired:ORCH_ADMIN_MERGE_CLASSES}|calls=- auth=-
-a set ORCH_MERGE_BYPASS refuses --auto before any call|checks:ci-required post-queue env:ORCH_MERGE_BYPASS=fast-path|auto|1|-|pr-merge: retired-setting key=ORCH_MERGE_BYPASS;{retired:ORCH_MERGE_BYPASS}|calls=- auth=-
-a key set to the empty string is still set, and --check refuses too|checks:ci-required env:ORCH_MERGE_BYPASS=|check|1|-|pr-merge: retired-setting key=ORCH_MERGE_BYPASS;{retired:ORCH_MERGE_BYPASS}|calls=- auth=-
-two keys set name each on its own first line|checks:ci-required env:ORCH_ADMIN_MERGE_CLASSES= env:ORCH_MERGE_BYPASS=off|immediate|1|-|pr-merge: retired-setting key=ORCH_ADMIN_MERGE_CLASSES;pr-merge: retired-setting key=ORCH_MERGE_BYPASS;{retired:ORCH_ADMIN_MERGE_CLASSES+ORCH_MERGE_BYPASS}|calls=- auth=-
-the router refuses a set key the same way|checks:ci-required post:MERGED merge-commit:merged-oid env:ORCH_MERGE_BYPASS=off|router:--auto|1|-|pr-merge: retired-setting key=ORCH_MERGE_BYPASS;{retired:ORCH_MERGE_BYPASS}|calls=- auth=-
-a key in kendex.settings.toml [env] refuses the direct call|checks:ci-required post-queue cwd:toml|auto|1|-|pr-merge: retired-setting key=ORCH_MERGE_BYPASS;{retired:ORCH_MERGE_BYPASS}|calls=- auth=-
-a key in .kendex/settings.toml [env] refuses the direct call|checks:ci-required post-queue cwd:dot-kendex|auto|1|-|pr-merge: retired-setting key=ORCH_ADMIN_MERGE_CLASSES;{retired:ORCH_ADMIN_MERGE_CLASSES}|calls=- auth=-
-an unexported .env.local line refuses the direct call|checks:ci-required post-queue cwd:env-local|auto|1|-|pr-merge: retired-setting key=ORCH_ADMIN_MERGE_GH_CONFIG_DIR;{retired:ORCH_ADMIN_MERGE_GH_CONFIG_DIR}|calls=- auth=-
-a key in kendex.settings.toml [env] refuses through the router|checks:ci-required post-queue|router-in:toml|1|-|pr-merge: retired-setting key=ORCH_MERGE_BYPASS;{retired:ORCH_MERGE_BYPASS}|calls=- auth=-
-a key in .kendex/settings.toml [env] refuses through the router|checks:ci-required post-queue|router-in:dot-kendex|1|-|pr-merge: retired-setting key=ORCH_ADMIN_MERGE_CLASSES;{retired:ORCH_ADMIN_MERGE_CLASSES}|calls=- auth=-
-an unexported .env.local line refuses through the router, which sources it without exporting it|checks:ci-required post-queue|router-in:env-local|1|-|pr-merge: retired-setting key=ORCH_ADMIN_MERGE_GH_CONFIG_DIR;{retired:ORCH_ADMIN_MERGE_GH_CONFIG_DIR}|calls=- auth=-
-a settings file the loader rejects exits 1 on the loader's own lines before any call|checks:ci-required post-queue cwd:bad-settings|auto|1|-|kendex-env: duplicate-key file=<tmp>/settings-bad-settings/kendex.settings.toml key=ORCH_TMUX_VERIFY_SECS;::error::<tmp>/settings-bad-settings/kendex.settings.toml: ORCH_TMUX_VERIFY_SECS is assigned more than once in [env] (each key must be unique in the table)|calls=- auth=-
+a set ORCH_MERGE_BYPASS no longer refuses: the immediate merge runs|checks:ci-required post:MERGED merge-commit:merged-oid env:ORCH_MERGE_BYPASS=fast-path|immediate|0|-|{no-token};MERGED PR #123|calls=$PRE,merge:squash,graphql:queue auth=<unset>
+a set ORCH_ADMIN_MERGE_GH_CONFIG_DIR no longer refuses --check|checks:ci-required env:ORCH_ADMIN_MERGE_GH_CONFIG_DIR=/home/dev/.config/gh-admin|check|0|merge=true transient=false $OPEN runs=- issues=[] warnings=[] $KEYS|mergeable;head-run: none|calls=$CHECK auth=<unset>
+a key in kendex.settings.toml [env] no longer refuses the direct call|checks:ci-required post-queue cwd:toml|auto|75|-|{no-token};QUEUED IN MERGE QUEUE PR #123 — queueState=QUEUED;{volatile}|calls=$PRE,merge:squash:auto,graphql:queue auth=<unset>
+a key in kendex.settings.toml [env] no longer refuses through the router|checks:ci-required post-queue|router-in:toml|75|-|{no-token};QUEUED IN MERGE QUEUE PR #123 — queueState=QUEUED;{volatile}|calls=$PRE,merge:squash:auto,graphql:queue auth=<unset>
 "
 
-# --admin reads the queue-only class off harness-ci's change-class beside the
-# scripts tree pr-merge runs from. So the route rows run pr-merge.sh out of a
+# The merge route reads the queue-only class off harness-ci's change-class
+# beside the scripts tree pr-merge runs from. So the route rows run pr-merge.sh out of a
 # mirror of the scripts tree: real directories holding a symlink per file,
 # with the mirror's own harness-ci sibling written as the stub. Production
 # resolution is untouched: a run from the real tree still reaches the shipped
@@ -226,17 +219,82 @@ for path_dir in "${path_dirs[@]}"; do
   [[ -x "$path_dir/change-class" ]] || CLASSLESS_PATH+=":$path_dir"
 done
 
-# --admin reads the queue-only class off the classifier and refuses, naming
-# it: a queue-only PR, and a class nothing could read, keep the queue; every
-# other PR meets the retired admin route. The not-queue-only row is the
-# inverse of the queue-only one. No row reaches a merge call.
-run_table "the admin request" "\
-a queue-only PR refuses --admin, naming the class and the path that made it|route:true|admin-classified|1|-|pr-merge: admin-refused class=queue-only pr=123;$QUEUE_TRUE;{admin-queue}|calls=view:range auth=<unset>
-any other PR meets the retired admin route, its class named|route:false|admin-classified|1|-|pr-merge: admin-retired class=not-queue-only pr=123;$QUEUE_FALSE;{admin-retired}|calls=view:range auth=<unset>
-a classifier that prints no queue-only line reads queue-only, its stderr replayed|route:-|admin-classified|1|-|pr-merge: admin-refused class=queue-only pr=123;cause=classifier-unreadable;class: class=standard measured=true cause=stub;{admin-queue}|calls=view:range auth=<unset>
-a classifier that fails reads queue-only|route:fail|admin-classified|1|-|pr-merge: admin-refused class=queue-only pr=123;cause=classifier-exit-1;{admin-queue}|calls=view:range auth=<unset>
-an unreadable pull request range reads queue-only, gh's words replayed|route:range-fail|admin-classified|1|-|pr-merge: admin-refused class=queue-only pr=123;cause=range-unreadable;could not read the pull request endpoints;{admin-queue}|calls=view:range auth=<unset>
-no classifier beside the scripts tree or on PATH reads queue-only, before any gh call|-|admin-classless|1|-|pr-merge: admin-refused class=queue-only pr=123;cause=classifier-absent;{admin-queue}|calls=- auth=-
+# The immediate merge reads the route under the merge's token: every queue
+# ruleset holding the queue rule alone and answering a bypass, every other
+# ruleset answering never, no classic protection, an accepted method a direct
+# merge allows, and a PR that is not queue-only take --admin, with that
+# method. The control for each admin row is the no-bypass row beside it, whose trace names the queue's --auto merge; a failed read, the queue-only
+# class and a class nothing could read keep the queue too, and --auto never
+# reads a route but in the arm at creation, --unless-admin, which arms nothing
+# where the route reads admin. Every queue route passes --auto, since the gh
+# stub refuses a merge on a queue base that passes neither --auto nor --admin,
+# as GitHub does.
+#
+# Each rule that keeps --admin to the queue alone has its must-fail control, a
+# copy of the scripts tree with that rule's line cut and the classifier stub
+# beside it: every merge-queue ruleset judged, not the first; a queue ruleset
+# holding another rule; another ruleset the token may bypass; classic
+# protection; the classified head being the pinned head; the arm at
+# creation's route read; and the direct method, both the read that leaves the
+# queue's method out and the admin merge taking its answer; and the queue
+# route's --auto, whose cut leaves the merge GitHub refuses. --unless-admin
+# without --auto is refused, and its control cuts that refusal.
+route_mutant() { # NAME FROM TO
+  mutant_copy "$@" >/dev/null || exit 2
+  mkdir -p "$TMPDIR/$1/skills/harness-ci/scripts"
+  cp -- "$MIRROR/skills/harness-ci/scripts/change-class" "$TMPDIR/$1/skills/harness-ci/scripts/change-class"
+}
+route_mutant route-every '            bypasses="${bypasses:+$bypasses,}$bypass"' '            bypasses="${bypasses:+$bypasses,}$bypass"; break'
+route_mutant route-mixed '    if [ -n "$mixed" ]; then' '    if false; then'
+route_mutant route-other '        elif [ "$bypass" != never ]; then' '        elif false; then'
+route_mutant route-classic '    false) ;;' '    false | true) ;;'
+mutant_copy route-autoless '    if [ "$unless_admin" = true ] && [ "$auto" != true ]; then' '    if false; then' >/dev/null
+route_mutant route-head '        if [ "$head_sha" != "$pinned" ]; then' '        if false; then'
+route_mutant route-direct-read "    kinds='\"pull_request\"'" "    kinds='\"merge_queue\", \"pull_request\"'" lib/repo-settings.sh
+route_mutant route-direct-take '    [ "$route" != admin ] || method="$MERGE_ROUTE_METHOD"' '    :'
+route_mutant route-arm '    if [ "$dry_run" != true ] && { [ "$auto" != true ] || [ "$unless_admin" = true ]; }; then' '    if [ "$dry_run" != true ] && [ "$auto" != true ]; then'
+route_mutant route-queue-auto '    [ "$auto" != true ] && [ "$route" != queue ] || cmd+=(--auto)' '    [ "$auto" != true ] || cmd+=(--auto)'
+ROUTE_PRE="$PRE,view:range"
+QUEUED="QUEUED IN MERGE QUEUE PR #123 — queueState=QUEUED;{volatile}"
+run_table "the merge route past the queue" "\
+a token that may always bypass the queue ruleset admin-merges a PR that is not queue-only|checks:ci-required queue-rule:always route:false post:MERGED merge-commit:merged-oid|immediate-classified|0|-|merge-route: admin ruleset=20569265 bypass=always;$QUEUE_FALSE;{no-token};MERGED PR #123|calls=$ROUTE_PRE,merge:squash:admin,graphql:queue auth=<unset>
+a pull-request-mode bypass admin-merges too|checks:ci-required queue-rule:pull_requests_only route:false post:MERGED merge-commit:merged-oid|immediate-classified|0|-|merge-route: admin ruleset=20569265 bypass=pull_requests_only;$QUEUE_FALSE;{no-token};MERGED PR #123|calls=$ROUTE_PRE,merge:squash:admin,graphql:queue auth=<unset>
+a token that may never bypass takes the queue, naming the ruleset and its answer|checks:ci-required queue-rule:never route:false post-queue|immediate-classified|75|-|merge-route: queue cause=no-bypass ruleset=20569265 bypass=never;{route-queue:no-bypass};{no-token};QUEUED IN MERGE QUEUE PR #123 — queueState=QUEUED;{volatile}|calls=$PRE,merge:squash:auto,graphql:queue auth=<unset>
+a ruleset answer with no bypass field takes the queue|checks:ci-required queue-rule:absent route:false post-queue|immediate-classified|75|-|merge-route: queue cause=no-bypass ruleset=20569265 bypass=absent;{route-queue:no-bypass};{no-token};QUEUED IN MERGE QUEUE PR #123 — queueState=QUEUED;{volatile}|calls=$PRE,merge:squash:auto,graphql:queue auth=<unset>
+a failed ruleset read takes the queue and names the ruleset|checks:ci-required queue-rule:fail route:false post-queue|immediate-classified|75|-|merge-route: queue cause=ruleset-unreadable ruleset=20569265;{route-queue:ruleset};{no-token};QUEUED IN MERGE QUEUE PR #123 — queueState=QUEUED;{volatile}|calls=$PRE,merge:squash:auto,graphql:queue auth=<unset>
+the bypass is read under the merge's own token|checks:ci-required queue-rule:always route:false post:MERGED merge-commit:merged-oid require-token env:GH_BOT_TOKEN=ghp_test_token|immediate-classified|0|-|merge-route: admin ruleset=20569265 bypass=always;$QUEUE_FALSE;Using GH_BOT_TOKEN as stub-user;MERGED PR #123|calls=$ROUTE_PRE,user,merge:squash:admin,graphql:queue auth=<unset>+ghp_test_token
+a queue-only PR takes the queue whatever the token may bypass, naming the path that made it|checks:ci-required queue-rule:always route:true post-queue|immediate-classified|75|-|merge-route: queue cause=queue-only;{route-queue:queue-only};$QUEUE_TRUE;{no-token};QUEUED IN MERGE QUEUE PR #123 — queueState=QUEUED;{volatile}|calls=$ROUTE_PRE,merge:squash:auto,graphql:queue auth=<unset>
+a classifier that prints no queue-only line reads queue-only, its stderr replayed|checks:ci-required queue-rule:always route:- post-queue|immediate-classified|75|-|merge-route: queue cause=queue-only;{route-queue:queue-only};cause=classifier-unreadable;class: class=standard measured=true cause=stub;{no-token};QUEUED IN MERGE QUEUE PR #123 — queueState=QUEUED;{volatile}|calls=$ROUTE_PRE,merge:squash:auto,graphql:queue auth=<unset>
+a classifier that fails reads queue-only|checks:ci-required queue-rule:always route:fail post-queue|immediate-classified|75|-|merge-route: queue cause=queue-only;{route-queue:queue-only};cause=classifier-exit-1;{no-token};QUEUED IN MERGE QUEUE PR #123 — queueState=QUEUED;{volatile}|calls=$ROUTE_PRE,merge:squash:auto,graphql:queue auth=<unset>
+an unreadable pull request range reads queue-only, gh's words replayed|checks:ci-required queue-rule:always route:range-fail post-queue|immediate-classified|75|-|merge-route: queue cause=queue-only;{route-queue:queue-only};cause=range-unreadable;could not read the pull request endpoints;{no-token};QUEUED IN MERGE QUEUE PR #123 — queueState=QUEUED;{volatile}|calls=$ROUTE_PRE,merge:squash:auto,graphql:queue auth=<unset>
+no classifier beside the scripts tree or on PATH reads queue-only|checks:ci-required queue-rule:always post-queue|immediate-classless|75|-|merge-route: queue cause=queue-only;{route-queue:queue-only};cause=classifier-absent;{no-token};QUEUED IN MERGE QUEUE PR #123 — queueState=QUEUED;{volatile}|calls=$PRE,merge:squash:auto,graphql:queue auth=<unset>
+two merge-queue rulesets the token may bypass admin-merge, both named|checks:ci-required queue-two:always,pull_requests_only route:false post:MERGED merge-commit:merged-oid|immediate-classified|0|-|merge-route: admin ruleset=20569265,20569266 bypass=always,pull_requests_only;$QUEUE_FALSE;{no-token};MERGED PR #123|calls=$ROUTE_PRE,merge:squash:admin,graphql:queue auth=<unset>
+a second merge-queue ruleset the token may not bypass takes the queue, naming it|checks:ci-required queue-two:always,never route:false post-queue|immediate-classified|75|-|merge-route: queue cause=no-bypass ruleset=20569266 bypass=never;{route-queue:no-bypass};{no-token};$QUEUED|calls=$PRE,merge:squash:auto,graphql:queue auth=<unset>
+must-fail: with only the first merge-queue ruleset judged, the second's never admin-merges|checks:ci-required queue-two:always,never route:false post:MERGED merge-commit:merged-oid|route-mutant:route-every|0|-|merge-route: admin ruleset=20569265 bypass=always;$QUEUE_FALSE;{no-token};MERGED PR #123|calls=$ROUTE_PRE,merge:squash:admin,graphql:queue auth=<unset>
+a merge-queue ruleset holding another rule takes the queue, naming the rule|checks:ci-required queue-rule:always queue-mixed route:false post-queue|immediate-classified|75|-|merge-route: queue cause=queue-ruleset-mixed ruleset=20569265 rule=pull_request;{route-queue:mixed};{no-token};$QUEUED|calls=$PRE,merge:squash:auto,graphql:queue auth=<unset>
+must-fail: with the mixed-ruleset check cut, the queue ruleset's other rule is admin-merged past|checks:ci-required queue-rule:always queue-mixed route:false post:MERGED merge-commit:merged-oid|route-mutant:route-mixed|0|-|merge-route: admin ruleset=20569265 bypass=always;$QUEUE_FALSE;{no-token};MERGED PR #123|calls=$ROUTE_PRE,merge:squash:admin,graphql:queue auth=<unset>
+another ruleset the token may bypass takes the queue, naming it and its answer|checks:ci-required queue-rule:always other-bypass:pull_requests_only route:false post-queue|immediate-classified|75|-|merge-route: queue cause=other-bypass ruleset=24148610 bypass=pull_requests_only;{route-queue:other-bypass};{no-token};$QUEUED|calls=$PRE,merge:squash:auto,graphql:queue auth=<unset>
+another ruleset answering no bypass field takes the queue|checks:ci-required queue-rule:always other-bypass:absent route:false post-queue|immediate-classified|75|-|merge-route: queue cause=other-bypass ruleset=24148610 bypass=absent;{route-queue:other-bypass};{no-token};$QUEUED|calls=$PRE,merge:squash:auto,graphql:queue auth=<unset>
+must-fail: with the other-ruleset check cut, a ruleset the token may bypass is admin-merged past|checks:ci-required queue-rule:always other-bypass:pull_requests_only route:false post:MERGED merge-commit:merged-oid|route-mutant:route-other|0|-|merge-route: admin ruleset=20569265 bypass=always;$QUEUE_FALSE;{no-token};MERGED PR #123|calls=$ROUTE_PRE,merge:squash:admin,graphql:queue auth=<unset>
+classic branch protection takes the queue|checks:ci-required queue-rule:always protection:on route:false post-queue|immediate-classified|75|-|merge-route: queue cause=classic-protection;{route-queue:classic};{no-token};$QUEUED|calls=$PRE,merge:squash:auto,graphql:queue auth=<unset>
+a protection answer with no enabled field takes the queue|checks:ci-required queue-rule:always protection:unknown route:false post-queue|immediate-classified|75|-|merge-route: queue cause=protection-unreadable;{route-queue:protection};{no-token};$QUEUED|calls=$PRE,merge:squash:auto,graphql:queue auth=<unset>
+must-fail: with the classic check cut, classic protection is admin-merged past|checks:ci-required queue-rule:always protection:on route:false post:MERGED merge-commit:merged-oid|route-mutant:route-classic|0|-|merge-route: admin ruleset=20569265 bypass=always;$QUEUE_FALSE;{no-token};MERGED PR #123|calls=$ROUTE_PRE,merge:squash:admin,graphql:queue auth=<unset>
+a head that moved between the head read and the class read takes the queue, naming both|checks:ci-required queue-rule:always route:false head-moved:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb post-queue|immediate-classified|75|-|merge-route: queue cause=queue-only;{route-queue:queue-only};cause=head-moved classified=$RANGE_HEAD pinned=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb;{no-token};$QUEUED|calls=$ROUTE_PRE,merge:squash:auto,graphql:queue auth=<unset>
+must-fail: with the head comparison cut, a head nobody classified is admin-merged|checks:ci-required queue-rule:always route:false head-moved:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb post:MERGED merge-commit:merged-oid|route-mutant:route-head|0|-|merge-route: admin ruleset=20569265 bypass=always;$QUEUE_FALSE;{no-token};MERGED PR #123|calls=$ROUTE_PRE,merge:squash:admin,graphql:queue auth=<unset>
+the arm at creation on an unapproved PR arms nothing where the route reads admin, the route its first stderr line|checks:none queue-rule:always route:false post-entry review:none|auto-unless-admin-classified|1|-|merge-route: admin ruleset=20569265 bypass=always;$QUEUE_FALSE;{arm-admin}|calls=$ROUTE_PRE auth=<unset>
+the arm at creation arms where the route reads queue|checks:none queue-rule:never route:false post-entry|auto-unless-admin-classified|75|-|merge-route: queue cause=no-bypass ruleset=20569265 bypass=never;{route-queue:no-bypass};Warnings:;⚠ ci_unconfigured: No status checks configured;{no-token};$QUEUED|calls=$PRE,merge:squash:auto,graphql:queue auth=<unset>
+the arm at creation arms where the base holds no merge queue, naming no route|checks:ci-required post-auto|auto-unless-admin|75|-|{no-token};AUTO-MERGE ENABLED PR #123 — will fire when CI + branch protection clear;{volatile}|calls=$PRE,merge:squash:auto,graphql:queue auth=<unset>
+the arm at creation arms where the queue ruleset cannot be read, naming the read|checks:ci-required queue-rule:fail route:false post-entry|auto-unless-admin-classified|75|-|merge-route: queue cause=ruleset-unreadable ruleset=20569265;{route-queue:ruleset};{no-token};$QUEUED|calls=$PRE,merge:squash:auto,graphql:queue auth=<unset>
+must-fail: with the arm's route read cut, the arm queues a PR the admin route would take|checks:none queue-rule:always route:false post-entry review:none|auto-route-mutant:route-arm|75|-|Warnings:;⚠ ci_unconfigured: No status checks configured;⚠ not_approved: Review status is '';{no-token};$QUEUED|calls=$PRE,merge:squash:auto,graphql:queue auth=<unset>
+the admin route merges with a method a direct merge allows, not the queue's|checks:ci-required queue-rule:always queue-rule-method:MERGE methods:squash route:false post:MERGED merge-commit:merged-oid|immediate-classified|0|-|merge-route: admin ruleset=20569265 bypass=always;$QUEUE_FALSE;{no-token};MERGED PR #123|calls=$ROUTE_PRE,merge:squash:admin,graphql:queue auth=<unset>
+must-fail: with the direct read taking the queue's method, the admin merge passes a method the repository does not allow|checks:ci-required queue-rule:always queue-rule-method:MERGE methods:squash route:false post:MERGED merge-commit:merged-oid|route-mutant:route-direct-read|0|-|merge-route: admin ruleset=20569265 bypass=always;$QUEUE_FALSE;{no-token};MERGED PR #123|calls=$ROUTE_PRE,merge:merge:admin,graphql:queue auth=<unset>
+must-fail: with the direct method not taken, the admin merge passes the queue's method|checks:ci-required queue-rule:always queue-rule-method:MERGE methods:squash route:false post:MERGED merge-commit:merged-oid|route-mutant:route-direct-take|0|-|merge-route: admin ruleset=20569265 bypass=always;$QUEUE_FALSE;{no-token};MERGED PR #123|calls=$ROUTE_PRE,merge:merge:admin,graphql:queue auth=<unset>
+a direct merge allowing none of the accepted methods takes the queue with the queue's method, naming both sets|checks:ci-required queue-rule:always queue-rule-method:MERGE methods:squash route:false post-queue|classified-with:--merge|75|-|merge-route: queue cause=direct-method allowed=squash accepted=merge;{route-queue:direct-method};{no-token};$QUEUED|calls=$PRE,merge:merge:auto,graphql:queue auth=<unset>
+direct-merge methods that cannot be read take the queue, naming the read|checks:ci-required queue-rule:always repo:pushless route:false post-queue|immediate-classified|75|-|merge-route: queue cause=direct-method-unreadable read=settings;{route-queue:direct-unread};{no-token};$QUEUED|calls=$PRE,merge:squash:auto,graphql:queue auth=<unset>
+--auto without --unless-admin reads no route and never passes --admin, whatever the token may bypass|checks:ci-required queue-rule:always route:false post-entry|auto-classified|75|-|{no-token};QUEUED IN MERGE QUEUE PR #123 — queueState=QUEUED;{volatile}|calls=$PRE,merge:squash:auto,graphql:queue auth=<unset>
+must-fail: with the queue route's --auto cut, GitHub refuses the merge and nothing is queued|checks:ci-required queue-rule:never route:false post-queue|route-mutant:route-queue-auto|1|-|merge-route: queue cause=no-bypass ruleset=20569265 bypass=never;{route-queue:no-bypass};{no-token};BLOCKED PR #123 — gh reported success but state=OPEN, autoMerge=false, mergeQueue=false;! The merge strategy for main is set by the merge queue|calls=$PRE,merge:squash,graphql:queue auth=<unset>
+--unless-admin without --auto is refused before any call|-|with:--unless-admin|1|-|Error: --unless-admin gates the --auto arm and needs --auto|calls=- auth=-
+must-fail: with the needs-auto check cut, --unless-admin alone runs the immediate merge|checks:ci-required post:MERGED merge-commit:merged-oid|mutant:route-autoless:--unless-admin+--keep-branch|0|-|{no-token};MERGED PR #123|calls=$PRE,merge:squash,graphql:queue auth=<unset>
 "
 
 echo

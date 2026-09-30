@@ -1,0 +1,1 @@
+- **Breaking:** harness-ci reads every change as queue-only until the base commit's `[env]` sets `HARNESS_CI_QUEUE_PATHS`; set it empty for none.

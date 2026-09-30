@@ -43,7 +43,20 @@
 #     route:<true|false|-|fail|range-fail>  the classifier stub's queue-only
 #     line for the pull request's range: queue_only=true on a CI workflow,
 #     queue_only=false, no line, a classifier that fails, or a range read
-#     that fails
+#     that fails; head-moved:<sha> after it, the head every read but the
+#     range's answers
+#     queue-rule:<value|absent|fail>  a merge_queue rule on the base
+#     from ruleset 20569265, beside a required check from ruleset 24148610
+#     that answers never, whose read answers current_user_can_bypass
+#     <value>, carries no such field, or fails; after it, queue-mixed puts a
+#     pull_request rule in the queue ruleset, other-bypass:<value> is the
+#     checks ruleset's answer, and
+#     protection:on turns classic branch protection on, protection:unknown
+#     answers a protection object with no enabled field
+#     queue-two:<a>,<b>  two merge_queue rulesets, 20569265 answering <a> and
+#     20569266 answering <b>, beside the checks ruleset answering never
+#     queue-rule-method:<METHOD> after a queue-rule word, the queue's
+#     merge_method in place of SQUASH
 #     env:NAME=value  the caller's environment
 #   argv   check | auto | immediate | with:<flag+flag> (the flags alone,
 #          `+` a space, no --keep-branch) | mutant:<name>:<flag+flag> (the
@@ -51,12 +64,19 @@
 #          expected:<sha> (--auto with --expected-head) | router:<flags> |
 #          auto-mutant:<name> (--auto, run from the copy pr-merge.test.sh
 #          builds under that name with one line of pr-merge.sh replaced) |
-#          force | admin-credential (the retired flags) | admin (--admin) |
-#          admin-classified (--admin from the mirror tree whose harness-ci
-#          sibling is the classifier stub, which pr-merge.test.sh builds as
-#          $MIRROR) | admin-classless (--admin from that suite's mirror with
-#          no harness-ci sibling, $CLASSLESS_PR_MERGE, on $CLASSLESS_PATH,
-#          which holds no change-class)
+#          force | admin | admin-credential (the retired flags) |
+#          auto-classified | immediate-classified |
+#          classified-with:<flag+flag> (the immediate merge with those flags,
+#          `+` a space) (run from the mirror tree
+#          whose harness-ci sibling is the classifier stub, which
+#          pr-merge.test.sh builds as $MIRROR) | immediate-classless (the
+#          immediate merge from that suite's mirror with no harness-ci
+#          sibling, $CLASSLESS_PR_MERGE, on $CLASSLESS_PATH, which holds no
+#          change-class) | auto-unless-admin (--auto --unless-admin, the arm
+#          at creation) | auto-unless-admin-classified (the same, from
+#          $MIRROR) | route-mutant:<name> | auto-route-mutant:<name> (the
+#          immediate merge, or the arm at creation, from the copy mutant_copy
+#          built as <name>, with the classifier stub beside it)
 #   out    check: `merge=<bool> transient=<bool> state=<S> mergeable=<M>
 #          at=<mergedAt|-> runs=<ids|-> issues=[a;b] warnings=[c]
 #          keys=[<the JSON's keys>]`; otherwise stdout, `-` when empty
@@ -77,7 +97,7 @@ source "$TEST_DIR/lib/check-stub.sh"
 TMPDIR_PHYSICAL="$(cd "$TMPDIR" && pwd -P)"
 REPO="$TMPDIR/repo"
 
-# --admin asks a classifier to read the diff between two commits, and
+# The merge route asks a classifier to read the diff between two commits, and
 # pr-merge reads a range this checkout does not hold as queue-only. So the
 # fixture repo is a real repository with two commits, and the route rows name
 # them. No remote is added: the slug resolution and the volatile note below
@@ -96,11 +116,8 @@ git -C "$REPO" commit -q -m head
 RANGE_BASE="$(git -C "$REPO" rev-parse HEAD~1)"
 RANGE_HEAD="$(git -C "$REPO" rev-parse HEAD)"
 
-# One checkout per project settings source, each planting a retired key the way
-# that source spells it. A settings table is exported by the loader and a
-# private env file line is not, so a row run from each checkout proves the
-# refusal reads the key where that source leaves it. `bad-settings` carries a
-# settings file the loader rejects.
+# A checkout whose settings still carry a retired merge key, which no mode
+# reads any more.
 settings_fixture() { # NAME RELPATH CONTENT
   local dir="$TMPDIR/settings-$1"
   git init -q "$dir"
@@ -110,9 +127,6 @@ settings_fixture() { # NAME RELPATH CONTENT
   printf '%s\n' "$3" >"$dir/$2"
 }
 settings_fixture toml kendex.settings.toml $'[env]\nORCH_MERGE_BYPASS = "fast-path"'
-settings_fixture dot-kendex .kendex/settings.toml $'[env]\nORCH_ADMIN_MERGE_CLASSES = "render"'
-settings_fixture env-local .env.local 'ORCH_ADMIN_MERGE_GH_CONFIG_DIR=/home/dev/.config/gh-admin'
-settings_fixture bad-settings kendex.settings.toml $'[env]\nORCH_TMUX_VERIFY_SECS = "15"\nORCH_TMUX_VERIFY_SECS = "15"'
 
 
 # --- the checks fixtures -------------------------------------------------------
@@ -162,6 +176,7 @@ RUN_DIR=""
 CALL_LOG="$TMPDIR/calls.log"
 AUTH_LOG="$TMPDIR/auth.log"
 FAIL_ONCE="$TMPDIR/state-failed-once"
+MERGE_REFUSED="$TMPDIR/merge-refused"
 word() {
   local v="${1#*:}"
   case "$1" in
@@ -214,7 +229,22 @@ word() {
     route:fail) W_ENV+=("STUB_BASE_OID=$RANGE_BASE" "STUB_HEAD=$RANGE_HEAD") ;;
     route:-) W_ENV+=("STUB_CLASS=standard" "STUB_BASE_OID=$RANGE_BASE" "STUB_HEAD=$RANGE_HEAD" "STUB_EXPECT_BASE=$RANGE_BASE" "STUB_EXPECT_HEAD=$RANGE_HEAD") ;;
     route:true) W_ENV+=("STUB_CLASS=standard" "STUB_QUEUE_LINE=$QUEUE_TRUE" "STUB_BASE_OID=$RANGE_BASE" "STUB_HEAD=$RANGE_HEAD" "STUB_EXPECT_BASE=$RANGE_BASE" "STUB_EXPECT_HEAD=$RANGE_HEAD") ;;
+    # The head every read but the range's answers, the range still at the
+    # head the classifier measured.
+    head-moved:*) W_ENV+=("STUB_RANGE_HEAD=$RANGE_HEAD" "STUB_HEAD=$v") ;;
     route:false) W_ENV+=("STUB_CLASS=standard" "STUB_QUEUE_LINE=$QUEUE_FALSE" "STUB_BASE_OID=$RANGE_BASE" "STUB_HEAD=$RANGE_HEAD" "STUB_EXPECT_BASE=$RANGE_BASE" "STUB_EXPECT_HEAD=$RANGE_HEAD") ;;
+    # The base's merge_queue rule and the answer its ruleset read gives.
+    queue-rule:fail) W_ENV+=("STUB_GATE_RULES=$QUEUE_RULES" "STUB_RULESET_EXIT=1") ;;
+    queue-rule:absent) W_ENV+=("STUB_GATE_RULES=$QUEUE_RULES" 'STUB_RULESET_JSON_20569265={"id":20569265}' "$CHECKS_NEVER") ;;
+    queue-rule:*) W_ENV+=("STUB_GATE_RULES=$QUEUE_RULES" "$(ruleset_answer 20569265 "$v")" "$CHECKS_NEVER") ;;
+    queue-mixed) W_ENV+=("STUB_GATE_RULES=$(jq -c '. + [{type: "pull_request", ruleset_id: 20569265}]' <<<"$QUEUE_RULES")") ;;
+    other-bypass:absent) W_ENV+=('STUB_RULESET_JSON_24148610={"id":24148610}') ;;
+    other-bypass:*) W_ENV+=("$(ruleset_answer 24148610 "$v")") ;;
+    protection:on) W_ENV+=('STUB_CLASSIC_JSON={"protection":{"enabled":true,"required_status_checks":{"contexts":[],"checks":[]}}}') ;;
+    protection:unknown) W_ENV+=('STUB_CLASSIC_JSON={"protection":{"required_status_checks":{"contexts":[],"checks":[]}}}') ;;
+    queue-rule-method:*) W_ENV+=("STUB_GATE_RULES=$(jq -c --arg m "$v" '[.[] | if .type == "merge_queue" then .parameters.merge_method = $m else . end]' <<<"$QUEUE_RULES")") ;;
+    queue-two:*) W_ENV+=("STUB_GATE_RULES=$(jq -c '[.[0], (.[0] | .ruleset_id = 20569266)] + .[1:]' <<<"$QUEUE_RULES")" \
+      "$(ruleset_answer 20569265 "${v%,*}")" "$(ruleset_answer 20569266 "${v#*,}")" "$CHECKS_NEVER") ;;
     post-graphql:partial) W_ENV+=("STUB_POST_GRAPHQL_PARTIAL=true") ;;
     cwd:*) RUN_DIR="$TMPDIR/settings-$v" ;;
     env:*) W_ENV+=("$v") ;;
@@ -229,7 +259,7 @@ build() {
   RUN_DIR="$REPO"
   : >"$CALL_LOG"
   : >"$AUTH_LOG"
-  rm -f "$FAIL_ONCE"
+  rm -f "$FAIL_ONCE" "$MERGE_REFUSED"
   for w in "$@"; do word "$w"; done
 }
 
@@ -240,8 +270,10 @@ argv_for() {
     check) printf '%s\n' "$PR_MERGE" 123 --check ;;
     # The mirrored tree, where the change classifier is the stub, so the
     # queue-only class is the row's own and not this repository's diff.
-    admin-classified) printf '%s\n' "$MIRROR_PR_MERGE" 123 --admin --keep-branch ;;
-    admin-classless) printf '%s\n' env "PATH=$CLASSLESS_PATH" "$CLASSLESS_PR_MERGE" 123 --admin --keep-branch ;;
+    auto-classified) printf '%s\n' "$MIRROR_PR_MERGE" 123 --auto --keep-branch ;;
+    immediate-classified) printf '%s\n' "$MIRROR_PR_MERGE" 123 --keep-branch ;;
+    classified-with:*) printf '%s\n' "$MIRROR_PR_MERGE" 123 --keep-branch; printf '%s' "${1#classified-with:}" | tr '+' '\n'; echo ;;
+    immediate-classless) printf '%s\n' env "PATH=$CLASSLESS_PATH" "$CLASSLESS_PR_MERGE" 123 --keep-branch ;;
     auto) printf '%s\n' "$PR_MERGE" 123 --auto --keep-branch ;;
     immediate) printf '%s\n' "$PR_MERGE" 123 --keep-branch ;;
     with:*) printf '%s\n' "$PR_MERGE" 123; printf '%s' "${1#with:}" | tr '+' '\n'; echo ;;
@@ -255,6 +287,10 @@ argv_for() {
     admin) printf '%s\n' "$PR_MERGE" 123 --admin --keep-branch ;;
     expected:*) printf '%s\n' "$PR_MERGE" 123 --auto --keep-branch --expected-head "${1#expected:}" ;;
     auto-mutant:*) printf '%s\n' "$TMPDIR/${1#auto-mutant:}/skills/github/scripts/commands/pr-merge.sh" 123 --auto --keep-branch ;;
+    auto-unless-admin) printf '%s\n' "$PR_MERGE" 123 --auto --unless-admin --keep-branch ;;
+    auto-unless-admin-classified) printf '%s\n' "$MIRROR_PR_MERGE" 123 --auto --unless-admin --keep-branch ;;
+    route-mutant:*) printf '%s\n' "$TMPDIR/${1#route-mutant:}/skills/github/scripts/commands/pr-merge.sh" 123 --keep-branch ;;
+    auto-route-mutant:*) printf '%s\n' "$TMPDIR/${1#auto-route-mutant:}/skills/github/scripts/commands/pr-merge.sh" 123 --auto --unless-admin --keep-branch ;;
     admin-credential) printf '%s\n' "$PR_MERGE" 123 --admin-credential --keep-branch ;;
     router-in:*) printf '%s\n' "$GITHUB" -C "$TMPDIR/settings-${1#router-in:}" pr-merge 123 --auto --keep-branch ;;
     router:*) printf '%s\n' "$GITHUB" -C "$REPO" pr-merge 123 "${1#router:}" --keep-branch ;;
@@ -332,11 +368,9 @@ run() {
   while IFS= read -r line; do argv+=("$line"); done < <(argv_for "$1")
   # Every token name and GH_REPO come off: a row pins whole stderr lines and
   # the token each call saw, so a lane's own environment would decide them.
-  # The retired merge settings come off too, so only a row's own env: word
-  # sets one.
   (cd "$RUN_DIR" && PATH="$TMPDIR/bin:$PATH" env -u GH_TOKEN -u GITHUB_TOKEN -u GH_BOT_TOKEN -u GH_REPO -u KENDEX_ENV_FILE \
-    -u ORCH_ADMIN_MERGE_GH_CONFIG_DIR -u ORCH_ADMIN_MERGE_CLASSES -u ORCH_MERGE_BYPASS -u GH_CONFIG_DIR \
-    STUB_CALL_LOG="$CALL_LOG" STUB_AUTH_LOG="$AUTH_LOG" \
+    -u GH_CONFIG_DIR \
+    STUB_CALL_LOG="$CALL_LOG" STUB_AUTH_LOG="$AUTH_LOG" STUB_MERGE_REFUSED="$MERGE_REFUSED" \
     ${W_ENV[@]+"${W_ENV[@]}"} "${argv[@]}" >"$TMPDIR/stdout" 2>"$TMPDIR/stderr") || rc=$?
   printf 'rc=%s out=%s err=%s calls=%s auth=%s' "$rc" "$(stdout_text "$1")" "$(err_lines)" "$(calls)" "$(auth)"
 }
@@ -377,13 +411,23 @@ err_macro() {
     # flattened into one sentence; a git that rewords this moves this macro.
     fetch-no-origin) printf "pr-merge: the pull request's range is not in this checkout and the fetch of its two commits from origin failed:;fatal: 'origin' does not appear to be a git repository;fatal: Could not read from remote repository.;Please make sure you have the correct access rights;and the repository exists." ;;
     hint-auto) printf 'Use --auto to queue for auto-merge.' ;;
-    volatile) printf 'NOTE: queue/auto-merge state is VOLATILE — an ejection or a failed protection check disarms it silently\\; follow orch merge-pr.md § 5 for PR #123;Block on .agents/skills/orch/scripts/queue-wait 123 --json once, with a poll interval and budget sized as orch merge-pr.md § 5 step 1 does\\; route its verdict by that same step, and never re-arm an unrecognized verdict. The fleet reducer is .agents/skills/review-gate/scripts/pr-watch.sh with GH_REPO set to the repository (not resolvable locally here)\\; repair what the cause names before re-arming with .agents/skills/github/scripts/github.sh pr-merge 123 --auto' ;;
+    volatile) printf 'NOTE: queue/auto-merge state is VOLATILE — an ejection or a failed protection check disarms it silently\\; follow orch merge-pr.md § 5 for PR #123;Block on .agents/skills/orch/scripts/queue-wait 123 --json once, with a poll interval and budget sized as orch merge-pr.md § 5 step 1 does\\; route its verdict by that same step, and never re-arm an unrecognized verdict. The fleet reducer is .agents/skills/review-gate/scripts/pr-watch.sh with GH_REPO set to the repository (not resolvable locally here)\\; repair what the cause names, then re-arm only through the merge route of orch merge-pr.md § 5 step 1, never a bare pr-merge 123 --auto, which queues a PR the admin route would take' ;;
     merge-failed) printf 'BLOCKED PR #123 — gh pr merge failed' ;;
     no-token) printf 'Warning: GH_BOT_TOKEN not configured, using current user' ;;
     closed) printf 'CLOSED (not merged) PR #123;No merge attempted, none queued. Reopen the PR or supersede it.' ;;
-    retired:*) printf 'The overseer'"'"'s admin merge and the ORCH_MERGE_BYPASS fast path are retired (kendex decision D003): every merge goes through the merge queue, armed with --auto.;Remove %s from kendex.settings.toml [env], .kendex/settings.toml [env], the private env file (.env.local unless KENDEX_ENV_FILE names another) and the environment, then retry.' "$(printf '%s' "${1#retired:}" | tr '+' ' ')" ;;
-    admin-queue) printf 'A queue-only change runs in a merge group before it lands: arm it with --auto and wait in the queue. Nothing was merged or armed.' ;;
-    admin-retired) printf 'The admin route is retired (kendex decision D003): every merge goes through the merge queue, armed with --auto. Nothing was merged or armed.' ;;
+    # route-queue:<why> the second line of a queue route; route-why:<name>
+    # names the why.
+    route-queue:*) printf '%s The merge call passes --auto and no --admin.' "$(err_macro "route-why:${1#route-queue:}")" ;;
+    route-why:ruleset) printf 'The ruleset could not be read, so no bypass is proven.' ;;
+    route-why:no-bypass) printf 'This token may not bypass the merge-queue ruleset.' ;;
+    route-why:mixed) printf 'The merge-queue ruleset holds another rule, which --admin would skip too.' ;;
+    route-why:other-bypass) printf 'This token may bypass another ruleset on the base, which --admin would skip too.' ;;
+    route-why:classic) printf 'The base branch has classic branch protection, which --admin would skip too.' ;;
+    route-why:protection) printf "The base branch's classic protection could not be read, so no bypass is proven." ;;
+    arm-admin) printf 'Nothing armed: the immediate merge takes this PR past the queue once its gates pass, and an arm now would queue it first.' ;;
+    route-why:direct-method) printf "A merge past the queue takes the repository's methods and the base's pull_request rules, which allow none of the accepted methods." ;;
+    route-why:direct-unread) printf 'The methods a merge past the queue may take could not be read.' ;;
+    route-why:queue-only) printf 'A queue-only change runs in a merge group before it lands.' ;;
     auto-remedy) printf 'Nothing mutated. Enable auto-merge on the repository.' ;;
     approval-remedy) printf "Nothing mutated. No ruleset on the base branch requires an approval, so GitHub would merge the armed PR before review\\; require at least 1 approval, thread resolution and stale-approval dismissal in its pull_request rule." ;;
     thread-remedy) printf "Nothing mutated. No ruleset on the base branch requires thread resolution, so GitHub would merge the armed PR on its first approval past open review threads\\; require review threads resolved in its pull_request rule." ;;
@@ -434,3 +478,12 @@ KEYS="keys=[can_merge,issues,warnings,mergeable,review,transient,state,merged_at
 # The classifier's queue-only lines, as harness-ci's change-class prints them.
 QUEUE_TRUE="queue_only=true cause=queue-path path=.github/workflows/ci.yml glob=.github/workflows/*"
 QUEUE_FALSE="queue_only=false cause=no-queue-path"
+# The base's rules: a merge_queue rule from ruleset 20569265, and a required
+# check and the default world's pull_request rule from ruleset 24148610, and
+# the answer of that checks ruleset for a token that may not bypass it.
+QUEUE_RULES='[{"type":"merge_queue","ruleset_id":20569265,"parameters":{"merge_method":"SQUASH"}},{"type":"required_status_checks","ruleset_id":24148610},{"type":"pull_request","ruleset_id":24148610,"parameters":{"required_approving_review_count":1,"required_review_thread_resolution":true,"dismiss_stale_reviews_on_push":true}}]'
+CHECKS_NEVER='STUB_RULESET_JSON_24148610={"id":24148610,"current_user_can_bypass":"never"}'
+# The environment word for a ruleset read answering current_user_can_bypass.
+ruleset_answer() { # ID VALUE
+  printf 'STUB_RULESET_JSON_%s={"id":%s,"current_user_can_bypass":"%s"}' "$1" "$1" "$2"
+}

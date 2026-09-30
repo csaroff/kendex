@@ -6,17 +6,24 @@
 # STUB_STATE_STDERR, STUB_STATE_EXIT, STUB_STATE_SILENT_FAIL, STUB_PR_MISSING
 # and STUB_STATE_FAIL_ONCE, a marker path the first lookup of a run creates;
 # the branch-rule reads' failures through STUB_RULES_EXIT and
-# STUB_BRANCH_EXIT). STUB_POST_GRAPHQL_PARTIAL makes the post-merge read a
-# GraphQL 200 carrying an errors array beside data, and STUB_POST_VIEW_FAIL
-# fails its pr-view fallback. STUB_BASE_OID is the base end of the pull
-# request's range, whose head end is STUB_HEAD, and STUB_RANGE_FAIL fails that
+# STUB_BRANCH_EXIT; a ruleset read's answer through STUB_RULESET_JSON_<id>,
+# per ruleset id, and its failure through STUB_RULESET_EXIT). STUB_POST_GRAPHQL_PARTIAL makes the
+# post-merge read a GraphQL 200 carrying an errors array beside data, and
+# STUB_POST_VIEW_FAIL fails its pr-view fallback. STUB_BASE_OID is the base end of the pull
+# request's range, whose head end is STUB_RANGE_HEAD where set, else
+# STUB_HEAD, and STUB_RANGE_FAIL fails that
 # read. STUB_REVIEW_DECISION and STUB_REVIEW_LATEST are the readiness check's
 # reviewDecision and latestReviews, and STUB_REQUIRE_TOKEN refuses a
 # merge-path call without the bot token. The repository read answers
 # STUB_MERGE_METHODS, STUB_DELETE_BRANCH_ON_MERGE, STUB_DEFAULT_BRANCH and
 # STUB_REPO_PUSHLESS, or fails on STUB_REPO_EXIT; the branch-rule read adds
 # STUB_QUEUE_METHOD's queue on STUB_QUEUE_BRANCH and STUB_RULE_METHODS's
-# pull_request rule; STUB_NO_REPO fails `repo view`.
+# pull_request rule; STUB_NO_REPO fails `repo view`. A merge call passing
+# neither --auto nor --admin on a base holding a merge_queue rule (in
+# STUB_GATE_RULES, or STUB_QUEUE_METHOD's on STUB_BASE) is refused as GitHub
+# refuses it: gh warns and exits 0, and where STUB_MERGE_REFUSED names a
+# file, the refusal creates it and every later post-merge read answers the
+# PR open, unqueued and unarmed.
 # Sourced, never run — CI's suite glob picks up skills/*/tests/*.sh only, so
 # this file lives one level down.
 #
@@ -73,6 +80,10 @@ if [[ -n "${STUB_CALL_LOG:-}" ]]; then
     printf '%s\n' "$*" >>"$STUB_CALL_LOG"
 fi
 [[ -z "${STUB_AUTH_LOG:-}" ]] || printf 'GH=%s|GITHUB=%s|%s\n' "${GH_TOKEN-<unset>}" "${GITHUB_TOKEN-<unset>}" "$*" >>"$STUB_AUTH_LOG"
+# A refused merge changed nothing, whatever outcome the row's world set.
+if [[ -n "${STUB_MERGE_REFUSED:-}" && -f "$STUB_MERGE_REFUSED" ]]; then
+    unset STUB_POST_STATE STUB_POST_AUTO_JSON STUB_POST_IN_QUEUE STUB_POST_QUEUE_ENTRY_JSON STUB_POST_QUEUE_STATE STUB_MERGE_COMMIT
+fi
 
 case "${1:-}" in
     auth)
@@ -103,7 +114,7 @@ case "${1:-}" in
         # A slash after branches/ is an unencoded branch name: no answer.
         rules='[{"type":"required_status_checks"},{"type":"pull_request","parameters":{"required_approving_review_count":1,"required_review_thread_resolution":true,"dismiss_stale_reviews_on_push":true}}]'
         [[ -z "${STUB_GATE_RULES:-}" ]] || rules="$STUB_GATE_RULES"
-        classic='{"protection":{"required_status_checks":{"contexts":[],"checks":[]}}}'
+        classic='{"protection":{"enabled":false,"required_status_checks":{"contexts":[],"checks":[]}}}'
         [[ -z "${STUB_CLASSIC_JSON:-}" ]] || classic="$STUB_CLASSIC_JSON"
         jq_filter=""
         prev=""
@@ -127,6 +138,24 @@ case "${1:-}" in
                 exit 0
                 ;;
             'repos/{owner}/{repo}/rules/branches/'*/* | 'repos/{owner}/{repo}/branches/'*/*) ;;
+            # A ruleset the merge route reads for current_user_can_bypass.
+            'repos/{owner}/{repo}/rulesets/'*)
+                if [[ "${STUB_RULESET_EXIT:-0}" != "0" ]]; then
+                    echo "gh: Not Found (HTTP 404)" >&2
+                    exit "$STUB_RULESET_EXIT"
+                fi
+                # The bypass answer is the caller's own, so it is read with
+                # the merge's token or not at all.
+                if [[ "${STUB_REQUIRE_TOKEN:-false}" == "true" && "${GH_TOKEN:-}" != "ghp_test_token" ]]; then
+                    echo "missing effective token for the ruleset read" >&2
+                    exit 41
+                fi
+                ruleset_var="STUB_RULESET_JSON_${2##*/}"
+                ruleset='{}'
+                [[ -z "${!ruleset_var:-}" ]] || ruleset="${!ruleset_var}"
+                jq -r "$jq_filter" <<<"$ruleset"
+                exit 0
+                ;;
             # The repository, by gh's placeholder or by the slug `repo view`
             # answers: the allowed merge methods are STUB_MERGE_METHODS, and
             # STUB_REPO_PUSHLESS drops every setting GitHub withholds from a
@@ -165,13 +194,14 @@ case "${1:-}" in
                 exit 0
                 ;;
             # The required-context read takes the whole branch object and
-            # filters in-shell.
+            # filters in-shell; the merge route's classic-protection read
+            # filters with --jq.
             'repos/{owner}/{repo}/branches/'*)
                 if [[ "${STUB_BRANCH_EXIT:-0}" != "0" ]]; then
                     echo "gh: Not Found (HTTP 404)" >&2
                     exit "$STUB_BRANCH_EXIT"
                 fi
-                printf '%s\n' "$classic"
+                if [[ -n "$jq_filter" ]]; then jq -r "$jq_filter" <<<"$classic"; else printf '%s\n' "$classic"; fi
                 exit 0
                 ;;
         esac
@@ -242,15 +272,15 @@ case "${1:-}" in
                         '{state:$state,mergedAt:(if $merged_at == "" then null else $merged_at end)}'
                     exit 0
                 fi
-                # The pull request's range, read only by --admin. Matched
-                # before the headRefOid handler, whose pattern this one
-                # contains.
+                # The pull request's range, read only by the merge route.
+                # Matched before the headRefOid handler, whose pattern this
+                # one contains.
                 if [[ "$*" == *"--json baseRefOid,headRefOid"* ]]; then
                     if [[ "${STUB_RANGE_FAIL:-false}" == "true" ]]; then
                         echo "could not read the pull request endpoints" >&2
                         exit 1
                     fi
-                    jq -cn --arg b "${STUB_BASE_OID-base-oid}" --arg h "${STUB_HEAD:-test-head}" \
+                    jq -cn --arg b "${STUB_BASE_OID-base-oid}" --arg h "${STUB_RANGE_HEAD:-${STUB_HEAD:-test-head}}" \
                         '{baseRefOid:(if $b == "" then null else $b end),headRefOid:$h}'
                     exit 0
                 fi
@@ -313,6 +343,19 @@ case "${1:-}" in
                 if [[ "${STUB_MERGE_EXIT:-0}" != "0" ]]; then
                     printf '%s\n' "${STUB_MERGE_STDERR:-failed to run merge}" >&2
                     exit "${STUB_MERGE_EXIT}"
+                fi
+                if [[ " $* " != *" --auto "* && " $* " != *" --admin "* ]]; then
+                    queue_base=false
+                    if [[ -n "${STUB_QUEUE_METHOD:-}" && "${STUB_BASE:-main}" == "${STUB_QUEUE_BRANCH:-main}" ]]; then
+                        queue_base=true
+                    elif jq -e 'any(.[]; .type == "merge_queue")' <<<"${STUB_GATE_RULES:-[]}" >/dev/null; then
+                        queue_base=true
+                    fi
+                    if [[ "$queue_base" == true ]]; then
+                        [[ -z "${STUB_MERGE_REFUSED:-}" ]] || : >"$STUB_MERGE_REFUSED"
+                        echo "! The merge strategy for ${STUB_BASE:-main} is set by the merge queue" >&2
+                        exit 0
+                    fi
                 fi
                 echo "merge command accepted"
                 exit 0
