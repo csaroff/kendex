@@ -2,6 +2,10 @@
 
 ## Consumer-impacting changes
 
+### Unreleased
+
+- `tests/pi-contract.test.ts` compares literal `pi.on` events and dotted `pi`/`ctx` accesses with the Pi compatibility audit inventory. Missing or extra entries for these uses fail the tests, so an omitted literal hook event cannot hide a blocking Pi update. Named package exports remain manual, as [DEVELOPMENT.md](DEVELOPMENT.md) documents.
+
 ### 0.17.0
 
 - The native session-start drift check sends its `kendex-drift` message only to the lead session. A child started by pi-agents-tmux no longer receives that message, which can pull it away from its delegated task. Registered `SessionStart` hook output (`kendex-hook`) remains unchanged.
