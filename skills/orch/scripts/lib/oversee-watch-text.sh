@@ -277,10 +277,11 @@ The long pass's events, checked and reported in this order:
   EVENT window-gone <lane>   the tmux window no longer exists. Nothing follows
                              the line: the remedy is one relaunch, which
                              reads the item's worktree and PR, not a screen
-  EVENT lane-exited <lane>   `pgrep -P` reports no child under a bare shell on
-                             two passes; the lane's closing lines follow. An
-                             unusable probe is not an answer and keeps the
-                             lane watched
+  EVENT lane-exited <lane>   childless local shell on two consecutive passes, or
+                             provider exit now despite live SSH, for a listed
+                             hosted lane whose running record names the harness.
+                             Closing lines follow. Failed provider reads stay
+                             unjudged; unusable local probes keep the lane watched
   EVENT lane-closed <item>   under a lane-exited whose window watches a --hosted
                              item already reported merged, once the pass finds
                              its worktree gone: `lane-close` succeeded; the

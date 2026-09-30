@@ -99,7 +99,7 @@ create)
   fi
   printf '%s\\n' "$path" ;;
 exists) if [[ -d "$path" ]]; then printf 'true\\n'; else printf 'false\\n'; fi ;;
-path) printf '%s\\n' "$path" ;;
+path) if [[ -d "$path" ]]; then printf '%s\\n' "$path"; else printf '%s\\n' "$PWD/configured-$2"; fi ;;
 remove)
   if [[ -n "${SSH_TEST_CLOSE_STDOUT:-}" ]]; then
     printf 'before-delete:%s\\n' "$(cat -- "$SSH_TEST_CLOSE_STDOUT")" >> "$SSH_TEST_LOG"
@@ -692,6 +692,82 @@ exec "$REAL_CAT" "$@"
         self.assertTrue(closed.stdout.startswith(b"kept="), closed.stdout)
         self.assertTrue(Path(self.row["clone"]).exists())
         self.assertFalse(Path(self.row["clone"] + "-worktree").exists())
+        self.assertEqual(self.call("list").stdout, b"owner/repo/TEST-1\tavailable\t-\tlane.example\n")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "provider stop integration requires procfs")
+    def test_status_reads_the_owned_harness_and_refuses_failed_reads(self):
+        self.assertEqual(self.create().returncode, 0)
+        shutil.copy2(shutil.which("bash"), self.bin / "claude")
+        lane = subprocess.Popen([str(self.bin / "claude"), "-c", "printf 'ready\\n'; read -r line"],
+                                cwd=Path(self.row["clone"] + "-worktree"), env=self.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        try:
+            self.assertEqual(lane.stdout.readline(), b"ready\n")
+            for harness, expected in (("claude", b"running\n"), ("codex", b"exited\n")):
+                with self.subTest(harness=harness):
+                    result = self.call("status", "--item", "TEST-1", "--harness", harness)
+                    self.assertEqual((result.returncode, result.stdout, lane.poll()), (0, expected, None), result.stderr)
+            original = self.script.read_text()
+            rule = 'if test -n "$LANE_OWNED_PROCESS_PIDS"; then printf'
+            self.assertEqual(original.count(rule), 1)
+            self.script.write_text(original.replace(rule, rule.replace("test -n", "test -z")))
+            self.assertNotEqual(self.call("status", "--item", "TEST-1", "--harness", "claude").stdout, b"running\n")
+            self.script.write_text(original)
+        finally:
+            lane.stdin.close()
+            lane.stdout.close()
+            lane.wait(timeout=2)
+        self.assertEqual(self.call("status", "--item", "TEST-1", "--harness", "claude").stdout, b"exited\n")
+        library = Path(self.row["clone"]) / ".agents/skills/orch/scripts/lib/lane-state.sh"
+        library.write_text(library.read_text() + '\nlane_owned_processes() { return 2; }\n')
+        for env in ({}, {"SSH_TEST_FAIL": "7"}):
+            result = self.call("status", "--item", "TEST-1", "--harness", "claude", **env)
+            self.assertEqual((result.returncode != 0, result.stdout), (True, b""), (env, result.stderr))
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "deleted cwd integration requires procfs")
+    def test_status_follows_the_launch_root_through_merge_cleanup(self):
+        self.assertEqual(self.create().returncode, 0)
+        clone = Path(self.row["clone"])
+        worktree = Path(self.row["clone"] + "-worktree")
+        shutil.copy2(shutil.which("bash"), self.bin / "claude")
+        lane = subprocess.Popen([str(self.bin / "claude"), "-c", "printf 'ready\\n'; read -r line"],
+                                cwd=worktree, env=self.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        library = clone / ".agents/skills/orch/scripts/lib/lane-state.sh"
+        original = library.read_text()
+        try:
+            self.assertEqual(lane.stdout.readline(), b"ready\n")
+            # merge-pr removes the registered tree before its harness exits.
+            subprocess.run([self.env["REAL_GIT"], "-C", str(clone), "worktree", "remove", "--force", str(worktree)],
+                           check=True, capture_output=True, env=self.env)
+            result = self.call("status", "--item", "TEST-1", "--harness", "claude")
+            self.assertEqual((result.returncode, result.stdout, lane.poll()), (0, b"running\n", None), result.stderr)
+            controls = (
+                ('launch-record) root="$1";', 'launch-record) root="$(cd -- "$1" && pwd -P)" || return 2;'),
+                ('"$cwd" == "$root (deleted)"', '"$cwd" == "$root"'),
+            )
+            for old, new in controls:
+                self.assertEqual(original.count(old), 1)
+                library.write_text(original.replace(old, new))
+                mutant = self.call("status", "--item", "TEST-1", "--harness", "claude")
+                self.assertNotEqual((mutant.returncode, mutant.stdout), (0, b"running\n"), mutant.stderr)
+            for failure in ('lane_process_table() { return 1; }', 'lane_process_cwd() { return 1; }'):
+                library.write_text(original + '\n' + failure + '\n')
+                failed = self.call("status", "--item", "TEST-1", "--harness", "claude")
+                self.assertEqual((failed.returncode, failed.stdout), (1, b""), failed.stderr)
+            library.write_text(original)
+        finally:
+            library.write_text(original)
+            lane.stdin.close()
+            lane.stdout.close()
+            lane.wait(timeout=2)
+        exited = self.call("status", "--item", "TEST-1", "--harness", "claude")
+        self.assertEqual((exited.returncode, exited.stdout), (0, b"exited\n"), exited.stderr)
+        marker = clone / ".git/lane-mail/test-1"
+        marker.unlink()
+        unknown = self.call("status", "--item", "TEST-1", "--harness", "claude")
+        self.assertEqual((unknown.returncode, unknown.stdout), (1, b""), unknown.stderr)
+        marker.write_text(str(worktree) + '\n')
+        closed = self.call("close", "--item", "TEST-1", "--merged")
+        self.assertEqual(closed.returncode, 0, closed.stderr)
         self.assertEqual(self.call("list").stdout, b"owner/repo/TEST-1\tavailable\t-\tlane.example\n")
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "provider stop integration requires procfs")
