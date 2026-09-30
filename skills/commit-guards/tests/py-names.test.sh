@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Pins for scripts/py-names: a staged Python script holding an undefined name
 # or a syntax error is refused at its path and line, and a clean one is judged
-# and passes. A row
+# and passes; a scope that selects no Python file passes at its no-match line
+# without reading the render inventory, and a render the inventory lists is
+# excluded even when it is the path that triggers the read. A row
 # stages CONTENT as script.py in a fresh repository, runs the lane with
 # --staged, and pins the exit status with the first stable line printed.
 set -euo pipefail
@@ -44,6 +46,45 @@ for row in \
   printf '%b' "$content" >"$r/script.py"
   git -C "$r" add script.py
   assert_eq "$label" "$expect" "$(run "$r")"
+done
+
+echo "=== the render inventory is read at the first Python path selected, and judges that path too ==="
+# Each row's repository commits a script, then holds a render inventory and
+# stages a settings change and, where the row names one, a second Python file
+# with its content. The control rows' inventory the loader refuses at entry
+# shape, so a lane that read it exits 2. The render row's inventory lists the
+# one Python file it stages, which holds an undefined name: that file is the
+# path that triggers the read, and a lane that did not judge it against the
+# inventory it just read would refuse it. The batch hands the lane each of
+# these scopes.
+ROW=0
+for row in \
+  "a staged change with no Python file skips at its no-match line|--staged|[1]|-||rc=0 py-names: no-match=staged:*.py" \
+  "a range with no Python file skips at its no-match line|--against HEAD|[1]|-||rc=0 py-names: no-match=against:*.py" \
+  "control: a staged Python file reads the inventory, which refuses at entry shape|--staged|[1]|script.py|x = 1\n|rc=2 py-names: inventory-status=21" \
+  "control: the whole tree selects the committed script, and the inventory refuses|--all|[1]|-||rc=2 py-names: inventory-status=21" \
+  "a render the inventory lists, the first Python path selected, is excluded though it holds an undefined name|--staged|[\"render.py\"]|render.py|print(undefined_x)\n|rc=0 py-names: summary=violations=0 files=0 scope=staged skipped=0"; do
+  IFS='|' read -r label scope inventory py content expect <<<"$row"
+  ROW=$((ROW + 1))
+  r="$TMP/scope-$ROW"
+  git -c init.defaultBranch=main init -q "$r"
+  git -C "$r" config user.email test@example.com
+  git -C "$r" config user.name test
+  printf 'print(1)\n' >"$r/committed.py"
+  git -C "$r" add committed.py
+  git -C "$r" commit -qm 'feat: seed'
+  printf '%s\n' "$inventory" >"$r/.kendex-generated.json"
+  printf '[env]\nREVIEW_MAX_CYCLES = "1"\n' >"$r/kendex.settings.toml"
+  git -C "$r" add .kendex-generated.json kendex.settings.toml
+  if [ "$py" != - ]; then
+    printf '%b' "$content" >"$r/$py"
+    git -C "$r" add "$py"
+  fi
+  rc=0
+  # $scope is a flag and, for a range, its ref.
+  # shellcheck disable=SC2086
+  out="$(cd "$r" && "$PY_NAMES" $scope 2>&1)" || rc=$?
+  assert_eq "$label" "$expect" "rc=$rc $(printf '%s\n' "$out" | LC_ALL=C awk '/^py-names: [a-z-]+=/ && !seen { print; seen=1 }')"
 done
 
 echo "=== with neither tool reachable the lane refuses and names the CI remedy ==="
