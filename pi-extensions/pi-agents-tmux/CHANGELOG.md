@@ -2,9 +2,10 @@
 
 ## Consumer-impacting changes
 
-### Unreleased
+### 3.2.2
 
 - Completion polling and task updates reuse the dashboard's cached task registry. Local writes update the cache, so sequential child usage writes and the next completion poll do not reread registry content. External registry changes apply on the next poll or update. The cache holds only the most recent runtime and clears when a session ends.
+- Tool-call previews read agent definitions from memory instead of reading files while Pi draws them. File checks update the cached definitions outside rendering, so previews use changed agent files after the next check.
 
 ### 3.2.1
 
