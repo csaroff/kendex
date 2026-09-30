@@ -2,8 +2,11 @@
 // a pass-through theme, record and item builders, the settings writers and
 // an observer that reads a rendered pane back as `label=value` pairs.
 // Nothing here plants a defect; a row that needs one builds it inline.
+import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import { spyOn } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { AgentConfig } from "../extensions/subagent/agents.js";
 import type { AgentBrowserUiState, AgentPaneStatus, PaneTaskRecord, SubagentDashboardItem } from "../extensions/subagent/types.js";
 import { tempRuntime } from "./single-agent-fixture.js";
@@ -12,6 +15,127 @@ import { clearPackageConfigCache } from "../extensions/subagent/package-config.j
 export { cleanupTempRuntimes, tempRuntime, writeSettings } from "./single-agent-fixture.js";
 
 export const ABSENT = "ABSENT";
+
+/** Count synchronous filesystem work during a warmed renderer call. */
+export function filesystemCalls(run: () => void): number[] {
+	const spies = [
+		spyOn(fs, "readFileSync"), spyOn(fs, "readdirSync"), spyOn(fs, "statSync"),
+		spyOn(fs, "realpathSync"), spyOn(fs, "existsSync"),
+	];
+	try {
+		run();
+		return spies.map((spy) => spy.mock.calls.length);
+	} finally {
+		for (const spy of spies) spy.mockRestore();
+	}
+}
+
+/** Load a disposable production edit with the real package's modules and dependencies. */
+export async function importRuntimeCopy(fileName: string, before: string, after: string): Promise<unknown> {
+	const runtimeDir = resolve(import.meta.dir, "../extensions/subagent");
+	const original = fs.readFileSync(join(runtimeDir, fileName), "utf8");
+	assert.equal(original.split(before).length - 1, 1, "control must edit exactly one production behavior");
+	const modified = original.replace(before, after);
+	assert.notEqual(modified, original);
+	const source = modified.replace(/from "\.\/([^\"]+)\.js"/g, (_match, name: string) => `from ${JSON.stringify(join(runtimeDir, `${name}.ts`))}`);
+	const copyDir = tempRuntime();
+	// Bare imports resolve from the copy, outside the package's dependency tree.
+	fs.symlinkSync(resolve(import.meta.dir, "../node_modules"), join(copyDir, "node_modules"), "dir");
+	const copy = join(copyDir, fileName);
+	writeFileSync(copy, source);
+	return import(copy);
+}
+
+/** Deliver Node's file-check notification without waiting for its polling clock. */
+export function notifyFileCheck(watch: { mock: { calls: unknown[][] } }, filePath: string): void {
+	const call = watch.mock.calls.find((args) => String(args[0]) === filePath);
+	assert.ok(call, `file check missing: ${filePath}`);
+	const listener = call.at(-1);
+	assert.equal(typeof listener, "function");
+	const stat = fs.existsSync(filePath) ? fs.statSync(filePath) : new fs.Stats();
+	(listener as (current: fs.Stats, previous: fs.Stats) => void)(stat, stat);
+}
+
+/** Model kendex's bulk WriteFile agent updates without waiting for Node's polling clock. */
+export function assertBulkDiscoveryUpdate(runtime: Pick<typeof import("../extensions/subagent/agents.js"), "discoverAgents" | "cachedAgentDiscovery">, combinations: number): void {
+	withTempPiUserDir(() => {
+		const roots = Array.from({ length: combinations }, () => tempRuntime());
+		const names = Array.from({ length: 17 }, (_, index) => `agent-${index}`);
+		const watch = spyOn(fs, "watchFile");
+		try {
+			for (const cwd of roots) {
+				for (const name of names) writeProjectAgent(cwd, name, ["pane: false"]);
+				runtime.discoverAgents(cwd, "both");
+				for (const name of names) writeProjectAgent(cwd, name, ["pane: true", "allowed-subagents: scout"]);
+			}
+			const calls = filesystemCalls(() => {
+				for (const cwd of roots) {
+					for (const name of names) notifyFileCheck(watch, join(cwd, `.pi/agents/${name}.md`));
+				}
+			});
+			assert.equal(calls[0], names.length * roots.length, "each changed file is read once");
+			assert.equal(calls[1], 0, "listed-file notifications must not scan directories");
+			// notifyFileCheck takes one stat; discovery may take only the changed file's stat.
+			assert.equal(calls[2], 2 * names.length * roots.length, "unchanged files must not be checked again");
+			for (const cwd of roots) {
+				const agents = runtime.cachedAgentDiscovery(cwd, "project")?.agents;
+				assert.equal(agents?.length, names.length);
+				assert.deepEqual(agents?.map(({ name, pane, allowedSubagents }) => ({ name, pane, allowedSubagents })),
+					names.toSorted().map((name) => ({ name, pane: true, allowedSubagents: ["scout"] })));
+			}
+		} finally {
+			for (const check of watch.mock.calls) {
+				fs.unwatchFile(check[0] as string, check.at(-1) as (current: fs.Stats, previous: fs.Stats) => void);
+			}
+			watch.mockRestore();
+		}
+	});
+}
+
+/** Exercise inventory identity and release of every evicted path/listener pair. */
+export function assertDiscoveryEviction(runtime: Pick<typeof import("../extensions/subagent/agents.js"), "discoverAgents" | "cachedAgentDiscovery">): void {
+	withTempPiUserDir(() => {
+		const roots = Array.from({ length: 9 }, () => tempRuntime());
+		const watch = spyOn(fs, "watchFile");
+		const unwatch = spyOn(fs, "unwatchFile");
+		const inventory = (index: number) => [
+			{ name: `local-${index}`, filePath: join(roots[index]!, `.pi/agents/local-${index}.md`) },
+			{ name: "scout", filePath: join(roots[index]!, ".pi/agents/scout.md") },
+		];
+		const readInventory = (index: number) => runtime.cachedAgentDiscovery(roots[index]!, "project")?.agents
+			.map(({ name, filePath }) => ({ name, filePath }));
+		let evictedChecks: unknown[][] = [];
+		try {
+			for (const [index, cwd] of roots.entries()) {
+				writeProjectAgent(cwd, "scout");
+				writeProjectAgent(cwd, `local-${index}`);
+				const start = watch.mock.calls.length;
+				const discovery = runtime.discoverAgents(cwd, "project");
+				assert.deepEqual(discovery.agents.map(({ name, filePath }) => ({ name, filePath })), inventory(index));
+				if (index === 1) evictedChecks = watch.mock.calls.slice(start);
+				if (index === 7) assert.deepEqual(readInventory(0), inventory(0));
+			}
+			assert.deepEqual(readInventory(0), inventory(0));
+			assert.deepEqual(readInventory(8), inventory(8));
+			assert.equal(runtime.cachedAgentDiscovery(roots[1]!, "project"), undefined);
+			// The captured subscriptions include present directories and absent candidates.
+			for (const relative of [".pi/agents/scout.md", ".pi/agents", ".claude/agents"]) {
+				assert.ok(evictedChecks.some((args) => args[0] === join(roots[1]!, relative)));
+			}
+			for (const check of evictedChecks) {
+				assert.ok(unwatch.mock.calls.some((args) => args[0] === check[0] && args[1] === check.at(-1)),
+					`evicted subscription still registered: ${check[0]}`);
+			}
+		} finally {
+			// Controls can retain subscriptions; release those too before deleting their files.
+			for (const check of watch.mock.calls) {
+				fs.unwatchFile(check[0] as string, check.at(-1) as (current: fs.Stats, previous: fs.Stats) => void);
+			}
+			watch.mockRestore();
+			unwatch.mockRestore();
+		}
+	});
+}
 
 export const theme = {
 	bg: (_tone: string, text: string) => text,
