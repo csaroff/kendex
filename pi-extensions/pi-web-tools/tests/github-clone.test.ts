@@ -1,26 +1,54 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { join, posix, win32 } from "node:path";
 import test from "node:test";
-import { cloneOrUpdateRepo, readBlobFromCache, readReadmeFromCache, readTreeFromCache, summarizeTreeEntries } from "../src/extract/github-clone.js";
-import { isolateEnvironment, tempDir } from "./fixtures.js";
+import { cloneOrUpdateRepo, isInside, readBlobFromCache, readReadmeFromCache, readTreeFromCache, summarizeTreeEntries } from "../src/extract/github-clone.js";
+import type { UrlReads } from "../src/extract/byte-budget.js";
+import { githubFixtureRepo, tempDir, urlReads } from "./fixtures.js";
 
 for (const row of [
-	{ name: "blob", read: (repo: string) => readBlobFromCache(repo, "src/index.ts"), expected: { content: "export const x = 1;\n", bytes: 20 } },
-	{ name: "traversal", read: (repo: string) => readBlobFromCache(repo, "../outside.txt"), expected: null },
-	{ name: "tree excludes Git state", read: (repo: string) => readTreeFromCache(repo, "")?.entries.map((entry) => entry.name), expected: ["src", "README.md"] },
-	{ name: "README", read: (repo: string) => readReadmeFromCache(repo), expected: "# Hello\n\nbody" },
+	{ name: "blob", read: (repo: string, reads: UrlReads) => readBlobFromCache(repo, "src/index.ts", reads), expected: { content: "export const x = 1;\n", bytes: 20 } },
+	{ name: "blob over the call budget", budget: 6, read: (repo: string, reads: UrlReads) => readBlobFromCache(repo, "src/index.ts", reads), expected: { content: "export", bytes: 20, cut: { atBytes: 6, by: "call-budget" } } },
+	{ name: "missing blob", read: (repo: string, reads: UrlReads) => readBlobFromCache(repo, "src/absent.ts", reads), expected: null },
+	{ name: "directory as blob", read: (repo: string, reads: UrlReads) => readBlobFromCache(repo, "src", reads), expected: null },
+	{ name: "traversal", read: (repo: string, reads: UrlReads) => readBlobFromCache(repo, "../outside.txt", reads), expected: null },
+	{ name: "symlinked file outside the cache", read: (repo: string, reads: UrlReads) => readBlobFromCache(repo, "src/escape.txt", reads), expected: null },
+	{ name: "symlinked README outside the cache", read: (repo: string, reads: UrlReads) => readReadmeFromCache(join(repo, "src"), reads), expected: null },
+	{ name: "symlinked file inside the cache", read: (repo: string, reads: UrlReads) => readBlobFromCache(repo, "src/alias.ts", reads), expected: { content: "export const x = 1;\n", bytes: 20 } },
+	{ name: "tree excludes Git state", read: async (repo: string) => (await readTreeFromCache(repo, ""))?.entries.map((entry) => entry.name), expected: ["src", "outer", "README.md"] },
+	{ name: "symlinked directory outside the cache", read: (repo: string) => readTreeFromCache(repo, "outer"), expected: null },
+	{ name: "README", read: (repo: string, reads: UrlReads) => readReadmeFromCache(repo, reads), expected: { content: "# Hello\n\nbody", bytes: 13 } },
 ]) {
-	test(`GitHub cache: ${row.name}`, (t) => {
+	test(`GitHub cache: ${row.name}`, async (t) => {
 		const root = tempDir(t);
 		const repo = join(root, "repo");
 		mkdirSync(join(repo, "src"), { recursive: true });
 		mkdirSync(join(repo, ".git"));
+		mkdirSync(join(root, "outside"));
 		writeFileSync(join(repo, "README.md"), "# Hello\n\nbody");
 		writeFileSync(join(repo, "src", "index.ts"), "export const x = 1;\n");
-		if (row.name === "traversal") writeFileSync(join(root, "outside.txt"), "outside");
-		assert.deepEqual(row.read(repo), row.expected);
+		writeFileSync(join(root, "outside.txt"), "outside");
+		writeFileSync(join(root, "outside", "secret.txt"), "secret");
+		symlinkSync(join(root, "outside.txt"), join(repo, "src", "escape.txt"));
+		symlinkSync(join(root, "outside.txt"), join(repo, "src", "README.md"));
+		symlinkSync(join(repo, "src", "index.ts"), join(repo, "src", "alias.ts"));
+		symlinkSync(join(root, "outside"), join(repo, "outer"));
+		assert.deepEqual(await row.read(repo, urlReads(t, row.budget)), row.expected);
+	});
+}
+
+// The symlink rows above run on POSIX only; a target on another Windows drive or UNC share is reachable only through win32 rules.
+for (const row of [
+	{ name: "POSIX file under the cache", paths: posix, parent: "/cache", child: "/cache/src/a.ts", expected: true },
+	{ name: "POSIX sibling of the cache", paths: posix, parent: "/cache", child: "/other/a.ts", expected: false },
+	{ name: "POSIX cache root itself", paths: posix, parent: "/cache", child: "/cache", expected: false },
+	{ name: "Windows file under the cache", paths: win32, parent: "C:\\cache", child: "C:\\cache\\src\\a.ts", expected: true },
+	{ name: "Windows sibling on the same drive", paths: win32, parent: "C:\\cache", child: "C:\\other\\a.ts", expected: false },
+	{ name: "Windows target on another drive", paths: win32, parent: "C:\\cache", child: "D:\\secret.txt", expected: false },
+	{ name: "Windows target on a UNC share", paths: win32, parent: "C:\\cache", child: "\\\\server\\share\\secret.txt", expected: false },
+]) {
+	test(`GitHub cache containment: ${row.name}`, () => {
+		assert.equal(isInside(row.paths, row.parent, row.child), row.expected);
 	});
 }
 
@@ -30,25 +58,9 @@ test("GitHub tree summary retains paths, size, and truncation marker", () => {
 });
 
 test("cloneOrUpdateRepo clones the local fixture through its GitHub URL", async (t) => {
-	isolateEnvironment(t, [...Object.keys(process.env).filter((key) => key.startsWith("GIT_")), "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"]);
-	const root = tempDir(t);
-	const source = join(root, "source");
-	const cache = join(root, "cache");
-	const config = join(root, "gitconfig");
-	process.env.GIT_CONFIG_GLOBAL = config;
-	process.env.GIT_CONFIG_NOSYSTEM = "1";
-	process.env.GIT_CONFIG_COUNT = "1";
-	process.env.GIT_CONFIG_KEY_0 = "core.hooksPath";
-	process.env.GIT_CONFIG_VALUE_0 = join(root, "no-hooks");
-	const git = (...args: string[]) => execFileSync("git", args, { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
-	git("init", "-q", "--initial-branch=main", source);
-	writeFileSync(join(source, "README.md"), "# Source repo\n");
-	git("-C", source, "add", "README.md");
-	git("-C", source, "-c", "user.email=test@example.com", "-c", "user.name=Test", "-c", "commit.gpgSign=false", "commit", "-q", "-m", "init");
-	const head = git("-C", source, "rev-parse", "HEAD");
-	git("config", "--file", config, `url.${source}.insteadOf`, "https://github.com/fixture/repo.git");
+	const { cache, head } = githubFixtureRepo(t, { "README.md": "# Source repo\n" });
 	const result = await cloneOrUpdateRepo("fixture", "repo", undefined, { cacheDir: cache });
-	assert.deepEqual({ ...result, readme: readBlobFromCache(result.cachePath, "README.md")?.content }, {
+	assert.deepEqual({ ...result, readme: (await readBlobFromCache(result.cachePath, "README.md", urlReads(t)))?.content }, {
 		cachePath: join(cache, "fixture__repo"), headRef: head, cloned: true, updated: false, readme: "# Source repo\n",
 	});
 });

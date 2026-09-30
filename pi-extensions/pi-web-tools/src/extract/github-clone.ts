@@ -1,7 +1,9 @@
 import { execFile, execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
-import { dirname, join, normalize, relative, resolve } from "node:path";
+import { existsSync, mkdirSync, rmSync, statSync } from "node:fs";
+import { readdir, realpath, stat } from "node:fs/promises";
+import nativePath, { join, relative, type PlatformPath } from "node:path";
 import { promisify } from "node:util";
+import { TEXT_READ_BYTE_LIMIT, type BoundedRead, type UrlReads } from "./byte-budget.js";
 
 import { piUserDir } from "../package-config.js";
 
@@ -28,9 +30,11 @@ function repoCachePath(cacheDir: string, owner: string, repo: string): string {
 	return join(cacheDir, `${owner}__${repo}`);
 }
 
-function isInside(parent: string, child: string): boolean {
-	const rel = relative(resolve(parent), resolve(child));
-	return Boolean(rel) && !rel.startsWith("..") && !rel.startsWith("/");
+/** Whether `child` lies strictly under `parent` by the rules of `paths`. On Windows `relative` returns the target itself
+ * for another drive or a UNC share, an absolute path that no `..` prefix marks. */
+export function isInside(paths: PlatformPath, parent: string, child: string): boolean {
+	const rel = paths.relative(paths.resolve(parent), paths.resolve(child));
+	return Boolean(rel) && !rel.startsWith("..") && !paths.isAbsolute(rel);
 }
 
 async function runGit(args: string[], cwd: string | undefined, timeoutMs: number): Promise<string> {
@@ -71,43 +75,58 @@ export async function cloneOrUpdateRepo(owner: string, repo: string, ref: string
 	return { cachePath: targetPath, headRef, cloned: false, updated };
 }
 
-export function readBlobFromCache(cachePath: string, path: string): { content: string; bytes: number } | null {
-	const target = normalize(join(cachePath, path));
-	if (!isInside(cachePath, target)) return null;
-	if (!existsSync(target)) return null;
-	const info = statSync(target);
-	if (!info.isFile()) return null;
-	const content = readFileSync(target, "utf8");
-	return { content, bytes: info.size };
+export interface CachedBlob {
+	content: string;
+	/** The file's size on disk. */
+	bytes: number;
+	/** Where the read was cut and by which ceiling; absent when the file was read whole. */
+	cut?: BoundedRead["cut"];
+}
+
+function isMissing(error: unknown): boolean {
+	const code = (error as NodeJS.ErrnoException | undefined)?.code;
+	return code === "ENOENT" || code === "ENOTDIR";
+}
+
+/** The canonical path of `path` under the clone cache with every symlink resolved, or null when it is missing or resolves
+ * outside the cache, so a committed symlink cannot reach a file or directory beyond it. */
+async function resolveInCache(cachePath: string, path: string): Promise<{ root: string; target: string } | null> {
+	const resolved = await Promise.all([realpath(cachePath), realpath(join(cachePath, path))]).catch((error: unknown) => { if (isMissing(error)) return null; throw error; });
+	if (!resolved) return null;
+	const [root, target] = resolved;
+	return target === root || isInside(nativePath, root, target) ? { root, target } : null;
+}
+
+/** Reads a file from the clone cache through `reads`, which sizes it before the read and reads at most its ceiling. */
+export async function readBlobFromCache(cachePath: string, path: string, reads: UrlReads): Promise<CachedBlob | null> {
+	const resolved = await resolveInCache(cachePath, path);
+	if (!resolved || !(await stat(resolved.target)).isFile()) return null;
+	const read = await reads.readFile(resolved.target, TEXT_READ_BYTE_LIMIT);
+	return { content: read.bytes.toString("utf8"), bytes: read.size, ...(read.cut ? { cut: read.cut } : {}) };
 }
 
 export interface CacheTreeEntry { name: string; path: string; type: "dir" | "file"; size?: number }
 
-export function readTreeFromCache(cachePath: string, path = "", limit = 200): { entries: CacheTreeEntry[]; truncated: boolean } | null {
-	const target = normalize(join(cachePath, path));
-	if (!isInside(cachePath, target) && resolve(target) !== resolve(cachePath)) return null;
-	if (!existsSync(target) || !statSync(target).isDirectory()) return null;
-	const dirEntries = readdirSync(target, { withFileTypes: true })
+export async function readTreeFromCache(cachePath: string, path = "", limit = 200): Promise<{ entries: CacheTreeEntry[]; truncated: boolean } | null> {
+	const resolved = await resolveInCache(cachePath, path);
+	if (!resolved || !(await stat(resolved.target)).isDirectory()) return null;
+	const { root, target } = resolved;
+	const dirEntries = (await readdir(target, { withFileTypes: true }))
 		.filter((entry) => entry.name !== ".git")
 		.sort((a, b) => Number(b.isDirectory()) - Number(a.isDirectory()) || a.name.localeCompare(b.name));
-	const total = dirEntries.length;
-	const entries = dirEntries.slice(0, limit).map((entry) => {
+	const entries = await Promise.all(dirEntries.slice(0, limit).map(async (entry) => {
 		const full = join(target, entry.name);
-		let size: number | undefined;
-		if (entry.isFile()) try { size = statSync(full).size; } catch { /* ignore */ }
-		const rel = relative(cachePath, full);
-		return { name: entry.name, path: rel, type: entry.isDirectory() ? "dir" : "file", size } as CacheTreeEntry;
-	});
-	return { entries, truncated: total > limit };
+		const size = entry.isFile() ? await stat(full).then((stats) => stats.size, () => undefined) : undefined;
+		return { name: entry.name, path: relative(root, full), type: entry.isDirectory() ? "dir" : "file", size } as CacheTreeEntry;
+	}));
+	return { entries, truncated: dirEntries.length > limit };
 }
 
-export function readReadmeFromCache(cachePath: string): string | null {
+export async function readReadmeFromCache(cachePath: string, reads: UrlReads): Promise<CachedBlob | null> {
 	const candidates = ["README.md", "README.MD", "Readme.md", "readme.md", "README.markdown", "README.rst", "README.txt", "README"];
 	for (const name of candidates) {
-		const path = join(cachePath, name);
-		if (existsSync(path)) {
-			try { return readFileSync(path, "utf8"); } catch { /* ignore */ }
-		}
+		const readme = await readBlobFromCache(cachePath, name, reads);
+		if (readme) return readme;
 	}
 	return null;
 }

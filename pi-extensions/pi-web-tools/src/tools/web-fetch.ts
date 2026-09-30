@@ -2,12 +2,12 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { basename, isAbsolute, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
+import { ByteBudget, ByteBudgetExhausted, readLocalPdfWithin, readPdfWithin, sourceCutNote } from "../extract/byte-budget.js";
 import { extractGitHubUrl } from "../extract/github.js";
 import { fetchHttpContent, isProbablyPdf } from "../extract/http.js";
 import { extractLocalVideo, isLocalVideoPath } from "../extract/video.js";
 import { extractYouTubeUrl, isTranscriptPrompt, parseYouTubeUrl } from "../extract/youtube.js";
-import { readFile as fsReadFile } from "node:fs/promises";
-import { fetchLocalPdfText, fetchPdfText, extractPdfTextBest } from "../extract/pdf.js";
+import { extractPdfTextBest } from "../extract/pdf.js";
 import { looksLikeScannedPdf, rasterizePdfPages, type PdfPageImage } from "../extract/pdf-pages.js";
 import { ExaClient } from "../providers/exa.js";
 import type { WebToolsSettings } from "../settings.js";
@@ -20,7 +20,7 @@ export const webFetchSchema = Type.Object({
 	urls: Type.Optional(Type.Array(Type.String())),
 	filePath: Type.Optional(Type.String({ description: "Local file path to extract. Currently supports PDFs. Relative paths resolve against ctx.cwd; leading @ is stripped." })),
 	filePaths: Type.Optional(Type.Array(Type.String({ description: "Local file paths to extract. Currently supports PDFs." }))),
-	textMaxCharacters: Type.Optional(Type.Number({ description: "Preview character cap for direct/GitHub/PDF fetches and provider extraction cap for Exa fallback/override. Direct fetches still store the full extracted text in session storage before preview truncation. Multi-URL calls otherwise cap the aggregate `content[0].text` (16 KB for 2–5 URLs, 25 KB for 6+ URLs with a manifest); passing this flag opts back into larger per-URL previews." })),
+	textMaxCharacters: Type.Optional(Type.Number({ description: "Preview character cap for direct/GitHub/PDF fetches and provider extraction cap for Exa fallback/override. Direct fetches still store the full extracted text in session storage before preview truncation; a page or file past 8 MB is cut there, a PDF past 32 MB is refused, and a URL past the call's byte budget is cut or fails. Multi-URL calls otherwise cap the aggregate `content[0].text` (16 KB for 2–5 URLs, 25 KB for 6+ URLs with a manifest); passing this flag opts back into larger per-URL previews." })),
 	provider: Type.Optional(Type.Union([Type.Literal("auto"), Type.Literal("http"), Type.Literal("exa")])),
 	prompt: Type.Optional(Type.String({ description: "Optional prompt for video/YouTube extraction. Transcript requests use native YouTube captions; other video prompts use Gemini Web/API. Ignored for non-video URLs." })),
 	videoMode: Type.Optional(Type.Union([Type.Literal("auto"), Type.Literal("transcript"), Type.Literal("understand")], { description: "YouTube handling mode. auto detects transcript requests from prompt; transcript fetches complete native captions; understand uses Gemini for audio/visual analysis." })),
@@ -325,7 +325,9 @@ export function buildWebFetchToolResult(
 	const ids = stored.map((item) => item.id).join(", ");
 	const previewBlocks = previewItems.map(({ item, text, stats }) => {
 		const label = displayTitle(item);
-		const meta = `preview ${stats.shownCharacters}/${stats.fullCharacters} chars${stats.truncated ? "; full text stored" : ""}`;
+		const cutNote = sourceCutNote(item.metadata);
+		const cut = cutNote ? `; ${cutNote}` : "";
+		const meta = `preview ${stats.shownCharacters}/${stats.fullCharacters} chars${stats.truncated ? "; full text stored" : ""}${cut}`;
 		return `- ${item.id}: ${label}\n[${meta}]\n${text}`;
 	}).join("\n\n");
 	const previewMeta = preview.truncated ? ` (${preview.shownCharacters}/${preview.fullCharacters} chars shown)` : "";
@@ -399,7 +401,7 @@ export function createWebFetchToolDefinition(pi: ExtensionAPI, getSettings: (cwd
 		renderShell: "self" as const,
 		name,
 		label: name === "web_fetch" ? "Web Fetch" : "Fetch Content",
-		description: "Fetch known URL or local PDF content and store full extracted text for get_web_content. Auto handles GitHub, PDF, HTML/text/JSON, with Exa contents fallback/override for URLs. Direct/GitHub/PDF fetches store full extracted text; the tool result is only a preview.",
+		description: "Fetch known URL or local PDF content and store full extracted text for get_web_content. Auto handles GitHub, PDF, HTML/text/JSON, with Exa contents fallback/override for URLs. Direct/GitHub/PDF fetches store full extracted text; the tool result is only a preview. A page or file past 8 MB is cut there and its preview says so; a PDF past 32 MB is refused; a URL past the call's byte budget is cut or fails with the budget named, or goes to the Exa fallback: fetch fewer URLs per call.",
 		promptSnippet: "Fetch and store known URL or local PDF content; use the returned content id with get_web_content for full stored text.",
 		parameters: webFetchSchema,
 		renderCall(args: WebFetchInput, theme: any, context: any) {
@@ -523,6 +525,7 @@ export function createWebFetchToolDefinition(pi: ExtensionAPI, getSettings: (cwd
 			if (params.provider !== "exa") {
 				const stored = [];
 				const pageImages: PdfPageImage[] = [];
+				const byteBudget = new ByteBudget();
 				const failed: Array<{ url: string; error: unknown; provider?: string; allowExaFallback: boolean }> = transcriptConflictFailures.map((failure) => ({ ...failure, allowExaFallback: false }));
 				async function handlePdfBuffer(buffer: Buffer | ArrayBuffer | Uint8Array, source: { provider: "http" | "local"; url: string; title: string; localPath?: string }) {
 					const bufferLike = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer));
@@ -552,6 +555,7 @@ export function createWebFetchToolDefinition(pi: ExtensionAPI, getSettings: (cwd
 				for (const url of list) {
 					if (transcriptConflictUrls.has(url)) continue;
 					let youtubeExtractionAttempted = false;
+					const reads = byteBudget.openUrl(signal);
 					try {
 						if (isLocalFileInput(url)) {
 							const localPath = resolveLocalFilePath(ctx.cwd, url);
@@ -561,11 +565,15 @@ export function createWebFetchToolDefinition(pi: ExtensionAPI, getSettings: (cwd
 								continue;
 							}
 							if (!isProbablyPdf(localPath)) throw new Error(`Local file extraction currently supports PDFs and videos only: ${localPath}`);
-							const buffer = await fsReadFile(localPath);
+							const buffer = await readLocalPdfWithin(localPath, reads);
 							await handlePdfBuffer(buffer, { provider: "local", url: pathToFileURL(localPath).href, title: basename(localPath), localPath });
 							continue;
 						}
-						const github = await extractGitHubUrl(url, { signal, cloneEnabled: settings.githubClone.enabled, maxRepoSizeMB: settings.githubClone.maxRepoSizeMB, cloneTimeoutSeconds: settings.githubClone.cloneTimeoutSeconds, maxAgeHours: settings.githubClone.cacheMaxAgeHours }).catch((error) => ({ error }));
+						byteBudget.assertRemaining();
+						const github = await extractGitHubUrl(url, { signal, cloneEnabled: settings.githubClone.enabled, maxRepoSizeMB: settings.githubClone.maxRepoSizeMB, cloneTimeoutSeconds: settings.githubClone.cloneTimeoutSeconds, maxAgeHours: settings.githubClone.cacheMaxAgeHours, reads }).catch((error: unknown) => {
+							if (error instanceof ByteBudgetExhausted) throw error;
+							return { error };
+						});
 						if (github && !("error" in github)) {
 							stored.push(storeWebContent(pi, { title: github.title, url, content: github.content, metadata: github.metadata }));
 							continue;
@@ -582,15 +590,17 @@ export function createWebFetchToolDefinition(pi: ExtensionAPI, getSettings: (cwd
 						if (isProbablyPdf(url)) {
 							const response = await fetch(url, { signal });
 							if (!response.ok) throw new Error(`PDF fetch failed (${response.status}) for ${url}`);
-							const buffer = await response.arrayBuffer();
+							const buffer = await readPdfWithin(response, reads, url);
 							await handlePdfBuffer(buffer, { provider: "http", url, title: url.split("/").pop() || url });
 							continue;
 						}
-						const extracted = await httpExtractor(url, { signal, jinaFallback: settings.htmlExtraction.jinaFallback, jinaApiKey: settings.apiKeys.jina });
+						const extracted = await httpExtractor(url, { signal, jinaFallback: settings.htmlExtraction.jinaFallback, jinaApiKey: settings.apiKeys.jina, reads });
 						stored.push(storeWebContent(pi, { title: extracted.title, url: extracted.url, content: extracted.content, metadata: { provider: "http", tool: name, ...extracted.metadata } }));
 					} catch (error) {
 						if (isAbortError(error, signal)) throw error;
 						failed.push({ url, error, provider: youtubeExtractionAttempted ? "youtube" : "direct", allowExaFallback: !transcriptUrlSet.has(url) });
+					} finally {
+						reads.release();
 					}
 				}
 				if (failed.length) {

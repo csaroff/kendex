@@ -1,3 +1,4 @@
+import { ByteBudgetExhausted, readTextWithin, truncationMetadata, type UrlReads } from "./byte-budget.js";
 import { cloneOrUpdateRepo, defaultCacheDir, isGitInstalled, readBlobFromCache, readReadmeFromCache, readTreeFromCache, summarizeTreeEntries } from "./github-clone.js";
 
 export type GitHubUrlKind = "repo" | "blob" | "tree" | "commit";
@@ -21,6 +22,8 @@ export interface GitHubExtractOptions {
 	cloneTimeoutSeconds?: number;
 	cacheDir?: string;
 	maxAgeHours?: number;
+	/** This URL's reads under the calling web_fetch call's budget; the caller releases them when the URL's processing ends. */
+	reads: UrlReads;
 }
 
 function splitRefAndPath(parts: string[]): { ref?: string; path?: string } {
@@ -77,23 +80,24 @@ async function extractFromClone(parsed: ParsedGitHubUrl, options: GitHubExtractO
 	});
 	const meta = { provider: "github", ...parsed, extraction: "clone", cachePath: clone.cachePath, headRef: clone.headRef, cloned: clone.cloned, updated: clone.updated, defaultBranch };
 	if (parsed.kind === "blob" && parsed.path) {
-		const blob = readBlobFromCache(clone.cachePath, parsed.path);
+		const blob = await readBlobFromCache(clone.cachePath, parsed.path, options.reads);
 		if (!blob) throw new Error(`File not found in cloned repo: ${parsed.path}`);
-		return { title: `${parsed.owner}/${parsed.repo}/${parsed.path}`, content: blob.content, metadata: { ...meta, bytes: blob.bytes } };
+		return { title: `${parsed.owner}/${parsed.repo}/${parsed.path}`, content: blob.content, metadata: { ...meta, bytes: blob.bytes, ...truncationMetadata(blob.cut) } };
 	}
 	if (parsed.kind === "tree") {
-		const tree = readTreeFromCache(clone.cachePath, parsed.path ?? "", options.maxTreeEntries ?? 200);
+		const tree = await readTreeFromCache(clone.cachePath, parsed.path ?? "", options.maxTreeEntries ?? 200);
 		if (!tree) throw new Error(`Directory not found in cloned repo: ${parsed.path ?? "/"}`);
 		return { title: `${parsed.owner}/${parsed.repo}/${parsed.path ?? ""}`, content: summarizeTreeEntries(tree.entries, tree.truncated), metadata: { ...meta, entries: tree.entries.length, truncated: tree.truncated } };
 	}
-	const readme = readReadmeFromCache(clone.cachePath) ?? "";
-	const tree = readTreeFromCache(clone.cachePath, "", options.maxTreeEntries ?? 80);
+	const readmeBlob = await readReadmeFromCache(clone.cachePath, options.reads);
+	const readme = readmeBlob?.content ?? "";
+	const tree = await readTreeFromCache(clone.cachePath, "", options.maxTreeEntries ?? 80);
 	const treeText = tree ? summarizeTreeEntries(tree.entries, tree.truncated) : "";
 	const body = [`# ${parsed.owner}/${parsed.repo}`, `Cached at: ${clone.cachePath}`, treeText ? `\n## Tree (top entries)\n${treeText}` : undefined, readme ? `\n## README\n\n${readme}` : undefined].filter(Boolean).join("\n");
-	return { title: `${parsed.owner}/${parsed.repo}`, content: body, metadata: { ...meta, hasReadme: Boolean(readme), entries: tree?.entries.length ?? 0 } };
+	return { title: `${parsed.owner}/${parsed.repo}`, content: body, metadata: { ...meta, hasReadme: Boolean(readme), entries: tree?.entries.length ?? 0, ...truncationMetadata(readmeBlob?.cut) } };
 }
 
-export async function extractGitHubUrl(input: string, options: GitHubExtractOptions = {}) {
+export async function extractGitHubUrl(input: string, options: GitHubExtractOptions) {
 	const parsed = parseGitHubUrl(input);
 	if (!parsed) return undefined;
 	const fetchImpl = options.fetchImpl ?? fetch;
@@ -102,20 +106,25 @@ export async function extractGitHubUrl(input: string, options: GitHubExtractOpti
 		try {
 			return await extractFromClone(parsed, options, decision.defaultBranch);
 		} catch (error) {
-			// fall through to API path on clone failure
+			// A clone failure falls through to the API path; a byte-budget refusal or an abort ends the URL instead.
+			if (error instanceof ByteBudgetExhausted || options.signal?.aborted) throw error;
 		}
 	}
 	if (parsed.kind === "blob" && parsed.rawUrl) {
 		const response = await fetchImpl(parsed.rawUrl, { signal: options.signal });
 		if (!response.ok) throw new Error(`GitHub raw fetch failed (${response.status}) for ${parsed.rawUrl}`);
-		const content = await response.text();
-		return { title: `${parsed.owner}/${parsed.repo}/${parsed.path ?? ""}`, content, metadata: { provider: "github", ...parsed, extraction: "raw" } };
+		const body = await readTextWithin(response, options.reads);
+		return { title: `${parsed.owner}/${parsed.repo}/${parsed.path ?? ""}`, content: body.text, metadata: { provider: "github", ...parsed, extraction: "raw", ...truncationMetadata(body.cut) } };
 	}
 	const data = await jsonFetch(fetchImpl, parsed.apiUrl, options.signal);
 	if (parsed.kind === "repo") {
-		const readme = await fetchImpl(`https://raw.githubusercontent.com/${parsed.owner}/${parsed.repo}/HEAD/README.md`, { signal: options.signal }).then((r) => r.ok ? r.text() : "").catch(() => "");
-		const content = `# ${data.full_name ?? `${parsed.owner}/${parsed.repo}`}\n\n${data.description ?? ""}\n\n${readme}`.trim();
-		return { title: data.full_name ?? `${parsed.owner}/${parsed.repo}`, content, metadata: { provider: "github", ...parsed, extraction: "repo", stars: data.stargazers_count, defaultBranch: data.default_branch } };
+		const readme = await fetchImpl(`https://raw.githubusercontent.com/${parsed.owner}/${parsed.repo}/HEAD/README.md`, { signal: options.signal }).then((r) => r.ok ? readTextWithin(r, options.reads) : undefined).catch((error: unknown) => {
+			// A repo without a readable README still returns its description; a byte-budget refusal or an abort ends the URL instead.
+			if (error instanceof ByteBudgetExhausted || options.signal?.aborted) throw error;
+			return undefined;
+		});
+		const content = `# ${data.full_name ?? `${parsed.owner}/${parsed.repo}`}\n\n${data.description ?? ""}\n\n${readme?.text ?? ""}`.trim();
+		return { title: data.full_name ?? `${parsed.owner}/${parsed.repo}`, content, metadata: { provider: "github", ...parsed, extraction: "repo", stars: data.stargazers_count, defaultBranch: data.default_branch, ...truncationMetadata(readme?.cut) } };
 	}
 	if (Array.isArray(data)) {
 		const entries = data.slice(0, options.maxTreeEntries ?? 200).map((entry: any) => `- ${entry.type === "dir" ? "dir" : "file"}: ${entry.path ?? entry.name}`).join("\n");
