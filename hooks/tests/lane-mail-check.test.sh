@@ -271,18 +271,6 @@ expect 2 "lane-mail-check: unread=1" \
 # Sets MUTANT_PATH rather than printing it: the assertion below writes to the
 # same stdout a substitution would capture.
 MUTANT_PATH=""
-# A copy of the hook with one constant rewritten, so a row can reach a bound
-# the shipped value would make it wait for. The rewrite is asserted, never
-# assumed. This is a fixture, not a control: it plants no defect.
-VARIANT_PATH=""
-variant() { # NAME SED-ARGUMENT...
-  VARIANT_PATH="$TMP_ROOT/$1.sh"
-  local name="$1"
-  shift
-  sed "$@" "$HOOK" > "$VARIANT_PATH"
-  assert_eq "$(cmp -s "$VARIANT_PATH" "$HOOK" && echo same || echo differs)" "differs" \
-    "the $name copy really differs from the hook"
-}
 
 # --- the handoff marks ---------------------------------------------------
 #
@@ -1349,68 +1337,9 @@ assert_eq "$(text_reads "${RENDERS[@]}")" "0" "no copy of the hook reads a lane'
 # here, and this hook judges neither: `oversee-succeed --check-marks` decides
 # where they sit and what this session's pane and account say, and the rows
 # below are about which of its answers refuses a turn end and which ends one.
-#
-# The judge, and the whole of what this hook reads about an overseer's marks.
-# It records its argv, so a row can pin that the hook asked for the judgement
-# and nothing else, and answers from files a row writes: `out` its keyed line,
-# `rc` its exit status, `err` its own words, `hang` a read that outlasts the
-# hook's ceiling. Its own behaviour is oversee_succeed.sh's subject.
-JUDGE_DIR="$TMP_ROOT/judge"
-mkdir -p "$JUDGE_DIR"
-plant_judge() {
-  plant_install oversee-succeed
-  cat > "$LANE/.claude/skills/orch/scripts/oversee-succeed" <<JUDGE
-#!/bin/sh
-printf '%s\n' "\$*" >> "$JUDGE_DIR/args"
-# stdout is handed away before the wait: the hook reads this in a command
-# substitution, which stays open while any writer holds that pipe, so a sleep
-# left behind by the ceiling would outlast the kill.
-[ ! -f "$JUDGE_DIR/hang" ] || { exec 1>/dev/null; sleep 120; }
-[ ! -f "$JUDGE_DIR/err" ] || cat "$JUDGE_DIR/err" >&2
-[ ! -f "$JUDGE_DIR/out" ] || cat "$JUDGE_DIR/out"
-exit "\$(cat "$JUDGE_DIR/rc" 2>/dev/null || echo 0)"
-JUDGE
-  chmod +x "$LANE/.claude/skills/orch/scripts/oversee-succeed"
-  rm -f -- "${JUDGE_DIR:?}/args" "${JUDGE_DIR:?}/out" "${JUDGE_DIR:?}/err" \
-    "${JUDGE_DIR:?}/rc" "${JUDGE_DIR:?}/hang"
-}
-judge_says() { printf '%s\n' "$1" > "$JUDGE_DIR/out"; }
-judge_calls() { [ -f "$JUDGE_DIR/args" ] && wc -l < "$JUDGE_DIR/args" | tr -d ' ' || echo 0; }
-judge_argv() { cat "$JUDGE_DIR/args" 2>/dev/null || true; }
-
-CONTEXT_MARK_LINE="oversee-succeed: mark-reached kind=context value=612000 mark=500000 succession=on headroom=80"
-# The same crossing with the succession the operator turned off, which the
-# judgement reports on its own line and this hook reads nowhere else.
-OFF_MARK_LINE="oversee-succeed: mark-reached kind=context value=612000 mark=500000 succession=off headroom=80"
-OFF_HEADROOM_LINE="oversee-succeed: mark-reached kind=headroom value=4 mark=10 succession=off account=eclaude resets=2026-07-27T06:00:00Z"
-HEADROOM_MARK_LINE="oversee-succeed: mark-reached kind=headroom value=4 mark=10 succession=on account=eclaude resets=2026-07-27T06:00:00Z"
-RATE_MARK_LINE="oversee-succeed: mark-reached kind=rate value=30 mark=30 succession=on account=eclaude"
-QUALIFYING_MARK_LINE="oversee-succeed: mark-reached kind=qualifying value=1 mark=1 succession=on headroom=unreadable"
-BELOW_MARK_LINE="oversee-succeed: context-below-mark tokens=100000 mark=500000 headroom=80"
-
-# An overseer session: a repository on a branch no mailbox is named for, so the
-# lane rules find nothing, with the orch install and the judge beside the hook
-# and a fleet state whose `.overseer` names this pane.
-new_overseer() { # NAME [PANE] [SERVER]
-  new_lane "$1" main
-  unmark_lanes
-  plant_judge
-  (cd "$LANE" && "$REPO_ROOT/skills/orch/scripts/workflow-state" init oversee >/dev/null)
-  record_overseer "${2:-$OVERSEER_PANE}" "${3:-$OVERSEER_SERVER}"
-}
-
-# The record that ends an overseer's refusal, written on the fleet's own item.
-# It names the session that wrote it in both of the two names this hook reads,
-# the payload's id and the pane key, and a row supplies another value for
-# whichever name it is about.
-record_overseer_handoff() { # [SESSION_ID] [PANE_KEY]
-  local record
-  record="$(jq -nc --arg s "${1:-s1}" --arg k "${2:-$OVERSEER_SERVER $OVERSEER_PANE}" \
-    '{written_at:"2026-09-20T06:20:00Z",handoff_file:"tmp/handoffs/OVERSEER-HANDOFF.md",
-      pane_key:$k,session_id:$s}')"
-  (cd "$LANE" && "$REPO_ROOT/skills/orch/scripts/workflow-state" set oversee handoff \
-    "$record" >/dev/null)
-}
+# The judge, the overseer session and the answers it gives are
+# lib/lane-mail-world.sh's; the tool-call judgement is
+# lane-mail-check-overseer-tool.test.sh's.
 
 # A turn end from a harness whose payload names no session, which is what sends
 # this hook to the pane key.
@@ -1419,15 +1348,7 @@ stop_unnamed() { # [ENV=VAL...]
     '{stop_hook_active:false,transcript_path:$p}')" "$@"
 }
 
-# The overseer's own native transcript: the claude file the payload's session
-# s1 owns under OVERSEER_HOME_DIR, the shape lib/adapters/claude.sh names, so
-# the ownership gate reads it as this session's own. The overseer rows write
-# and read it through TRANSCRIPT, as the lane rows above did their own flat one.
-TRANSCRIPT="$OVERSEER_HOME_DIR/projects/repo/s1.jsonl"
-mkdir -p "$(dirname "$TRANSCRIPT")"
-# The reading the overseer transcript below leaves, as the judge takes it.
-OVERSEER_CONTEXT=600000:1000000
-write_transcript "$TRANSCRIPT" "${OVERSEER_CONTEXT%%:*}"
+overseer_transcript
 # The two commands an overseer's refusal names, counted in the stderr it wrote:
 # the succession is handed the reading this turn end took, as the judge was.
 overseer_route() { grep -cF -- "/oversee-succeed --context $OVERSEER_CONTEXT -- [THE PERMISSION" "$ERR_FILE"; }
@@ -1551,27 +1472,37 @@ owned_payload s2 "$TRANSCRIPT" $(overseer_env)
 assert_eq "RC=$RC first=$(first_line) argv=$(judge_argv | tail -n 1) headroom=$(grep -c '^lane-mail-check: headroom=4' "$ERR_FILE")" \
   "RC=2 first=lane-mail-check: transcript-unowned=$TRANSCRIPT argv=--check-marks --harness claude headroom=1" \
   "a predecessor's transcript is not this session's, so its context is unmeasured and the account mark decides" "$ERR_FILE"
-# A record naming no launch home, one `oversee register` wrote for a session
-# with no account, can bind nothing: context unmeasured, account triggers
-# decide, and the judge is handed the harness this install names, since no
-# reading of this session was recorded for it to take one from.
+# A record naming this pane and no launch home, one `oversee register` wrote
+# for a session with no account, is healed from the session's own
+# environment: the home the harness variable carries is written into the
+# record and binds the transcript on this very turn end. A session whose
+# environment names another home than the one its transcript sits under
+# still binds nothing: the heal names the environment's home, the gate reads
+# the file as another home's, context is unmeasured and the account triggers
+# decide, the judge handed the harness this install names.
 new_overseer overseer_no_home
-(cd "$LANE" && "$REPO_ROOT/skills/orch/scripts/workflow-state" set oversee overseer \
-  "$(jq -nc --arg s "$OVERSEER_SERVER" --arg p "$OVERSEER_PANE" --argjson start "$OVERSEER_SERVER_START" \
-    '{server:$s,server_start:$start,pane:$p,window:"@7",launch_line:"claude -n overseer"}')" >/dev/null)
+startless_record "{\"server_start\":$OVERSEER_SERVER_START}"
+judge_says "$HEADROOM_MARK_LINE"
+# shellcheck disable=SC2046
+stop_at "$TRANSCRIPT" false $(overseer_env) "CLAUDE_CONFIG_DIR=$OVERSEER_HOME_DIR"
+assert_eq "RC=$RC first=$(first_line) argv=$(judge_argv | tail -n 1) home=$(recorded_field home) harness=$(recorded_field harness)" \
+  "RC=2 first=lane-mail-check: headroom=4 argv=--check-marks --context $OVERSEER_CONTEXT home=$OVERSEER_HOME_DIR harness=claude" \
+  "a record naming no launch home is healed from the session's own home, which binds the transcript on the same turn end" "$ERR_FILE"
+new_overseer overseer_other_home
+startless_record "{\"server_start\":$OVERSEER_SERVER_START}"
 judge_says "$HEADROOM_MARK_LINE"
 # shellcheck disable=SC2046
 stop_at "$TRANSCRIPT" false $(overseer_env)
-assert_eq "RC=$RC first=$(first_line) argv=$(judge_argv | tail -n 1) reason=$(grep -c 'home-unnamed' "$ERR_FILE")" \
-  "RC=2 first=lane-mail-check: transcript-unowned=$TRANSCRIPT argv=--check-marks --harness claude reason=1" \
-  "a record naming no launch home cannot bind the transcript, so context is unmeasured and the account mark decides" "$ERR_FILE"
+assert_eq "RC=$RC first=$(first_line) argv=$(judge_argv | tail -n 1) reason=$(grep -c 'home-mismatch' "$ERR_FILE") home=$(recorded_field home)" \
+  "RC=2 first=lane-mail-check: transcript-unowned=$TRANSCRIPT argv=--check-marks --harness claude reason=1 home=$OFFLINE_HOME/.claude" \
+  "a session whose own home is not the one its transcript sits under binds nothing, so the account mark decides" "$ERR_FILE"
 # That turn end still writes the overseer's context record, with no figure and
 # the gate's reason as its gap, so the record advances at every turn end and
 # oversee-watch can report why it carries no reading.
 gap_record() { jq -r '"\(.tokens) \(.gap) \(.pane_key)"' "$LANE/tmp/lane-mail/overseer/context.json" 2>/dev/null || echo none; }
-assert_eq "$(gap_record)" "null home-unnamed $OVERSEER_SERVER $OVERSEER_PANE" \
+assert_eq "$(gap_record)" "null home-mismatch $OVERSEER_SERVER $OVERSEER_PANE" \
   "and the context record is written with no reading, the gate's reason as its gap and this pane's key" "$ERR_FILE"
-variant no-gap-record -e '/^      \[ -z "\$READ_GAP" \] || overseer_gap_record "\$READ_GAP"$/d'
+variant no-gap-record -e '/^  \[ -z "\$READ_GAP" \] || overseer_gap_record "\$READ_GAP"$/d'
 install_hook "$VARIANT_PATH" "$LANE/.claude/hooks/lane-mail-check.sh"
 rm -f -- "${LANE:?}/tmp/lane-mail/overseer/context.json"
 # shellcheck disable=SC2046
@@ -1579,6 +1510,55 @@ stop_at "$TRANSCRIPT" false $(overseer_env)
 assert_eq "$(gap_record)" "none" \
   "control: a hook that writes no gap record leaves an unowned turn end recording nothing"
 install_hook "$HOOK" "$LANE/.claude/hooks/lane-mail-check.sh"
+
+# The record that lost its launch identity: it names this pane on this server
+# and carries no server start, no home and no harness, the shape a writer from
+# before starts were recorded left and a watch start then kept. It names the
+# session in its pane (lib/overseer-launch.sh § ol_unstarted), which is judged
+# on its marks and heals the record, so the session is never left judged on
+# nothing while it runs into its window. The judge is the real
+# oversee-succeed, which answers the reading this turn end hands it with
+# `mark-reached kind=context` before it discovers anything else.
+lost_identity() { # NAME [HOOK] [STUB]: STUB is a state_stub mode
+  new_overseer "$1"
+  install_hook "${2:-$HOOK}" "$LANE/.claude/hooks/lane-mail-check.sh"
+  rm -f -- "$LANE/.claude/skills/orch/scripts/oversee-succeed"
+  ln -s "$REPO_ROOT/skills/orch/scripts/oversee-succeed" "$LANE/.claude/skills/orch/scripts/oversee-succeed"
+  startless_record
+  [ -z "${3:-}" ] || state_stub "$3"
+  # shellcheck disable=SC2046
+  stop_at "$TRANSCRIPT" false $(overseer_env) "CLAUDE_CONFIG_DIR=$OVERSEER_HOME_DIR"
+  LOST="RC=$RC first=$(first_line) record=$(jq -r '"\(.tokens) \(.gap)"' "$LANE/tmp/lane-mail/overseer/context.json" 2>/dev/null || echo none) start=$(recorded_field server_start) home=$(recorded_field home) harness=$(recorded_field harness)"
+}
+lost_identity overseer_lost_identity
+assert_eq "$LOST" \
+  "RC=2 first=lane-mail-check: context=${OVERSEER_CONTEXT%%:*} record=${OVERSEER_CONTEXT%%:*} null start=$OVERSEER_SERVER_START home=$OVERSEER_HOME_DIR harness=claude" \
+  "a record naming this pane with no start, home or harness still names this session: the reading is recorded, the context mark is refused, and the record is healed" "$ERR_FILE"
+# The start test that reads a record carrying no start as another session's:
+# the session is judged on nothing, and nothing is healed.
+variant startless-unnamed \
+  -e 's/^    elif ol_unstarted(.*/    else "other" end),/'
+lost_identity control_lost_identity_start "$VARIANT_PATH"
+assert_eq "$LOST" "RC=0 first=- record=none start=none home=none harness=none" \
+  "control: a hook that reads a record carrying no start as another session's judges the lost overseer on nothing"
+# The heal skipped: the record names no home, the transcript binds to nothing
+# and the context mark is left to nothing.
+variant no-heal -e 's/^  \[ "\$NEED_HEAL" -eq 1 \] || return 0$/  return 0/'
+lost_identity control_lost_identity_heal "$VARIANT_PATH"
+assert_eq "$LOST" "RC=0 first=lane-mail-check: transcript-unowned=$TRANSCRIPT record=null home-unnamed start=none home=none harness=none" \
+  "control: a hook that heals nothing leaves the lost overseer's transcript unbound and its context mark judged by nothing"
+# A heal whose write fails still binds this run to the home the session's own
+# environment names: the failure is reported under its own key, the reading is
+# taken and the context mark judged, and the record waits for the next run.
+lost_identity overseer_lost_unhealed "$HOOK" update-fails
+assert_eq "$LOST unhealed=$(grep -c "^lane-mail-check: record-unhealed=$OVERSEER_SERVER $OVERSEER_PANE\$" "$ERR_FILE") mark=$(grep -c "^lane-mail-check: context=${OVERSEER_CONTEXT%%:*}\$" "$ERR_FILE")" \
+  "RC=2 first=lane-mail-check: record-unhealed=$OVERSEER_SERVER $OVERSEER_PANE record=${OVERSEER_CONTEXT%%:*} null start=none home=none harness=none unhealed=1 mark=1" \
+  "a heal whose write fails is reported, and the run still binds the transcript to the session's own home and judges the mark" "$ERR_FILE"
+# The home dropped with the failed write: the transcript binds to nothing.
+variant unhealed-unbound -e 's/^    message record-unhealed "\$CALLER_KEY" "\$(cat -- "\$WORK_DIR\/heal.err")"$/&\n    HEAL_HOME=""/'
+lost_identity control_lost_unhealed "$VARIANT_PATH" update-fails
+assert_eq "${LOST#* record=}" "null home-unnamed start=none home=none harness=none" \
+  "control: a hook that drops the home with a failed heal leaves the transcript unbound and the mark judged by nothing"
 # A Pi install states no transcript shape, so its overseer binds nothing and
 # reads the payload's own window as a Pi lane does; nothing is reported.
 new_overseer overseer_pi
@@ -1687,7 +1667,7 @@ assert_eq "$(overseer_gap_word control_session_record_gap - .github)" \
   "record=none unread=0 unlisted=0 unrecorded=1" \
   "control: a Copilot arm that names no gap leaves an unanswered session record unrecorded"
 HOOK="$HOOK_SAVED"
-variant no-overseer-unread -e 's/^          "\$LANE_CONTEXT_UNREAD") message usage-unread "\$TRANSCRIPT" ;;$/          "$LANE_CONTEXT_UNREAD") ;;/'
+variant no-overseer-unread -e 's/^    \[ "\$READ_GAP" != usage-unread \] || message usage-unread "\$TRANSCRIPT"$/    :/'
 HOOK_SAVED="$HOOK"
 HOOK="$VARIANT_PATH"
 assert_eq "$(overseer_gap_word control_overseer_unread "$(usage_line unread 900000)")" \
@@ -1729,7 +1709,7 @@ HOOK="$HOOK_SAVED"
 # Control: with the ownership gate gone the predecessor's foreign file is read
 # and its reading handed to the judge, the very thing the gate prevents.
 new_overseer overseer_binding_control
-variant read-any-transcript -e 's/^      if overseer_transcript_owned; then$/      if true; then/'
+variant read-any-transcript -e 's/^  if overseer_transcript_owned; then$/  if true; then/'
 install_hook "$VARIANT_PATH" "$LANE/.claude/hooks/lane-mail-check.sh"
 judge_says "$HEADROOM_MARK_LINE"
 # shellcheck disable=SC2046
@@ -1823,6 +1803,10 @@ esac
 REALTMUX
   chmod +x "$REAL_TMUX_BIN/tmux"
   # The real judge handles a node pane before slow capacity or a stored identity.
+  # The record names no harness, and the turn end heals it with this install's,
+  # so the context-after-identity judge meets no harness-unnamed refusal; it
+  # still reads the account before the due reading and answers nothing the
+  # hook can act on.
   mkdir -p "$LANE/.codex/skills"
   ln -s "$LANE/.claude/skills/orch" "$LANE/.codex/skills/orch"
   install_hook "$VARIANT_PATH" "$LANE/.codex/hooks/lane-mail-check.sh"
@@ -1865,7 +1849,7 @@ FAILWRITE
   done <<ROWS
 kept|$REPO_ROOT/skills/orch/scripts/oversee-succeed|2|lane-mail-check: context=400000|0|0|0|400000 258400 $OVERSEER_SERVER $OVERSEER_PANE
 failed|$REPO_ROOT/skills/orch/scripts/oversee-succeed|2|lane-mail-check: context=400000|1|0|1|none
-failed|$VARIANT_PATH|0|lane-mail-check: marks=unjudged|1|1|1|none
+failed|$VARIANT_PATH|0|lane-mail-check: marks=unjudged|1|0|1|none
 ROWS
   write_transcript "$TRANSCRIPT" 600000
 
@@ -1970,10 +1954,10 @@ assert_eq "$(state_unread overseer_state_unread)" "RC=0 first=- record=600000 nu
 variant ungated-unrecorded -e '/^  \[ "\$OVERSEER_UNRECORDED" -eq 1 \] || return 0$/d'
 HOOK_SAVED="$HOOK"
 HOOK="$VARIANT_PATH"
-# The path's first read of RECORDED_KEY, unset by the failed read, stops the
+# The path's first read of CALLER_KEY, unset by the failed read, stops the
 # hook on both shells; bash 3.2 then exits with its EXIT trap's 0, bash 5 with
 # 1, so the error line is the witness and the status is not.
-assert_eq "$(state_unread control_state_unread >/dev/null; grep -c ': RECORDED_KEY: unbound variable$' "$ERR_FILE")" "1" \
+assert_eq "$(state_unread control_state_unread >/dev/null; grep -c ': CALLER_KEY: unbound variable$' "$ERR_FILE")" "1" \
   "control: without the unrecorded gate a fleet state that cannot be read reaches the lost-overseer path" "$ERR_FILE"
 HOOK="$HOOK_SAVED"
 
@@ -2092,15 +2076,8 @@ stop "HOME=$GLOBAL_HOME"
 expect 2 "lane-mail-check: reader-outside=$LANE/.agents/skills/orch/scripts/lane-mail" \
   "control: without it a relocated harness root finds none either"
 
-# The lane-mail-deliver and lane-mail-halt hooks run the judge beside them. A
-# tool payload names the command the lane is about to run.
-install_arms() { # [JUDGE]
-  install_hook "$TEST_DIR/../lane-mail-deliver.sh" "$LANE/.claude/hooks/lane-mail-deliver.sh"
-  install_hook "$TEST_DIR/../lane-mail-halt.sh" "$LANE/.claude/hooks/lane-mail-halt.sh"
-  install_hook "${1:-$HOOK}" "$LANE/.claude/hooks/lane-mail-check.sh"
-}
-
-# The tool a call names, Bash unless a case names the harness question tool.
+# The tool a call names, Bash unless a case names the harness question tool;
+# the payload names the command the lane is about to run.
 TOOL_NAME=Bash
 tool() { # ARM [COMMAND] [FIELD] — FIELD, agent_id or agent_type, marks a subagent's call
   local judge="$CASE_HOOK"
@@ -2108,13 +2085,6 @@ tool() { # ARM [COMMAND] [FIELD] — FIELD, agent_id or agent_type, marks a suba
   run_payload "$(jq -nc --arg n "$TOOL_NAME" --arg c "${2:-git status}" --arg f "${3:-}" \
     '{tool_name: $n, tool_input: {command: $c}} + (if $f == "" then {} else {($f): "dev-1"} end)')"
   CASE_HOOK="$judge"
-}
-
-# The event a deliver run's JSON names and the first line of the context it
-# carries; `-` for no output.
-context_line() {
-  [ -s "$TMP_ROOT/stdout" ] || { echo -; return; }
-  jq -r '"\(.hookSpecificOutput.hookEventName) \(.hookSpecificOutput.additionalContext | split("\n")[0])"' "$TMP_ROOT/stdout"
 }
 
 # An install with no orch skill beside the hook and nothing in the mailbox:
@@ -2550,7 +2520,7 @@ assert_eq "$([ "$RC" -eq 2 ] && echo refused || echo passed)" "passed" \
   "control: without its exit the halt hook with no judge beside it does not refuse"
 
 # Each handoff mark's refusal replaced by a pass, its judgement still made.
-mutant no-context-mark -e 's@^      0) \[ "\$DUE" != due \] || refuse_handoff context "\$TOKENS" ;;$@      0) : ;;@'
+mutant no-context-mark -e 's@^    0) \[ "\$DUE" != due \] || refuse_handoff context "\$TOKENS" ;;$@    0) : ;;@'
 new_handoff_lane control_context KEN-56
 install_hook "$MUTANT_PATH" "$LANE/.claude/hooks/lane-mail-check.sh"
 write_transcript "$TRANSCRIPT" 600000
@@ -2722,7 +2692,7 @@ assert_eq "unowned=$(grep -c '^lane-mail-check: transcript-unowned' "$ERR_FILE")
 # The overseer identification's control: the pane comparison removed, so any
 # session with no lane is taken for the overseer. An ordinary session in a
 # fleet checkout is then held at its own turn end on marks nobody set for it.
-mutant any-session-overseer -e 's@^  if \[ "\$RECORDED_KEY" != "\$CALLER_KEY" \]; then$@  if false; then@'
+mutant any-session-overseer -e '/^   (if ol_names(/s@\$pane)@(.pane // ""))@'
 new_overseer control_any_session
 install_hook "$MUTANT_PATH" "$LANE/.claude/hooks/lane-mail-check.sh"
 judge_says "$CONTEXT_MARK_LINE"
@@ -3071,8 +3041,8 @@ expect 2 "lane-mail-check: unread=1" \
 # numbers its panes from %0 again. One naming this server's start names the
 # session in its pane; one naming an earlier start names a server that is
 # gone, and the session a later server put in the same pane id is handed
-# nothing; one carrying no start names no session; one whose server start
-# tmux cannot read establishes nothing.
+# nothing; one carrying no start names the session in its pane, which heals
+# it; one whose server start tmux cannot read establishes nothing.
 EARLIER_START=$((OVERSEER_SERVER_START - 3600))
 bound_session() { # NAME START [JUDGE]
   named_session "$1" "${3:-$HOOK}"
@@ -3094,11 +3064,11 @@ assert_eq "$(overseer_unread 'Sent to the gone server.')" "1" "and the note stay
 bound_session peer_startless none
 peer_send 'Sent to no start.'
 stop "${SESSION_ENV[@]}"
-expect 0 - "a session in the recorded pane is handed nothing from a record carrying no start"
-bound_session peer_start_unread "$OVERSEER_SERVER_START"
+expect 2 "lane-mail-check: unread=1" "a record carrying no start names the session in its pane"
+bound_session peer_start_unread none
 peer_send 'Start unread.'
 stop "${SESSION_ENV[@]}" TMUX_SERVER_START=
-expect 0 - "a session whose server start tmux cannot read is handed nothing from a bound record"
+expect 0 - "a session whose server start tmux cannot read is handed nothing"
 assert_eq "$(overseer_unread 'Start unread.')" "1" "and the note stays unread"
 
 # A checkout with no fleet record names no reader: no session there is handed
@@ -3127,20 +3097,6 @@ start_watch() {
 stop_watch() {
   kill "$FAKE_WATCH" 2>/dev/null || :
   wait "$FAKE_WATCH" 2>/dev/null || :
-}
-# The workflow-state of the install new_overseer planted replaced by one that
-# runs the real script for every verb but `path`, which fails where MODE is
-# path-fails. The real one is run by its own path, so it sources its own
-# libraries whatever the install holds.
-state_stub() { # path-fails|delegate
-  rm -f -- "${LANE:?}/.claude/skills/orch/scripts/workflow-state"
-  {
-    printf '#!/bin/sh\n'
-    [ "$1" != path-fails ] ||
-      printf '[ "$1" != path ] || { echo "workflow-state: lock-failed lock-file=x" >&2; exit 3; }\n'
-    printf 'exec %q "$@"\n' "$REPO_ROOT/skills/orch/scripts/workflow-state"
-  } > "$LANE/.claude/skills/orch/scripts/workflow-state"
-  chmod +x "$LANE/.claude/skills/orch/scripts/workflow-state"
 }
 # Every orch library but the watch record's, linked one by one, since the
 # reader sources its own from the install's directory.
@@ -3240,29 +3196,23 @@ expect 2 "lane-mail-check: unread=1" \
   "control: without the record test a session in another pane is handed the named session's note"
 
 # With the start test gone the pair alone names the session: a later server
-# handed the recorded pid and pane id is handed the gone server's note, and a
-# record carrying no start names the session in its pane.
-mutant pair-only -e 's@^  if \[ "\$CALLER_START" != "\$RECORDED_START" \]; then$@  if false; then@'
+# handed the recorded pid and pane id is handed the gone server's note.
+mutant pair-only -e '/^   (if ol_names(/s@\$start;@(.server_start | tostring);@'
 bound_session control_peer_reused "$EARLIER_START" "$MUTANT_PATH"
 peer_send 'Taken by a later server.'
 stop "${SESSION_ENV[@]}"
 expect 2 "lane-mail-check: unread=1" \
   "control: without the start test a later server's session in the recorded pane id is handed the note"
-bound_session control_peer_startless none "$MUTANT_PATH"
-peer_send 'Taken with no start.'
-stop "${SESSION_ENV[@]}"
-expect 2 "lane-mail-check: unread=1" \
-  "control: without the start test a record carrying no start names the session in its pane"
-# With an unread start taken as a match, a bound record names a session whose
+# With an unread start read on, a startless record names a session whose
 # server nothing could read.
-mutant start-unread-names -e '/^  if ! CALLER_START=/,/^  fi$/ s@^    return 1$@    return 0@'
-bound_session control_peer_start_unread "$OVERSEER_SERVER_START" "$MUTANT_PATH"
+mutant start-unread-names -e '/^      start=\$(tmux_server_start /s@)$@ || :)@'
+bound_session control_peer_start_unread none "$MUTANT_PATH"
 peer_send 'Unread start taken.'
 stop "${SESSION_ENV[@]}" TMUX_SERVER_START=
-expect 2 "lane-mail-check: unread=1" \
-  "control: a hook that takes an unread start as a match hands a bound record's note to that session"
+assert_eq "RC=$RC unread=$(overseer_unread 'Unread start taken.')" "RC=2 unread=0" \
+  "control: a hook that reads past an unread start hands that session the note"
 
-mutant record-at-call-dir -e '/^overseer_identified() {/,/^}/ s@cd -- "\$ROOT" 2>/dev/null && @@'
+mutant record-at-call-dir -e '/^overseer_identify() {/,/^}/ s@cd -- "\$ROOT" 2>/dev/null && @@'
 named_session control_peer_call_elsewhere "$MUTANT_PATH"
 peer_send 'Named at the call dir.'
 CALL_DIR="$PEER_SENDER"

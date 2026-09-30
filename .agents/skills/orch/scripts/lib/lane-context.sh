@@ -10,8 +10,9 @@
 #
 # One judge: lane_context_handoff_due enforces the absolute token cap and the
 # remaining-capacity mark. ORCH_HANDOFF_CONTEXT_PCT can request an earlier
-# handoff. No reader carries its own arithmetic. Missing capacity is unmeasured
-# below the absolute cap, never judged against a guess.
+# handoff. lane_context_window_full is the one judge of a reading that fills
+# its window. No reader carries its own arithmetic. Missing capacity is
+# unmeasured below the absolute cap, never judged against a guess.
 set -euo pipefail
 
 # A launch home reaches this library in CODEX_HOME, and only lane-home.sh says
@@ -152,7 +153,7 @@ lane_context_caller_cfg() { # SHAPE
   local home="${LANES_HOME:-$HOME}"
   case "${1:-}" in
     claude) printf '%s\n' "${CLAUDE_CONFIG_DIR:-$home/.claude}" ;;
-    codex) lane_launch_home_account "${CODEX_HOME:-$home/.codex}" ;;
+    codex) lane_launch_home_account "$(lane_context_caller_home codex)" ;;
     pi) lane_adapter_pi_agent_dir ;;
     copilot) printf '%s\n' "${COPILOT_HOME:-$home/.copilot}" ;;
     *)
@@ -189,6 +190,24 @@ lane_context_copilot_note() { # REC NOW
   copilot_session_lane_note "$home" "$session" "$root" "${f%%	*}" "$2" "${f#*	}"
 }
 
+# lane_context_caller_home HARNESS — the launch home a session of HARNESS runs
+# from, read off this process's own environment: the directory the harness
+# variable carries, or the harness's own default where none is set. For claude
+# and copilot that is the account itself (lane_context_caller_cfg); for codex
+# it is CODEX_HOME as it stands, a private home built under an account
+# included, since that home is where its rollouts are written. The home a
+# transcript is bound to (lane_context_transcript_owned) is this one, so the
+# turn-end hook fills a fleet record naming no home from it
+# (lib/overseer-launch.sh § ol_record_heal). Exit 1, printing nothing, for a
+# harness with no transcript shape.
+lane_context_caller_home() { # HARNESS
+  case "${1:-}" in
+    claude | copilot) lane_context_caller_cfg "$1" ;;
+    codex) printf '%s\n' "${CODEX_HOME:-${LANES_HOME:-$HOME}/.codex}" ;;
+    *) return 1 ;;
+  esac
+}
+
 # lane_context_mark_model HARNESS MODEL — the model a session of HARNESS
 # launched on MODEL is judged on by its own account mark, which reads the model
 # its recorded reading names. A claude session's account mark is judged on
@@ -215,8 +234,9 @@ lane_context_mark_model() { # HARNESS MODEL
 # through HARNESS's adapter: `<tokens>\t<window>\t<model>`, the word
 # LANE_CONTEXT_UNREAD for a usage object the adapter does not read, or nothing
 # for a transcript holding no usage yet. WINDOW is a window the harness named
-# outside its transcript, which only Pi's turn-end payload does. Exit 3 names a
-# harness no adapter reads; any other failure is the adapter's own. DIR is the
+# outside its transcript, which only Pi's hook payloads do, at a turn end and
+# after a tool call. Exit 3 names a harness no adapter reads; any other failure
+# is the adapter's own. DIR is the
 # session project for Pi settings. The reading's window field holds the verified
 # compaction point, empty when the effective configuration is unresolved.
 lane_context_reading() { # HARNESS [WINDOW] [DIR]
@@ -299,6 +319,34 @@ lane_context_handoff_due() { # TOKENS WINDOW PCT
   else
     printf 'room\n'
   fi
+}
+
+# lane_context_window_full TOKENS WINDOW HARNESS — whether a reading of a
+# HARNESS session fills the window it names, so that session can take no turn
+# again: exit 0 where it does, 1 where it does not or cannot. Only the window a
+# claude, codex or pi reading names is the hard limit a session stops at, since
+# each adapter names one only where the harness would not compact first
+# (lib/adapters/). A copilot reading's window is the point Copilot starts to
+# compact, which cannot be turned off, so a copilot reading at it is a session
+# about to compact and never full. A reading with no window is never full.
+# Exit 2 where a figure is not a whole number, and 3 for a harness no adapter
+# reads.
+lane_context_window_full() { # TOKENS WINDOW HARNESS
+  case "${3:-}" in
+    claude | codex | pi) ;;
+    copilot) return 1 ;;
+    *) return 3 ;;
+  esac
+  case "${1:-}" in
+    '' | *[!0-9]*) return 2 ;;
+    0) ;;
+    0*) return 2 ;;
+  esac
+  case "${2:-}" in
+    '' | 0) return 1 ;;
+    *[!0-9]* | 0*) return 2 ;;
+  esac
+  [ "$1" -ge "$2" ]
 }
 
 # lane_context_file_write BOX FILE JQ_ARGS... — the document jq prints from

@@ -628,6 +628,49 @@ CALL_ENV=("HOME=$COP_HOME")
 assert_eq "RC=$RC stdout=$(cat "$TMP_ROOT/stdout") unread=$(overseer_unread 'For the named session.')" "RC=0 stdout= unread=0" \
   "and marks it read, so its next prompt is handed nothing"
 
+# The overseer's tool-call judgement is the lead's alone. A Copilot call in
+# the named pane whose session no sessionStart recorded, a custom subagent's
+# as Copilot CLI 1.0.88 was measured sending it, is judged on nothing: it is
+# handed nothing and writes no context record for the overseer.
+unknown_tool_rows() { # NAME [JUDGE]
+  new_copilot_named "$1" "${2:-$HOOK}"
+  mkdir -p "$LANE/tmp/lane-mail/overseer"
+  CALL_ENV=("${COP_NAMED_ENV[@]}")
+  COP_SESSION=c1
+  copilot_tool deliver
+  COP_SESSION=s1
+  CALL_ENV=("HOME=$COP_HOME")
+  UNKNOWN_TOOL="RC=$RC stdout=$(cat "$TMP_ROOT/stdout") record=$([ -e "$LANE/tmp/lane-mail/overseer/context.json" ] && echo written || echo none)"
+}
+unknown_tool_rows copilot_overseer_unknown_tool
+assert_eq "$UNKNOWN_TOOL" "RC=0 stdout= record=none" \
+  "a Copilot call in the named pane from no recorded lead is judged on nothing and writes no context record" "$ERR_FILE"
+
+# A crossed mark and a mailbox refusal on the same Copilot tool call: the
+# refusal's additionalContext opens with the context mark, so the refusal
+# never withholds it. The context is the session record the account's status
+# line writes, and the refusal is the fleet state's path failing.
+refused_mark_rows() { # NAME [JUDGE]
+  new_copilot_named "$1" "${2:-$HOOK}"
+  plant_copilot_install
+  mkdir -p "$LANE/tmp/lane-mail/overseer" "$COP_LEADS"
+  : > "$COP_LEADS/s1"
+  cop_record 400000 1000000
+  peer_send 'Beside a crossed mark.'
+  state_stub path-fails "$LANE/.github/skills/orch/scripts"
+  CALL_ENV=("${COP_NAMED_ENV[@]}" "COPILOT_HOME=$COP_ACCOUNT")
+  copilot_tool deliver
+  CALL_ENV=("HOME=$COP_HOME")
+  REFUSED_MARK="RC=$RC context=$(stdout_field '.additionalContext' | head -n 1) fleet=$(stdout_field '.additionalContext' | grep -c '^lane-mail-check: fleet-state=')"
+}
+refused_mark_rows copilot_overseer_refused_mark
+assert_eq "$REFUSED_MARK" "RC=0 context=lane-mail-check: context=400000 fleet=1" \
+  "a Copilot tool call past the mark whose mailbox check refuses hands the mark over ahead of the refusal" "$ERR_FILE"
+mutant refuse-drops-notice -e 's/^  \[ "\$ARM" != deliver \] || text="\$TOOL_NOTICE\$text"$/  :/'
+refused_mark_rows control_copilot_refused_mark "$MUTANT_PATH"
+assert_eq "${REFUSED_MARK% fleet=*}" "RC=0 context=lane-mail-check: fleet-state=$LANE/.github/skills/orch/scripts/workflow-state" \
+  "control: a hook whose refusal drops the notice withholds the crossed mark"
+
 # --- a Copilot call reaching the Claude copy ------------------------------
 # Copilot runs a Claude copy registered in `.claude/settings.json` by hand or
 # by kendex before the Copilot skip, where no refresh has rewritten it,
@@ -711,6 +754,12 @@ CASE_HOOK="$LANE/.github/hooks/lane-mail-check.sh"
 expect 2 "lane-mail-check: unread=1" "a Claude turn end through the same copy is refused as before"
 
 # --- copilot controls ----------------------------------------------------
+# The tool-call judgement's lead test dropped: a call from no recorded lead
+# in the named pane is judged as the overseer's.
+mutant tool-any-caller -e 's/^if \[ "\$ARM" = deliver \] && \[ -z "\$ITEM" \] && \[ "\$CALLER" = lead \]; then$/if [ "$ARM" = deliver ] \&\& [ -z "$ITEM" ]; then/'
+unknown_tool_rows control_copilot_unknown_tool "$MUTANT_PATH"
+assert_eq "${UNKNOWN_TOOL##* record=}" "written" \
+  "control: without the lead test a Copilot call from no recorded lead writes the overseer's context record"
 # With the record test gone, every lead session in a checkout no live watch
 # holds is handed the overseer mailbox.
 mutant any-lead-reads -e '/^mail_check() {/,/^}/ { /^    overseer_identified || return 0$/d; }'
@@ -794,7 +843,7 @@ assert_eq "RC=$RC stdout=$(cat "$TMP_ROOT/stdout")" "RC=2 stdout=" \
 # The deliver context in Claude Code's shape on Copilot: the key Copilot
 # reads is absent, so the model is handed nothing while the lines are
 # acknowledged.
-mutant copilot-nested-context -e "s@^      CONTEXT_SHAPE='{additionalContext: \\\$text}'\$@      CONTEXT_SHAPE='{hookSpecificOutput: {hookEventName: \"PostToolUse\", additionalContext: \$text}}'@"
+mutant copilot-nested-context -e "s@^    CONTEXT_SHAPE='{additionalContext: \\\$text}'\$@    CONTEXT_SHAPE='{hookSpecificOutput: {hookEventName: \"PostToolUse\", additionalContext: \$text}}'@"
 new_copilot_lane control_cop_deliver ken-215 "$MUTANT_PATH"
 mkdir -p "$LANE/tmp/lane-mail/KEN-215"
 copilot_context start
