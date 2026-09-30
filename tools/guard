@@ -50,6 +50,12 @@ finding_text() { # KEY VALUE — the English for one key, and the whole of it
       echo "the bot instruction check refused the working tree; its own report above names each file." ;;
     decision-ids)
       echo "decisions check refused; its own records above say why. An error=id-* record names a decision ID two records share: renumber per the decider skill's workflows/create-decision.md. An error=base-unverified record means the base branch could not be fetched or read, and an error=index-row-invalid record names an INDEX row check could not parse; the reason and guidance follow each." ;;
+    shipped-decision-link)
+      echo 'a shipped decision citation needs a link: [D<digits>](https://github.com/vanillagreencom/kendex/blob/main/docs/decisions/<ID>-<name>.md). The file, line and bare ID follow.' ;;
+    shipped-decision-scan)
+      echo 'the shipped decision citation scan could not read that input; its diagnostic follows.' ;;
+    file-set)
+      echo 'the common file set could not be read, so its scans were not judged.' ;;
     homebrew-formula)
       echo "a Homebrew formula claims the plain kendex name — the cask owns it; name the formula KendexCli." ;;
     catalog-fs-read)
@@ -407,7 +413,76 @@ show() { # HITS — the same lines, safe to print
   printf '%s\n' "$1" | LC_ALL=C awk '{ gsub(/[\001-\010\013-\037\177]/, "?"); print }'
 }
 
-files=$({ git ls-files; git diff --cached --name-only; } | sort -u)
+files=$({ git ls-files && git diff --cached --name-only; } | sort -u) ||
+  { files=""; say file-set unreadable; }
+
+# The top-level entries of a skill no render carries: its tests, evaluation
+# sets and maintainer notes. NOT_RENDERED in crates/core/src/source_read.rs
+# is the list the renderer reads; the test
+# guard_not_rendered_is_the_render_list holds this copy to it.
+not_rendered='tests evals DEVELOPMENT.md'
+rendered_in_skill() { # REL: a path inside a skill, carried by its render
+  local name
+  for name in $not_rendered; do
+    [ "${1%%/*}" != "$name" ] || return 1
+  done
+}
+
+# Catalog prose travels to repositories without kendex's decision directory.
+# GitHub cannot judge that prose rule, so this repository's commit lane does.
+# Reuse md-refs' block, code-span, link and ID readers. This rule requires a
+# link even where md-refs can resolve a bare ID in the author's repository.
+md_lib="$TOOLS_DIR/../.agents/skills/commit-guards/scripts/lib"
+while IFS= read -r f; do
+  case "$f" in
+    skills/*.md | agents/*.md | hooks/*.md) ;;
+    *) continue ;;
+  esac
+  case "$f" in */tests/* | */AGENTS.md) continue ;; esac
+  case "$f" in
+    skills/*)
+      skill_rel=${f#skills/}
+      rendered_in_skill "${skill_rel#*/}" || continue ;;
+  esac
+  [ -e "$f" ] || [ -L "$f" ] || continue # a deleted source has no prose
+  if [ ! -f "$f" ] || [ -L "$f" ]; then
+    say shipped-decision-scan "$f"
+    continue
+  fi
+  if ! lines=$(LC_ALL=C awk -v mode=lines -f "$md_lib/md-shapes.awk" -f "$md_lib/md-blocks.awk" "./$f" 2>&1); then
+    say shipped-decision-scan "$f"
+    show "$lines"
+    continue
+  fi
+  if ! ids=$(LC_ALL=C awk -v mode=refs -v src="$f" -v id_prefix=D -v id_width=1 \
+    -f "$md_lib/md-slug.awk" -f /dev/fd/3 -f "$md_lib/md-refs.awk" \
+    2>&1 3<<'AWK' <<<"$lines"
+{
+  # Content follows two protocol tabs, and can contain more tabs of its own.
+  first = index($0, "\t")
+  if (!first) next
+  block_kind = substr($0, 1, first - 1)
+  rest = substr($0, first + 1)
+  second = index(rest, "\t")
+  line_no = substr(rest, 1, second - 1)
+  text = substr(rest, second + 1)
+  split_spans(text)
+  text = outside
+  if (block_kind != "X") text = mask_links(text, 0)
+  emit_ids(text, block_kind)
+  next
+}
+AWK
+  ); then
+    say shipped-decision-scan "$f"
+    show "$ids"
+    continue
+  fi
+  if [ -n "$ids" ]; then
+    say shipped-decision-link "$f"
+    show "$ids"
+  fi
+done <<<"$files"
 
 # Content rules over hand-written source. Every caller names the tree it
 # means, so the only blanket skips left are the generated files inside those
@@ -797,8 +872,8 @@ fi
 # render left unchanged by a source change that only moves a frontmatter key
 # between values its harness renders to nothing, the render_blind rows below. Rendered is judged at
 # the tree: a skill with anything tracked under .agents/skills/<x> renders
-# every file but the top-level entries a render leaves out, not_rendered
-# below, so each other source there owes a render, and an agent owes a
+# every file rendered_in_skill above carries, so each such source there
+# owes a render, and an agent owes a
 # file to each harness directory that tracks any. Hooks are judged per file
 # instead — the harness hook sets are deliberately not uniform, and
 # hooks/tests/* renders nowhere. A source with no tracked render has nothing
@@ -814,17 +889,6 @@ fi
 agent_roots=(.claude/agents:md .codex/agents:toml .pi/agents:md)
 hook_roots=(.claude/hooks .codex/hooks .pi/kendex/hooks)
 render_roots=(.agents/skills "${agent_roots[@]%:*}" "${hook_roots[@]}")
-# The top-level entries of a skill no render carries: its tests, evaluation
-# sets and maintainer notes. NOT_RENDERED in crates/core/src/source_read.rs
-# is the list the renderer reads; the test
-# guard_not_rendered_is_the_render_list holds this copy to it.
-not_rendered='tests evals DEVELOPMENT.md'
-rendered_in_skill() { # REL — a path inside a skill, carried by its render
-  local name
-  for name in $not_rendered; do
-    [ "${1%%/*}" != "$name" ] || return 1
-  done
-}
 # The whole rule reads one tree. The commit chain reads the index, which is
 # what the commit records whatever the worktree holds beside it; --range and
 # --full read the worktree. render_diff is that tree's diff against the base,
