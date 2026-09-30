@@ -1,0 +1,1 @@
+- Hook and Pi session-start reports state the lane install rule and replace kendex fix advice with a drift-item count. Main-checkout reports stay unchanged.
