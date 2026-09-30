@@ -20,6 +20,10 @@ if [[ -n "${ASSERT_LIB_LOADED:-}" ]]; then
 fi
 ASSERT_LIB_LOADED=1
 
+# Key fixtures must not select a developer's app from the process or project.
+# OAuth cases pass their own app pair in the child's explicit environment.
+export LINEAR_CLIENT_ID="" LINEAR_CLIENT_SECRET=""
+
 ASSERT_COUNT=0
 ASSERT_FAILURES=0
 ASSERT_TMPDIRS=()
@@ -236,6 +240,62 @@ assert_file_lacks() {
 assert_fail() {
 	__assert_ran
 	__assert_failed "$@"
+}
+
+# Run the OAuth suite's fixture command with an explicit environment and clock.
+run_oauth_request() {
+	local command="$PROJECT/request" action=()
+	if [[ "$1" == auth-check ]]; then command="$LINEAR"; action=(auth-check); fi
+	if [[ "$1" == cache-fetch ]]; then command="$LINEAR"; action=(cache attachments fetch TEAM-1); fi
+	if [[ "$1" == cache-read ]]; then command="$LINEAR"; action=(cache attachments list TEAM-1); fi
+	shift
+	OUT=$(cd -- "$PROJECT" && env -i PATH="$PROJECT/bin:$PATH" HOME="$TMP_ROOT" \
+		LINEAR_CACHE_ROOT="$PROJECT" LOG="$LOG" NOW="$NOW" REAL_JQ="$REAL_JQ" LINEAR_RETRY_BASE_DELAY=0 \
+		"$@" bash "$command" "${action[@]}" 2>"$LOG/error") && RC=0 || RC=$?
+}
+
+# Run the OAuth suite with repository redirects emitted by Git for normal and
+# linked caller worktrees. The child flag prevents recursive isolation probes.
+run_oauth_git_redirects() {
+	local suite="$1" root="$2" kind caller base git_dir common_dir work_tree index_file rc
+	local before after
+	for kind in normal linked; do
+		base="$root/$kind/base"
+		mkdir -p "$base"
+		git -C "$base" init -q -b main
+		git -C "$base" config gc.auto 0
+		git -C "$base" config maintenance.auto false
+		printf 'caller data\n' >"$base/tracked"
+		git -C "$base" add tracked
+		git -C "$base" -c user.name=fixture -c user.email=fixture@example.invalid commit -qm base
+		caller="$base"
+		if [[ "$kind" == linked ]]; then
+			caller="$root/$kind/worktree"
+			git -C "$base" worktree add -q -b caller "$caller"
+		fi
+		# rev-parse supplies the same redirects Git hooks inherit; resolving
+		# relative outputs keeps the child's working directory out of their meaning.
+		git_dir=$(git -C "$caller" rev-parse --absolute-git-dir)
+		common_dir=$(git -C "$caller" rev-parse --git-common-dir)
+		common_dir=$(cd -- "$caller" && cd -- "$common_dir" && pwd -P)
+		work_tree=$(git -C "$caller" rev-parse --show-toplevel)
+		index_file=$(git -C "$caller" rev-parse --git-path index)
+		[[ "$index_file" == /* ]] || index_file="$caller/$index_file"
+		cp -- "$common_dir/config" "$root/$kind/config.before"
+		cp -- "$index_file" "$root/$kind/index.before"
+		before=$(git -C "$caller" rev-parse HEAD)
+		env -i PATH="$PATH" HOME="$root" OAUTH_GIT_REDIRECT_CHILD=1 \
+			GIT_DIR="$git_dir" GIT_COMMON_DIR="$common_dir" GIT_WORK_TREE="$work_tree" \
+			GIT_INDEX_FILE="$index_file" bash "$suite" >"$root/$kind/suite.log" 2>&1 && rc=0 || rc=$?
+		assert_eq "$kind Git redirects: OAuth suite succeeds" "$rc" 0
+		if [[ "$rc" != 0 ]]; then cat -- "$root/$kind/suite.log"; fi
+		assert "$kind Git redirects: caller config stays unchanged" \
+			cmp -s -- "$root/$kind/config.before" "$common_dir/config"
+		assert "$kind Git redirects: caller index stays unchanged" \
+			cmp -s -- "$root/$kind/index.before" "$index_file"
+		after=$(git -C "$caller" rev-parse HEAD)
+		assert_eq "$kind Git redirects: caller HEAD stays unchanged" "$after" "$before"
+	done
 }
 
 # assert_stop DESC [DIAGNOSTIC...] — assert_fail, then end the suite.
