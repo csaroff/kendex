@@ -30,10 +30,10 @@ fn warning(
     }
 }
 
-/// The hook as Copilot would register it, or `None` with the note saying why
-/// nothing is registered: an event Copilot has no counterpart for. A hook
-/// switched off machine-wide still installs — it is written where Copilot
-/// looks, and the warning says it will sit there doing nothing.
+/// The hook as Copilot would register it, or `None` under the failed-delivery
+/// contract in docs/architecture/engine.md when its event has no counterpart.
+/// A hook switched off machine-wide still installs where Copilot looks;
+/// the warning says it will sit there doing nothing.
 pub(super) fn hook(
     env: &Env,
     scope: &Scope,
@@ -49,7 +49,7 @@ pub(super) fn hook(
         remediation,
     };
     let Some(registered) = crate::harness::copilot::hook_for(hook) else {
-        state.notes.push(super::targets::unsupported_hook_event(
+        state.refused.push(super::targets::unsupported_hook_event(
             name,
             &hook.event,
             HarnessId::Copilot,

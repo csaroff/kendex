@@ -235,15 +235,24 @@ impl Artifact {
     }
 }
 
-/// A declared installation a renderer refused to produce — expressing it on
-/// this harness would widen access. The plan turns each into a conflict row
-/// and a removal of whatever the old, wider rendering left installed.
+/// A declared installation the engine cannot deliver. The plan turns each
+/// into a conflict row and removes the previous unedited installation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Refused {
     pub kind: ItemKind,
     pub name: String,
     pub harness: HarnessId,
+    pub refusal: RefusalKind,
     pub reason: String,
+}
+
+/// The engine's reason for withholding a declared installation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalKind {
+    /// The item's rendered content, configuration or name cannot load.
+    Render,
+    /// The declared harness cannot run the hook's event.
+    UnsupportedHookEvent,
 }
 
 #[derive(Debug, Default)]
