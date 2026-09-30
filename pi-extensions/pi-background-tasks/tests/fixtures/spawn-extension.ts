@@ -52,6 +52,11 @@ async function state() {
 	if (!task) throw new Error("spawn_fixture.task_missing=bg-1");
 	return { id: task.id, pid: task.pid, status: task.status, reason: task.terminationReason ?? null, exitCode: task.exitCode, exitNotified: task.exitNotified };
 }
+// A task with pending log text finalizes after its log flush, which the real
+// file system finishes in real time.
+async function finalized() {
+	for (let waited = 0; waited < 5_000 && (await state()).status === "running"; waited += 1) await Bun.sleep(1);
+}
 try {
 	const { default: backgroundTasks } = await import("../../extensions/background-tasks.js");
 	backgroundTasks(pi);
@@ -89,10 +94,14 @@ try {
 			native.fireTimeout(5000);
 			escalated = { state: await state(), signals: [...native.signals], unitCalls: native.syncCalls.slice(stopStart) };
 			child.emit("close", null);
+			await finalized();
 		}
 	}
 	if (input.mode === "spawn") child.emit("close", 0);
 	const final = await state();
+	// Log lines are written asynchronously; the drain lands them before the read.
+	const { taskLogs } = await import("../../extensions/log-writer.js");
+	await taskLogs.drain();
 	const log = readFileSync(spawned.details.task!.logFile as string, "utf8");
 	const stoppedTimers = native.activeTimers();
 	const stopCalls = native.syncCalls.slice(stopStart);

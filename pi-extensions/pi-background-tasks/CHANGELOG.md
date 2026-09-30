@@ -2,6 +2,13 @@
 
 ## Consumer-impacting changes
 
+### 2.0.4
+
+- A task that prints a lot no longer makes Pi write the task log synchronously, save the full task state and redraw the widget for every output chunk. Slow task log writes no longer block Pi; the task waits on its output instead.
+- A log write that fails loses its bytes, and a log write that stalls loses the output that arrives past a bounded buffer; the log marks each loss with its byte count. In 2.0.3 and earlier a failed write lost its bytes with no mark, and a stalled write blocked Pi.
+- Checks of this session's tasks that outlived a Pi restart or reload no longer block Pi at startup or on their 30-second recheck.
+- Startup and reload with a long task history no longer slow down.
+
 ### 2.0.3
 
 - Settings reads come from memory. A read is answered for one second without touching disk, then the settings files are read again. A change made in the extension manager, or a new session, applies at once; a hand edit to `settings.json` applies within one second. Before, every read went to disk.
