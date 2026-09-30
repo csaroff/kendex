@@ -35,7 +35,7 @@ Requires Python 3.8+ and the orch skill, which the install adds.
 - A directive's message gets an :eyes: reaction as it is delivered. Once the overseer's mailbox read passes that directive, the relay swaps it for :white_check_mark:. Neither mark posts a message. A mark Slack refuses is made again on the next poll.
 - The mailbox's new envelopes for the owner are posted to the channel: a question with its options, recommendation and deadline, a notice in the thread of the message it answers, a report as an uploaded file. An envelope older than `SLACK_THREAD_DAYS` is never posted.
 - The relay's first run reads Slack from the moment of the binding and the mailbox from its newest envelope, so neither side's past is replayed. Open questions are posted whatever their age inside `SLACK_THREAD_DAYS`.
-- While `SLACK_MASTER_FILE` is younger than `SLACK_MASTER_MAX_AGE`, a master session answers the overseer and the relay posts no questions, notices, reports or answers from the mailbox; owner messages in the channel still reach the overseer, the relay's replies to them still post, and `slack listen --status` shows `held-by=master`. When the file goes stale or is gone, the relay posts the questions still open and the answer to a question the channel shows open. A notice written during the hold never posts; one written just before it can, though the master saw it. The exact window: [schemas/journal.md](schemas/journal.md), the `resume` line.
+- While `SLACK_MASTER_FILE` is younger than `SLACK_MASTER_MAX_AGE`, a master session answers the overseer and the relay posts no questions, notices, reports or answers from the mailbox; owner messages in the channel still reach the overseer, the relay's replies to them still post, and `slack listen --status` shows `held-by=master`. When the file goes stale or is gone, the relay resumes. [The master hold](#the-master-hold) defines which envelopes post.
 - `slack compact` drops journal lines older than `SLACK_THREAD_DAYS` once resolved. The relay runs it once a day, so the verb is refused `relay-running` while the relay runs on that checkout.
 - `slack install` writes the systemd user unit that runs the relay over the roots you name.
 
@@ -95,15 +95,9 @@ The app must be a member of every channel it posts to. `setup` creates the chann
 4. Run `slack install --root <checkout>` on a host with systemd, or `slack listen --root <checkout>` in a terminal. To add a checkout later, run `slack install` again with every `--root`; it restarts the running relay on the new list.
 5. Write in the channel. The overseer's reply lands in the thread.
 
-## The local run
+## The master hold
 
-A workstation runs the relay by hand:
-
-```bash
-.agents/skills/slack/scripts/slack listen --root "$PWD"
-```
-
-The relay prints `slack: listening=1 poll_seconds=15`, then `slack: connected=<UTC second>`, and runs until stopped. `--once` opens no connection: it reads each root's channel and mailbox once and exits, which is the form a test uses. The doctor reads `listen --status`. A second relay on the same checkout is refused `relay-running`.
+After reading the mailbox, the external master's watch writes its read line count to `<root>/tmp/lane-mail/overseer/to-overseer.seen` as one bare integer. The relay only reads this file. On resume, it clamps the count to the mailbox length, skips notices at or below it and journals their ids. Later notices post once. Open asks and held answers still post. Missing or unreadable files skip nothing. Hold times do not set a notice cutoff.
 
 ## Steering contract
 
