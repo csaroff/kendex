@@ -253,8 +253,9 @@ fi
 cat "$TMP/predicate-original" >"$PREDICATE"
 
 # Source preparation is bounded because the judged manifest chooses how much
-# work it asks for. Either bound refuses THIS pull request's classification and
-# writes no verdict, which leaves its status for the next pass.
+# work it asks for. Either bound refuses THIS pull request's classification:
+# a non-zero exit of the class resolution, which answers class-unresolved on
+# its head with no evidence read. Scope: the SKILL.md class-unresolved row.
 while IFS='|' read -r label stub_env key value; do
   [ -n "$label" ] || continue
   reset
@@ -263,8 +264,13 @@ while IFS='|' read -r label stub_env key value; do
   out="$(run_predicate "$RENDER" render $stub_env)"
   rc=$?
   set -e
-  assert_eq "$rc" "2" "$label refuses"
-  assert_eq "$([ -z "$out" ] && echo empty || echo lines)" "empty" "$label writes no verdict"
+  assert_eq "$rc:$out" "0:verdict=class-unresolved detail=change class unresolved at $RENDER; the writer log names the cause, and the next pass retries" \
+    "$label answers class-unresolved on its own head"
+  if grep -Eq '/reviews|graphql' "$FIXTURES/.urls.log" 2>/dev/null; then
+    bad "$label reads no review evidence" "$(cat "$FIXTURES/.urls.log")"
+  else
+    ok "$label reads no review evidence"
+  fi
   assert_eq "$(grep -Fxc "review-gate-error=$key value=$value" "$TMP/stderr")" "1" "$label is named by its own key and value"
   assert_eq "$(grep -c 'review-gate-error=predicate-policy-resolve' "$TMP/stderr")" "1" \
     "$label reaches the caller as predicate-policy-resolve"
@@ -305,8 +311,9 @@ else
   set -e
   if [ "$rc:$out" = "$UNMEASURED_WANT" ]; then
     bad "must-fail: a predicate that ignores exit 3 must lose the unmeasured verdict" "$rc:$out"
-  elif [ "$rc:$out" = "2:" ] && grep -q 'review-gate-error=predicate-policy-resolve' "$TMP/stderr"; then
-    ok "must-fail: a predicate that ignores exit 3 fails the evaluation as predicate-policy-resolve"
+  elif [ "$rc" = 0 ] && [ "${out%% *}" = "verdict=class-unresolved" ] &&
+    grep -q 'review-gate-error=predicate-policy-resolve' "$TMP/stderr"; then
+    ok "must-fail: a predicate that ignores exit 3 falls to class-unresolved at the policy resolve"
   else
     bad "must-fail: the mutant failed somewhere other than the policy resolve" "$rc:$out $(cat "$TMP/stderr")"
   fi

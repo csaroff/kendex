@@ -678,10 +678,45 @@ while IFS='|' read -r label base_state head_state cause; do
     "$(printf '%s\n' "$integrity_err" | grep '^class: ')"
 done <<'INTEGRITY'
 that is not a list of strings|not json {|not json {|cause=invalid-generated-paths
-absent at both endpoints|absent|absent|cause=unreadable-base-inventory base=BASE
+the base holds and cannot parse|not json {|keep|cause=invalid-generated-paths
 the head endpoint has lost|keep|absent|cause=unreadable-head-inventory head=HEAD
 INTEGRITY
 require_rows change-class-integrity "$integrity_rows"
+
+# A base that holds no inventory at all is older than the render that first
+# wrote one, a long-lived branch's normal state. Nothing there is generated,
+# so the diff is product source and standard is a verdict, measured, whether
+# or not the head has gained an inventory since. The row above whose base
+# holds an inventory that does not parse is this rule's control: an absent
+# file and an unreadable one are two answers.
+absent_rows=0
+while IFS='|' read -r label head_state; do
+  absent_rows=$((absent_rows + 1))
+  read -r absent_repo absent_base \
+    <<<"$(integrity_fixture "change-class-absent-$absent_rows" absent "$head_state")"
+  absent_err="$(PATH="$stub_bin:$PATH" "$CHANGE_CLASS" --repo "$absent_repo" \
+    --event pull_request --base "$absent_base" --head HEAD 2>&1 >/dev/null)"
+  assert_eq "a base with no inventory, head $label, is a measured standard" \
+    "class: class=standard measured=true cause=base-inventory-absent base=$absent_base" \
+    "$(printf '%s\n' "$absent_err" | grep '^class: ')"
+done <<'ABSENT'
+without one either|absent
+that has gained one|[]
+ABSENT
+require_rows change-class-absent-base "$absent_rows"
+
+# The control that separates absent from unreadable at git's own read: the
+# base commits an inventory, then its blob goes missing, so the tree still
+# lists the file and git cannot read it. That is unreadable, never absent.
+read -r lost_repo lost_base \
+  <<<"$(integrity_fixture change-class-lost-base-blob '["seed.txt","lost-base-blob"]' '[]')"
+lost_blob="$(git -C "$lost_repo" rev-parse "$lost_base:.kendex-generated.json")"
+rm -- "${lost_repo:?}/.git/objects/${lost_blob:0:2}/${lost_blob:2}"
+lost_err="$(PATH="$stub_bin:$PATH" "$CHANGE_CLASS" --repo "$lost_repo" \
+  --event pull_request --base "$lost_base" --head HEAD 2>&1 >/dev/null)"
+assert_eq "a base inventory git cannot read is never measured" \
+  "class: class=standard measured=false cause=unreadable-base-inventory base=$lost_base" \
+  "$(printf '%s\n' "$lost_err" | grep '^class: ')"
 
 # Those three are not a list of the causes that refuse: they are three of the
 # causes harness-only raises before it has read the changed paths at all. The
