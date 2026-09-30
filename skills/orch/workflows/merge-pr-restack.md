@@ -16,7 +16,7 @@ Use this cycle for a `conflicting` queue-wait verdict, and for a `worktree-push-
 
    It pushes nothing. Exit 0 is the only answer that permits the restack; any other exit hands back, and the command says which it was (`worktree-push --help`). `worktree create [ISSUE] --reuse` rebases outside this check too, and carries no live-round refusal of its own.
 
-   Then start the guarded restack:
+   The restack takes [SKILL.md § The Cycle](../SKILL.md#the-cycle), Rules reload after a rebase. Then start the guarded restack:
 
    ```bash
    [MAIN_REPO_ROOT]/.agents/skills/worktree/scripts/worktree create [ISSUE] --restack
