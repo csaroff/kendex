@@ -2122,25 +2122,54 @@ launch_session_resolve() { # TITLE
 # launch handed to a background job opens it before the hand-off, so the next
 # item's pick counts this account while the host is still preparing.
 tmux_window_open() { # DIR TITLE
-  local dir="$1" title="$2" last_idx pane spec server
+  local dir="$1" title="$2" last_idx pane spec server matches row idx id owner identity replace_idx=""
+  local window_args=()
   tmux_server_named || { ot_message tmux-missing "item=$title" >&2; return 1; }
   launchable_dir "$dir" "$title" || return 1
+  dir="$(cd -- "$dir" && pwd -P)" || return 1
+  # Hosted windows start in the caller's checkout, not the remote worktree.
+  # The repository and worktree id distinguish those lanes even at that path.
+  identity="$(jq -cn --arg dir "$dir" --arg repo "$repo" --arg item "$wt_id" '[$dir, ($repo | ascii_downcase), $item]')" || return 1
   launch_session_resolve "$title" || return 1
   # Exact (`=`): tmux otherwise takes a prefix match for a session name.
   if ! last_idx=$(tmux list-windows -t "=$LAUNCH_SESSION" -F '#{window_index}' | tail -1) || [[ -z "$last_idx" ]]; then
     ot_message tmux-failed "operation=list-windows" "item=$title" >&2
     return 1
   fi
+  window_args=(-a -t "=$LAUNCH_SESSION:$last_idx")
+  if [[ "$RELAUNCH" == true ]]; then
+    matches="$(tmux list-windows -t "=$LAUNCH_SESSION" -f "#{==:#{window_name},$title}" -F '#{window_index} #{window_id} #{@kendex_lane}')" || {
+      ot_message tmux-failed "operation=list-windows" "item=$title" >&2; return 1;
+    }
+    # Linear keys identify an item; GitHub numbers require a matching identity.
+    # Window ids keep duplicate removal stable through renumbering.
+    while IFS= read -r row; do
+      [[ -n "$row" ]] || continue
+      read -r idx id owner <<<"$row"
+      if [[ "$TRACKER" == github && "$owner" != "$identity" ]]; then
+        [[ -n "$owner" ]] || printf 'open-terminal: window-preserved item=%s window=%s reason=owner-unrecorded\n' "$title" "$id" >&2; continue
+      fi
+      if [[ -z "$replace_idx" ]]; then replace_idx="$idx"
+      else tmux kill-window -t "$id" || { ot_message tmux-failed "operation=kill-window" "item=$title" >&2; return 1; }; fi
+    done <<<"$matches"
+    # new-window -k keeps a session whose only window is the old lane alive.
+    [[ -z "$replace_idx" ]] || window_args=(-k -t "=$LAUNCH_SESSION:$replace_idx")
+  fi
   # The server pid rides along with the pane id: it is the other half of a
   # lane claim's liveness key, and taking both from the creating call means no
   # second tmux round trip and no window between them.
-  if ! spec=$(tmux new-window -a -t "=$LAUNCH_SESSION:$last_idx" -n "$title" -c "$dir" -P -F '#{pid} #{pane_id}') || [[ -z "$spec" ]]; then
+  if ! spec=$(tmux new-window "${window_args[@]}" -n "$title" -c "$dir" -P -F '#{pid} #{pane_id}') || [[ -z "$spec" ]]; then
     ot_message tmux-failed "operation=new-window" "item=$title" >&2
     return 1
   fi
   pane="${spec##* }"
   server="${spec% *}"
   [[ "$server" != "$spec" ]] || server=""
+  if ! tmux set-option -w -t "$pane" @kendex_lane "$identity"; then
+    ot_message tmux-failed "operation=set-option" "item=$title" >&2
+    tmux_window_close "$pane" "$title" || true
+    return 1
+  fi
   # A lane launch is in flight the moment its window exists: `lanes pick`
   # counts it from here, minutes before the account's usage numbers move.
   # Recorded only under a resolved lane — the config dir is the account's
