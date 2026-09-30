@@ -724,11 +724,13 @@ pi_lane_root_apply() {
 }
 # The refusal for an `auto` pick `lanes` answered with RC, the fields after it
 # appended, by the account lane_pick_harness says the launch spends. Every one
-# stops the launch, and each names what answers it: 3 is every candidate at or
-# above the threshold, which for the Copilot pool is the owner's stated reading
-# and moves only when the owner restates it, never a window a reset reopens; 5
-# is a Pi pick with no pool stated at all, a setting to state, or one on a
-# provider nothing measures; anything else is lanes failing.
+# stops the launch, and each names what answers it: 3 is no candidate with
+# room, which for the Copilot pool is every pool read at or above the
+# threshold, a pool the lane host read reopening at its binding_resets_at and a
+# stated one moving only when the owner restates it; 5 is a Pi pick where no
+# read measured any pool, a read to repair as the `fix=` line `lanes` printed
+# above says, or one on a provider nothing measures; anything else is lanes
+# failing, a failed accounts read that a retry can answer among them.
 auto_pick_refusal() { # RC [FIELD...]
   local rc="$1"
   shift
@@ -864,10 +866,12 @@ named_lane_judge() {
       # second reading of the conditions the branches below judge on — asking
       # only for the shapes that act on the answer would state each of those
       # conditions twice, and a rule stated twice is a rule that can be
-      # changed in one place. Pi is not asked: the accounts protocol names no
-      # Pi account, the Copilot pool is the reading the owner states, which no
-      # copy of a credential measures, and a Pi launch on a Claude seat or on
-      # a provider nothing measures is refused below on every host.
+      # changed in one place. Pi is not asked: the judge above already read
+      # the provider's harness=pi row for a Pi root on the Copilot pool, so a
+      # pool neither that row nor the override measured is refused below
+      # rather than relaunched unjudged, the fix= line `lanes` printed above
+      # naming the read that failed, and a Pi launch on a Claude seat or on a
+      # provider nothing measures is refused below on every host.
       [[ "$LANE_HOST" == local || "$LAUNCH_HARNESS" == pi ]] || host_account_read "${LANE_ENV#*=}" "$LAUNCH_HARNESS"
       if [[ "$HOST_RELAUNCH" == true && "$HOST_ACCOUNT" == held ]]; then
         ot_message host-relaunch-credential "lane=${LANE_ENV#*=}" "host=$LANE_HOST" >&2

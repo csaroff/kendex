@@ -316,8 +316,9 @@ table \
   "pick exits 3 when no lane is under the threshold||pick --harness claude --max-pct 15|rc=3"
 
 echo "=== pick: a Pi launch on a Copilot model is judged on the stated Copilot pool ==="
-# Such a launch spends Copilot credits and no Claude or Codex window, so the
-# owner's ORCH_LANE_COPILOT_POOL reading is its whole judgement: a monthly
+# Such a launch spends Copilot credits and no Claude or Codex window, so with
+# no lane host the owner's ORCH_LANE_COPILOT_POOL reading is its whole
+# judgement (lanes-copilot.sh holds the provider's harness=pi rows): a monthly
 # bucket at the used share rounded up and held at 100 past the grant, handed
 # back under Pi's own root variable. One named account unstated is unmeasured
 # rather than unlisted (which a launcher would launch on), no entry at all is
@@ -332,7 +333,7 @@ table \
   "a pool at its grant is walled even under a bound of 100|$POOL=1000000/1000000|pick --harness pi $COPILOT --max-pct 100|rc=3 key=no-candidate,harness=pi,max-pct=100,model=github-copilot/claude-sonnet-5,walled=1,unmeasured=0,seats=0" \
   "one credit short of the grant rounds up to a spent pool|$POOL=999999/1000000|pick --lane $H/.pi1 --harness pi $COPILOT --max-pct 100 --json|rc=3 wall=100 binding_bucket=monthly" \
   "a pool used past its grant reads 100, with no negative headroom|$POOL=1500/1000|pick --lane $H/.pi1 --harness pi $COPILOT --json|rc=3 wall=100 headroom_pct=0" \
-  "no stated pool is exit 5 by the setting's name||pick --harness pi $COPILOT|rc=5 key=copilot-pool-unstated,model=github-copilot/claude-sonnet-5,setting=ORCH_LANE_COPILOT_POOL" \
+  "no stated pool is exit 5 by the setting's name||pick --harness pi $COPILOT|rc=5 key=copilot-pool-unstated,model=github-copilot/claude-sonnet-5,setting=ORCH_LANE_COPILOT_POOL,read=local" \
   "a stated pool every entry of which is excluded is a pick with no candidate, not an unstated one|$POOL=1/10;ORCH_LANE_EXCLUDE=pi1|pick --harness pi $COPILOT|rc=3 key=no-candidate,harness=pi,max-pct=95,model=github-copilot/claude-sonnet-5,walled=0,unmeasured=0,seats=0" \
   "a named account the setting states nothing for is unmeasured, never unlisted|$POOL=1/10|pick --lane $H/.eclaude --harness pi $COPILOT --json|rc=5 status=no_usage_data" \
   "a listing of every harness leaves the stated pool out|$POOL=1/10|list --json|aliases=claude,eclaude,nclaude,openclaude"
@@ -370,46 +371,20 @@ pool_control mutant-pool-clamp lanes '(( used >= limit ))' 'false' \
 pool_control mutant-pool-unlisted lanes '\[\[ -n "\$found" || "\$harness" != pi \]\] || found="\$dir"' - \
   "control: an unstated account read as unlisted exits 4, which a launcher launches on|$POOL=1/10|pick --lane $H/.eclaude --harness pi $COPILOT --json|rc=4"
 pool_control mutant-pool-bucket lib/lane-model.sh 'pct: (.monthly_pct' 'pct: (null' \
-  "control: with the monthly bucket out of the shared windows the stated pool measures nothing|$POOL=100000/1000000|pick --harness pi $COPILOT|rc=3"
+  "control: with the monthly bucket out of the shared windows the stated pool measures nothing|$POOL=100000/1000000|pick --harness pi $COPILOT|rc=5"
 pool_control mutant-pool-relative lanes '"\$dir" != .\* || ' '' \
   "control: with no absolute-path test a relative account dir is picked|ORCH_LANE_COPILOT_POOL=pi1=1/10|pick --harness pi $COPILOT|rc=0"
 pool_control mutant-pool-grant lanes '(( limit > 0 ))' '(( limit >= 0 ))' \
   "control: with no grant test 0/0 is judged, as a spent pool|$POOL=0/0|pick --harness pi $COPILOT|rc=3"
-pool_control mutant-pool-status lanes 'pool_entries="\$(copilot_pool_entries)" || return 1$' 'pool_entries="$(copilot_pool_entries)"' \
+pool_control mutant-pool-status lanes '^[[:space:]]*copilot_pool_entries >.dev.null || return 1$' '		copilot_pool_entries' \
   "control: the chooser ignoring the refusal reads an unreadable entry as no entry|$POOL=12.5/300|pick --harness pi $COPILOT|rc=5"
-pool_control mutant-pool-lane-status lanes '[[:space:]]entries="\$(copilot_pool_entries)" || return 1$' ' entries="$(copilot_pool_entries)"' \
-  "control: the named form ignoring the refusal reads an unreadable entry as no reading|$POOL=12.5/300|pick --lane $H/.pi1 --harness pi $COPILOT|rc=5"
+# The named Pi form's refusal is held twice, by cmd_pick_lane before any read
+# and by measure_copilot_pool, so no one edit reddens its row above; each
+# guard's control is in lanes-copilot.sh, on the form only that guard holds.
 pool_control mutant-pool-anchors lanes '=~ \^(\[0-9]{1,12})' '=~ ([0-9]{1,12})' \
   "control: with the credits anchors gone 12.5/300 is read as its tail|$POOL=12.5/300|pick --harness pi $COPILOT|rc=0"
 pool_control mutant-pool-duplicate lanes 'case "\$seen" in' - \
   "control: with no duplicate check the first of two readings for one account wins|$POOL=1/10,$H/.pi1=10/10|pick --harness pi $COPILOT --json|rc=0 monthly_pct=10 qualifying_count=2"
-
-# The pool reading is the owner's statement, so a Pi pick asks no lane
-# provider, in either form, even with one configured: the stub logs every verb
-# it is asked. The control makes Pi picks ask again, and both rows read the
-# accounts call.
-PI_HOST_LOG="$TMP_ROOT/pi-host.log"
-PI_HOST="ORCH_LANE_HOST=$TEST_DIR/fixtures/lane-host;LANE_HOST_STUB_LOG=$PI_HOST_LOG;$POOL=1/10"
-# Run in this shell, never a command substitution: run_lanes numbers its run
-# directory, and a subshell's number is lost, so a second pick would reuse the
-# first one's usage cache and its cached provider answer.
-pi_host_calls() { # ARGS... — sets PI_CALLS to rc and the provider verbs asked
-  : > "$PI_HOST_LOG"
-  run_lanes "$PI_HOST" "$@"
-  PI_CALLS="$(awk '{ print $1 }' "$PI_HOST_LOG" | paste -sd, - || true)"
-  PI_CALLS="rc=$RC calls=${PI_CALLS:-none}"
-}
-pi_host_rows() { # EXPECT_CALLS LABEL_PREFIX
-  pi_host_calls pick --harness pi $COPILOT
-  assert_eq "$PI_CALLS" "rc=0 calls=$1" "$2 the chooser"
-  pi_host_calls pick --lane "$H/.pi1" --harness pi $COPILOT
-  assert_eq "$PI_CALLS" "rc=0 calls=$1" "$2 the named form"
-}
-pi_host_rows none "a Pi pick under a configured provider asks it nothing:"
-lanes_mutant mutant-pool-host lanes 'if \[\[ "\$1" == pi \]\]; then printf'
-LANES="$TMP_ROOT/mutant-pool-host/scripts/lanes"
-pi_host_rows accounts "control: a Pi pick that asks the provider calls its accounts verb:"
-LANES="$SCRIPTS_DIR/lanes"
 
 echo "=== pick: a Pi launch is judged on the account its model's provider bills ==="
 # A pi-claude model runs Claude Code on a Claude seat, so its pick is a claude
@@ -2431,7 +2406,7 @@ table \
   "and for the chooser|$LOCAL_WINDOWLESS|$PICK|rc=3 key=no-candidate-unmeasured,harness=claude,model=none,unmeasured=3 considered.wclaude=host"
 # Control: a judge that takes any local reading with an age lets the
 # window-less one stand in and names it.
-lanes_mutant mutant-local-unmeasured lanes '\.headroom_pct != null and ' ''
+lanes_mutant mutant-local-unmeasured lanes 'if \.headroom_pct == null then empty' 'if false then empty'
 LANES="$TMP_ROOT/mutant-local-unmeasured/scripts/lanes"
 table \
   "control: with no figure required, the named form answers the window-less local reading|$LOCAL_WINDOWLESS|$PICK_LANE $H/.wclaude|rc=5 status=no_usage_data measured_through=local key=pick-local-reading,lane=$H/.wclaude,host=$HOST_FIXTURE,age-s=0" \
@@ -2439,7 +2414,7 @@ table \
 LANES="$LANES_PATCHED"
 # Control: a judge that never reads a host row as unreachable refuses the
 # account this machine measured fresh.
-lanes_mutant mutant-host-row-always-stands lanes '!= unreachable \]\]' '!= never-unreachable ]]'
+lanes_mutant mutant-host-row-always-stands lanes '\.status == "unreachable" end' '.status == "never-unreachable" end'
 LANES="$TMP_ROOT/mutant-host-row-always-stands/scripts/lanes"
 table \
   "control: with every host row standing, the chooser refuses the fresh local account on the unreachable row|$LOCAL_DARK|$PICK|rc=3 considered.fclaude=host" \
