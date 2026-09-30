@@ -146,6 +146,190 @@ fn harness_paths_prints_the_adapters_paths_from_anywhere() {
     })));
 }
 
+/// The Copilot home and the project come from the flags, never from the
+/// caller's own home or folder, and the file named is the one whose
+/// `disableAllHooks` the later layers leave standing. A home that holds no
+/// settings answers null, the one form a launch passes on.
+#[test]
+#[allow(clippy::unwrap_used)]
+fn hooks_off_names_the_copilot_settings_file_that_switched_every_hook_off() {
+    let tmp = fixture_home();
+    let home = tmp.path();
+    let folder = tempfile::tempdir().unwrap();
+    let root = rooted(&folder);
+    let copilot_home = root.join("copilot-home");
+    let project = root.join("worktree");
+    fs::create_dir_all(&copilot_home).unwrap();
+    fs::create_dir_all(project.join(".github/copilot")).unwrap();
+    fs::create_dir_all(project.join(".claude")).unwrap();
+    let home_config = copilot_home.join("config.json");
+    let home_settings = copilot_home.join("settings.json");
+    let claude_settings = project.join(".claude/settings.json");
+    let repo_settings = project.join(".github/copilot/settings.json");
+    let ask = || {
+        let output = kendex(
+            home,
+            home,
+            &[
+                "hooks-off",
+                "--copilot-home",
+                copilot_home.to_str().unwrap(),
+                "--project",
+                project.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let named = |path: &Path| serde_json::json!({ "switched_off_by": path.to_str().unwrap() });
+    let none = serde_json::json!({ "switched_off_by": null });
+
+    // A label, the settings file the row writes with its text, and the
+    // answer; each write lands on top of the rows before it.
+    type Row<'a> = (&'a str, Option<(&'a Path, &'a str)>, serde_json::Value);
+    let rows: [Row; 5] = [
+        ("no settings anywhere", None, none.clone()),
+        (
+            "the home's config.json, under the header Copilot writes, switches them off",
+            Some((
+                &home_config,
+                "// User settings belong in settings.json.\n{\"disableAllHooks\": true}\n",
+            )),
+            named(&home_config),
+        ),
+        (
+            "the home named by the flag switches them off",
+            Some((&home_settings, r#"{"disableAllHooks": true}"#)),
+            named(&home_settings),
+        ),
+        (
+            "a repository file, a later layer, switches them back on",
+            Some((&repo_settings, r#"{"disableAllHooks": false}"#)),
+            none.clone(),
+        ),
+        (
+            "Claude Code's project file sits below the repository file",
+            Some((&claude_settings, r#"{"disableAllHooks": true}"#)),
+            none,
+        ),
+    ];
+    for (label, write, want) in rows {
+        if let Some((path, text)) = write {
+            fs::write(path, text).unwrap();
+        }
+        assert_eq!(ask(), want, "{label}");
+    }
+    fs::remove_file(&repo_settings).unwrap();
+    assert_eq!(
+        ask(),
+        named(&claude_settings),
+        "with the repository file gone, the project's Claude Code file is the last word"
+    );
+}
+
+/// A settings file that is there but is no JSON once its comments are
+/// stripped is a layer the answer cannot judge, so the verb fails naming it and prints no answer, and
+/// `open-terminal` refuses the lane instead of reading null.
+#[test]
+#[allow(clippy::unwrap_used)]
+fn hooks_off_fails_naming_a_copilot_settings_file_it_cannot_parse() {
+    let tmp = fixture_home();
+    let home = tmp.path();
+    let folder = tempfile::tempdir().unwrap();
+    let root = rooted(&folder);
+    let copilot_home = root.join("copilot-home");
+    let project = root.join("worktree");
+    fs::create_dir_all(&copilot_home).unwrap();
+    fs::create_dir_all(&project).unwrap();
+    let home_settings = copilot_home.join("settings.json");
+    fs::write(&home_settings, "// a comment\n{\"disableAllHooks\": true\n").unwrap();
+    let output = kendex(
+        home,
+        home,
+        &[
+            "hooks-off",
+            "--copilot-home",
+            copilot_home.to_str().unwrap(),
+            "--project",
+            project.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!("{}: invalid JSON", home_settings.display())),
+        "{stderr}"
+    );
+}
+
+/// A hook document named with `--hook-document` carries its own
+/// `disableAllHooks`: one switched on is named, one switched off or silent
+/// is not, and one that is no JSON fails the verb naming it, so
+/// `open-terminal` refuses the lane instead of reading null.
+#[test]
+#[allow(clippy::unwrap_used)]
+fn hooks_off_reads_the_switch_of_each_named_hook_document() {
+    let tmp = fixture_home();
+    let home = tmp.path();
+    let folder = tempfile::tempdir().unwrap();
+    let root = rooted(&folder);
+    let copilot_home = root.join("copilot-home");
+    let project = root.join("worktree");
+    let hooks = project.join(".github/hooks");
+    fs::create_dir_all(&copilot_home).unwrap();
+    fs::create_dir_all(&hooks).unwrap();
+    let check = hooks.join("lane-mail-check.json");
+    let compact = hooks.join("lane-mail-compact.json");
+    fs::write(&compact, r#"{"version": 1, "hooks": {}}"#).unwrap();
+    let ask = || {
+        kendex(
+            home,
+            home,
+            &[
+                "hooks-off",
+                "--copilot-home",
+                copilot_home.to_str().unwrap(),
+                "--project",
+                project.to_str().unwrap(),
+                "--hook-document",
+                compact.to_str().unwrap(),
+                "--hook-document",
+                check.to_str().unwrap(),
+            ],
+        )
+    };
+    // A label, lane-mail-check.json's text, and the answer.
+    let rows: [(&str, &str, serde_json::Value); 2] = [
+        (
+            "a document switching its own hooks off is named",
+            "// kendex\n{\"version\": 1, \"disableAllHooks\": true}\n",
+            serde_json::json!({ "switched_off_by": check.to_str().unwrap() }),
+        ),
+        (
+            "a document switching them on is not",
+            r#"{"version": 1, "disableAllHooks": false}"#,
+            serde_json::json!({ "switched_off_by": null }),
+        ),
+    ];
+    for (label, text, want) in rows {
+        fs::write(&check, text).unwrap();
+        let output = ask();
+        assert_eq!(output.status.code(), Some(0), "{label}: {output:?}");
+        let got: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(got, want, "{label}");
+    }
+    fs::write(&check, "{\"disableAllHooks\": true\n").unwrap();
+    let output = ask();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!("{}: invalid JSON", check.display())),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn scope_project_outside_a_project_is_an_error() {
     let tmp = fixture_home();

@@ -80,7 +80,7 @@ printf '%s\n' "$*" >> "$OT_WT_LOG"
 n=0; [[ -f "$OWNED_COUNT" ]] && n="$(cat "$OWNED_COUNT")"
 n=$((n + 1)); printf '%s' "$n" > "$OWNED_COUNT"
 [[ "$n" -eq 1 ]] || exit 75
-d="$(mktemp -d "$OWNED_ROOT/wt.XXXXXX")"; git init -q "$d"; printf '%s\n' "$d"
+d="$(mktemp -d "$OWNED_ROOT/wt.XXXXXX")"; git init -q "$d"; git -C "$d" config gc.auto 0; git -C "$d" config maintenance.auto false; printf '%s\n' "$d"
 STUBEOF
 chmod +x "$OWNED_STUB"
 
@@ -112,14 +112,14 @@ TABBED="$TMP_ROOT/tab	lane"; mkdir -p "$TABBED"
 
 # Checkouts a row can run from: one holding a directory named like a lane
 # alias, one holding a bare directory no alias claims, one with no git at all.
-COLLIDE="$TMP_ROOT/collide"; mkdir -p "$COLLIDE/work"; git -C "$COLLIDE" init -q -b main
-BARE="$TMP_ROOT/bare"; mkdir -p "$BARE/somelane"; git -C "$BARE" init -q -b main
+COLLIDE="$TMP_ROOT/collide"; mkdir -p "$COLLIDE/work"; git -C "$COLLIDE" init -q -b main; git -C "$COLLIDE" config gc.auto 0; git -C "$COLLIDE" config maintenance.auto false
+BARE="$TMP_ROOT/bare"; mkdir -p "$BARE/somelane"; git -C "$BARE" init -q -b main; git -C "$BARE" config gc.auto 0; git -C "$BARE" config maintenance.auto false
 NOREPO="$TMP_ROOT/norepo"; mkdir -p "$NOREPO"
 # A git repository with no kendex settings of its own. A script copied outside
 # every checkout resolves no PROJECT_ROOT, and `lane-host resolve` then runs
 # from the working directory, which has to be a repository; this one carries no
 # settings for that script to pick up on the way.
-NOSETTINGS="$TMP_ROOT/nosettings"; mkdir -p "$NOSETTINGS"; git -C "$NOSETTINGS" init -q -b main
+NOSETTINGS="$TMP_ROOT/nosettings"; mkdir -p "$NOSETTINGS"; git -C "$NOSETTINGS" init -q -b main; git -C "$NOSETTINGS" config gc.auto 0; git -C "$NOSETTINGS" config maintenance.auto false
 
 standard_home home
 
@@ -311,7 +311,7 @@ observe() {
         value="${value:-none}"
         ;;
       statusline)
-        value="$(awk '$1 == "open-terminal:" && $2 == "unsupported-for-oversee" && $4 == "reason=status-line" { print $5 "," $6; exit }' <<<"$OUT")"
+        value="$(awk '$1 == "open-terminal:" && $2 == "unsupported-for-oversee" && $4 == "reason=no-context-reader" { print $5 "," $6 "," $7; exit }' <<<"$OUT")"
         value="${value:-none}"
         ;;
       pickrefusal)
@@ -671,25 +671,39 @@ assert_eq "$(observe "launched=2 pi_root=pi1,pi2 compactionon=none")" "launched=
   "control: a re-pick that keeps the first root launches the second item on an account nobody gated"
 rm -f -- "${H:?}/.pi1/settings.json" "${H:?}/.pi2/settings.json"
 
-# The same re-pick on the Copilot pool is gated on the second account's status
-# line: copilot1 (10) takes the first item, its claim moves the second onto
-# copilot2 (20), which has no settings file, so the second is refused. Its
-# control drops the re-pick's gate, and the second item launches with no status
-# line to write its session record.
-mkdir -p "$H/.copilot1" "$H/.copilot2"
+# The same re-pick on the Copilot pool is gated on the second account's own
+# context reader: copilot1 (10) takes the first item, the extension reader
+# installed in its home and the hooks in its global scope, and its claim moves
+# the second onto copilot2 (20), whose settings turn extensions off and run no
+# status line for the fallback reader, so the second is refused. Its control
+# drops the re-pick's gate, and the second item launches with neither reader.
+# Both homes hold the hooks in their global scope and the kendex stub answers
+# the hooks gate that none is switched off, so the context reader is the one
+# gate the two accounts differ on. The batch runs with HOME the fixture's, so
+# the reader's pending directory the gate makes lands there.
+mkdir -p "$H/.copilot1/hooks" "$H/.copilot2/hooks"
 printf '{}\n' > "$H/.copilot1/config.json"
 printf '{}\n' > "$H/.copilot2/config.json"
-printf '{"statusLine":{"type":"command","command":"%s","refreshInterval":30}}\n' "$SCRIPTS_DIR/copilot-statusline" > "$H/.copilot1/settings.json"
-CP_BATCH="ORCH_LANE_COPILOT_POOL=$H/.copilot1=100000/1000000,$H/.copilot2=200000/1000000;cmd=true --model claude-sonnet-5 --reasoning-effort high"
+for hook in lane-mail-check lane-mail-compact lane-mail-start; do
+  for home in "$H/.copilot1" "$H/.copilot2"; do
+    printf '#!/bin/sh\n' > "$home/hooks/$hook.sh"
+    printf '{"version":1,"hooks":{}}\n' > "$home/hooks/$hook.json"
+  done
+done
+printf '{"enabledFeatureFlags":{"EXTENSIONS":false}}\n' > "$H/.copilot2/settings.json"
+printf '#!/bin/sh\nprintf '"'"'{"switched_off_by":null}\\n'"'"'\n' > "$OT_STUB_BIN/kendex"
+chmod +x "$OT_STUB_BIN/kendex"
+CP_BATCH="HOME=$H;ORCH_LANE_COPILOT_POOL=$H/.copilot1=100000/1000000,$H/.copilot2=200000/1000000;cmd=true --model claude-sonnet-5 --reasoning-effort high"
 run_ot "$CP_BATCH" --harness copilot --lane auto --state-dir "$TMP_ROOT/cp-fleet-1" CC-1680 CC-1681
-assert_eq "$(observe "launched=1 copilot_home=copilot1 statusline=cause=settings-missing,file=$H/.copilot2/settings.json")" \
-  "launched=1 copilot_home=copilot1 statusline=cause=settings-missing,file=$H/.copilot2/settings.json" \
-  "a Copilot batch's re-pick onto a second pool account is gated on that account's own status line"
+assert_eq "$(observe "launched=1 copilot_home=copilot1 statusline=file=$H/.copilot2/settings.json,detail=disabled,cause=no-status-line")" \
+  "launched=1 copilot_home=copilot1 statusline=file=$H/.copilot2/settings.json,detail=disabled,cause=no-status-line" \
+  "a Copilot batch's re-pick onto a second pool account is gated on that account's own context reader"
 pi_control ctl-copilot-repick open-terminal 'pi_lane_root_apply && copilot_fleet_gate || return 1; }' \
   'pi_lane_root_apply || return 1; }' "$CP_BATCH" --harness copilot --lane auto --state-dir "$TMP_ROOT/cp-fleet-2" CC-1680 CC-1681
 assert_eq "$(observe "launched=2 copilot_home=copilot1,copilot2 statusline=none")" "launched=2 copilot_home=copilot1,copilot2 statusline=none" \
-  "control: a re-pick with no Copilot gate launches the second item on an account whose status line nobody read"
+  "control: a re-pick with no Copilot gate launches the second item on an account whose context reader nobody set up"
 rm -rf -- "${H:?}/.copilot1" "${H:?}/.copilot2"
+rm -f -- "${OT_STUB_BIN:?}/kendex"
 
 echo "=== a Pi launch on a pi-claude model is judged on the Claude seat it spends ==="
 # pi-claude-bridge runs Claude Code on the Claude seat CLAUDE_CONFIG_DIR names,
@@ -1420,7 +1434,7 @@ assert_eq "$(observe "rc= launched=") invalid=$(said "open-terminal: host-line-i
   "a create line missing its remote prefix is host-line-invalid and opens no window"
 # lane-host create writes the hosted lane's marker on its host. A local one
 # would bind the caller's own checkout, which would then pose as a lane.
-HOSTCALLER="$TMP_ROOT/hostcaller"; mkdir -p "$HOSTCALLER"; git -C "$HOSTCALLER" init -q
+HOSTCALLER="$TMP_ROOT/hostcaller"; mkdir -p "$HOSTCALLER"; git -C "$HOSTCALLER" init -q; git -C "$HOSTCALLER" config gc.auto 0; git -C "$HOSTCALLER" config maintenance.auto false
 run_ot "cwd=$HOSTCALLER;$CHOICE_CMD" --host "$HOST_STUB" --harness claude --lane auto --repo o/r CC-47
 assert_eq "$(observe "rc= launched=") local_marker=$([[ -e "$HOSTCALLER/.git/lane-mail" ]] && echo present || echo absent)" "rc=0 launched=1 local_marker=absent" \
   "a hosted launch writes no lane marker into the caller's own checkout"
@@ -1602,7 +1616,12 @@ cp "$OPEN_TERMINAL" "$SCRIPTS_DIR/lanes" "$SCRIPTS_DIR/lane-host" "$SCRIPTS_DIR/
 cp -R "$SCRIPTS_DIR/lib/." "$SCRIPTREPO/scripts/lib/"
 orch_fixture_shared_libs "$SCRIPTREPO"
 chmod +x "$SCRIPTREPO/scripts/open-terminal" "$SCRIPTREPO/scripts/lanes" "$SCRIPTREPO/scripts/lane-marker"
-git -C "$SCRIPTREPO" init -q; git -C "$CALLERREPO" init -q
+git -C "$SCRIPTREPO" init -q
+git -C "$SCRIPTREPO" config gc.auto 0
+git -C "$SCRIPTREPO" config maintenance.auto false
+git -C "$CALLERREPO" init -q
+git -C "$CALLERREPO" config gc.auto 0
+git -C "$CALLERREPO" config maintenance.auto false
 ( cd "$CALLERREPO" && LANES_HOME="$H" ORCH_LANES_FETCH_CMD="$FETCHER" GH_ISSUE_PATTERN='[A-Z]+-[0-9]+' \
   TMUX=stub,1,0 ORCH_TMUX_SESSION=stub OT_TMUX_LOG="$TMP_ROOT/caller.tmux.log" OT_TMUX_SERVER_PID="$$" OT_TMUX_PANES="$TMP_ROOT/caller.panes" \
   OT_WT_LOG="$TMP_ROOT/caller.worktree.log" PATH="$OT_STUB_BIN:$PATH" WORKTREE_CLI="$OT_STUB_BIN/worktree" \
@@ -1646,6 +1665,8 @@ run_bad_repo() {
   local caller="$TMP_ROOT/$name-caller" log="$TMP_ROOT/$name.tmux.log"
   mkdir -p "$caller"
   git -C "$caller" init -q
+  git -C "$caller" config gc.auto 0
+  git -C "$caller" config maintenance.auto false
   ( cd "$caller" && LANES_HOME="$H" ORCH_LANES_FETCH_CMD="$FETCHER" GH_ISSUE_PATTERN='[A-Z]+-[0-9]+' \
     GH_REPO="$BAD_REPO" TMUX=stub,1,0 ORCH_TMUX_SESSION=stub OT_TMUX_LOG="$log" OT_TMUX_SERVER_PID="$$" \
     OT_TMUX_PANES="$TMP_ROOT/$name.panes" OT_WT_LOG="$TMP_ROOT/$name.worktree.log" \
@@ -1686,6 +1707,8 @@ marked() {
   local script="$1" name="$2" runs="$TMP_ROOT/$2-runs" caller="$TMP_ROOT/$2-caller" out rc=0 wt marker=none box=none
   mkdir -p "$runs" "$caller"
   git -C "$caller" init -q
+  git -C "$caller" config gc.auto 0
+  git -C "$caller" config maintenance.auto false
   out="$( cd "$caller" && GIT_CEILING_DIRECTORIES="$TMP_ROOT" LANES_HOME="$H" ORCH_LANES_FETCH_CMD="$FETCHER" \
     GH_ISSUE_PATTERN='[A-Z]+-[0-9]+' TMUX=stub,1,0 ORCH_TMUX_SESSION=stub OT_TMUX_LOG="$runs/tmux.log" OT_TMUX_SERVER_PID="$$" \
     OT_TMUX_PANES="$runs/panes" OT_WT_LOG="$runs/worktree.log" PATH="$OT_STUB_BIN:$PATH" WORKTREE_CLI="$3" \
@@ -1714,6 +1737,8 @@ cat > "$TMPLINK_STUB" <<'STUBEOF'
 [[ "${1:-}" == "create" ]] || exit 0
 d="$(mktemp -d "$(dirname "$OT_WT_LOG")/wt.XXXXXX")"
 git init -q "$d"
+git -C "$d" config gc.auto 0
+git -C "$d" config maintenance.auto false
 scratch="$(mktemp -d "$(dirname "$OT_WT_LOG")/scratch.XXXXXX")"
 ln -s "$scratch" "$d/tmp"
 printf '%s\n' "$d"
@@ -1729,6 +1754,8 @@ cat > "$LINKED_STUB" <<'STUBEOF'
 [[ "${1:-}" == "create" ]] || exit 0
 d="$(mktemp -d "$(dirname "$OT_WT_LOG")/wt.XXXXXX")"
 git init -q "$d"
+git -C "$d" config gc.auto 0
+git -C "$d" config maintenance.auto false
 mkdir -p "$d/.git/lane-mail"
 ln -s "$(dirname "$OT_WT_LOG")/marker-target" "$d/.git/lane-mail/cc-40"
 printf '%s\n' "$d"
@@ -1885,6 +1912,8 @@ lane_launch() {
   launcher="$(basename -- "$lane")"; launcher="${launcher#.}"
   mkdir -p "$runs" "$caller"
   git -C "$caller" init -q
+  git -C "$caller" config gc.auto 0
+  git -C "$caller" config maintenance.auto false
   local gate=""
   [[ "$late" != late ]] || trigger="$runs/trigger"
   [[ "$late" != gated ]] || gate="$runs/gate"

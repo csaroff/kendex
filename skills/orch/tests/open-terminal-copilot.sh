@@ -82,7 +82,7 @@ set -euo pipefail
 if [[ "\${1:-}" == "create" ]]; then
   d="$TMP_ROOT/wt/\${2:-unknown}"
   mkdir -p "\$d"
-  [[ -d "\$d/.git" ]] || git init -q "\$d"
+  [[ -d "\$d/.git" ]] || { git init -q "\$d"; git -C "\$d" config gc.auto 0; git -C "\$d" config maintenance.auto false; }
   printf '%s\n' "\$d"
   exit 0
 fi
@@ -96,6 +96,8 @@ stage() {
   cp -R "$SCRIPTS_DIR/." "$1/scripts/"
   orch_fixture_shared_libs "$1"
   git -C "$1" init -q
+  git -C "$1" config gc.auto 0
+  git -C "$1" config maintenance.auto false
 }
 REPO="$TMP_ROOT/repo"
 stage "$REPO"
@@ -498,8 +500,8 @@ assert_eq "$(grep -o "'--context'" <<<"$CMD" | wc -l | tr -d '[:space:]')" "2" \
 # The named lane's store cut from the lookup: the --lane relaunch scans the
 # default home, which holds no record of its worktree, and starts afresh.
 stage "$TMP_ROOT/lane-store-ctrl"
-mutate_file "$TMP_ROOT/lane-store-ctrl/scripts/lib/lane-relaunch.sh" \
-  '[[ "${LANE_ENV%%=*}" != COPILOT_HOME ]] || config="${LANE_ENV#*=}"' ':'
+mutate_file "$TMP_ROOT/lane-store-ctrl/scripts/open-terminal" \
+  '  if [[ "${LANE_ENV%%=*}" == COPILOT_HOME ]]; then' '  if false; then'
 OT="$TMP_ROOT/lane-store-ctrl/scripts/open-terminal" launch lane-store-ctrl --relaunch --harness copilot --lane "$TMP_ROOT/.1copilot" --launch-flags "$FLAGS" CC-741
 assert_contains "$CMD" "'--allow-all' -i 'Read .agents/skills/orch/SKILL.md and execute the orch start workflow for CC-741'" \
   "control: without the named lane's store a --lane relaunch resumes nothing"

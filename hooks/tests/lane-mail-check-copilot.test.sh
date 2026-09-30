@@ -26,13 +26,10 @@ echo "=== lane-mail-check: copilot ==="
 # or agent_type (the copilot_context rows passing FIELD) is assumed, not
 # referenced. Every run gets a user home of its own, COP_HOME, where the
 # judge keeps its Copilot lead records, and each lane starts with none.
-COP_HOME="$TMP_ROOT/copilot-user"
-COP_LEADS="$COP_HOME/.cache/lane-mail/copilot-leads"
-mkdir -p "$COP_HOME"
 CALL_ENV=("HOME=$COP_HOME")
 COP_SESSION=s1
-# The lead records the judge holds, comma-joined in name order; clearing them
-# all; and a cache the records directory cannot be made under.
+# The lead records the judge holds, comma-joined in name order, and a cache
+# the records directory cannot be made under.
 cop_recorded() {
   local f out=""
   for f in "$COP_LEADS"/*; do
@@ -40,9 +37,6 @@ cop_recorded() {
     out="$out,${f##*/}"
   done
   printf '%s' "${out#,}"
-}
-cop_clear_leads() {
-  rm -rf -- "${COP_HOME:?}/.cache"
 }
 cop_unrecordable() {
   cop_clear_leads
@@ -106,11 +100,13 @@ copilot_context_unwritable() { # start|prompt
 lane_unread() { # ITEM TEXT
   (cd "$LANE" && "$LANE_MAIL" inbox --item "$1" --root "$LANE" --peek) | grep -cF -- "$2" || :
 }
-# A Copilot lane's passing turn end in the offline world reports two gaps: the
-# context, since no status line wrote a session record for s1 under the
-# account, and the account, which that world's home holds no lane for.
-cop_gap() {
-  printf 'session-record=missing;account=unlisted'
+# A Copilot lane's passing turn end in the offline world reports three gaps:
+# the context, since no usage reading of its session stands
+# (lane-mail-usage.test.sh) and no status line wrote a session record for s1
+# under the account, the fallback's own line, and the account, which that
+# world's home holds no lane for.
+cop_gap() { # ITEM
+  printf 'reading-unrecorded=%s;session-record=missing;account=unlisted' "$LANE/tmp/lane-mail/$1/context.json"
 }
 # Every keyed value the run wrote, in order, each under its own English: the
 # leading run keyed_block reads stops at the first explanation.
@@ -142,8 +138,8 @@ assert_eq "recorded=$(cop_recorded)" "recorded=s1" \
 assert_eq "$(stdout_field .reason | grep -c 'Rebase onto main.') $(stdout_field .reason | head -n 1)" \
   "1 lane-mail-check: unread=1" "the block reason is the refusal text, keyed line first, directive under it"
 copilot_stop "$COP_TRANSCRIPT"
-assert_eq "RC=$RC keyed=$(cop_keys) stdout=$(cat "$TMP_ROOT/stdout")" "RC=0 keyed=$(cop_gap) stdout=" \
-  "a second stop passes with the two gaps reported and no answer on stdout: the block acknowledged the mail"
+assert_eq "RC=$RC keyed=$(cop_keys) stdout=$(cat "$TMP_ROOT/stdout")" "RC=0 keyed=$(cop_gap KEN-201) stdout=" \
+  "a second stop passes with the gaps reported and no answer on stdout: the block acknowledged the mail"
 
 send KEN-201 'Then re-arm auto-merge.'
 COP_SESSION=c1 copilot_stop "$COP_TRANSCRIPT"
@@ -172,7 +168,7 @@ assert_eq "RC=$RC decision=$(stdout_field .decision) exact=$(stdout_field .reaso
   "a directive holding a backslash and a quote reaches the block reason byte for byte"
 send KEN-201 'Continued.'
 copilot_stop "$COP_TRANSCRIPT" true
-assert_eq "RC=$RC keyed=$(cop_keys)" "RC=0 keyed=$(cop_gap)" \
+assert_eq "RC=$RC keyed=$(cop_keys)" "RC=0 keyed=$(cop_gap KEN-201)" \
   "the turn Copilot continued after a block skips the mailbox check, as on every harness"
 
 # The halt arm: the deny answer under exit 2. A call from a session the judge
@@ -297,9 +293,17 @@ assert_eq "RC=$RC carried=$(stdout_field '.additionalContext' | grep -cF 'After 
 perl -e '$t = time - $ARGV[0] * 86400; utime($t, $t, $ARGV[1]) or die "utime: $!\n"' 29 "$COP_LEADS/s1"
 perl -e '$t = time - $ARGV[0] * 86400; utime($t, $t, $ARGV[1]) or die "utime: $!\n"' 31 "$COP_LEADS/s2"
 touch -t 200001010000 "$COP_LEADS/crashed"
+# The pending reading markers beside them, on the same window.
+COP_USAGE="$COP_HOME/.cache/lane-mail/copilot-usage"
+mkdir -p "$COP_USAGE"
+: > "$COP_USAGE/young"
+: > "$COP_USAGE/old"
+perl -e '$t = time - $ARGV[0] * 86400; utime($t, $t, $ARGV[1]) or die "utime: $!\n"' 29 "$COP_USAGE/young"
+perl -e '$t = time - $ARGV[0] * 86400; utime($t, $t, $ARGV[1]) or die "utime: $!\n"' 31 "$COP_USAGE/old"
 COP_SESSION=s3 copilot_context start
-assert_eq "RC=$RC stderr=$(first_line) recorded=$(cop_recorded)" "RC=0 stderr=- recorded=s1,s3" \
-  "a session start prunes the records untouched for 30 days and keeps the younger ones"
+assert_eq "RC=$RC stderr=$(first_line) recorded=$(cop_recorded) pending=$(ls "$COP_USAGE" | paste -sd, -)" \
+  "RC=0 stderr=- recorded=s1,s3 pending=young" \
+  "a session start prunes the records and pending markers untouched for 30 days and keeps the younger ones"
 COP_SESSION=crashed copilot_stop "$COP_TRANSCRIPT"
 assert_eq "RC=$RC recorded=$(cop_recorded)" "RC=0 recorded=s1,s3" \
   "a stop whose session is not the one its transcript is named for records nothing"
@@ -312,9 +316,9 @@ chmod +x "$FAKE_FIND_BIN/find"
 CALL_ENV=("HOME=$COP_HOME" "PATH=$FAKE_FIND_BIN:$PATH")
 copilot_context start
 CALL_ENV=("HOME=$COP_HOME")
-assert_eq "RC=$RC first=$(first_line) cause=$(grep -cxF 'find: planted failure' "$ERR_FILE")" \
-  "RC=0 first=lane-mail-check: leads-unpruned=$COP_LEADS cause=1" \
-  "a prune that fails is reported with its cause, and the start still passes"
+assert_eq "RC=$RC keys=$(cop_keys) cause=$(grep -cxF 'find: planted failure' "$ERR_FILE")" \
+  "RC=0 keys=leads-unpruned=$COP_LEADS;leads-unpruned=$COP_USAGE cause=2" \
+  "a prune that fails is reported for each directory with its cause, and the start still passes"
 
 # A lead whose record cannot be written: reported and never refused, and its
 # tool calls are then a session the judge cannot name, handed no mail, while
@@ -437,18 +441,19 @@ assert_eq "RC=$RC first=$(first_line) decision=$(stdout_field .decision)" \
   "RC=0 first=lane-mail-check: unread=1 decision=block" \
   "a hook under an account directory not spelled copilot is Copilot's by the registry document beside it"
 
-# The context mark on Copilot is read from the session record its status line
-# writes, never from the transcript: with no record the mark is reported
-# unjudged and never holds a turn end, whatever the transcript carries.
+# The context mark on Copilot is judged on its recorded usage reading first and
+# else on the session record its status line writes, never on the transcript:
+# with neither the mark is reported unjudged and never holds a turn end,
+# whatever the transcript carries.
 new_copilot_lane copilot_context ken-204
 mkdir -p "$LANE/tmp/lane-mail/KEN-204"
 (cd "$LANE" && "$REPO_ROOT/skills/orch/scripts/workflow-state" init KEN-204 >/dev/null)
 copilot_stop "$COP_TRANSCRIPT"
-assert_eq "RC=$RC keyed=$(cop_keys) stdout=$(cat "$TMP_ROOT/stdout")" "RC=0 keyed=$(cop_gap) stdout=" \
-  "a Copilot lane with no unread mail ends its turn with the context and account reported unjudged"
+assert_eq "RC=$RC keyed=$(cop_keys) stdout=$(cat "$TMP_ROOT/stdout")" "RC=0 keyed=$(cop_gap KEN-204) stdout=" \
+  "a Copilot lane with no unread mail and no context reading ends its turn with the context and account reported unjudged"
 usage_line claude 900000 > "$COP_TRANSCRIPT"
 copilot_stop "$COP_TRANSCRIPT"
-assert_eq "RC=$RC keyed=$(cop_keys) stdout=$(cat "$TMP_ROOT/stdout")" "RC=0 keyed=$(cop_gap) stdout=" \
+assert_eq "RC=$RC keyed=$(cop_keys) stdout=$(cat "$TMP_ROOT/stdout")" "RC=0 keyed=$(cop_gap KEN-204) stdout=" \
   "a Copilot transcript is never read for a figure, so a usage line past the mark does not hold the turn end"
 : > "$COP_TRANSCRIPT"
 
@@ -476,21 +481,58 @@ cop_record 400000 1000000
 copilot_stop "$COP_TRANSCRIPT" "" "COPILOT_HOME=$COP_ACCOUNT"
 assert_eq "RC=$RC first=$(first_line) decision=$(stdout_field .decision)" \
   "RC=0 first=lane-mail-check: context=400000 decision=block" \
-  "a record at the 400000-token cap holds the turn end with the documented block answer"
+  "with no extension reading of the session, a fresh status-line record at the 400000-token cap holds the turn end with the documented block answer"
 cop_record 130000 200000
 copilot_stop "$COP_TRANSCRIPT" "" "COPILOT_HOME=$COP_ACCOUNT"
 assert_eq "RC=$RC first=$(first_line)" "RC=0 first=lane-mail-check: context=130000" \
   "a 200K window is judged on its own compaction point, past half of 160000"
 cop_record 400000 1000000 "$TMP_ROOT/session-state/s2/events.jsonl"
 copilot_stop "$COP_TRANSCRIPT" "" "COPILOT_HOME=$COP_ACCOUNT"
-assert_eq "RC=$RC keyed=$(cop_keys)" "RC=0 keyed=session-record=wrong-transcript;account=unmeasured" \
+assert_eq "RC=$RC keyed=$(cop_keys)" "RC=0 keyed=reading-unrecorded=$LANE/tmp/lane-mail/KEN-204/context.json;session-record=wrong-transcript;account=unmeasured" \
   "a record naming another transcript is unmeasured, never read as this session's"
 cop_record 400000 1000000
 jq -c '.written_at = 1' "$COP_ACCOUNT/lane-status/s1.json" > "$TMP_ROOT/stale.json"
 mv -- "$TMP_ROOT/stale.json" "$COP_ACCOUNT/lane-status/s1.json"
 copilot_stop "$COP_TRANSCRIPT" "" "COPILOT_HOME=$COP_ACCOUNT"
-assert_eq "RC=$RC keyed=$(cop_keys)" "RC=0 keyed=session-record=stale;account=unmeasured" \
+assert_eq "RC=$RC keyed=$(cop_keys)" "RC=0 keyed=reading-unrecorded=$LANE/tmp/lane-mail/KEN-204/context.json;session-record=stale;account=unmeasured" \
   "a record the status line stopped refreshing is unmeasured, never read as room"
+# The extension's reading is read first: one below the mark stands although
+# the status line's record of the same session is past it.
+# cop_extension_reading ITEM TOKENS CAPACITY [SESSION]: the reading the usage
+# arm records for SESSION, s1 by default, in the lane's mailbox, under the
+# capacity source it writes.
+cop_extension_reading() { # ITEM TOKENS CAPACITY [SESSION]
+  bash -c 'set -euo pipefail; . "$1/lib/lane-context.sh"
+    lane_context_record "$2" copilot "$3" "$4" "" "$5" "" "" "$LANE_CONTEXT_COPILOT_CAPACITY_SOURCE"' \
+    _ "$REPO_ROOT/skills/orch/scripts" "$LANE/tmp/lane-mail/$1" "$2" "$3" "${4:-s1}"
+}
+# cop_gap_record ITEM: the gap record an overseer's turn end that took no
+# reading writes for s1 (overseer_gap_record): no figure, no capacity source.
+cop_gap_record() { # ITEM
+  bash -c 'set -euo pipefail; . "$1/lib/lane-context.sh"
+    lane_context_record "$2" copilot null "" "" s1 "" pane-unrecorded' \
+    _ "$REPO_ROOT/skills/orch/scripts" "$LANE/tmp/lane-mail/$1"
+}
+cop_record 400000 1000000
+cop_extension_reading KEN-204 100000 800000
+copilot_stop "$COP_TRANSCRIPT" "" "COPILOT_HOME=$COP_ACCOUNT"
+assert_eq "RC=$RC keyed=$(cop_keys) decision=$(stdout_field .decision)" "RC=0 keyed=account=unmeasured decision=" \
+  "an extension reading below the mark is judged room, never overridden by a status-line record past it"
+# A record that is no extension reading of this session is passed over for
+# the status-line record: a predecessor's in the same mailbox, and a gap record.
+cop_record 400000 1000000
+cop_extension_reading KEN-204 100000 800000 s0
+copilot_stop "$COP_TRANSCRIPT" "" "COPILOT_HOME=$COP_ACCOUNT"
+assert_eq "RC=$RC first=$(first_line) decision=$(stdout_field .decision)" \
+  "RC=0 first=lane-mail-check: context=400000 decision=block" \
+  "an extension reading of another session gives way to this session's fresh status-line record past the mark"
+cop_record 400000 1000000
+cop_gap_record KEN-204
+copilot_stop "$COP_TRANSCRIPT" "" "COPILOT_HOME=$COP_ACCOUNT"
+assert_eq "RC=$RC first=$(first_line) decision=$(stdout_field .decision)" \
+  "RC=0 first=lane-mail-check: context=400000 decision=block" \
+  "a gap record gives way to this session's fresh status-line record past the mark"
+rm -f -- "${LANE:?}/tmp/lane-mail/KEN-204/context.json"
 
 # The account mark on Copilot: the account the session runs on is measured
 # through `lanes`, and a pool at zero holds the turn end at the headroom mark.
@@ -783,8 +825,17 @@ touch -t 200001010000 "$COP_LEADS/crashed"
 copilot_context start
 assert_eq "RC=$RC recorded=$(cop_recorded)" "RC=0 recorded=crashed,s1" \
   "control: without the prune a crashed session's record outlives the next start"
+# The pending markers left out of the prune: one untouched for 30 days
+# outlives every start.
+mutant copilot-no-usage-prune -e 's@^  for dir in "\$COPILOT_LEADS" "\$COPILOT_USAGE"; do$@  for dir in "$COPILOT_LEADS"; do@'
+new_copilot_lane control_cop_usage_prune ken-255 "$MUTANT_PATH"
+mkdir -p "$COP_HOME/.cache/lane-mail/copilot-usage"
+touch -t 200001010000 "$COP_HOME/.cache/lane-mail/copilot-usage/crashed"
+copilot_context start
+assert_eq "RC=$RC pending=$(ls "$COP_HOME/.cache/lane-mail/copilot-usage")" "RC=0 pending=crashed" \
+  "control: without the markers in the prune a crashed session's marker outlives the next start"
 # The prune's failure report dropped: a prune that fails is passed in silence.
-mutant copilot-prune-quiet -e 's@^    message leads-unpruned "\$COPILOT_LEADS" "\$err"$@    :@'
+mutant copilot-prune-quiet -e 's@^      message leads-unpruned "\$dir" "\$err"$@      :@'
 new_copilot_lane control_cop_prune_quiet ken-235 "$MUTANT_PATH"
 mkdir -p "$LANE/tmp/lane-mail/KEN-235"
 CALL_ENV=("HOME=$COP_HOME" "PATH=$FAKE_FIND_BIN:$PATH")
@@ -878,9 +929,11 @@ copilot_tool halt "$MKDIR_216" object
 expect 2 "lane-mail-check: mailbox-missing=$LANE/tmp/lane-mail" \
   "control: without the toolArgs read the command that restores the mailbox is refused"
 
-# The session-record read cut: a Copilot turn end falls to the transcript
-# read, which holds no count, and a record at the cap no longer holds it.
-mutant copilot-no-record -e 's@^  if \[ "\$HARNESS" = copilot \]; then$@  if false; then@'
+# The Copilot arm of the context read cut: a Copilot turn end falls to the
+# transcript read, which holds no count, and a record at the cap no longer
+# holds it. Held to the context read, so the block answer refuse() writes for
+# Copilot stands.
+mutant copilot-no-record -e '/^context_read_and_record() {/,/^}/s@^  if \[ "\$HARNESS" = copilot \]; then$@  if false; then@'
 new_copilot_lane control_cop_record ken-217 "$MUTANT_PATH"
 mkdir -p "$LANE/tmp/lane-mail/KEN-217"
 (cd "$LANE" && "$REPO_ROOT/skills/orch/scripts/workflow-state" init KEN-217 >/dev/null)
@@ -888,6 +941,29 @@ cop_record 400000 1000000
 copilot_stop "$COP_TRANSCRIPT" "" "COPILOT_HOME=$COP_ACCOUNT"
 assert_eq "RC=$RC decision=$(stdout_field .decision)" "RC=0 decision=" \
   "control: without the record read a Copilot lane at the cap ends its turn"
+# The extension's reading skipped: the status line's record past the mark
+# overrides a reading below it.
+mutant copilot-no-primary -e 's@^    copilot_context_read "\$1" && return 0$@    false \&\& return 0@'
+new_copilot_lane control_cop_primary ken-256 "$MUTANT_PATH"
+mkdir -p "$LANE/tmp/lane-mail/KEN-256"
+(cd "$LANE" && "$REPO_ROOT/skills/orch/scripts/workflow-state" init KEN-256 >/dev/null)
+cop_record 400000 1000000
+cop_extension_reading KEN-256 100000 800000
+copilot_stop "$COP_TRANSCRIPT" "" "COPILOT_HOME=$COP_ACCOUNT"
+assert_eq "RC=$RC decision=$(stdout_field .decision)" "RC=0 decision=block" \
+  "control: without the extension's reading read first a status-line record past the mark overrides one below it"
+# A record that is no extension reading of this session reported unmeasured
+# where the fallback should be read: another session's reading then hides this
+# session's status-line record past the mark.
+mutant copilot-no-fallback -e '/^copilot_context_read() {/,/^}/s@^    return 1$@    if [ "$LANE_CTX_SESSION" != "$SESSION" ] || [ -n "$LANE_CTX_GAP" ]; then READ_GAP=session-record; message reading-unrecorded "$1/$LANE_CONTEXT_RECORD"; message session-record missing; return 0; fi; return 1@'
+new_copilot_lane control_cop_fallback ken-257 "$MUTANT_PATH"
+mkdir -p "$LANE/tmp/lane-mail/KEN-257"
+(cd "$LANE" && "$REPO_ROOT/skills/orch/scripts/workflow-state" init KEN-257 >/dev/null)
+cop_record 400000 1000000
+cop_extension_reading KEN-257 100000 800000 s0
+copilot_stop "$COP_TRANSCRIPT" "" "COPILOT_HOME=$COP_ACCOUNT"
+assert_eq "RC=$RC decision=$(stdout_field .decision)" "RC=0 decision=" \
+  "control: without the fallback past another session's record a status-line record past the mark does not hold the turn end"
 # The account arm cut: a Copilot account at zero is reported unlisted and the
 # turn ends.
 mutant copilot-no-account -e 's@^    claude | codex | copilot) CFG=@    claude | codex) CFG=@'
