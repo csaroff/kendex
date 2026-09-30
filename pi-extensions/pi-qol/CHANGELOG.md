@@ -2,6 +2,11 @@
 
 ## Consumer-impacting changes
 
+### 2.2.1
+
+- Turn-end notifications no longer freeze Pi when tmux is slow. Each tmux call now stops after 1 second and runs in the background. Each notification reads Pi's tmux pane, window and session in one call, so the window mark follows a pane that `break-pane` or `join-pane` moved. A terminal that does not accept output, such as a tmux client behind a dropped SSH link, is skipped at once, so later notifications still arrive. The window mark and the tmux message no longer wait for terminal writes, and a mark cleared by your input while its notification is still in flight is not set.
+- Long tool output no longer costs an extra scan on every screen redraw. The queued-message status alignment now checks a text block again only when its text changes. It is installed when an interactive session starts and removed when the session ends.
+
 ### 2.2.0
 
 - Show a provider label before the model by default, using readable names such as `Copilot / GPT 6 Astra`. Disable it with `statusline.showProvider`.
