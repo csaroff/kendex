@@ -229,9 +229,19 @@ fn candidates_are_path_then_the_installer_s_own_dirs_without_repeats() {
 #[test]
 fn fetched_urls_are_always_positional_arguments() {
     assert_eq!(
-        curl_args("--output=/tmp/owned"),
+        curl_args(
+            "--output=/tmp/owned",
+            Path::new("download body"),
+            CurlRetries::AllErrors,
+        ),
         [
+            "--disable",
             "-fsS",
+            "--no-silent",
+            "--retry",
+            "3",
+            "--retry-delay",
+            "2",
             "--location",
             "--max-redirs",
             "3",
@@ -239,8 +249,12 @@ fn fetched_urls_are_always_positional_arguments() {
             "=https,file",
             "--proto-redir",
             "=https",
+            "--retry-all-errors",
+            "--output",
+            "download body",
             "--",
             "--output=/tmp/owned",
         ]
+        .map(OsString::from)
     );
 }
