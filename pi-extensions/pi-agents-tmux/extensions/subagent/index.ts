@@ -58,7 +58,6 @@ import {
 	getFinalOutput,
 	normalizeSummaryText,
 	oneLinePreview,
-	parseTranscriptUsage,
 	resolveSubagentStatuslineInfo,
 	shortTaskId,
 	stringifyError,
@@ -143,7 +142,8 @@ import {
 	stableSessionSnapshotFingerprint,
 } from "./session-persistence.js";
 import { subagentToolRenderers } from "./subagent-render.js";
-import { loadTaskRegistrySync, taskNumberById } from "./task-records.js";
+import { TaskRegistryReader, taskNumberById } from "./task-records.js";
+import { statTranscriptVersion, TranscriptTailCache, type TranscriptSnapshot } from "./transcript-tail.js";
 import {
 	prepareSingleResultForReturn,
 	runSingleAgent,
@@ -381,18 +381,18 @@ function appendRuntimeDiagnostic(runtimeRoot: string | undefined, source: string
 	void fs.promises.appendFile(logFile, `${JSON.stringify(entry)}\n`, { encoding: "utf-8", mode: 0o600 }).catch(() => undefined);
 }
 
-export function pruneTranscriptFingerprints(fingerprintsByTask: Map<string, string>, retainedTaskIds: Set<string>): void {
-	for (const taskId of fingerprintsByTask.keys()) {
-		if (!retainedTaskIds.has(taskId)) fingerprintsByTask.delete(taskId);
+export function pruneTaskEntries(byTask: Map<string, string>, retainedTaskIds: Set<string>): void {
+	for (const taskId of byTask.keys()) {
+		if (!retainedTaskIds.has(taskId)) byTask.delete(taskId);
 	}
 }
 
 export function transcriptUsageRefreshSnapshot(
 	items: Iterable<SubagentDashboardItem>,
-	fingerprintsByTask: Map<string, string>,
+	versionsByTask: Map<string, string>,
 ): Array<{ item: SubagentDashboardItem; transcriptPath: string }> {
 	const snapshot = Array.from(items).flatMap((item) => (item.transcriptPath ? [{ item, transcriptPath: item.transcriptPath }] : []));
-	pruneTranscriptFingerprints(fingerprintsByTask, new Set(snapshot.map(({ item }) => item.taskId)));
+	pruneTaskEntries(versionsByTask, new Set(snapshot.map(({ item }) => item.taskId)));
 	return snapshot;
 }
 
@@ -411,41 +411,55 @@ export function patchTaskRecordUsage(
 	return true;
 }
 
-async function transcriptUsageFingerprint(transcriptPath: string): Promise<string | undefined> {
-	try {
-		const stat = await fs.promises.stat(transcriptPath);
-		return `${transcriptPath}\0${stat.size}:${stat.mtimeMs}`;
-	} catch {
-		return undefined;
-	}
-}
-
-// Records the fingerprint as ATTEMPTED, not as parsed: a terminal transcript's
-// bytes never change, so re-parsing one can only repeat the previous answer.
-// Growth moves the fingerprint, which arms exactly one fresh attempt.
-export async function claimTranscriptParse(transcriptPath: string, taskId: string, fingerprintsByTask: Map<string, string>): Promise<boolean> {
-	const fingerprint = await transcriptUsageFingerprint(transcriptPath);
-	if (!fingerprint || fingerprintsByTask.get(taskId) === fingerprint) return false;
-	fingerprintsByTask.set(taskId, fingerprint);
+// Records a transcript version as ATTEMPTED, not as applied: an unchanged
+// transcript can only repeat the previous answer, and growth moves the
+// version, which arms exactly one fresh attempt.
+function claimTranscriptVersion(taskId: string, version: string, versionsByTask: Map<string, string>): boolean {
+	if (versionsByTask.get(taskId) === version) return false;
+	versionsByTask.set(taskId, version);
 	return true;
 }
 
-export async function claimSummaryBackfill(record: PaneTaskRecord, fingerprintsByTask: Map<string, string>): Promise<boolean> {
-	if (!taskNeedsSummaryBackfill(record) || !record.transcriptPath) return false;
-	return claimTranscriptParse(record.transcriptPath, record.taskId, fingerprintsByTask);
+export async function claimTranscriptParse(transcriptPath: string, taskId: string, versionsByTask: Map<string, string>): Promise<boolean> {
+	const version = await statTranscriptVersion(transcriptPath);
+	return version !== undefined && claimTranscriptVersion(taskId, version, versionsByTask);
 }
 
-export async function refreshTranscriptUsage(
+export async function claimSummaryBackfill(record: PaneTaskRecord, versionsByTask: Map<string, string>): Promise<boolean> {
+	if (!taskNeedsSummaryBackfill(record) || !record.transcriptPath) return false;
+	return claimTranscriptParse(record.transcriptPath, record.taskId, versionsByTask);
+}
+
+// Advances every shown transcript by its appended bytes and hands each task
+// its snapshot once per transcript version.
+export async function refreshTranscriptSnapshots(
 	items: Iterable<SubagentDashboardItem>,
-	fingerprintsByTask: Map<string, string>,
-	persistUsage: (taskId: string, parsed: { usage: UsageStats; model?: string }) => Promise<boolean>,
+	tails: TranscriptTailCache,
+	versionsByTask: Map<string, string>,
+	apply: (taskId: string, snapshot: TranscriptSnapshot) => Promise<void>,
 ): Promise<void> {
-	const snapshot = transcriptUsageRefreshSnapshot(items, fingerprintsByTask);
+	const snapshot = transcriptUsageRefreshSnapshot(items, versionsByTask);
+	tails.retain(new Set(snapshot.map(({ transcriptPath }) => transcriptPath)));
 	for (const { item, transcriptPath } of snapshot) {
-		if (!(await claimTranscriptParse(transcriptPath, item.taskId, fingerprintsByTask))) continue;
-		const parsed = await parseTranscriptUsage(transcriptPath).catch(() => undefined);
-		if (parsed) await persistUsage(item.taskId, parsed);
+		const transcript = await tails.read(transcriptPath);
+		if (!transcript || !claimTranscriptVersion(item.taskId, transcript.version, versionsByTask)) continue;
+		await apply(item.taskId, transcript);
 	}
+}
+
+// A terminal registry record the poll already applied, and that has not
+// changed since, is cold: re-checking its artifacts cannot move it, so the
+// poll skips it. A record still owed a summary backfill stays warm, because
+// transcript growth re-arms that backfill.
+export function registryRecordIsCold(record: PaneTaskRecord, appliedByTask: Map<string, string>): boolean {
+	return isTerminalTaskStatus(record.status)
+		&& !taskNeedsSummaryBackfill(record)
+		&& appliedByTask.get(record.taskId) === JSON.stringify(record);
+}
+
+export function markRegistryRecordApplied(record: PaneTaskRecord, appliedByTask: Map<string, string>): void {
+	if (isTerminalTaskStatus(record.status)) appliedByTask.set(record.taskId, JSON.stringify(record));
+	else appliedByTask.delete(record.taskId);
 }
 
 export default function (pi: ExtensionAPI) {
@@ -490,8 +504,16 @@ export default function (pi: ExtensionAPI) {
 	let childPollInFlight = false;
 	let childCurrentTaskFile: string | undefined;
 	let agentCommandCompletions: Array<{ value: string; label: string; description: string; pane: boolean }> = [];
-	const usageTranscriptFingerprintsByTask = new Map<string, string>();
-	const summaryBackfillFingerprintsByTask = new Map<string, string>();
+	const usageTranscriptVersionsByTask = new Map<string, string>();
+	const summaryBackfillVersionsByTask = new Map<string, string>();
+	const transcriptTails = new TranscriptTailCache();
+	const taskRegistryReader = new TaskRegistryReader();
+	// Terminal registry records the dashboard already reflects. Cleared where a row is
+	// dropped on purpose (removeDashboardAgent, the unknown one-shot branch of
+	// updateDashboardFromTaskRecord) and at session start and end, so the next poll can put
+	// a cold record back. Rows the maxKeep trim in updateDashboard drops stay dropped until
+	// the next session start: clearing there would re-apply every trimmed record each poll.
+	const appliedRegistryRecords = new Map<string, string>();
 	const pendingTranscriptUsagePersistences = new Set<Promise<void>>();
 	const trackTranscriptUsagePersistence = (work: Promise<void>) => {
 		let tracked: Promise<void>;
@@ -595,7 +617,7 @@ export default function (pi: ExtensionAPI) {
 		},
 		listActiveTasks: async () => {
 			if (!currentRuntimeRoot) return [];
-			const records = await readTaskRegistry(currentRuntimeRoot);
+			const records = taskRegistryReader.read(currentRuntimeRoot);
 			return Object.values(records).filter(
 				(record) =>
 					record?.taskId &&
@@ -683,7 +705,8 @@ export default function (pi: ExtensionAPI) {
 	const persistRuntimeSnapshot = async (ctx: ExtensionContext, runtimeRoot: string) => {
 		if (childAgentName) return;
 		try {
-			const [panes, tasks] = await Promise.all([readPaneRegistry(runtimeRoot), readTaskRegistry(runtimeRoot)]);
+			const panes = await readPaneRegistry(runtimeRoot);
+			const tasks = taskRegistryReader.read(runtimeRoot);
 			const sessionKey = ctx.sessionManager.getSessionFile?.() ?? ctx.sessionManager.getSessionId?.() ?? runtimeRoot;
 			// Fingerprint over registry only (not updatedAt) so cosmetic bumps don't burn a session entry.
 			const fingerprintInput = { panes, tasks };
@@ -812,7 +835,7 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		const widgetRuntimeRoot = sessionRuntimeDir(runtimeSessionId(ctx));
-		const widgetTaskNumbers = taskNumberById(Object.values(loadTaskRegistrySync(widgetRuntimeRoot)));
+		const widgetTaskNumbers = taskNumberById(Object.values(taskRegistryReader.read(widgetRuntimeRoot)));
 		setMiniDashboardWidget(ctx, SUBAGENT_WIDGET_KEY, MINI_DASHBOARD_RANK.AGENTS, (tui, theme) => {
 			const animationTimer = (() => {
 				if (!Object.values(dashboardState.items).some((item) => isDashboardAnimatingStatus(item.status))) return undefined;
@@ -891,6 +914,7 @@ export default function (pi: ExtensionAPI) {
 			usage: item.usage ?? existing?.usage,
 			model: item.model ?? existing?.model,
 			effort: item.effort ?? existing?.effort,
+			activity: item.activity ?? existing?.activity,
 		};
 		const maxKeep = Math.max(10, dashboardMaxItems(dashboardCtx?.cwd) * 3);
 		const sorted = Object.values(dashboardState.items).sort((a, b) => {
@@ -928,11 +952,21 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
+	// A terminal task's usage from its whole transcript. The version is recorded only when
+	// the usage persisted: leaving it unset on failure buys the poll loop one retry, and
+	// the poll's own claim then caps this transcript at that attempt.
+	const restoreTranscriptUsage = async (runtimeRoot: string, taskId: string, transcriptPath: string): Promise<void> => {
+		const transcript = await transcriptTails.read(transcriptPath);
+		const persisted = await patchDashboardUsage(runtimeRoot, taskId, transcript?.usage);
+		if (dashboardCtx?.hasUI && transcript?.usage && persisted) usageTranscriptVersionsByTask.set(taskId, transcript.version);
+	};
+
 	const removeDashboardAgent = (agentName: string | undefined) => {
 		if (!agentName) return;
 		for (const [key, item] of Object.entries(dashboardState.items)) {
 			if (item.agent === agentName) delete dashboardState.items[key];
 		}
+		appliedRegistryRecords.clear();
 		syncDashboard();
 	};
 
@@ -966,6 +1000,7 @@ export default function (pi: ExtensionAPI) {
 			if (kind === "oneshot") {
 				if (existingKey) {
 					delete dashboardState.items[existingKey];
+					appliedRegistryRecords.clear();
 					requestDashboardSync();
 				}
 				return;
@@ -997,19 +1032,23 @@ export default function (pi: ExtensionAPI) {
 
 	const syncDashboardFromTaskRegistry = async (ctx: ExtensionContext, runtimeRoot: string) => {
 		await withDashboardBatch(async () => {
-			const records = await readTaskRegistry(runtimeRoot);
+			const records = taskRegistryReader.read(runtimeRoot);
 			const registry = await readPaneRegistry(runtimeRoot);
-			pruneTranscriptFingerprints(summaryBackfillFingerprintsByTask, new Set(Object.keys(records)));
+			const taskIds = new Set(Object.keys(records));
+			pruneTaskEntries(summaryBackfillVersionsByTask, taskIds);
+			pruneTaskEntries(appliedRegistryRecords, taskIds);
 			const sorted = Object.values(records).sort((a, b) => (a.createdAt ?? a.completedAt ?? a.updatedAt).localeCompare(b.createdAt ?? b.completedAt ?? b.updatedAt));
 			for (const record of sorted) {
 				if (!record.taskId || !record.agent) continue;
+				if (registryRecordIsCold(record, appliedRegistryRecords)) continue;
 				if (inferTaskRecordKind(runtimeRoot, record) === "pane" && record.paneId && isTerminalTaskStatus(record.status) && !registry[record.agent]) continue;
 				try {
 					const refreshed = await refreshTaskDiagnostics(runtimeRoot, record);
-					const backfilled = (await claimSummaryBackfill(refreshed.record, summaryBackfillFingerprintsByTask))
+					const backfilled = (await claimSummaryBackfill(refreshed.record, summaryBackfillVersionsByTask))
 						? await backfillTaskSummaryFromTranscript(runtimeRoot, refreshed.record)
 						: { record: refreshed.record, updated: false };
 					updateDashboardFromTaskRecord(backfilled.record, runtimeRoot);
+					markRegistryRecordApplied(record, appliedRegistryRecords);
 				} catch (error) {
 					if (!isFileLockTimeoutError(error)) throw error;
 					warnBestEffortRegistryFailure(`dashboard sync for task ${record.taskId}`, error);
@@ -1212,14 +1251,7 @@ export default function (pi: ExtensionAPI) {
 			effort: eventEffort,
 		});
 		if (transcriptPath && runtimeRoot) {
-			trackTranscriptUsagePersistence((async () => {
-				const fingerprint = await transcriptUsageFingerprint(transcriptPath);
-				const parsed = await parseTranscriptUsage(transcriptPath).catch(() => undefined);
-				const persisted = await patchDashboardUsage(runtimeRoot, taskId, parsed);
-				// Leaving the fingerprint unset on failure buys the poll loop one
-				// retry — its own claim then caps this transcript at that attempt.
-				if (dashboardCtx?.hasUI && fingerprint && parsed && persisted) usageTranscriptFingerprintsByTask.set(taskId, fingerprint);
-			})());
+			trackTranscriptUsagePersistence(restoreTranscriptUsage(runtimeRoot, taskId, transcriptPath));
 		}
 	};
 
@@ -1338,7 +1370,10 @@ export default function (pi: ExtensionAPI) {
 		if (completionPoller) clearInterval(completionPoller);
 		if (childInboxPoller) clearInterval(childInboxPoller);
 		if (childTitlePoller) clearInterval(childTitlePoller);
-		usageTranscriptFingerprintsByTask.clear();
+		usageTranscriptVersionsByTask.clear();
+		transcriptTails.clear();
+		taskRegistryReader.clear();
+		appliedRegistryRecords.clear();
 
 		const runtimeRoot = runtimeDirForContext(ctx);
 		retryMarkerRuntimeRoot = runtimeRoot;
@@ -1433,24 +1468,17 @@ export default function (pi: ExtensionAPI) {
 		await restoreRuntimeSnapshot(ctx, runtimeRoot);
 		try {
 			await withDashboardBatch(async () => {
-				const records = await readTaskRegistry(runtimeRoot);
+				const records = taskRegistryReader.read(runtimeRoot);
 				const sortedRecords = Object.values(records).sort((a, b) => (a.createdAt ?? "").localeCompare(b.createdAt ?? ""));
 				for (const record of sortedRecords) {
 					if (!record.taskId || !record.agent) continue;
 					const refreshed = await refreshTaskDiagnostics(runtimeRoot, record);
-					const backfilled = (await claimSummaryBackfill(refreshed.record, summaryBackfillFingerprintsByTask))
+					const backfilled = (await claimSummaryBackfill(refreshed.record, summaryBackfillVersionsByTask))
 						? await backfillTaskSummaryFromTranscript(runtimeRoot, refreshed.record)
 						: { record: refreshed.record, updated: false };
 					updateDashboardFromTaskRecord(backfilled.record, runtimeRoot);
-					if (taskNeedsTranscriptUsageRestore(backfilled.record)) {
-						const capturedTaskId = backfilled.record.taskId;
-						const fingerprint = await transcriptUsageFingerprint(backfilled.record.transcriptPath);
-						const parsed = await parseTranscriptUsage(backfilled.record.transcriptPath).catch(() => undefined);
-						const persisted = await patchDashboardUsage(runtimeRoot, capturedTaskId, parsed);
-						// Leaving the fingerprint unset on failure buys the poll loop one
-						// retry — its own claim then caps this transcript at that attempt.
-						if (ctx.hasUI && fingerprint && parsed && persisted) usageTranscriptFingerprintsByTask.set(capturedTaskId, fingerprint);
-					}
+					markRegistryRecordApplied(record, appliedRegistryRecords);
+					if (taskNeedsTranscriptUsageRestore(backfilled.record)) await restoreTranscriptUsage(runtimeRoot, backfilled.record.taskId, backfilled.record.transcriptPath);
 				}
 			});
 		} catch {
@@ -1458,13 +1486,18 @@ export default function (pi: ExtensionAPI) {
 		}
 		syncDashboard(ctx);
 		if (!ctx.hasUI) {
-			usageTranscriptFingerprintsByTask.clear();
-			summaryBackfillFingerprintsByTask.clear();
+			usageTranscriptVersionsByTask.clear();
+			summaryBackfillVersionsByTask.clear();
+			transcriptTails.clear();
+			taskRegistryReader.clear();
+			appliedRegistryRecords.clear();
 			return;
 		}
-		const refreshLiveUsage = async () => {
-			await refreshTranscriptUsage(Object.values(dashboardState.items), usageTranscriptFingerprintsByTask, (taskId, parsed) => patchDashboardUsage(runtimeRoot, taskId, parsed));
-		};
+		const refreshLiveUsage = () => withDashboardBatch(() => refreshTranscriptSnapshots(Object.values(dashboardState.items), transcriptTails, usageTranscriptVersionsByTask, async (taskId, transcript) => {
+			const key = dashboardKeyForTask(taskId);
+			if (transcript.activity && key && dashboardState.items[key]?.activity !== transcript.activity) patchDashboard(taskId, { activity: transcript.activity });
+			if (transcript.usage) await patchDashboardUsage(runtimeRoot, taskId, transcript.usage);
+		}));
 		const poll = () => {
 			if (completionPollInFlight) return;
 			completionPollInFlight = true;
@@ -1649,7 +1682,10 @@ export default function (pi: ExtensionAPI) {
 		completionPoller = undefined;
 		childInboxPoller = undefined;
 		dashboardCtx = undefined;
-		usageTranscriptFingerprintsByTask.clear();
+		usageTranscriptVersionsByTask.clear();
+		transcriptTails.clear();
+		taskRegistryReader.clear();
+		appliedRegistryRecords.clear();
 
 		idleStallWatchdog.stop();
 		currentRuntimeRoot = undefined;

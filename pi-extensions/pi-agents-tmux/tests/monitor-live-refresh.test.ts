@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -13,13 +13,18 @@ import {
 import {
 	claimSummaryBackfill,
 	claimTranscriptParse,
+	markRegistryRecordApplied,
 	patchTaskRecordUsage,
-	pruneTranscriptFingerprints,
-	refreshTranscriptUsage,
+	pruneTaskEntries,
+	refreshTranscriptSnapshots,
+	registryRecordIsCold,
 	taskNeedsTranscriptUsageRestore,
 	transcriptUsageRefreshSnapshot,
 } from "../extensions/subagent/index.js";
-import { sortedMonitorRecords } from "../extensions/subagent/task-records.js";
+import { taskRegistryPath } from "../extensions/subagent/paths.js";
+import { sortedMonitorRecords, TaskRegistryReader } from "../extensions/subagent/task-records.js";
+import { writeTaskRegistry } from "../extensions/subagent/tasks.js";
+import { TranscriptTailCache, type TranscriptSnapshot } from "../extensions/subagent/transcript-tail.js";
 import type { AgentBrowserUiState, PaneTaskRecord, PaneTaskRegistry, SubagentDashboardItem, UsageStats } from "../extensions/subagent/types.js";
 
 function record(agent: string, taskId: string, createdAt: string, extra: Partial<PaneTaskRecord> = {}): PaneTaskRecord {
@@ -136,37 +141,37 @@ test("usage persistence remains retryable until the task record exists", () => {
 	assert.equal(registry["planner-1"]?.model, "test-model");
 });
 
-test("terminal usage refresh stops re-parsing a failed persistence and rearms on appended final usage", async () => {
+test("a transcript snapshot reaches its task once per transcript change and again on appended final usage", async () => {
 	const runtimeRoot = mkdtempSync(join(tmpdir(), "subagent-usage-refresh-"));
 	const transcriptPath = join(runtimeRoot, "task.jsonl");
 	const completed = item("planner", "planner-1", "2026-05-14T05:02:00.000Z", { status: "completed", transcriptPath });
 	const fingerprints = new Map([["stale-2", "stale-fingerprint"]]);
+	const tails = new TranscriptTailCache();
 	const persistedInputs: number[] = [];
-	const persistUsage = async (_taskId: string, parsed: { usage: UsageStats }) => {
-		persistedInputs.push(parsed.usage.input);
-		return false;
+	const persistUsage = async (_taskId: string, transcript: TranscriptSnapshot) => {
+		if (transcript.usage) persistedInputs.push(transcript.usage.usage.input);
 	};
 	try {
 		writeFileSync(transcriptPath, JSON.stringify({ event: { type: "message_end", message: { usage: { input: 2, output: 3 } } } }));
-		await refreshTranscriptUsage([completed], fingerprints, persistUsage);
+		await refreshTranscriptSnapshots([completed], tails, fingerprints, persistUsage);
 		assert.deepEqual(persistedInputs, [2]);
 		assert.equal(fingerprints.has("planner-1"), true);
 		assert.equal(fingerprints.has("stale-2"), false);
 
-		await refreshTranscriptUsage([completed], fingerprints, persistUsage);
+		await refreshTranscriptSnapshots([completed], tails, fingerprints, persistUsage);
 		assert.deepEqual(persistedInputs, [2]);
 
 		appendFileSync(transcriptPath, `\n${JSON.stringify({ event: { type: "message_end", message: { usage: { input: 5, output: 7 } } } })}`);
-		await refreshTranscriptUsage([completed], fingerprints, persistUsage);
+		await refreshTranscriptSnapshots([completed], tails, fingerprints, persistUsage);
 		assert.deepEqual(persistedInputs, [2, 7]);
-		await refreshTranscriptUsage([completed], fingerprints, persistUsage);
+		await refreshTranscriptSnapshots([completed], tails, fingerprints, persistUsage);
 		assert.deepEqual(persistedInputs, [2, 7]);
 	} finally {
 		rmSync(runtimeRoot, { force: true, recursive: true });
 	}
 });
 
-test("terminal transcripts whose usage never persists are parsed once per task, not once per poll", async () => {
+test("an unchanged transcript reaches its task once, not once per poll", async () => {
 	const runtimeRoot = mkdtempSync(join(tmpdir(), "subagent-usage-poll-cost-"));
 	const taskCount = 5;
 	const pollCount = 20;
@@ -176,13 +181,13 @@ test("terminal transcripts whose usage never persists are parsed once per task, 
 		return item("planner", `planner-${index}`, "2026-05-14T05:02:00.000Z", { status: "completed", transcriptPath });
 	});
 	const fingerprints = new Map<string, string>();
+	const tails = new TranscriptTailCache();
 	let persistCalls = 0;
 	const persistUsage = async () => {
 		persistCalls += 1;
-		return false;
 	};
 	try {
-		for (let poll = 0; poll < pollCount; poll += 1) await refreshTranscriptUsage(completed, fingerprints, persistUsage);
+		for (let poll = 0; poll < pollCount; poll += 1) await refreshTranscriptSnapshots(completed, tails, fingerprints, persistUsage);
 
 		assert.equal(persistCalls, taskCount);
 	} finally {
@@ -246,13 +251,62 @@ test("summary backfill of a terminal transcript is attempted once per task, not 
 	}
 });
 
-test("fingerprint pruning drops tasks that left the registry", () => {
+// label | record the poll reads | record the poll applied before (none = never) | expect cold
+const coldRows: Array<[string, PaneTaskRecord, PaneTaskRecord | undefined, boolean]> = [
+	["an applied, unchanged terminal record", record("planner", "planner-1", "2026-05-14T05:00:00.000Z", { status: "completed", summary: "done" }), record("planner", "planner-1", "2026-05-14T05:00:00.000Z", { status: "completed", summary: "done" }), true],
+	["a terminal record never applied", record("planner", "planner-1", "2026-05-14T05:00:00.000Z", { status: "completed", summary: "done" }), undefined, false],
+	["a terminal record changed since it was applied", record("planner", "planner-1", "2026-05-14T05:00:00.000Z", { status: "completed", summary: "done", updatedAt: "2026-05-14T05:03:00.000Z" }), record("planner", "planner-1", "2026-05-14T05:00:00.000Z", { status: "completed", summary: "done" }), false],
+	["a running record", record("planner", "planner-1", "2026-05-14T05:00:00.000Z"), record("planner", "planner-1", "2026-05-14T05:00:00.000Z"), false],
+	["a needs_completion record", record("planner", "planner-1", "2026-05-14T05:00:00.000Z", { status: "needs_completion" }), record("planner", "planner-1", "2026-05-14T05:00:00.000Z", { status: "needs_completion" }), false],
+	["a terminal record still owed a summary backfill", record("planner", "planner-1", "2026-05-14T05:00:00.000Z", { status: "completed", transcriptPath: "/runtime/task.jsonl" }), record("planner", "planner-1", "2026-05-14T05:00:00.000Z", { status: "completed", transcriptPath: "/runtime/task.jsonl" }), false],
+];
+
+test("the poll skips only terminal registry records it already applied", () => {
+	for (const [label, read, applied, expect] of coldRows) {
+		const appliedByTask = new Map<string, string>();
+		if (applied) markRegistryRecordApplied(applied, appliedByTask);
+		assert.equal(registryRecordIsCold(read, appliedByTask), expect, label);
+	}
+});
+
+test("TaskRegistryReader re-reads the task registry only when the registry file version changes", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-agents-registry-reader-"));
+	// Whole seconds, so both writes below carry the same mtime to the nanosecond.
+	const pinTimes = () => utimesSync(taskRegistryPath(root), 1_800_000_000, 1_800_000_000);
+	try {
+		const running = record("planner", "planner-1", "2026-05-14T05:00:00.000Z");
+		await writeTaskRegistry(root, registryOf(running));
+		pinTimes();
+		const reader = new TaskRegistryReader();
+		const first = reader.read(root);
+		assert.deepEqual(first, registryOf(running));
+		assert.equal(reader.read(root), first, "an unchanged registry file is not re-read");
+		assert.throws(() => { (first["planner-1"] as PaneTaskRecord).status = "failed"; }, TypeError);
+		assert.equal(reader.read(root)["planner-1"]?.status, "running", "a caller's write never reaches the next reader");
+
+		await writeTaskRegistry(root, registryOf(running));
+		pinTimes();
+		const rewritten = reader.read(root);
+		assert.notEqual(rewritten, first, "a registry rewritten with the same size and mtime is a new inode and is re-read");
+
+		const completed = { ...running, status: "completed" as const };
+		await writeTaskRegistry(root, registryOf(completed));
+		chmodSync(taskRegistryPath(root), 0o000);
+		assert.deepEqual(reader.read(root), {}, "an unreadable registry reads as empty");
+		chmodSync(taskRegistryPath(root), 0o600);
+		assert.deepEqual(reader.read(root), registryOf(completed), "a failed read is not cached for the same file version");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("pruning drops tasks that left the registry", () => {
 	const fingerprints = new Map([
 		["planner-1", "planner-fingerprint"],
 		["stale-3", "stale-fingerprint"],
 	]);
 
-	pruneTranscriptFingerprints(fingerprints, new Set(["planner-1"]));
+	pruneTaskEntries(fingerprints, new Set(["planner-1"]));
 
 	assert.deepEqual([...fingerprints.keys()], ["planner-1"]);
 });
