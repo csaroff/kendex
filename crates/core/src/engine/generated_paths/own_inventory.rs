@@ -150,8 +150,9 @@ fn refusal(finding: &Finding) -> String {
             // finding standing.
             text.push_str(
                 "the installed kendex that wrote it lays the set out this way, so install \
-                 this checkout's own CLI first (AGENTS.md § Commands: `cargo build --release \
-                 -p kendex-cli`, then copy the binary to `~/.cargo/bin/kendex`), then\n",
+                 this checkout's own CLI first (AGENTS.md § Commands: \
+                 `KENDEX_SOURCE_COMMIT=$(git rev-parse HEAD) cargo build --release -p kendex-cli`, \
+                 then copy the binary to `~/.cargo/bin/kendex`), then\n",
             );
             text.push_str(&rewrite());
         }
@@ -356,8 +357,8 @@ fn an_inventory_laid_out_on_one_line_is_refused() {
     // the file out this way writes it that way again, so the refresh alone
     // cannot clear this finding.
     let install = text
-        .find("cargo build --release -p kendex-cli")
-        .expect("the reflowed remedy names the CLI install");
+        .find("KENDEX_SOURCE_COMMIT=$(git rev-parse HEAD) cargo build --release -p kendex-cli")
+        .expect("the reflowed remedy names the CLI install with its source commit");
     let refresh = text
         .find("run `kendex refresh`")
         .expect("the reflowed remedy names the refresh");
