@@ -2,6 +2,10 @@
 
 ## Consumer-impacting changes
 
+### Unreleased
+
+- **The Codex provider shim sends the system prompt and tools again on Pi 0.86.0 and later.** Pi 0.86 moved the system prompt and the tool declarations out of a provider's `systemPrompt` and `tools` fields and into the transcript's `system` messages. The Codex provider shim still read the old fields, so on Pi 0.86 and later every `openai-codex` request reached the model with no system prompt and no tools. The shim now reads both from the transcript, with later system messages folded into the instructions and the tool set, and sends no `system` message as an input item. On a Pi host below 0.86.0 it still reads the old fields, as before.
+
 ### 2.0.2
 
 - Patch and image validation errors expose stable error codes. Grammar schema and response-header timeout errors include a stable key and value before their explanation.

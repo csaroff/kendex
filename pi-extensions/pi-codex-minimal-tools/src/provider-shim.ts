@@ -29,6 +29,7 @@ import {
 	convertResponsesMessages,
 	convertResponsesTools,
 	processResponsesStream,
+	promptAndTools,
 	splitDeferredTools,
 } from "./providers/openai-responses-shared.js";
 
@@ -525,8 +526,9 @@ export function buildRequestBody<TApi extends Api>(model: Model<TApi>, context: 
 	const supportsStrictMode = (model.compat as { supportsStrictMode?: boolean } | undefined)?.supportsStrictMode ?? true;
 	const supportsOpenAIGrammarTools = (model.compat as { supportsOpenAIGrammarTools?: boolean } | undefined)?.supportsOpenAIGrammarTools ?? false;
 	const supportsToolSearch = (model.compat as { supportsToolSearch?: boolean } | undefined)?.supportsToolSearch ?? false;
-	const grammarToolInputProperties = createGrammarToolInputProperties(context.tools, supportsOpenAIGrammarTools);
-	const toolPlacement = splitDeferredTools(context, supportsToolSearch);
+	const { systemPrompt, tools } = promptAndTools(context);
+	const grammarToolInputProperties = createGrammarToolInputProperties(tools, supportsOpenAIGrammarTools);
+	const toolPlacement = splitDeferredTools({ messages: context.messages, tools }, supportsToolSearch);
 	const messages = convertResponsesMessages(model, context, CODEX_TOOL_CALL_PROVIDERS, {
 		includeSystemPrompt: false,
 		grammarToolInputProperties,
@@ -539,7 +541,7 @@ export function buildRequestBody<TApi extends Api>(model: Model<TApi>, context: 
 		model: model.id,
 		store: false,
 		stream: true,
-		instructions: context.systemPrompt,
+		instructions: systemPrompt,
 		input: messages,
 		text: { verbosity: ((options as { textVerbosity?: string } | undefined)?.textVerbosity ?? "low") as string },
 		include: ["reasoning.encrypted_content"],
@@ -1658,7 +1660,7 @@ function createCodexStream<TApi extends Api>(
 
 		try {
 			grammarToolInputProperties = createGrammarToolInputProperties(
-				context.tools,
+				promptAndTools(context).tools,
 				(model.compat as { supportsOpenAIGrammarTools?: boolean } | undefined)?.supportsOpenAIGrammarTools ?? false,
 			);
 			const apiKey = options?.apiKey || await getEnvApiKeyCompat(model.provider) || "";
@@ -1723,7 +1725,7 @@ function createCodexStream<TApi extends Api>(
 							output,
 							createAssistantMessageDiagnostic("provider_transport_failure", error, {
 								configuredTransport: transport,
-								fallbackTransport: websocketStarted ? undefined : "sse",
+								...(websocketStarted ? {} : { fallbackTransport: "sse" }),
 								eventsEmitted: websocketStarted,
 								phase: websocketStarted ? "after_message_stream_start" : "before_message_stream_start",
 								requestBytes: new TextEncoder().encode(bodyJson).byteLength,
