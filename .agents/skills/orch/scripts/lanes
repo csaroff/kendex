@@ -253,6 +253,8 @@
 #          a fleet state whose records cannot be read refuses as
 #          `lanes: state-fleet`. The pane judge is the last-resort fallback
 #          for a window no such record names, whatever harness runs there.
+#          A Copilot allow-all lane's record note is on stderr beside it
+#          (references/copilot-runtime.md).
 #          A name no pane on this server carries is
 #          `unjudged`: a window that closed and a name two windows share are
 #          the same silence from here. `gone` is the judge's answer for a
@@ -796,6 +798,10 @@ message() {
       printf 'lanes: host-unreachable item=%s state=%s\n' "$1" "$2"
       printf '%s\n' "the host provider did not answer the touch probe; the state names what this machine could read of the lane and says nothing about the host, and the provider's own message follows"
       [ -z "$3" ] || printf '%s\n' "$3"
+      ;;
+    copilot-note)
+      printf 'lanes: %s item=%s\n' "$2" "$1"
+      printf '%s\n' "the Copilot allow-all lane's session record note; the state is the pane's (references/copilot-runtime.md § Allow-all blocked by policy)"
       ;;
     invalid-usage-ttl)
       printf 'lanes: invalid-usage-ttl value=%s\n' "$1"
@@ -2798,17 +2804,16 @@ mailbox_file_fetch() { # REC NAME
 # `unreadable` where they could not be read; it is empty for a window no
 # running fleet lane record names as a Pi lane's, whose pane is judged. Exit 2
 # where the fleet state is there and its records could not be read, since a Pi
-# lane read as any other would be judged by its pane.
-STATE_ROWS=""
+# lane read as any other would be judged by its pane. It keeps the records in
+# STATE_RECORDS.
+STATE_ROWS="" STATE_RECORDS=""
 state_rows_read() { # WINDOW
-	local exists records rec rows rc=0
-	STATE_ROWS=""
+	local exists rec rows rc=0
+	STATE_ROWS="" STATE_RECORDS=""
 	exists="$("$SCRIPT_DIR/workflow-state" exists --json oversee 2>/dev/null | jq -r '.exists')" || return 2
 	[[ "$exists" == true ]] || return 0
-	records="$("$SCRIPT_DIR/workflow-state" get oversee '.lanes // []' 2>/dev/null)" || return 2
-	rec="$(jq -c --arg w "${1#*:}" "$LANE_RUNNING_JQ"'
-		map(select(running and .harness == "pi" and ((.window // "") | sub("^.*:"; "")) == $w)) | first // empty' \
-		<<<"$records")" || return 2
+	STATE_RECORDS="$("$SCRIPT_DIR/workflow-state" get oversee '.lanes // []' 2>/dev/null)" || return 2
+	rec="$(lane_running_record "$STATE_RECORDS" "$1" pi)" || return 2
 	[[ -n "$rec" ]] || return 0
 	STATE_ROWS=unreadable
 	rows="$(mailbox_file_fetch "$rec" "$SESSION_ROWS_LANE")" || rc=$?
@@ -3634,6 +3639,9 @@ case "$SUB" in
 		# No pane on this server carries the name: nothing here sees the lane's
 		# harness, so its rows answer nothing either and the judge says unjudged.
 		[[ -n "$LANE_PANE_ID" ]] || STATE_ROWS=""
+		[[ -z "$LANE_PANE_ID" ]] || { rec="$(lane_running_record "$STATE_RECORDS" "$LANE_ARG" copilot)" &&
+			lane_context_copilot_note "$rec" "$(date +%s)"; } || die state-fleet "$LANE_ARG"
+		[[ -z "$COPILOT_SESSION_NOTE" ]] || message copilot-note "$LANE_ARG" "$COPILOT_SESSION_NOTE" >&2
 		lane_state_rc=0
 		lane_state LANE_STATE_ANSWER listed "$LANE_PANE_CMD" "$LANE_PANE_PID" "$LANE_PANE_SCREEN" "" "" "$STATE_ROWS" \
 			|| lane_state_rc=$?

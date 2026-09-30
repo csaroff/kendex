@@ -461,10 +461,11 @@ assert_eq "RC=$RC keyed=$(cop_keys) stdout=$(cat "$TMP_ROOT/stdout")" "RC=0 keye
 # COPILOT_HOME, for session s1 and its transcript, then judged by the shared
 # judge on the capacity the copilot adapter names: 80 percent of the window.
 COP_ACCOUNT="$TMP_ROOT/cop-account"
-cop_record() { # TOKENS WINDOW [TRANSCRIPT]
-  jq -nc --arg t "${3:-$COP_TRANSCRIPT}" --argjson n "$1" --argjson w "$2" \
+cop_record() { # TOKENS WINDOW [TRANSCRIPT] [ALLOW_ALL]
+  jq -nc --arg t "${3:-$COP_TRANSCRIPT}" --argjson n "$1" --argjson w "$2" --arg a "${4:-}" \
     '{session_id:"s1", transcript_path:$t, model:{id:"claude-opus-5"},
-      context_window:{current_context_tokens:$n, context_window_size:$w}}' |
+      context_window:{current_context_tokens:$n, context_window_size:$w}}
+     + (if $a == "" then {} else {allow_all_enabled: ($a == "true")} end)' |
     COPILOT_HOME="$COP_ACCOUNT" "$REPO_ROOT/skills/orch/scripts/copilot-statusline" >/dev/null
 }
 cop_context_recorded() { # the reading the hook recorded in the lane's mailbox
@@ -533,6 +534,29 @@ assert_eq "RC=$RC first=$(first_line) decision=$(stdout_field .decision)" \
   "RC=0 first=lane-mail-check: context=400000 decision=block" \
   "a gap record gives way to this session's fresh status-line record past the mark"
 rm -f -- "${LANE:?}/tmp/lane-mail/KEN-204/context.json"
+
+# A record reporting allow_all_enabled false in a session its launch line
+# granted allow-all, COPILOT_ALLOW_ALL=true, is a policy stop, reported under
+# its own cause at the turn end the lane reaches, and the turn end is still
+# judged: at the cap it is held. A launch without allow-all carries
+# COPILOT_ALLOW_ALL empty (lib/lane-launch.sh lane_copilot_env) and reads
+# false by design, so it names none; true names none. The extension's reading
+# carries no allow_all_enabled, so where one stands the record is still read
+# for the cause, and the context judged on the extension's reading.
+while IFS='|' read -r allow grant extension want; do
+  cop_record 400000 1000000 "" "$allow"
+  [ -z "$extension" ] || cop_extension_reading KEN-204 "$extension" 800000
+  copilot_stop "$COP_TRANSCRIPT" "" "COPILOT_HOME=$COP_ACCOUNT" "COPILOT_ALLOW_ALL=$grant"
+  assert_eq "RC=$RC keyed=$(cop_keys) decision=$(stdout_field .decision)" "RC=0 keyed=$want decision=block" \
+    "a record at the cap whose allow_all_enabled is $allow at the turn end, COPILOT_ALLOW_ALL=[$grant], extension reading [$extension]"
+  rm -f -- "${LANE:?}/tmp/lane-mail/KEN-204/context.json"
+done <<'ROWS'
+false|true||stop-cause=allow-all-blocked-by-policy;context=400000
+false|||context=400000
+true|true||context=400000
+false|true|700000|stop-cause=allow-all-blocked-by-policy;context=700000
+true|true|700000|context=700000
+ROWS
 
 # The account mark on Copilot: the account the session runs on is measured
 # through `lanes`, and a pool at zero holds the turn end at the headroom mark.
@@ -943,7 +967,7 @@ assert_eq "RC=$RC decision=$(stdout_field .decision)" "RC=0 decision=" \
   "control: without the record read a Copilot lane at the cap ends its turn"
 # The extension's reading skipped: the status line's record past the mark
 # overrides a reading below it.
-mutant copilot-no-primary -e 's@^    copilot_context_read "\$1" && return 0$@    false \&\& return 0@'
+mutant copilot-no-primary -e 's@^    copilot_context_read "\$1" || EXTENSION_READ=false$@    EXTENSION_READ=false@'
 new_copilot_lane control_cop_primary ken-256 "$MUTANT_PATH"
 mkdir -p "$LANE/tmp/lane-mail/KEN-256"
 (cd "$LANE" && "$REPO_ROOT/skills/orch/scripts/workflow-state" init KEN-256 >/dev/null)
@@ -964,6 +988,37 @@ cop_extension_reading KEN-257 100000 800000 s0
 copilot_stop "$COP_TRANSCRIPT" "" "COPILOT_HOME=$COP_ACCOUNT"
 assert_eq "RC=$RC decision=$(stdout_field .decision)" "RC=0 decision=" \
   "control: without the fallback past another session's record a status-line record past the mark does not hold the turn end"
+# The stop-cause read cut: a record reporting allow-all blocked by policy ends
+# the turn with no cause reported.
+mutant copilot-no-stop-cause -e 's@STOP_CAUSE=\$(copilot_session_stop_cause @STOP_CAUSE=$(false @'
+new_copilot_lane control_cop_cause ken-258 "$MUTANT_PATH"
+mkdir -p "$LANE/tmp/lane-mail/KEN-258"
+(cd "$LANE" && "$REPO_ROOT/skills/orch/scripts/workflow-state" init KEN-258 >/dev/null)
+cop_record 100000 1000000 "" false
+copilot_stop "$COP_TRANSCRIPT" "" "COPILOT_HOME=$COP_ACCOUNT" COPILOT_ALLOW_ALL=true
+assert_eq "RC=$RC keyed=$(cop_keys)" "RC=0 keyed=account=unmeasured" \
+  "control: without the stop-cause read a policy-blocked lane ends its turn with no cause"
+# The launch's grant cut: the hook hands the judge a grant whatever the launch
+# line set, so a lane launched without allow-all reports a policy stop.
+mutant copilot-grant-ignored -e 's@"\$COPILOT_SESSION_RECORD" "\${COPILOT_ALLOW_ALL:-}")@"$COPILOT_SESSION_RECORD" true)@'
+new_copilot_lane control_cop_grant ken-259 "$MUTANT_PATH"
+mkdir -p "$LANE/tmp/lane-mail/KEN-259"
+(cd "$LANE" && "$REPO_ROOT/skills/orch/scripts/workflow-state" init KEN-259 >/dev/null)
+cop_record 100000 1000000 "" false
+copilot_stop "$COP_TRANSCRIPT" "" "COPILOT_HOME=$COP_ACCOUNT" COPILOT_ALLOW_ALL=
+assert_eq "RC=$RC keyed=$(cop_keys)" "RC=0 keyed=stop-cause=allow-all-blocked-by-policy;account=unmeasured" \
+  "control: without the launch's grant a lane launched without allow-all reports a policy stop"
+# The record read only where no extension reading stands: a fleet lane whose
+# extension records its context ends a policy-blocked turn with no cause.
+mutant copilot-cause-fallback-only -e 's@^    \[ "\$COMPACTED" = false \] || return 0$@    [ "$EXTENSION_READ" = false ] || return 0@'
+new_copilot_lane control_cop_cause_extension ken-260 "$MUTANT_PATH"
+mkdir -p "$LANE/tmp/lane-mail/KEN-260"
+(cd "$LANE" && "$REPO_ROOT/skills/orch/scripts/workflow-state" init KEN-260 >/dev/null)
+cop_record 100000 1000000 "" false
+cop_extension_reading KEN-260 100000 800000
+copilot_stop "$COP_TRANSCRIPT" "" "COPILOT_HOME=$COP_ACCOUNT" COPILOT_ALLOW_ALL=true
+assert_eq "RC=$RC keyed=$(cop_keys)" "RC=0 keyed=account=unmeasured" \
+  "control: without the record read beside the extension's reading a policy-blocked lane ends its turn with no cause"
 # The account arm cut: a Copilot account at zero is reported unlisted and the
 # turn ends.
 mutant copilot-no-account -e 's@^    claude | codex | copilot) CFG=@    claude | codex) CFG=@'
