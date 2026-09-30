@@ -318,160 +318,113 @@ for wf in dev-fix review-pr-comments; do
 done
 
 # Approval-wait owns gate-mode resolution for workflows that wait on a
-# reviewer. The micro route reads its class exemption from review-policy.
-#
-# Under an ACTIVE class policy the resolver refuses a call with no range, so a
-# --resolve-mode call whose endpoints nothing binds is a step that cannot run.
-# Every workflow that resolves a mode therefore reads the pull request's own
-# endpoints first, in the call below, and every --resolve-mode line it carries
-# names both flags.
+# reviewer: each resolves it through the one --resolve-mode call, named for
+# the pull request whose base it reads.
 for wf in submit-pr merge-pr ci-fix; do
   doc="$SKILL_DIR/workflows/$wf.md"
-  assert_file_contains "$doc" 'approval-wait --resolve-mode' "$wf resolves the gate mode through approval-wait"
-  assert_file_contains "$doc" "gh pr view [PR_NUMBER] --json baseRefOid,headRefOid --jq '[.baseRefOid,.headRefOid]|@tsv'" \
-    "$wf binds the endpoints the resolver needs"
-  # The invocation spelling carries the script path; the preamble's prose
-  # mention of the flag is not a step and is not counted.
-  resolve_lines="$(grep -c -- 'scripts/approval-wait --resolve-mode' "$doc" || true)"
-  ranged_lines="$(grep -c -- 'scripts/approval-wait --resolve-mode --base ' "$doc" || true)"
-  if [ "$resolve_lines" -gt 0 ] && [ "$resolve_lines" -eq "$ranged_lines" ]; then
-    pass "$wf passes a range on every one of its $resolve_lines --resolve-mode calls"
-  else
-    fail "$wf has $resolve_lines --resolve-mode call(s) and $ranged_lines carrying a range"
-  fi
-  if grep -Fq 'orch-env PR_APPROVAL_GATE' "$doc" || grep -Fq 'orch-env PR_REVIEW_GATE' "$doc"; then
-    fail "$wf re-derives the gate mode from settings instead of --resolve-mode"
-  else
-    pass "$wf does not re-derive the gate mode from settings"
-  fi
+  assert_file_contains "$doc" 'approval-wait [PR_NUMBER] --resolve-mode' "$wf resolves the gate mode through approval-wait"
 done
 
-# The merged short-circuit is only a short-circuit while it precedes the reads
-# it skips: below them, a resolution that refuses for want of an orphaned head
-# stands between a completed merge and its cleanup.
-already_merged_line="$(grep -n -F '`[ALREADY_MERGED]=true` skips to step 2' "$merge_workflow" | cut -d: -f1 || true)"
-resolve_line="$(grep -n -F 'approval-wait --resolve-mode --base [PREPARED_BASE]' "$merge_workflow" | cut -d: -f1 || true)"
-if [[ -n "$already_merged_line" && -n "$resolve_line" && "$already_merged_line" -lt "$resolve_line" ]]; then
-  pass "merge-pr sends an already-merged PR to step 2 before it resolves a mode"
-else
-  fail "merge-pr must short-circuit an already-merged PR above the gate-mode resolution (short-circuit=${already_merged_line:-absent}, resolve=${resolve_line:-absent})"
-fi
-
-# A waiver is only pinned while the rows that apply it say which head it was
-# resolved for. Both gate rows name the recorded head, and the mode is written
-# beside that head in one write, so no future mode can be recorded without one.
-submit_workflow="$SKILL_DIR/workflows/submit-pr.md"
-pinned_waiver_is_closed() { # submit-doc
-  grep -Fq '`exempt` at the live endpoints: neither term applies' "$1" &&
-    grep -Fq '`exempt` at the live endpoints, and `off`: not applicable' "$1" &&
-    grep -Fq 'workflow-state set [ISSUE_ID] pr_review.head_sha [HEAD_SHA]' "$1" &&
-    grep -Fq 'Gates 3 and 4 waive on that fresh answer alone' "$1" &&
-    grep -Fq 'The recorded pair says what the last resolution saw and gates nothing' "$1"
+# approval-wait takes its repository from GH_REPO first (scripts/lib/gh-repo.sh).
+# A lane that inherited GH_REPO naming another repository would read that
+# repository's pull request and base, and a wrong `off` skips a required gate.
+# So every approval-wait run on a pull request, mode read and wait alike,
+# clears the override right before the command.
+approval_wait_clears_gh_repo() { # DOC...
+  awk '
+    {
+      line = $0; runs = gsub(/[^ `(]*approval-wait \[PR_NUMBER\]/, "", line)
+      line = $0; cleared = gsub(/env -u GH_REPO -u GITHUB_REPOSITORY [^ `(]*approval-wait \[PR_NUMBER\]/, "", line)
+      if (runs > cleared) { print FILENAME ":" FNR ": " $0 > "/dev/stderr"; bad = 1 }
+    }
+    END { exit bad }' "$@"
 }
-
-if pinned_waiver_is_closed "$submit_workflow"; then
-  pass "submit-pr waives gates 3 and 4 on a live resolution, not on the recorded pair"
+if approval_wait_clears_gh_repo "$SKILL_DIR"/workflows/*.md "$SKILL_DIR"/references/*.md; then
+  pass "every approval-wait run in workflows and references clears an inherited GH_REPO"
 else
-  fail "submit-pr must waive gates 3 and 4 on a live resolution, not on the recorded pair"
+  fail "an approval-wait run in workflows or references reads an inherited GH_REPO"
+fi
+assert_doc_mutant_fails approval_wait_clears_gh_repo "$ci_fix_workflow" \
+  'env -u GH_REPO -u GITHUB_REPOSITORY .agents/skills/orch/scripts/approval-wait [PR_NUMBER] --resolve-mode' \
+  '.agents/skills/orch/scripts/approval-wait [PR_NUMBER] --resolve-mode' \
+  "a gate mode read through an inherited GH_REPO"
+assert_doc_mutant_fails approval_wait_clears_gh_repo "$merge_workflow" \
+  '`env -u GH_REPO -u GITHUB_REPOSITORY .agents/skills/orch/scripts/approval-wait [PR_NUMBER] 30 --json --mode approval' \
+  '`approval-wait [PR_NUMBER] 30 --json --mode approval' \
+  "an inline approval poll through an inherited GH_REPO"
+
+# The merged short-circuit is only a short-circuit while it precedes the reads
+# it skips: below them, a micro classification that refuses for want of an
+# orphaned head stands between a completed merge and its cleanup.
+already_merged_line="$(grep -n -F '`[ALREADY_MERGED]=true` skips to step 2' "$merge_workflow" | cut -d: -f1 || true)"
+classify_line="$(grep -n -F 'item-tier --base [PREPARED_BASE] --head [PREPARED_HEAD]' "$merge_workflow" | cut -d: -f1 || true)"
+if [[ -n "$already_merged_line" && -n "$classify_line" && "$already_merged_line" -lt "$classify_line" ]]; then
+  pass "merge-pr sends an already-merged PR to step 2 before it classifies a micro entry"
+else
+  fail "merge-pr must short-circuit an already-merged PR above the micro classification (short-circuit=${already_merged_line:-absent}, classify=${classify_line:-absent})"
 fi
 
-assert_doc_mutant_fails pinned_waiver_is_closed "$submit_workflow" \
-  'The recorded pair says what the last resolution saw and gates nothing' \
-  'The recorded pair decides gates 3 and 4.' \
-  "a waiver decided from the record"
-
+# A micro run has no internal review, so step 1 re-resolves the gate mode
+# between its classification and its continue rule: a retarget can move the
+# pull request onto a base that requires no approval without moving the head.
+# merge-pr resolves the mode in § 3 as well, so only a call inside that span
+# is step 1's.
+micro_continue='A `[MICRO_ENTRY]` run continues only where the `item-tier` answer is `tier=micro`, the gate mode is `approval`, AND `[MICRO_HEAD]` equals `[PREPARED_HEAD]`'
 micro_head_is_pinned() { # merge-doc
-  grep -Fq 'A `[MICRO_ENTRY]` run continues only where the mode resolved above is `exempt` AND `[MICRO_HEAD]` equals `[PREPARED_HEAD]`' "$1" &&
+  local classify_at continue_at
+  classify_at="$(grep -m1 -n -F 'item-tier --base [PREPARED_BASE] --head [PREPARED_HEAD]' "$1" | cut -d: -f1 || true)"
+  continue_at="$(grep -m1 -n -F -- "$micro_continue" "$1" | cut -d: -f1 || true)"
+  [[ -n "$classify_at" && -n "$continue_at" ]] &&
+    awk -v from="$classify_at" -v to="$continue_at" \
+      'NR > from && NR < to && index($0, ".agents/skills/orch/scripts/approval-wait [PR_NUMBER] --resolve-mode") { found = 1 }
+       END { exit !found }' "$1" &&
     grep -Fq 'Any other answer arms nothing and escapes by micro.md condition 9' "$1"
 }
 
 if micro_head_is_pinned "$merge_workflow"; then
-  pass "merge-pr continues a micro entry only on a fresh exempt answer at the classified head"
+  pass "merge-pr continues a micro entry only on a fresh micro answer and approval mode at the classified head"
 else
-  fail "merge-pr must continue a micro entry only on a fresh exempt answer at the classified head"
+  fail "merge-pr must continue a micro entry only on a fresh micro answer and approval mode at the classified head"
 fi
 
 assert_doc_mutant_fails micro_head_is_pinned "$merge_workflow" \
-  'A `[MICRO_ENTRY]` run continues only where the mode resolved above is `exempt` AND `[MICRO_HEAD]` equals `[PREPARED_HEAD]`' \
+  "$micro_continue" \
   'A `[MICRO_ENTRY]` run continues' \
   "a micro entry continued on a stale answer"
+assert_doc_mutant_fails micro_head_is_pinned "$merge_workflow" \
+  '   env -u GH_REPO -u GITHUB_REPOSITORY .agents/skills/orch/scripts/approval-wait [PR_NUMBER] --resolve-mode' \
+  '   .agents/skills/orch/scripts/item-tier --help' \
+  "a micro entry continued with no fresh gate mode"
 
 micro_workflow="$SKILL_DIR/workflows/micro.md"
-micro_policy_is_closed() { # micro-doc
+micro_class_is_closed() { # micro-doc
   grep -Fq 'env -u GH_REPO -u GITHUB_REPOSITORY [MAIN_REPO_ROOT]/.agents/skills/github/scripts/github.sh -C [MAIN_REPO_ROOT] pr-view [PR_NUMBER] --json baseRefOid,headRefOid' "$1" &&
-    grep -Fq 'review-gate/scripts/review-policy --event pull_request --base [BASE_SHA] --head [HEAD_SHA] --repo [WT_PATH]' "$1" &&
-    grep -Fq 'each followed by `review_evidence=none policy=active`. Any such answer continues.' "$1" &&
-    grep -Fq 'independent of the repository'"'"'s `approval` or `review` gate mode' "$1" &&
-    grep -Fq 'Every other answer escapes (§ Escape condition 7): a command failure, an inactive policy, an unresolved class, a class above this tier (`small`, `standard`), or another evidence policy.' "$1" &&
-    grep -Fq '7. § 4 cannot prove both halves of its precheck. Either the review gate'"'"'s answer is outside the accepted set § 4 states, or' "$1" &&
-    ! grep -Fq 'exactly `change_class=' "$1" &&
+    grep -Fq 'orch/scripts/item-tier --base [BASE_SHA] --head [HEAD_SHA] --repo [WT_PATH]' "$1" &&
+    grep -Fq 'The accepted answer is `tier=micro`' "$1" &&
+    grep -Fq 'Every other answer escapes (§ Escape condition 7): a command failure, a class above this tier (`small`, `standard`), or a class the classifier did not measure.' "$1" &&
+    grep -Fq '[MAIN_REPO_ROOT]/.agents/skills/orch/scripts/approval-wait [PR_NUMBER] --resolve-mode' "$1" &&
+    grep -Fq 'Continue only on `approval`.' "$1" &&
+    grep -Fq '`off` or a non-zero exit escapes (§ Escape condition 7)' "$1" &&
+    grep -Fq '7. § 4 cannot prove all three parts of its precheck. Either the `item-tier` answer is not `tier=micro`, or `approval-wait --resolve-mode` does not print `approval`, or' "$1" &&
     grep -Fq 'Require a valid readiness object for an open pull request.' "$1" &&
     grep -Fq 'binding `[MICRO_ENTRY]` to `true` and `[MICRO_HEAD]` to `[HEAD_SHA]`.' "$1" &&
-    grep -Fq '9. merge-pr.md § 5 step 1 refuses: the mode it resolves over the prepared endpoints is not `exempt`, or `[PREPARED_HEAD]` is not `[MICRO_HEAD]`.' "$1" &&
-    ! grep -Fq 'approval-wait --resolve-mode' "$1"
+    grep -Fq '9. merge-pr.md § 5 step 1 refuses: the `item-tier` answer it reads over the prepared endpoints is not `tier=micro`, or the gate mode it resolves is not `approval`, or `[PREPARED_HEAD]` is not `[MICRO_HEAD]`.' "$1"
 }
 
-if micro_policy_is_closed "$micro_workflow"; then
-  pass "micro continues only on its active no-review class policy"
+if micro_class_is_closed "$micro_workflow"; then
+  pass "micro continues only on a measured micro class over a base in approval mode"
 else
-  fail "micro must escape when its no-review class policy cannot be proved"
+  fail "micro must escape when a measured micro class or approval mode cannot be proved"
 fi
 
-assert_doc_mutant_fails micro_policy_is_closed "$micro_workflow" \
-  'each followed by `review_evidence=none policy=active`. Any such answer continues.' \
-  'each followed by `policy=active`. Any such answer continues.' \
-  "accepting an unresolved evidence policy"
-
-assert_doc_mutant_fails micro_policy_is_closed "$micro_workflow" \
+assert_doc_mutant_fails micro_class_is_closed "$micro_workflow" \
   'Every other answer escapes (§ Escape condition 7)' \
   'Every other answer continues (§ Escape condition 7)' \
-  "continuing on an answer outside the accepted set"
-
-# The accepted set is stated once, in § 4: the classes at or below the tier
-# whose evidence is none. Condition 7 cites it and restates no class. Each
-# row reads one class against the sentence that opens the set: a class
-# inside it continues the precheck, a class outside it escapes.
-micro_accepted_set() { # micro-doc
-  grep -F 'The accepted set is every class at or below this tier' "$1"
-}
-micro_class_continues() { # FILE CLASS
-  local set_line
-  set_line="$(micro_accepted_set "$1")" || return 1
-  grep -Fq "\`change_class=$2\`" <<<"$set_line"
-}
-micro_class_escapes() { # FILE CLASS
-  local set_line
-  set_line="$(micro_accepted_set "$1")" || return 1
-  ! grep -Fq "\`change_class=$2\`" <<<"$set_line" &&
-    grep -Fq "a class above this tier (\`small\`, \`standard\`)" <<<"$set_line"
-}
-micro_trivial_continues() { micro_class_continues "$1" trivial; }
-micro_small_escapes() { micro_class_escapes "$1" small; }
-
-for class in render trivial micro; do
-  if micro_class_continues "$micro_workflow" "$class"; then
-    pass "micro precheck continues on change_class=$class"
-  else
-    fail "micro precheck must continue on change_class=$class"
-  fi
-done
-for class in small standard; do
-  if micro_class_escapes "$micro_workflow" "$class"; then
-    pass "micro precheck escapes on change_class=$class"
-  else
-    fail "micro precheck must escape on change_class=$class"
-  fi
-done
-
-assert_doc_mutant_fails micro_trivial_continues "$micro_workflow" \
-  '`change_class=render`, `change_class=trivial` or `change_class=micro`' \
-  '`change_class=render` or `change_class=micro`' \
-  "a trivial answer escaping the micro tier"
-
-assert_doc_mutant_fails micro_small_escapes "$micro_workflow" \
-  '`change_class=render`, `change_class=trivial` or `change_class=micro`' \
-  '`change_class=render`, `change_class=trivial`, `change_class=micro` or `change_class=small`' \
-  "a small answer continuing the micro tier"
+  "continuing on an answer outside the accepted one"
+assert_doc_mutant_fails micro_class_is_closed "$micro_workflow" \
+  'Continue only on `approval`.' \
+  'Continue on any gate mode.' \
+  "a micro run admitted on a base that requires no approval"
 
 micro_dirty_transfer_is_owned() { # micro-doc
   local route=""
