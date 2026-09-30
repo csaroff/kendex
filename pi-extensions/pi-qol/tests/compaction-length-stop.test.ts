@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { generateQolSummary } from "../extensions/qol/compaction.ts";
+import { clearPackageConfigCache } from "../extensions/qol/package-config.ts";
 
 let workdir = "";
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -18,6 +19,7 @@ beforeEach(() => {
 	workdir = mkdtempSync(join(tmpdir(), "pi-qol-length-stop-"));
 	process.env.PI_CODING_AGENT_DIR = workdir;
 	process.env.HOME = workdir;
+	clearPackageConfigCache();
 });
 
 afterEach(() => {
@@ -27,6 +29,7 @@ afterEach(() => {
 		else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
 		if (originalHome === undefined) delete process.env.HOME;
 		else process.env.HOME = originalHome;
+		clearPackageConfigCache();
 		mock.module("@earendil-works/pi-ai", () => ({
 			complete: async () => ({
 				content: [{ text: "stubbed summary text", type: "text" }],

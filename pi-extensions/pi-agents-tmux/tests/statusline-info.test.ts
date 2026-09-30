@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { resolveSubagentStatuslineInfo } from "../extensions/subagent/format.js";
+import { clearPackageConfigCache } from "../extensions/subagent/package-config.js";
 
 const rootTmp = join(import.meta.dir, "..", "..", "..", "tmp", "pi-agents-statusline-tests");
 const originalEnv = {
@@ -22,6 +23,7 @@ function restoreEnv(): void {
 	else process.env.PI_CODING_AGENT_DIR = originalEnv.PI_CODING_AGENT_DIR;
 	if (originalEnv.PI_SUBAGENT_CHILD_COLOR === undefined) delete process.env.PI_SUBAGENT_CHILD_COLOR;
 	else process.env.PI_SUBAGENT_CHILD_COLOR = originalEnv.PI_SUBAGENT_CHILD_COLOR;
+	clearPackageConfigCache();
 }
 
 function writeAgent(dir: string, name: string, description: string, frontmatterLines: string[] = []): string {
@@ -38,6 +40,7 @@ beforeEach(() => {
 	mkdirSync(home, { recursive: true });
 	process.env.HOME = home;
 	process.env.PI_CODING_AGENT_DIR = join(home, ".pi", "agent");
+	clearPackageConfigCache();
 	delete process.env.PI_SUBAGENT_CHILD_COLOR;
 });
 

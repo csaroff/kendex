@@ -3,7 +3,8 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { after } from "node:test";
-import { bgTaskTimeoutMs, DEFAULT_BG_TASK_TIMEOUT_MS, recordProjectTrust, settingNumber } from "../extensions/subagent/settings.js";
+import { clearPackageConfigCache, recordProjectTrust } from "../extensions/subagent/package-config.js";
+import { bgTaskTimeoutMs, DEFAULT_BG_TASK_TIMEOUT_MS, settingNumber } from "../extensions/subagent/settings.js";
 import { DEFAULT_MODEL_CONTEXT_LIMIT_TOKENS } from "../extensions/subagent/sessions.js";
 import { DEFAULT_RESULT_MAX_BYTES, DEFAULT_RESULT_MAX_LINES, MAX_CONCURRENCY } from "../extensions/subagent/types.js";
 
@@ -33,6 +34,8 @@ function writeProjectSettings(cwd: string, config: Record<string, unknown>): voi
 		kendex: { extensionManager: { config: { "@vanillagreen/pi-agents-tmux": config } } },
 	}), "utf8");
 	recordProjectTrust({ cwd, isProjectTrusted: () => true });
+	// What pi-extension-manager's settings-changed event does after a write.
+	clearPackageConfigCache();
 }
 
 test("settings metadata hides deprecated maxParallelTasks", () => {
@@ -64,11 +67,13 @@ test("settings metadata keeps bgTaskTimeoutMs visible and disableable", () => {
 	writeProjectSettings(cwd, { bgTaskTimeoutMs: 0 });
 	const previousPiDir = process.env.PI_CODING_AGENT_DIR;
 	process.env.PI_CODING_AGENT_DIR = join(cwd, "agent");
+	clearPackageConfigCache();
 	try {
 		assert.equal(bgTaskTimeoutMs(cwd), 0);
 	} finally {
 		if (previousPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = previousPiDir;
+		clearPackageConfigCache();
 	}
 });
 
@@ -109,10 +114,12 @@ test("legacy maxParallelTasks setting does not affect maxConcurrency", () => {
 	writeProjectSettings(cwd, { maxParallelTasks: 1 });
 	const previousPiDir = process.env.PI_CODING_AGENT_DIR;
 	process.env.PI_CODING_AGENT_DIR = join(cwd, "agent");
+	clearPackageConfigCache();
 	try {
 		assert.equal(settingNumber("maxConcurrency", MAX_CONCURRENCY, cwd), MAX_CONCURRENCY);
 	} finally {
 		if (previousPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = previousPiDir;
+		clearPackageConfigCache();
 	}
 });

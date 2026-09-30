@@ -13,7 +13,8 @@ import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { isolatedFromEnv, loadConfig, piUserDir, recordProjectTrust } from "../src/config.ts";
+import { isolatedFromEnv, loadConfig, recordProjectTrust } from "../src/config.ts";
+import { clearPackageConfigCache, piUserDir } from "../src/package-config.ts";
 import { extractAgentsAppend, resolveAgentsMdPath } from "../src/agents-md.ts";
 import { readAppendSystemPromptFiles } from "../src/prompt-context.ts";
 import { resolveClaudeExecutable } from "../src/index.ts";
@@ -27,12 +28,14 @@ function withEnv(overrides, fn) {
 			if (value === undefined) delete process.env[key];
 			else process.env[key] = value;
 		}
+		clearPackageConfigCache();
 		return fn();
 	} finally {
 		for (const [key, value] of saved) {
 			if (value === undefined) delete process.env[key];
 			else process.env[key] = value;
 		}
+		clearPackageConfigCache();
 	}
 }
 

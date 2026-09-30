@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { clearPackageConfigCache } from "../extensions/subagent/package-config.js";
 import {
 	setTmuxPaneTitleSpawnForTests,
 } from "../extensions/subagent/pane.js";
@@ -37,6 +38,7 @@ function createHarness(env: { childAgent?: string; childPane?: string; tmuxPane?
 	if (env.tmuxPane === undefined) delete process.env.TMUX_PANE;
 	else process.env.TMUX_PANE = env.tmuxPane;
 	process.env.PI_CODING_AGENT_DIR = piUserDir;
+	clearPackageConfigCache();
 	const titleSpawnCalls: Array<{ command: string; args: string[] }> = [];
 	setTmuxPaneTitleSpawnForTests(((command: string, args?: readonly string[]) => {
 		titleSpawnCalls.push({ command, args: [...(args ?? [])] });
@@ -57,6 +59,7 @@ function teardown(harness: Harness): void {
 	else process.env.TMUX_PANE = harness.previousEnv.tmuxPane;
 	if (harness.previousEnv.piDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 	else process.env.PI_CODING_AGENT_DIR = harness.previousEnv.piDir;
+	clearPackageConfigCache();
 	rmSync(harness.cwd, { force: true, recursive: true });
 }
 
@@ -65,7 +68,7 @@ async function installExtension(harness: Harness): Promise<(event: unknown, ctx:
 	const bus = new EventEmitter();
 	const pi = {
 		appendEntry: () => undefined,
-		events: { emit: bus.emit.bind(bus), on: bus.on.bind(bus) },
+		events: { emit: bus.emit.bind(bus), on: (channel: string, handler: (data: unknown) => void) => { bus.on(channel, handler); return () => bus.off(channel, handler); } },
 		getActiveTools: () => [],
 		getThinkingLevel: () => undefined,
 		on: (event: string, handler: (event: unknown, ctx: any) => Promise<void>) => {
@@ -82,9 +85,11 @@ async function installExtension(harness: Harness): Promise<(event: unknown, ctx:
 	url.searchParams.set("t", `${Date.now()}-${Math.random().toString(36).slice(2)}`);
 	const mod = await import(url.href);
 	mod.default(pi);
-	const handler = handlers.get("session_start")?.[0];
-	expect(handler).toBeTruthy();
-	return handler!;
+	const registered = handlers.get("session_start") ?? [];
+	expect(registered.length).toBeGreaterThan(0);
+	return async (event, ctx) => {
+		for (const handler of registered) await handler(event, ctx);
+	};
 }
 
 function fakeCtx(harness: Harness): any {

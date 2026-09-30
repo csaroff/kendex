@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import qolDefault from "../extensions/qol.ts";
+import { clearPackageConfigCache } from "../extensions/qol/package-config.ts";
 
 interface FakeApi {
 	handlers: Record<string, (event: any, ctx: any) => any>;
@@ -105,6 +106,7 @@ beforeEach(() => {
 	process.env.HOME = workdir;
 	delete process.env.TMUX;
 	delete process.env.TMUX_PANE;
+	clearPackageConfigCache();
 	zeroDelayCallbacks = [];
 	timerSpy = spyOn(globalThis, "setTimeout").mockImplementation(((callback: (...args: unknown[]) => void, delay?: number, ...args: unknown[]) => {
 		if (delay !== 0) return nativeTimeout(callback, delay, ...args);
@@ -129,6 +131,7 @@ afterEach(() => {
 		else process.env.TMUX = originalTmux;
 		if (originalTmuxPane === undefined) delete process.env.TMUX_PANE;
 		else process.env.TMUX_PANE = originalTmuxPane;
+		clearPackageConfigCache();
 	}
 });
 

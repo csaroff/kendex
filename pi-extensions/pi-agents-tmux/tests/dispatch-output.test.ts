@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test, { after } from "node:test";
 import { formatPreparedParallelSection, parallelResultLimits } from "../extensions/subagent/dispatch.js";
 import { prepareSingleResultForReturn } from "../extensions/subagent/runner.js";
-import { recordProjectTrust } from "../extensions/subagent/settings.js";
+import { clearPackageConfigCache, recordProjectTrust } from "../extensions/subagent/package-config.js";
 import { DEFAULT_RESULT_MAX_BYTES, DEFAULT_RESULT_MAX_LINES, type PreparedSingleResult } from "../extensions/subagent/types.js";
 
 function writeProjectSettings(cwd: string, config: Record<string, unknown>): void {
@@ -14,6 +14,8 @@ function writeProjectSettings(cwd: string, config: Record<string, unknown>): voi
 		kendex: { extensionManager: { config: { "@vanillagreen/pi-agents-tmux": config } } },
 	}), "utf8");
 	recordProjectTrust({ cwd, isProjectTrusted: () => true });
+	// What pi-extension-manager's settings-changed event does after a write.
+	clearPackageConfigCache();
 }
 
 const tempDirs: string[] = [];
@@ -27,6 +29,7 @@ test("parallel output divides total result budgets across returned agents", () =
 	tempDirs.push(cwd);
 	const previousPiDir = process.env.PI_CODING_AGENT_DIR;
 	process.env.PI_CODING_AGENT_DIR = join(cwd, "agent");
+	clearPackageConfigCache();
 	try {
 		assert.deepEqual(parallelResultLimits(cwd, 8), {
 			maxBytes: Math.floor(DEFAULT_RESULT_MAX_BYTES / 8),
@@ -38,6 +41,7 @@ test("parallel output divides total result budgets across returned agents", () =
 	} finally {
 		if (previousPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = previousPiDir;
+		clearPackageConfigCache();
 	}
 });
 
@@ -48,6 +52,7 @@ test("parallel result preparation writes artifacts and section surfaces them bef
 	writeProjectSettings(cwd, { resultMaxBytes: 128, resultMaxLines: 3, preserveFullOutput: true });
 	const previousPiDir = process.env.PI_CODING_AGENT_DIR;
 	process.env.PI_CODING_AGENT_DIR = join(cwd, "agent");
+	clearPackageConfigCache();
 	try {
 		const largeOutput = Array.from({ length: 80 }, (_, index) => `line-${index}-${"x".repeat(40)}`).join("\n");
 		const prepared = await prepareSingleResultForReturn({
@@ -78,6 +83,7 @@ test("parallel result preparation writes artifacts and section surfaces them bef
 	} finally {
 		if (previousPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = previousPiDir;
+		clearPackageConfigCache();
 	}
 });
 

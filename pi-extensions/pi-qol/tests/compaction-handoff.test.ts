@@ -4,9 +4,10 @@ import { tmpdir } from "node:os";
 import { dirname, join, sep } from "node:path";
 import {
 	buildBudgetHandoff, collectArtifactRefs, findLatestTaskState, handoffBaseDir,
-	piUserDir, safeFileName, sessionIdFromManager, writeBudgetHandoffArtifact,
+	safeFileName, sessionIdFromManager, writeBudgetHandoffArtifact,
 	type HandoffSessionAccessor,
 } from "../extensions/qol/compaction-handoff.ts";
+import { clearPackageConfigCache, piUserDir } from "../extensions/qol/package-config.ts";
 
 let workdir = "";
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -15,12 +16,14 @@ const timestamp = 1_700_000_000_000;
 beforeEach(() => {
 	workdir = mkdtempSync(join(tmpdir(), "pi-qol-handoff-"));
 	process.env.PI_CODING_AGENT_DIR = workdir;
+	clearPackageConfigCache();
 });
 afterEach(() => {
 	try { if (workdir) rmSync(workdir, { force: true, recursive: true }); }
 	finally {
 		if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+		clearPackageConfigCache();
 	}
 });
 

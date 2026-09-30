@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 
 import piHooks from "../extensions/hooks.ts";
+import { clearPackageConfigCache } from "../extensions/package-config.ts";
 
 /* Fixtures shared by the pi-hooks suites. */
 
@@ -43,6 +44,8 @@ export function writePiConfig(project: string, overrides: Record<string, unknown
 			},
 		},
 	}, null, 2));
+	// What pi-extension-manager's settings-changed event does after a write.
+	clearPackageConfigCache();
 }
 
 /* Git reads no config of the developer's here: a global core.hooksPath would
@@ -77,6 +80,7 @@ export function useIsolatedGitEnv(): void {
 		savedEnv.PI_CODING_AGENT_DIR = process.env.PI_CODING_AGENT_DIR;
 		emptyAgentDir = mkdtempSync(join(tmpdir(), "pi-hooks-empty-agent-"));
 		process.env.PI_CODING_AGENT_DIR = emptyAgentDir;
+		clearPackageConfigCache();
 		// The carrier names the calling agent from this, and a suite run from
 		// inside a Pi subagent inherits it.
 		savedEnv.PI_SUBAGENT_CHILD_AGENT = process.env.PI_SUBAGENT_CHILD_AGENT;
@@ -87,6 +91,7 @@ export function useIsolatedGitEnv(): void {
 			if (value === undefined) delete process.env[name];
 			else process.env[name] = value;
 		}
+		clearPackageConfigCache();
 		if (emptyAgentDir !== undefined) rmSync(emptyAgentDir, { recursive: true, force: true });
 	});
 }

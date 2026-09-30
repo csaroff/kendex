@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { clearPackageConfigCache } from "../extensions/qol/package-config.ts";
 import { renderStatusLine } from "../extensions/qol/statusline.ts";
 
 let workdir = "";
@@ -16,6 +17,8 @@ function config(showProvider?: boolean) {
 	writeFileSync(join(workdir, "settings.json"), JSON.stringify({ kendex: { extensionManager: { config: {
 		"@vanillagreen/pi-qol": showProvider === undefined ? {} : { "statusline.showProvider": showProvider },
 	} } } }));
+	// What pi-extension-manager's settings-changed event does after a write.
+	clearPackageConfigCache();
 }
 
 function context(provider?: string): ExtensionContext {
@@ -30,6 +33,7 @@ beforeEach(() => {
 	workdir = mkdtempSync(join(tmpdir(), "qol-provider-"));
 	mkdirSync(join(workdir, ".pi"));
 	process.env.PI_CODING_AGENT_DIR = workdir;
+	clearPackageConfigCache();
 	delete process.env.PI_SUBAGENT_CHILD_AGENT;
 	config(true);
 });
@@ -40,6 +44,7 @@ afterEach(() => {
 	else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
 	if (originalChildAgent === undefined) delete process.env.PI_SUBAGENT_CHILD_AGENT;
 	else process.env.PI_SUBAGENT_CHILD_AGENT = originalChildAgent;
+	clearPackageConfigCache();
 });
 
 const rows = [

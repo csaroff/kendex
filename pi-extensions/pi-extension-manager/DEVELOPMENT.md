@@ -12,7 +12,11 @@ The OMP inventory covers native npm/link installations and persisted configured 
 
 OMP settings edits are restricted to this manager's namespace. A different kendex extension's Pi JSON reader does not start reading YAML because this manager can write it. Update, uninstall and append-system execution remain Pi-only. Unsupported actions refuse before invoking a process or writing a Pi filter. Existing YAML filenames and unknown fields survive writes; comments and formatting do not. Invalid documents or malformed manager/native state refuse rather than being replaced with defaults. This is a synchronous local read-modify-write boundary, not a concurrent-writer locking protocol.
 
-OMP global settings prefer `config.yml`, then `config.yaml`. Native project settings layer `settings.json` before `config.yml`; edits target the last matching raw layer, never a merged document. `HostAdapter.projectSettingsWritable` treats trusted OMP project documents as creatable even when none exists, while Pi retains its existing-file fallback. The project settings directory is cwd-local, while the project plugin anchor can be an ancestor. Pi retains its root-anchored override policy when its runtime resolver returns a relative directory (`extensions/manager/paths.ts::rootAnchored`).
+OMP global settings prefer `config.yml`, then `config.yaml`. Native project settings layer `settings.json` before `config.yml`; edits target the last matching raw layer, never a merged document. `HostAdapter.projectSettingsWritable` treats trusted OMP project documents as creatable even when none exists, while Pi retains its existing-file fallback. The project settings directory is cwd-local, while the project plugin anchor can be an ancestor. Pi retains its root-anchored override policy when its runtime resolver returns a relative directory (`extensions/manager/package-config.ts::rootAnchored`).
+
+## Settings-changed event
+
+A quick-settings write emits `kendex:extension-settings-changed` on `pi.events` with `{ extensionId, key, value }` (`extensions/manager/quick-settings-ui.ts`). The other kendex packages memoize their settings reads through their vendored `package-config.ts` and drop them on this event, so a setting written here applies on their next read. This package memoizes only its glyph lookup (`settingsMemo` in `extensions/manager/glyphs.ts`); `HostAdapter.settings` reads and parses each readable file on every call. A write through `HostAdapter.write` also clears the glyph memo.
 
 ## External config resolvers
 

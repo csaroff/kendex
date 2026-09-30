@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import { acquireFileLock } from "../extensions/subagent/file-lock.js";
 import subagentExtension from "../extensions/subagent/index.js";
+import { clearPackageConfigCache } from "../extensions/subagent/package-config.js";
 import { taskRegistryPath } from "../extensions/subagent/paths.js";
 import { sessionRuntimeDir } from "../extensions/subagent/settings.js";
 import { readTaskRegistry, updateTaskRegistry, writeTaskRegistry } from "../extensions/subagent/tasks.js";
@@ -63,7 +64,7 @@ describe("subagent lifecycle event persistence", () => {
 			const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
 			const pi = {
 				appendEntry: () => undefined,
-				events: { emit: bus.emit.bind(bus), on: bus.on.bind(bus) },
+				events: { emit: bus.emit.bind(bus), on: (channel: string, handler: (data: unknown) => void) => { bus.on(channel, handler); return () => bus.off(channel, handler); } },
 				getActiveTools: () => [],
 				getThinkingLevel: () => undefined,
 				on: (name: string, handler: (event: unknown, ctx: unknown) => unknown) => handlers.set(name, handler),
@@ -125,6 +126,7 @@ describe("subagent lifecycle event persistence", () => {
 				if (previousEnv[key] === undefined) delete process.env[key];
 				else process.env[key] = previousEnv[key];
 			}
+			clearPackageConfigCache();
 			await removeSettled(cwd);
 		}
 	});
@@ -145,7 +147,7 @@ describe("subagent lifecycle event persistence", () => {
 			const bus = new EventEmitter();
 			const pi = {
 				appendEntry: () => undefined,
-				events: { emit: bus.emit.bind(bus), on: bus.on.bind(bus) },
+				events: { emit: bus.emit.bind(bus), on: (channel: string, handler: (data: unknown) => void) => { bus.on(channel, handler); return () => bus.off(channel, handler); } },
 				getActiveTools: () => [],
 				getThinkingLevel: () => undefined,
 				on: () => undefined,
@@ -214,7 +216,7 @@ describe("subagent lifecycle event persistence", () => {
 			const handlers = new Map<string, Array<(event: any, ctx: any) => unknown>>();
 			const pi = {
 				appendEntry: () => undefined,
-				events: { emit: bus.emit.bind(bus), on: bus.on.bind(bus) },
+				events: { emit: bus.emit.bind(bus), on: (channel: string, handler: (data: unknown) => void) => { bus.on(channel, handler); return () => bus.off(channel, handler); } },
 				getActiveTools: () => [],
 				getThinkingLevel: () => undefined,
 				on: (name: string, handler: (event: any, ctx: any) => unknown) => {
@@ -240,10 +242,10 @@ describe("subagent lifecycle event persistence", () => {
 				transcriptPath,
 			});
 
-			const shutdown = handlers.get("session_shutdown")?.[0];
-			expect(shutdown).toBeDefined();
+			const shutdownHandlers = handlers.get("session_shutdown") ?? [];
+			expect(shutdownHandlers.length).toBeGreaterThan(0);
 			let shutdownSettled = false;
-			const shutdownPromise = Promise.resolve(shutdown?.({ reason: "quit" }, {})).then(() => {
+			const shutdownPromise = Promise.all(shutdownHandlers.map((shutdown) => shutdown({ reason: "quit" }, {}))).then(() => {
 				shutdownSettled = true;
 			});
 			await new Promise((resolve) => setTimeout(resolve, 20));

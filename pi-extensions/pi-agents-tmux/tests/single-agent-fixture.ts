@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentConfig } from "../extensions/subagent/agents.js";
 import { setSingleAgentSpawnForTests } from "../extensions/subagent/runner.js";
-import { recordProjectTrust } from "../extensions/subagent/settings.js";
+import { clearPackageConfigCache, recordProjectTrust } from "../extensions/subagent/package-config.js";
 import type { SingleResult, SubagentDetails } from "../extensions/subagent/types.js";
 
 const tempRuntimeDirs = new Set<string>();
@@ -36,6 +36,8 @@ export function writeSettings(cwd: string, config: Record<string, unknown>) {
 		kendex: { extensionManager: { config: { "@vanillagreen/pi-agents-tmux": config } } },
 	}), "utf8");
 	recordProjectTrust({ cwd, isProjectTrusted: () => true });
+	// What pi-extension-manager's settings-changed event does after a write.
+	clearPackageConfigCache();
 }
 
 export function testAgent(): AgentConfig {
@@ -179,6 +181,7 @@ export function withPollutedEnv(fn: () => void) {
 		process.env.PI_SUBAGENT_PARENT_SESSION_ID = "polluted-parent";
 		process.env.PI_SUBAGENT_CHILD_AGENT = "polluted-child";
 		process.env.PI_CODING_AGENT_DIR = join(tempRuntime(), "agent-dir");
+		clearPackageConfigCache();
 		fn();
 	} finally {
 		if (previousParent === undefined) delete process.env.PI_SUBAGENT_PARENT_SESSION_ID;
@@ -187,6 +190,7 @@ export function withPollutedEnv(fn: () => void) {
 		else process.env.PI_SUBAGENT_CHILD_AGENT = previousChild;
 		if (previousDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = previousDir;
+		clearPackageConfigCache();
 	}
 }
 

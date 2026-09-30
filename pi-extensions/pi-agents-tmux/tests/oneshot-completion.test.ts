@@ -11,6 +11,7 @@ import { runSingleAgent, setGitExecFileForTests, setSingleAgentSpawnForTests } f
 import { isContextLengthExceededEnvelope, isContextLengthExceededText, resolveBgSession, setSessionCompactorForTests } from "../extensions/subagent/sessions.js";
 import type { SingleResult } from "../extensions/subagent/types.js";
 import { bridgeEvent, bridgeStdout, cleanupTempRuntimes, installMockSpawn, makeDetails, mockPiEvents, shapedStreamEvent, tempGitRepo, tempRuntime, testAgent, transcriptEventName, writeSettings } from "./single-agent-fixture.js";
+import { clearPackageConfigCache } from "../extensions/subagent/package-config.js";
 
 after(cleanupTempRuntimes);
 
@@ -252,11 +253,13 @@ test("the reused-session budget guard", async () => {
 	// keeps the developer's own settings out of the rows.
 	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 	process.env.PI_CODING_AGENT_DIR = tempRuntime();
+	clearPackageConfigCache();
 	try {
 		await runBudgetRows();
 	} finally {
 		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+		clearPackageConfigCache();
 	}
 });
 

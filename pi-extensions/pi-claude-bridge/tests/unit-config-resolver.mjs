@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { loadConfig, recordProjectTrust, resolveExternalConfigValue } from "../src/config.ts";
+import { clearPackageConfigCache } from "../src/package-config.ts";
 
 function withTempDirs(fn) {
 	const root = mkdtempSync(join(tmpdir(), "claude-bridge-resolver-"));
@@ -22,6 +23,7 @@ function withTempDirs(fn) {
 		process.env.PI_CODING_AGENT_DIR = user;
 		process.env.HOME = join(root, "home");
 		delete process.env.CLAUDE_BRIDGE_ISOLATED;
+		clearPackageConfigCache();
 		return fn({ root, user, project });
 	} finally {
 		if (oldPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
@@ -30,6 +32,7 @@ function withTempDirs(fn) {
 		else process.env.CLAUDE_BRIDGE_ISOLATED = oldIsolated;
 		if (oldHome === undefined) delete process.env.HOME;
 		else process.env.HOME = oldHome;
+		clearPackageConfigCache();
 		rmSync(root, { recursive: true, force: true });
 	}
 }
@@ -54,6 +57,7 @@ describe("resolveExternalConfigValue", () => {
 
 	it("shows the global source as a home-relative path", () => withTempDirs(({ root, user, project }) => {
 		process.env.HOME = root;
+		clearPackageConfigCache();
 		writeFileSync(join(user, "claude-bridge.json"), JSON.stringify({ enabled: false }));
 
 		assert.equal(resolveExternalConfigValue("enabled", project).source, "~/user/claude-bridge.json");
@@ -74,6 +78,8 @@ describe("resolveExternalConfigValue", () => {
 
 		// A key only the global file sets still reports the global file.
 		writeFileSync(join(user, "claude-bridge.json"), JSON.stringify({ provider: { strictMcpConfig: false } }));
+		// A read inside the settings window would still see the first write.
+		clearPackageConfigCache();
 		const strict = resolveExternalConfigValue("strictMcpConfig", project);
 		assert.equal(strict.value, false);
 		assert.equal(strict.source, join(user, "claude-bridge.json"));

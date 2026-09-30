@@ -1,9 +1,10 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { PROJECT_LOCK_FILE, projectRoot, readConfig, recordProjectTrust } from "../extensions/config.ts";
+import { clearPackageConfigCache } from "../extensions/package-config.ts";
 import { CONFIG_ID, initRustRepo, installToolCallHandler, readLog, renderStub, renderUserStub, sessionManager, trusted, useIsolatedGitEnv } from "./harness.ts";
 
 useIsolatedGitEnv();
@@ -85,14 +86,21 @@ describe("pi-hooks root selection", () => {
 
 	test("a `.pi` file is not a project, and a marked one below it still is", () => {
 		const outer = mkdtempSync(join(tmpdir(), "pi-hooks-shape-"));
+		// The memo window reads `performance.now()`; held still, both reads fall in one window.
+		const clock = spyOn(performance, "now").mockImplementation(() => 0);
 		try {
 			const inner = join(outer, "inner");
 			mkdirSync(join(inner, "deep"), { recursive: true });
 			writeFileSync(join(inner, ".pi"), "not a directory\n");
 			expect(projectRoot(join(inner, "deep"))).toBeUndefined();
 			mkdirSync(join(inner, ".claude"), { recursive: true });
+			// Every event asks, so "no project" is memoized like a root is; the
+			// next window, or a settings change, walks again.
+			expect(projectRoot(join(inner, "deep"))).toBeUndefined();
+			clearPackageConfigCache();
 			expect(projectRoot(join(inner, "deep"))).toBe(realpathSync(inner));
 		} finally {
+			clock.mockRestore();
 			rmSync(outer, { recursive: true, force: true });
 		}
 	});

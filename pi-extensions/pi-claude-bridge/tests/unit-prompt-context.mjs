@@ -4,6 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { buildPromptContextAppend } from "../src/prompt-context.ts";
+import { clearPackageConfigCache } from "../src/package-config.ts";
 
 const originalPiDir = process.env.PI_CODING_AGENT_DIR;
 const roots = [];
@@ -12,6 +13,7 @@ afterEach(() => {
 	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 	if (originalPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 	else process.env.PI_CODING_AGENT_DIR = originalPiDir;
+	clearPackageConfigCache();
 });
 
 function isolateGlobalPiDir(root) {
@@ -19,6 +21,7 @@ function isolateGlobalPiDir(root) {
 	const globalPi = join(root, "global-pi");
 	mkdirSync(globalPi, { recursive: true });
 	process.env.PI_CODING_AGENT_DIR = globalPi;
+	clearPackageConfigCache();
 }
 
 describe("prompt context forwarding", () => {

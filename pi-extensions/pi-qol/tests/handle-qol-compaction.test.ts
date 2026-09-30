@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { QOL_BUDGET_GUARD_SENTINEL } from "../extensions/qol/budget-guard.ts";
 import { handleQolCompaction } from "../extensions/qol/compaction.ts";
+import { clearPackageConfigCache } from "../extensions/qol/package-config.ts";
 
 let workdir = "";
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -12,6 +13,7 @@ beforeEach(() => {
 	workdir = mkdtempSync(join(tmpdir(), "pi-qol-handle-"));
 	process.env.PI_CODING_AGENT_DIR = workdir;
 	process.env.HOME = workdir;
+	clearPackageConfigCache();
 });
 afterEach(() => {
 	try { rmSync(workdir, { force: true, recursive: true }); }
@@ -20,6 +22,7 @@ afterEach(() => {
 		else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
 		if (originalHome === undefined) delete process.env.HOME;
 		else process.env.HOME = originalHome;
+		clearPackageConfigCache();
 		mock.module("@earendil-works/pi-ai", () => ({
 			complete: async () => ({ content: [{ text: "stubbed summary text", type: "text" }], stopReason: "end_turn" }),
 		}));
@@ -85,6 +88,7 @@ const cases = [
 			const file = join(workdir, "blocking-file");
 			writeFileSync(file, "blocker");
 			process.env.PI_CODING_AGENT_DIR = file;
+			clearPackageConfigCache();
 			const { ctx, notify } = makeCtx(file);
 			const result = await handleQolCompaction({ customInstructions: `${QOL_BUDGET_GUARD_SENTINEL} budget guard fired`, preparation: {
 				messagesToSummarize: [makeMessage("only message")], tokensBefore: 180_000, turnPrefixMessages: [],

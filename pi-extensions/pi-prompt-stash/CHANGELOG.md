@@ -2,6 +2,10 @@
 
 ## Consumer-impacting changes
 
+### 3.0.2
+
+- Settings reads come from memory. A read is answered for one second without touching disk, then the settings files are read again. A change made in the extension manager, or a new session, applies at once; a hand edit to `settings.json` applies within one second. Before, every read went to disk.
+
 ### 3.0.1
 
 - Prompt stash notices start with a stable item-count field.

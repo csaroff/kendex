@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { CONFIG_ID } from "../extensions/config.ts";
+import { clearPackageConfigCache } from "../extensions/package-config.ts";
 import nestedAgentsMd, { INSTRUCTIONS_FILE } from "../extensions/nested-agents-md.ts";
 
 type Handler = (event: Record<string, unknown>, ctx: Record<string, unknown>) => Promise<unknown> | unknown;
@@ -17,10 +18,12 @@ beforeAll(() => {
 	savedAgentDir = process.env.PI_CODING_AGENT_DIR;
 	emptyAgentDir = mkdtempSync(join(tmpdir(), "pi-nested-agents-md-empty-agent-"));
 	process.env.PI_CODING_AGENT_DIR = emptyAgentDir;
+	clearPackageConfigCache();
 });
 afterAll(() => {
 	if (savedAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 	else process.env.PI_CODING_AGENT_DIR = savedAgentDir;
+	clearPackageConfigCache();
 	if (emptyAgentDir !== undefined) rmSync(emptyAgentDir, { recursive: true, force: true });
 });
 
@@ -63,6 +66,8 @@ function writeConfig(root: string, config: Record<string, unknown>): void {
 	writeFileSync(join(root, ".pi", "settings.json"), JSON.stringify({
 		kendex: { extensionManager: { config: { [CONFIG_ID]: config } } },
 	}));
+	// What pi-extension-manager's settings-changed event does after a write.
+	clearPackageConfigCache();
 }
 
 function readEvent(path: string): Record<string, unknown> {

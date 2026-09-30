@@ -2,6 +2,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { TestContext } from "node:test";
+import { clearPackageConfigCache } from "../../extensions/package-config.ts";
 
 export function settingsFixture(t: TestContext) {
 	const root = mkdtempSync(join(tmpdir(), "pi-caveman-test-"));
@@ -9,6 +10,7 @@ export function settingsFixture(t: TestContext) {
 	t.after(() => {
 		if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = previous;
+		clearPackageConfigCache();
 		rmSync(root, { recursive: true, force: true });
 	});
 	const userDir = join(root, "agent");
@@ -16,10 +18,13 @@ export function settingsFixture(t: TestContext) {
 	mkdirSync(userDir, { recursive: true });
 	mkdirSync(join(projectDir, ".pi"), { recursive: true });
 	process.env.PI_CODING_AGENT_DIR = userDir;
+	clearPackageConfigCache();
 	const userPath = join(userDir, "settings.json");
 	const projectPath = join(projectDir, ".pi", "settings.json");
 	function writeConfig(path: string, packages: Record<string, unknown>): void {
 		writeFileSync(path, JSON.stringify({ kendex: { extensionManager: { config: packages } } }));
+		// What pi-extension-manager's settings-changed event does after a write.
+		clearPackageConfigCache();
 	}
 	return { userPath, projectPath, projectDir, writeConfig };
 }

@@ -2,6 +2,10 @@
 
 ## Consumer-impacting changes
 
+### 3.0.2
+
+- The manager's glyph style lookup comes from memory. A lookup is answered for one second without touching disk, then the settings files are read again. A change made in the extension manager, or a new session, applies at once; a hand edit to a settings file applies within one second. Before, every lookup read the settings files. The manager's other settings reads still read and parse the settings files on each call.
+
 ### 3.0.1
 
 - Manager notices, failures and command results now open with a `key=value` line naming the package, command or setting involved, followed by the explanation. This covers the enable and disable notices, the update-available notice, the npm and kendex install, update and uninstall results, the invalid `npmCommand` warning, and the self-disable refusal.

@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
-import { loadSettings, recordProjectTrust, settingsDiagnostics } from "../src/settings.js";
+import { clearPackageConfigCache, recordProjectTrust } from "../src/package-config.js";
+import { loadSettings, settingsDiagnostics } from "../src/settings.js";
 import { isolateEnvironment, settingsEnvironment, tempDir } from "./fixtures.js";
 
 function config(path: string, value: Record<string, unknown>): void {
@@ -65,6 +66,16 @@ for (const row of [
 		},
 		expected: [undefined, undefined, "env-file-exa", "env-file-pplx", "process-exa"],
 	},
+	{
+		name: "an unreadable dotenv is reported",
+		run(_root: string, _user: string, project: string) {
+			// A directory where the file should be fails the read on every platform and for every user.
+			mkdirSync(join(project, ".env"));
+			recordProjectTrust({ cwd: project, isProjectTrusted: () => true });
+			return loadSettings(project).warnings.filter((warning) => warning.startsWith(`${join(project, ".env")}: `)).length;
+		},
+		expected: 1,
+	},
 ]) {
 	test(`settings: ${row.name}`, (t) => {
 		isolateEnvironment(t, settingsEnvironment);
@@ -74,6 +85,7 @@ for (const row of [
 		mkdirSync(user);
 		mkdirSync(join(project, ".pi"), { recursive: true });
 		process.env.PI_CODING_AGENT_DIR = user;
+		clearPackageConfigCache();
 		assert.deepEqual(row.run(root, user, project), row.expected);
 	});
 }

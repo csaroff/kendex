@@ -1,7 +1,8 @@
 import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { managerNotice, stringifyError } from "./format.js";
-import { findProjectPiDir, rootAnchored, userPiDir } from "./paths.js";
+import { clearPackageConfigCache, piUserDir, rootAnchored } from "./package-config.js";
+import { findProjectPiDir } from "./paths.js";
 import { MANAGER_ID, type InventoryItem, type PackageManifest, type SettingsFile } from "./types.js";
 
 /** Host-owned resolvers are injected so profiles and XDG rules stay in the host. */
@@ -39,7 +40,7 @@ export class HostAdapter {
 	readonly commands: { manager: string; settings: string; recover: string };
 	readonly packageActions: boolean;
 
-	constructor(agent: () => string = userPiDir, omp?: OmpRuntime) {
+	constructor(agent: () => string = piUserDir, omp?: OmpRuntime) {
 		this.agent = agent;
 		this.omp = omp;
 		this.packageActions = !omp;
@@ -107,6 +108,9 @@ export class HostAdapter {
 		mkdirSync(dirname(file.path), { recursive: true });
 		writeFileSync(file.path, `${text.trimEnd()}\n`, "utf8");
 		file.exists = true;
+		// This package's own memoized reads see the write at once; other
+		// packages see it on pi-extension-manager's settings-changed event.
+		clearPackageConfigCache();
 	}
 
 	/** OMP replaces the configured extension array and resolves its paths against cwd. */
@@ -250,7 +254,7 @@ export async function selectHost(runtime: Record<string, unknown>, loadOmp: () =
 	if (typeof runtime.SettingsManager === "function") {
 		return host = new HostAdapter(() => {
 			const reported = agent();
-			return rootAnchored(reported, process.platform === "win32") ? resolve(reported) : userPiDir();
+			return rootAnchored(reported, process.platform === "win32") ? resolve(reported) : piUserDir();
 		});
 	}
 	throw new Error(managerNotice("host-api-missing", "settings", "The host settings API is unsupported."));

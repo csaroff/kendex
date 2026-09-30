@@ -9,7 +9,7 @@ import { stripAnsi } from "../tool-renderer/ansi.js";
 import { __test, withResultTheme } from "../tool-renderer/chrome.js";
 import { clearTrackedToolExecutionComponents, refreshToolExecutionComponents } from "../tool-renderer/live-settings.js";
 import { RESERVED_IMAGE_ROW_MARKER, TOOL_RENDER_OVERLAY_CHECK_SYMBOL } from "../tool-renderer/overlay.js";
-import { clearPackageConfigCache, recordProjectTrust } from "../tool-renderer/settings.js";
+import { clearPackageConfigCache, recordProjectTrust } from "../tool-renderer/package-config.js";
 
 const createdDirs: string[] = [];
 
@@ -17,6 +17,7 @@ afterEach(() => {
 	resetCapabilitiesCache();
 	clearTrackedToolExecutionComponents();
 	for (const dir of createdDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+	clearPackageConfigCache();
 });
 
 const theme = {
