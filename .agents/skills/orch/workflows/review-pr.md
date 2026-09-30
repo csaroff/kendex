@@ -295,15 +295,15 @@ Omit empty categories. Read `patched_causes` and `frozen_causes` first, with the
 
 ### At The Cap
 
-The cap decides before any delegation. One call reads the re-review cycles already entered, the cap they are measured against, and the verdict:
+At the default `REVIEW_MAX_CYCLES` of 1, a review with blockers runs one fix round and one re-review of that fix diff, then § 5 and submit. A project setting raises it for a standard item; [small.md](small.md) holds a small item to 1; micro runs none. A blocker open at the cap is escalated below, reaching § 8's filing candidates, or takes a cut round ([SKILL.md § The Cycle](../SKILL.md#the-cycle)), never another re-review. The cap decides before any delegation:
 
 ```bash
 .agents/skills/orch/scripts/workflow-state cap REVIEW_MAX_CYCLES --issue [ISSUE_ID]
 ```
 
-It prints `below [COUNT]/[CAP]` or `at-cap [COUNT]/[CAP]`. `rereview_cycles` counts the re-review cycles this loop has entered — the Bounded Re-Review write below raises it, and nothing else does. Below the cap → Fix Delegation. At it the fix loop ends here — the count is entries already taken, so it never goes past the cap — with no fix round beyond the `structural-close` items the `fix set` carries past it, so the items this pass reported are the latest word on the diff. Read `rereview_cycles`, never `cycles`: `cycles` is the general fix-round tally `dev-fix.md` keeps, and QA and pre-loop fix rounds bump it without spending this budget.
+It prints `below [COUNT]/[CAP]` or `at-cap [COUNT]/[CAP]`, counting `rereview_cycles`, which only the Bounded Re-Review write below raises, never `cycles`. Below the cap → Fix Delegation. At it the fix loop ends here, with no fix round beyond the `structural-close` items the `fix set` carries past it, so the items this pass reported are the latest word on the diff.
 
-**Capped items are escalated, never dropped.** Record every blocker, and every suggestion § 4 made one, that this pass found still outstanding, including one already listed in `fixed_items` whose fix did not hold. Exclude only what is already in `escalated_items`, what § 4 declined, and the `fix set`'s `structural-close` items; a decline is terminal. Match on the RECORDED entry's (location, description), the § 8 key — a re-reporting reviewer copies both fields verbatim off the Fixed line, so the pair matches. An item `fixed_items` already lists has a superseded entry there: its fix did not hold, so the same write drops it. One write per item, before routing to § 5 — the drop and the record land in one command, so the item is never in both buckets and never in neither:
+**Capped items are escalated, never dropped.** Record every blocker, and every suggestion § 4 made one, that this pass found still outstanding, including one already listed in `fixed_items` whose fix did not hold. Exclude only what is already in `escalated_items`, what § 4 declined, and the `fix set`'s `structural-close` items; a decline is terminal. Match on the RECORDED entry's (location, description), the § 8 key. An item `fixed_items` already lists has a superseded entry there: its fix did not hold, so the same write drops it. One write per item, before routing to § 5 — the drop and the record land in one command, so the item is never in both buckets and never in neither:
 
 ```bash
 .agents/skills/orch/scripts/workflow-state update [ISSUE_ID] --slurpfile art '[ARTIFACT_PATH]' --arg src [SOURCE] '$art[0].[ARRAY][[INDEX]] as $item | .fixed_items = ((.fixed_items // []) | map(select(.location != $item.location or .description != $item.description))) | .escalated_items = ((.escalated_items // []) + [{description: $item.description, location: $item.location, reason: "outstanding at the review cycle cap", outcome: "blocked", source: $src}])'

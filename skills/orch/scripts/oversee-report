@@ -77,8 +77,8 @@ Usage: oversee-report due    --state PATH --repo OWNER/REPO [--repo ...]
                              --summary-file PATH [--succession]
 
 The overseer's status report, in the rows
-references/communication-modes.md § Status report gives: Landed, Running,
-Validation, Next, Waiting on you.
+references/communication-modes.md § Status report gives: Landed, Escapes,
+Running, Validation, Next, Waiting on you.
 
 --state is the oversee workflow-state file the watch reads. The report is
 the owner progress report record schemas/workflow-state.md § Recording policy
@@ -121,6 +121,19 @@ Rows:
                   the last report, in any --repo: one merged search per repo,
                   matched against every item. The issue cell carries the
                   PR number and the merge commit.
+  Escapes         one line under Landed: pull requests merged to the base
+                  branch resolve-base-branch names that a revert commit
+                  there names as #N, or a `Regressed-by: #N` line (plain or
+                  bold) in a Linear issue labelled bug and created at or
+                  after the merge, in LINEAR_TEAM where that is set; a #N
+                  elsewhere in an issue is not counted. Within 14 days of
+                  the merge, in the week of the first finding, for this
+                  week, last week and the week the review cap fell to 1
+                  (lib/escapes.sh). It fetches that branch from origin in
+                  the project checkout and syncs a stale Linear cache
+                  first. `Escapes: unread (<cause>)`
+                  where git or the Linear cache could not be read or
+                  parsed, or the workspace has no label named bug.
   Running         each lanes[] record reading running, preparing or parked.
                   The issue cell carries its open PR, or `no PR`, and that
                   status; a parked record's PR is the one its `parked` names,
@@ -246,6 +259,10 @@ STATE_DIR_SETTING="${ORCH_STATE_DIR:-tmp}"
 # shellcheck source=lib/gh-auth.sh
 source "$SCRIPT_DIR/lib/gh-auth.sh" 2>"$WORK_DIR/gh-auth.err" \
   || refuse auth-helper "$SCRIPT_DIR/lib/gh-auth.sh" "$(cat "$WORK_DIR/gh-auth.err")"
+# After gh-auth.sh, which refuses a missing github skill first: lib/gh-repo.sh,
+# which this sources, reads the same skill.
+# shellcheck source=lib/escapes.sh
+source "$SCRIPT_DIR/lib/escapes.sh"
 
 # github_auth — the auth ladder oversee-watch runs (references/gates.md §
 # Waiter auth ladder): a stale env token yields to the keyring, and where
@@ -592,6 +609,26 @@ running_lanes() {
   VALIDATION="${VALIDATION%$'\n'}"
 }
 
+# escapes_row — the Escapes line under Landed: the escapes lib/escapes.sh
+# counts in this week, in last week and in the week the review cap fell to
+# one, or `Escapes: unread (<cause>)` where a source could not be read. The
+# count always holds the cap week, so a missing one is a broken count.
+escapes_row() {
+  local this last cap
+  if ! escapes_read "$PROJECT_ROOT" "$TRACKER" "$NOW" "$WORK_DIR"; then
+    printf 'Escapes: unread (%s)\n' "$ESCAPE_UNREAD"
+    return 0
+  fi
+  this="$(awk -F'\t' 'END { print $2 }' <<<"$ESCAPE_WEEKS")"
+  last="$(awk -F'\t' '{ prev = cur; cur = $2 } END { print prev }' <<<"$ESCAPE_WEEKS")"
+  if ! cap="$(awk -F'\t' -v week="$ESCAPE_CAP_WEEK" '$1 == week { print $2 }' <<<"$ESCAPE_WEEKS")" || [[ -z "$cap" ]]; then
+    printf 'Escapes: unread (the count holds no line for the cap week %s)\n' "$ESCAPE_CAP_WEEK"
+    return 0
+  fi
+  printf 'Escapes: this week %s, last week %s, the week the review cap fell to 1 (%s) %s\n' \
+    "$this" "$last" "$ESCAPE_CAP_WEEK" "$cap"
+}
+
 render() {
   local rows="" item number sha repo list open="" pr status landed_name=Landed cut_since
   github_auth
@@ -607,6 +644,7 @@ render() {
     landed_name="Landed (since $cut_since, earlier merges not listed)"
   fi
   table "$landed_name" "$rows"
+  escapes_row
   echo
 
   # Open PRs as `branch<TAB>number`, across every --repo.
