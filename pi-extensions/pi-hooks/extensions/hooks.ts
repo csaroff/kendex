@@ -8,7 +8,7 @@ import type {
 import { isAbsolute, resolve } from "node:path";
 
 import { getBool, getNumber, projectRoot, projectTrusted, readConfig, recordProjectTrust } from "./config.js";
-import { agentLine, deliver, type HookResult, personLine, runListener, unreadableLine } from "./dispatch.js";
+import { agentLine, boundForAgent, deliver, type HookResult, type ListenerRun, personLine, runListener, unreadableLine } from "./dispatch.js";
 import { deliverDrift, runDriftCheck } from "./drift-check.js";
 import { workspaceClippyOutcome } from "./lint-hooks.js";
 import { SESSION_START_LISTENER, TOOL_CALL_LISTENER, TOOL_RESULT_LISTENER, TURN_END_LISTENER } from "./registry.js";
@@ -75,24 +75,19 @@ async function unsupportedHostLine(): Promise<string | undefined> {
 	return undefined;
 }
 
-interface TurnState {
-	rustFilesTouched: Set<string>;
-}
-
-function freshTurnState(): TurnState {
-	return { rustFilesTouched: new Set<string>() };
-}
-
 export default function piHooks(pi: ExtensionAPI): void {
 	const guard = pi as unknown as Record<PropertyKey, unknown>;
 	if (guard[INSTALL_SYMBOL]) return;
 	guard[INSTALL_SYMBOL] = true;
 
-	let turn = freshTurnState();
-
-	pi.on("turn_start", () => {
-		turn = freshTurnState();
-	});
+	/**
+	 * The `.rs` files edited since the last end-of-turn check that finished.
+	 * A check the person ended before it finished proved nothing about them,
+	 * so they stay here for the next turn's check, which runs even if that
+	 * turn edits no `.rs` file. Pi fires `turn_end` with the run's signal
+	 * already aborted when the person ends a run during its tool calls.
+	 */
+	let rustFilesTouched = new Set<string>();
 
 	/**
 	 * Whether the last `agent_before_settle` dispatch asked Pi for its one
@@ -118,23 +113,32 @@ export default function piHooks(pi: ExtensionAPI): void {
 	};
 
 	/**
-	 * Everything one registered hook said on a listener Pi gives no verdict to.
+	 * Everything an event's hooks said on a listener Pi gives no verdict to.
 	 * `toAgent` is the listener's own way of putting words in front of the
 	 * model — a patched tool result, an entry the settle boundary appends, a
-	 * session's opening context — and stderr beside a clean exit goes to the
-	 * person instead.
+	 * session's opening context — and it is called at most once, with every
+	 * hook's text and an unreadable registry's line joined and bounded by
+	 * `boundForAgent`. Stderr beside a clean exit goes to the person instead.
 	 *
 	 * Each delivery goes through `deliver`, so one channel that is gone — the
 	 * session replaced under a `session_start` report that is still in flight —
-	 * costs its own line and not the rest of the listener's output.
+	 * costs its own text and not the rest of the listener's output.
 	 */
-	const report = (results: HookResult[], ctx: ExtensionContext, toAgent: (content: string) => void): void => {
-		for (const result of results) {
-			const forAgent = agentLine(result, ctx);
-			if (forAgent !== undefined) deliver(toAgent, forAgent);
+	const report = async (
+		listener: string,
+		run: ListenerRun,
+		ctx: ExtensionContext,
+		toAgent: (content: string) => void,
+	): Promise<void> => {
+		const forAgent: string[] = [];
+		if (run.unreadable !== undefined) forAgent.push(unreadableLine(listener, run.unreadable));
+		for (const result of run.results) {
+			const said = agentLine(result, ctx);
+			if (said !== undefined) forAgent.push(said);
 			const forPerson = personLine(result);
 			if (forPerson !== undefined) deliver(notify(ctx, "info"), forPerson);
 		}
+		if (forAgent.length > 0) deliver(toAgent, await boundForAgent(forAgent.join("\n")));
 	};
 
 	// Pi port of hooks/session-drift-check.sh. Fresh starts only: a resumed
@@ -158,27 +162,25 @@ export default function piHooks(pi: ExtensionAPI): void {
 		void runListener(
 			SESSION_START_LISTENER,
 			source,
-			JSON.stringify({ hook_event_name: "SessionStart", source, ...claudeSessionFields(ctx) }),
+			() => JSON.stringify({ hook_event_name: "SessionStart", source, ...claudeSessionFields(ctx) }),
 			ctx,
 			cfg,
 			project,
 			projectTrusted(ctx),
-		).then((run) => {
-			if (run.unreadable !== undefined) deliver(speak, unreadableLine(SESSION_START_LISTENER, run.unreadable));
-			report(run.results, ctx, speak);
+		).then((run) => report(SESSION_START_LISTENER, run, ctx, speak))
 			// Nothing awaits this chain, so it terminates in a catch: every
 			// hook here runs to its own budget while the session opens, and by
 			// the time the last one settles the session may have been replaced
 			// — at which point `pi` and `ctx` throw, and an unhandled rejection
 			// ends the process rather than reaching a handler Pi can absorb.
 			// Whichever channel is still alive says what was caught.
-		}).catch((error: unknown) => {
-			const line = `hook-report-failed=${SESSION_START_LISTENER}\n${
-				error instanceof Error ? error.message : String(error)
-			}`;
-			deliver(speak, line);
-			deliver(notify(ctx, "info"), line);
-		});
+			.catch((error: unknown) => {
+				const line = `hook-report-failed=${SESSION_START_LISTENER}\n${
+					error instanceof Error ? error.message : String(error)
+				}`;
+				deliver(speak, line);
+				deliver(notify(ctx, "info"), line);
+			});
 
 		if (event.reason === "reload" || event.reason === "resume") return;
 		// A fresh start alone, as the drift report below: a resumed session
@@ -215,9 +217,10 @@ export default function piHooks(pi: ExtensionAPI): void {
 		// this listener and this tool runs, in the order it names them, and
 		// the first refusal is the answer. Nothing here knows a hook's name in
 		// advance, which is what lets a custom hook run at all. The tool is
-		// named and its input keyed the way a hook was authored to read them.
+		// named and its input keyed the way a hook was authored to read them,
+		// and only once a hook is about to read them.
 		const toolName = claudeToolName(event.toolName);
-		const payload = JSON.stringify({
+		const payload = () => JSON.stringify({
 			tool_name: toolName,
 			tool_input: claudeToolInput(toolName, event.input, ctx.cwd),
 			...claudeSessionFields(ctx),
@@ -249,7 +252,8 @@ export default function piHooks(pi: ExtensionAPI): void {
 			const advisory = personLine(result);
 			if (advisory !== undefined && ctx.hasUI) ctx.ui.notify(advisory, "info");
 		}
-		return verdict;
+		// A refusal's reason is a hook's own stderr, and the model reads it.
+		return verdict === undefined ? undefined : { block: true, reason: await boundForAgent(verdict.reason) };
 	});
 
 	pi.on("tool_result", async (event, ctx: ExtensionContext) => {
@@ -264,16 +268,18 @@ export default function piHooks(pi: ExtensionAPI): void {
 		if ((tool === "edit" || tool === "write") && filePath.endsWith(".rs")) {
 			// Recorded for the end-of-turn check, which is the only lane that
 			// runs clippy. A .rs write costs nothing here.
-			turn.rustFilesTouched.add(isAbsolute(filePath) ? filePath : resolve(ctx.cwd, filePath));
+			rustFilesTouched.add(isAbsolute(filePath) ? filePath : resolve(ctx.cwd, filePath));
 		}
 
 		// Claude Code's `PostToolUse` payload, in the words a hook authored
 		// against it reads: the call it judged, plus what the tool answered.
 		// `tool_response` is the result's text, which is the whole of it for
 		// every tool a bash hook can read — an image block has no rendering a
-		// JSON payload could carry and is left out rather than faked.
+		// JSON payload could carry and is left out rather than faked. Built
+		// only once a hook is about to read it: joining a large result costs
+		// every tool call, and most calls have no hook.
 		const toolName = claudeToolName(event.toolName);
-		const payload = JSON.stringify({
+		const payload = () => JSON.stringify({
 			hook_event_name: "PostToolUse",
 			tool_name: toolName,
 			tool_input: claudeToolInput(toolName, event.input, ctx.cwd),
@@ -287,11 +293,10 @@ export default function piHooks(pi: ExtensionAPI): void {
 		// consequence Claude Code's own `PostToolUse` exit 2 has. `isError` is
 		// left exactly as the tool set it — the call succeeded or failed on its
 		// own terms, and a hook's opinion of it is not that answer.
-		const added: string[] = [];
-		if (run.unreadable !== undefined) added.push(unreadableLine(TOOL_RESULT_LISTENER, run.unreadable));
-		report(run.results, ctx, (content) => added.push(content));
+		const added: { type: "text"; text: string }[] = [];
+		await report(TOOL_RESULT_LISTENER, run, ctx, (text) => added.push({ type: "text", text }));
 		if (added.length === 0) return undefined;
-		return { content: [...event.content, { type: "text" as const, text: added.join("\n") }] };
+		return { content: [...event.content, ...added] };
 	});
 
 	// `Stop` and `TaskCompleted` fire when Claude Code's agent has finished
@@ -321,12 +326,13 @@ export default function piHooks(pi: ExtensionAPI): void {
 		continued = false;
 
 		// Pi refuses nothing here, so a hook's refusal is delivered rather than
-		// obeyed: each line becomes a session entry the next model request
-		// reads, and a `display: false` one leaves interactive rendering to the
-		// notification beside it, which a headless session never sees.
-		const said: CustomMessageEntryDraft[] = [];
+		// obeyed: what the hooks said becomes one session entry the next model
+		// request reads, and a `display: false` one leaves interactive
+		// rendering to the notification beside it, which a headless session
+		// never sees.
+		let said: CustomMessageEntryDraft | undefined;
 		const say = (content: string) => {
-			said.push({ type: "custom_message", customType: "kendex-hook", content, display: false });
+			said = { type: "custom_message", customType: "kendex-hook", content, display: false };
 			if (ctx.hasUI) ctx.ui.notify(content, "warning");
 		};
 
@@ -342,19 +348,18 @@ export default function piHooks(pi: ExtensionAPI): void {
 		const run = await runListener(
 			TURN_END_LISTENER,
 			undefined,
-			JSON.stringify({ hook_event_name: "Stop", stop_hook_active: stopHookActive, ...claudeSessionFields(ctx), ...piContextFields(ctx) }),
+			() => JSON.stringify({ hook_event_name: "Stop", stop_hook_active: stopHookActive, ...claudeSessionFields(ctx), ...piContextFields(ctx) }),
 			ctx,
 			cfg,
 			project,
 			projectTrusted(ctx),
 		);
-		if (run.unreadable !== undefined) deliver(say, unreadableLine(TURN_END_LISTENER, run.unreadable));
-		report(run.results, ctx, say);
-		if (said.length === 0) return undefined;
+		await report(TURN_END_LISTENER, run, ctx, say);
+		if (said === undefined) return undefined;
 		// Chained after what earlier handlers proposed, and `continue` is
 		// returned only as `true`: a `false` here would cancel another
 		// handler's continuation.
-		const entries = [...event.entries, ...said];
+		const entries = [...event.entries, said];
 		if (stopHookActive) return { entries };
 		continued = true;
 		return { entries, continue: true };
@@ -367,25 +372,43 @@ export default function piHooks(pi: ExtensionAPI): void {
 	});
 
 	pi.on("turn_end", async (_event, ctx: ExtensionContext) => {
+		const touched = rustFilesTouched;
+		rustFilesTouched = new Set<string>();
 		const project = ctx.cwd ? projectRoot(ctx.cwd) : undefined;
 		recordProjectTrust(ctx, project);
 		const cfg = readConfig(ctx.cwd, project);
 		if (!getBool(cfg, "enabled")) return undefined;
 		if (!getBool(cfg, "taskCompletedCheck")) return undefined;
-		if (turn.rustFilesTouched.size === 0) return undefined;
+		if (touched.size === 0) return undefined;
 
-		const outcome = workspaceClippyOutcome(ctx.cwd, getNumber(cfg, "clippyTimeoutMs"));
-		if (outcome.kind === "clean") return undefined;
-		const summary = outcome.kind === "errors"
-			? `clippy-errors=${outcome.lines.length}\n${outcome.lines.slice(0, 5).join("\n")}`
-			: `clippy-${outcome.code}=${outcome.value}\n${outcome.reason}`;
+		// Awaited, so the turn's report lands before the next turn starts, but
+		// never on Pi's thread: input, timers and other listeners run while
+		// cargo compiles. The turn's own signal stops it when the person ends
+		// the turn.
+		const outcome = await workspaceClippyOutcome(ctx.cwd, getNumber(cfg, "clippyTimeoutMs"), ctx.signal);
+		let summary: string;
+		switch (outcome.kind) {
+			case "clean":
+				return undefined;
+			case "aborted":
+				for (const path of touched) rustFilesTouched.add(path);
+				return undefined;
+			case "errors":
+				summary = `clippy-errors=${outcome.lines.length}\n${outcome.lines.slice(0, 5).join("\n")}`;
+				break;
+			case "unavailable":
+				summary = `clippy-${outcome.code}=${outcome.value}\n${outcome.reason}`;
+				break;
+			default:
+				throw new Error(`clippy outcome ${JSON.stringify(outcome satisfies never)} is no outcome this check knows`);
+		}
 
 		// Every failing turn reports: an agent that cannot fix an error hears
 		// the same advisory each turn, which is noisy and self-correcting,
 		// where suppressing a repeat can leave a headless turn told nothing
-		// when there was something to say. The turn state above is the bound —
-		// a turn that writes no `.rs` file runs no clippy — so a report costs
-		// an edit, not a loop.
+		// when there was something to say. The edit set above is the bound —
+		// a turn that writes no `.rs` file, and follows a check that finished,
+		// runs no clippy — so a report costs an edit, not a loop.
 		pi.sendMessage(
 			{ customType: "kendex-clippy", content: summary, display: false },
 			{ triggerTurn: true },

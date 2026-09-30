@@ -4,9 +4,13 @@
       "events": [],
       "calls": ["ctx.isProjectTrusted"]
     },
+    "extensions/dispatch.ts": {
+      "events": [],
+      "calls": ["@earendil-works/pi-coding-agent.formatSize", "@earendil-works/pi-coding-agent.truncateTail"]
+    },
     "extensions/hooks.ts": {
-      "events": ["agent_settled", "session_start", "tool_call", "tool_result", "turn_end", "turn_start"],
-      "calls": ["ctx.isIdle", "ctx.ui.notify", "pi.on", "pi.sendMessage"]
+      "events": ["agent_before_settle", "agent_settled", "session_start", "tool_call", "tool_result", "turn_end"],
+      "calls": ["@earendil-works/pi-coding-agent.VERSION", "ctx.signal", "ctx.ui.notify", "pi.on", "pi.sendMessage"]
     },
     "extensions/lane-mail-wake.ts": {
       "events": ["agent_settled", "session_shutdown", "session_start"],
