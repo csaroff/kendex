@@ -43,6 +43,51 @@ make_codex_lane() {
   jq -n '{tokens: {access_token: "codex-token", account_id: "acct-1"}}' > "$dir/auth.json"
 }
 
+# codex_jwt EXPIRES_IN_S — an access token in the shape the Codex CLI writes,
+# a JWT whose `exp` claim is EXPIRES_IN_S from now, negative for one already
+# expired. Its segments are unpadded base64url, as a real one's are, and the
+# `pad` claim makes the payload segment hold both `-` and `_` and need padding,
+# as a real one does, so a reader that skips the base64url translation fails
+# on it. A segment that stops holding them exits 1.
+codex_jwt() {
+  local jwt seg
+  jwt="$(jq -rn --argjson exp "$(( $(date +%s) + $1 ))" '
+    def seg: tojson | @base64 | gsub("\\+"; "-") | gsub("/"; "_") | gsub("="; "");
+    ({alg: "RS256"} | seg) + "." + ({exp: $exp, pad: "?????~~~~~"} | seg) + ".sig"')" || exit 1
+  seg="${jwt#*.}"; seg="${seg%%.*}"
+  [[ "$seg" == *-* && "$seg" == *_* && $(( ${#seg} % 4 )) -ne 0 ]] \
+    || { printf 'codex_jwt: payload segment %s lacks - or _, or needs no padding\n' "$seg" >&2; exit 1; }
+  printf '%s\n' "$jwt"
+}
+
+# make_codex_token_lane DIR EXPIRES_IN_S [REFRESH_TOKEN] — a codex home whose
+# auth.json holds a JWT access token expiring EXPIRES_IN_S from now; with no
+# REFRESH_TOKEN it holds none, the login `lanes` cannot ask the CLI to renew.
+make_codex_token_lane() {
+  local dir="$1" at
+  mkdir -p "$dir"
+  at="$(codex_jwt "$2")" || exit 1
+  jq -n --arg at "$at" --arg rt "${3:-}" \
+    '{tokens: ({access_token: $at, account_id: "acct-1"}
+               + (if $rt == "" then {} else {refresh_token: $rt} end))}' > "$dir/auth.json"
+}
+
+# path_without DIR NAME — makes DIR a PATH directory of symlinks to every
+# command on this PATH, the first of each name as a lookup finds it, save
+# NAME, so a run on it lacks that one command and keeps every tool it needs.
+path_without() {
+  local d
+  mkdir -p "$1"
+  (
+    IFS=:
+    for d in $PATH; do
+      [[ -d "$d" ]] || continue
+      ln -s "$d"/* "$1"/ 2>/dev/null || true
+    done
+  )
+  rm -f -- "${1:?}/$2"
+}
+
 # make_fetcher PATH — the ORCH_LANES_FETCH_CMD stub: answers in the shape both
 # network calls of `lanes` answer in, the HTTP status and any Retry-After on the
 # first line and the body under it, with the fixture file
