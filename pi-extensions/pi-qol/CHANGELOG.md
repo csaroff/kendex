@@ -2,6 +2,14 @@
 
 ## Consumer-impacting changes
 
+### 2.3.2
+
+- Session startup keeps fresh budget handoff files when their working directory exists and its name ends in whitespace. Cleanup previously trimmed the name and could delete these files.
+
+### 2.3.1
+
+- At session start, budget handoff files, including `latest.json`, are deleted when their recorded working directory is gone, or when a file is older than 5 days. Files from earlier versions without a working-directory record stay untouched.
+
 ### 2.3.0
 
 - A session without a UI (`pi -p`, headless lanes) no longer loads the session-search index at startup.
