@@ -62,9 +62,13 @@ stdout_field() { # JQ
 }
 MARK90=ORCH_HANDOFF_CONTEXT_PCT=90
 SOURCE="80% of tokenLimit, Copilot's backgroundCompactionThreshold default"
+# A lane that sets REPORT_ITEM reports a step before every turn end, so the
+# idle judge, whose rows are in lane-mail-check.test.sh, holds none of its
+# turn ends.
 
 echo "=== the reading ==="
 new_usage_lane lane KEN-401
+REPORT_ITEM=KEN-401
 usage 150000 272000
 assert_eq "$(quiet) record=$(record) source=$(jq -r '"\(.capacity_source) gap=\(.gap)"' "$BOX/context.json" 2>/dev/null)" \
   "RC=0 stdout= stderr=- record=150000 217600 s1 null source=$SOURCE gap=null" \
@@ -127,6 +131,7 @@ pend() { mkdir -p "${PENDING%/*}" && : > "$PENDING"; }
 # own poll being the thing under test.
 unpend_after() { (sleep "$1" && rm -f -- "${PENDING:?}") & UNPEND_PID=$!; }
 new_usage_lane pending KEN-421
+REPORT_ITEM=KEN-421
 usage 150000 272000
 pend
 # A real wait of the whole bound: the marker never goes.
