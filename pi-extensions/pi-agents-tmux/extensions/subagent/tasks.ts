@@ -16,6 +16,7 @@ import {
 	transcriptDir,
 } from "./paths.js";
 import { randomHex } from "./random.js";
+import { taskRegistryReader } from "./task-records.js";
 import {
 	type DashboardKind,
 	type CwdSnapshot,
@@ -60,8 +61,10 @@ export async function readPaneRegistry(runtimeRoot: string): Promise<PaneRegistr
 	}
 }
 
-async function atomicWriteJson(filePath: string, data: unknown): Promise<void> {
-	await atomicWriteFile(filePath, `${JSON.stringify(data, null, "\t")}\n`);
+async function atomicWriteJson(filePath: string, data: unknown): Promise<string> {
+	const content = `${JSON.stringify(data, null, "\t")}\n`;
+	await atomicWriteFile(filePath, content);
+	return content;
 }
 
 export async function writePaneRegistry(runtimeRoot: string, registry: PaneRegistry): Promise<void> {
@@ -104,22 +107,22 @@ export async function readTaskRegistry(runtimeRoot: string): Promise<PaneTaskReg
 
 export async function writeTaskRegistry(runtimeRoot: string, records: PaneTaskRegistry): Promise<void> {
 	const filePath = taskRegistryPath(runtimeRoot);
-	await withCrossProcessFileLock(filePath, () => atomicWriteJson(filePath, records));
+	await withCrossProcessFileLock(filePath, async () => {
+		const content = await atomicWriteJson(filePath, records);
+		taskRegistryReader.rememberWrite(runtimeRoot, content);
+	});
 }
 
 export async function updateTaskRegistry(runtimeRoot: string, mutator: (records: PaneTaskRegistry) => void): Promise<PaneTaskRegistry> {
 	const filePath = taskRegistryPath(runtimeRoot);
 	let records: PaneTaskRegistry = {};
 	await withCrossProcessFileLock(filePath, async () => {
-		try {
-			const content = await fs.promises.readFile(filePath, "utf-8");
-			const parsed = JSON.parse(content);
-			records = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as PaneTaskRegistry) : {};
-		} catch {
-			records = {};
-		}
+		// Check the file version under the writer lock, then copy the retained JSON
+		// so a nested mutation cannot change another reader's view before persistence.
+		records = taskRegistryReader.mutableCopy(runtimeRoot);
 		mutator(records);
-		await atomicWriteJson(filePath, records);
+		const content = await atomicWriteJson(filePath, records);
+		taskRegistryReader.rememberWrite(runtimeRoot, content);
 	});
 	return records;
 }
@@ -795,7 +798,7 @@ async function pollPaneCompletionsUnlocked(runtimeRoot: string, pi: ExtensionAPI
 	}
 
 	const registry = await readPaneRegistry(runtimeRoot);
-	let tasks = await readTaskRegistry(runtimeRoot);
+	let tasks = taskRegistryReader.read(runtimeRoot);
 	const completions: PaneCompletionDetails[] = [];
 
 	for (const agentDir of agentDirs) {

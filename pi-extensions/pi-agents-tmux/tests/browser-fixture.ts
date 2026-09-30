@@ -11,6 +11,9 @@ import type { AgentConfig } from "../extensions/subagent/agents.js";
 import type { AgentBrowserUiState, AgentPaneStatus, PaneTaskRecord, SubagentDashboardItem } from "../extensions/subagent/types.js";
 import { tempRuntime } from "./single-agent-fixture.js";
 import { clearPackageConfigCache } from "../extensions/subagent/package-config.js";
+import { taskRegistryPath } from "../extensions/subagent/paths.js";
+import type { TaskRegistryReader } from "../extensions/subagent/task-records.js";
+import { patchTaskRecordUsage } from "../extensions/subagent/index.js";
 
 export { cleanupTempRuntimes, tempRuntime, writeSettings } from "./single-agent-fixture.js";
 
@@ -31,19 +34,114 @@ export function filesystemCalls(run: () => void): number[] {
 }
 
 /** Load a disposable production edit with the real package's modules and dependencies. */
-export async function importRuntimeCopy(fileName: string, before: string, after: string): Promise<unknown> {
+export async function importRuntimeCopy(fileName: string, before: string, after: string, additionalEdits: Array<{ before: string; after: string }> = []): Promise<unknown> {
 	const runtimeDir = resolve(import.meta.dir, "../extensions/subagent");
 	const original = fs.readFileSync(join(runtimeDir, fileName), "utf8");
-	assert.equal(original.split(before).length - 1, 1, "control must edit exactly one production behavior");
-	const modified = original.replace(before, after);
+	let modified = original;
+	for (const edit of [{ before, after }, ...additionalEdits]) {
+		assert.equal(modified.split(edit.before).length - 1, 1, "control must match exactly one production site");
+		const next = modified.replace(edit.before, edit.after);
+		assert.notEqual(next, modified);
+		modified = next;
+	}
 	assert.notEqual(modified, original);
-	const source = modified.replace(/from "\.\/([^\"]+)\.js"/g, (_match, name: string) => `from ${JSON.stringify(join(runtimeDir, `${name}.ts`))}`);
+	const source = modified.replace(/from "(\.{1,2}\/[^\"]+)\.js"/g, (_match, name: string) => `from ${JSON.stringify(resolve(runtimeDir, `${name}.ts`))}`);
 	const copyDir = tempRuntime();
 	// Bare imports resolve from the copy, outside the package's dependency tree.
 	fs.symlinkSync(resolve(import.meta.dir, "../node_modules"), join(copyDir, "node_modules"), "dir");
 	const copy = join(copyDir, fileName);
 	writeFileSync(copy, source);
 	return import(copy);
+}
+
+/** Count reads of registry content through both Node file APIs, without replacing their behavior. */
+export async function taskRegistryReads(root: string, run: () => Promise<unknown>): Promise<number> {
+	const filePath = taskRegistryPath(root);
+	const sync = spyOn(fs, "readFileSync");
+	const asyncRead = spyOn(fs.promises, "readFile");
+	try {
+		await run();
+		return [...sync.mock.calls, ...asyncRead.mock.calls].filter(([file]) => String(file) === filePath).length;
+	} finally {
+		sync.mockRestore();
+		asyncRead.mockRestore();
+	}
+}
+
+/** Pin the no-content-read contract on the real completion poll. */
+export async function assertCachedCompletionPoll(runtime: Pick<typeof import("../extensions/subagent/tasks.js"), "pollPaneCompletions" | "writeTaskRegistry">): Promise<void> {
+	const root = tempRuntime();
+	mkdirSync(join(root, "outbox"), { recursive: true });
+	await runtime.writeTaskRegistry(root, {});
+	const pi = { events: { emit() {} }, sendMessage() {} } as unknown as Parameters<typeof runtime.pollPaneCompletions>[1];
+	assert.equal(await taskRegistryReads(root, () => runtime.pollPaneCompletions(root, pi)), 0);
+	assert.equal(await taskRegistryReads(root, () => runtime.pollPaneCompletions(root, pi)), 0);
+}
+
+/** Pin the cached read and mutable-copy contract on the real registry update. */
+export async function assertCachedRegistryUpdate(runtime: Pick<typeof import("../extensions/subagent/tasks.js"), "updateTaskRegistry" | "writeTaskRegistry">, reader: TaskRegistryReader): Promise<void> {
+	const root = tempRuntime();
+	await runtime.writeTaskRegistry(root, { child: { agent: "engineer", taskId: "child", task: "work", status: "running", createdAt: "2026-09-30T00:00:00Z", filesChanged: ["before.ts"] } });
+	const snapshot = reader.read(root);
+	assert.equal(await taskRegistryReads(root, () => runtime.updateTaskRegistry(root, (records) => {
+		records.child!.filesChanged!.push("after.ts");
+	})), 0);
+	assert.deepEqual(snapshot.child?.filesChanged, ["before.ts"]);
+	assert.equal(await taskRegistryReads(root, async () => {
+		assert.deepEqual(reader.read(root).child?.filesChanged, ["before.ts", "after.ts"]);
+	}), 0);
+}
+
+/** Drive patchDashboardUsage's per-child writes and the real following poll. */
+export async function assertSequentialUsageUpdates(runtime: Pick<typeof import("../extensions/subagent/tasks.js"), "updateTaskRegistry" | "writeTaskRegistry" | "pollPaneCompletions" | "readTaskRegistry">, reader: TaskRegistryReader): Promise<void> {
+	const root = tempRuntime();
+	mkdirSync(join(root, "outbox"), { recursive: true });
+	const records = Object.fromEntries(["engineer", "scout", "planner"].map((agent) => [agent, {
+		taskId: agent, agent, task: "work", status: "running" as const, createdAt: "2026-09-30T00:00:00Z",
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+	}]));
+	await runtime.writeTaskRegistry(root, records);
+	const before = reader.read(root);
+	const pi = { events: { emit() {} }, sendMessage() {} } as unknown as Parameters<typeof runtime.pollPaneCompletions>[1];
+	assert.equal(await taskRegistryReads(root, async () => {
+		for (const taskId of Object.keys(records)) {
+			const updated = await runtime.updateTaskRegistry(root, (registry) => {
+				assert.equal(patchTaskRecordUsage(registry, taskId, { usage: { ...records[taskId]!.usage, input: 4, output: 2, turns: 1 }, model: "test-model" }), true);
+			});
+			const written = reader.read(root);
+			assert.equal(written[taskId]?.usage?.input, 4);
+			assert.equal(Object.isFrozen(written[taskId]?.usage), true);
+			// The caller may retain and mutate both the returned record and its nested fields.
+			updated[taskId]!.usage!.input = 999;
+			updated[taskId]!.model = "caller-model";
+			assert.equal(reader.read(root), written);
+			assert.equal(written[taskId]?.usage?.input, 4);
+			assert.equal(written[taskId]?.model, "test-model");
+		}
+		assert.equal(await runtime.pollPaneCompletions(root, pi), 0);
+	}), 0, "local usage writes and the following poll must read no registry content");
+	assert.deepEqual(Object.values(before).map((record) => record.usage?.input), [0, 0, 0]);
+	assert.deepEqual(Object.values(await runtime.readTaskRegistry(root)).map((record) => [record.usage?.input, record.model]), [[4, "test-model"], [4, "test-model"], [4, "test-model"]]);
+}
+
+/** Exercise reuse, cross-runtime eviction and teardown through the reader's public API. */
+export async function assertRegistryReaderCache(reader: TaskRegistryReader): Promise<void> {
+	const roots = [tempRuntime(), tempRuntime()];
+	for (const [index, root] of roots.entries()) writeFileSync(taskRegistryPath(root), JSON.stringify({ [index]: { taskId: String(index) } }));
+	assert.deepEqual(reader.read(roots[0]!), { 0: { taskId: "0" } });
+	assert.equal(await taskRegistryReads(roots[0]!, async () => reader.read(roots[0]!)), 0);
+	assert.deepEqual(reader.read(roots[1]!), { 1: { taskId: "1" } });
+	assert.equal(await taskRegistryReads(roots[0]!, async () => reader.read(roots[0]!)), 1);
+	reader.clear();
+	assert.equal(await taskRegistryReads(roots[0]!, async () => reader.read(roots[0]!)), 1);
+	const content = JSON.stringify({ child: { taskId: "child", filesChanged: ["written.ts"] } });
+	writeFileSync(taskRegistryPath(roots[0]!), content);
+	reader.rememberWrite(roots[0]!, content);
+	assert.equal(await taskRegistryReads(roots[0]!, async () => {
+		const copy = reader.mutableCopy(roots[0]!);
+		copy.child!.filesChanged!.push("caller.ts");
+		assert.deepEqual(reader.read(roots[0]!).child?.filesChanged, ["written.ts"]);
+	}), 0);
 }
 
 /** Deliver Node's file-check notification without waiting for its polling clock. */
