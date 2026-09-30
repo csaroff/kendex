@@ -2,6 +2,12 @@
 
 ## Consumer-impacting changes
 
+### 2.2.0
+
+- A client that still leaves more than 8 MiB of bridge output unread when the next line is due is disconnected instead of growing the Pi process until it is killed. One response larger than 8 MiB still reaches a client that reads it. The session's user sees a `bridge-client-stalled=<bytes>` warning when the session has a UI.
+- `pi-bridge stream` stops reading from the bridge while its own output is not yet written. When the bridge closes the stream (the session ended, or the reader was disconnected), it prints `bridge-stream-closed` and exits 1 instead of 0.
+- The activity list keeps at most 100 events, 1,048,576 characters of serialized events (one larger event is still kept alone), and nothing older than one hour.
+
 ### 2.1.1
 
 - Settings reads come from memory. A read is answered for one second without touching disk, then the settings files are read again. A change made in the extension manager, or a new session, applies at once; a hand edit to `settings.json` applies within one second. Before, every read went to disk.

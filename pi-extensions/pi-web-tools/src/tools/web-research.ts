@@ -6,6 +6,7 @@ import { Type, type Static } from "typebox";
 import { ExaClient, type ExaDeepType, type NormalizedExaResponse } from "../providers/exa.js";
 import type { WebToolsSettings } from "../settings.js";
 import { accent, emptyComponent, errorSummary, firstText, muted, providerLabel, successSummary, textComponent, tree, webCallText } from "../utils/render.js";
+import { toResultRef } from "../utils/format.js";
 
 const deepTypes = ["deep-reasoning", "deep-lite", "deep"] as const;
 const researchModes = ["lite", "standard", "full"] as const;
@@ -74,7 +75,7 @@ export const webResearchSchema = Type.Object({
 	outputPath: Type.Optional(Type.String({ description: "Optional path for the findings report. Relative paths resolve against ctx.cwd; leading @ is stripped." })),
 	reportTitle: Type.Optional(Type.String()),
 	reportFormat: Type.Optional(StringEnum(reportFormats)),
-	rawOutputPath: Type.Optional(Type.String({ description: "Optional explicit path for raw Exa JSON metadata. Defaults to findings.raw.json next to outputPath for findings reports." })),
+	rawOutputPath: Type.Optional(Type.String({ description: "Optional explicit path for raw Exa JSON metadata. Defaults to findings.raw.json next to outputPath for findings and markdown reports; json reports write none." })),
 });
 
 export type WebResearchInput = Static<typeof webResearchSchema>;
@@ -341,6 +342,16 @@ export function buildRawSidecar(response: NormalizedExaResponse, rawOutputPath?:
 	};
 }
 
+/** The research metadata a tool result's details and the session entry carry:
+ *  the mode, type and counts the renderer draws. Pi keeps both in the session
+ *  record, and the request bodies in the full metadata hold the text of every
+ *  context file, so only the raw sidecar keeps them, and only when `execute`
+ *  writes one. */
+function researchDetailsMetadata(metadata: NormalizedExaResponse["metadata"]): Record<string, unknown> {
+	const { researchMode, type, queryCount, sourceCount, uniqueSourceCount } = metadata;
+	return { researchMode, type, queryCount, sourceCount, uniqueSourceCount };
+}
+
 export function renderWebResearchSourceTree(sources: any[], theme: any, expanded = false, limit = EXPANDED_SOURCE_LIMIT): string[] {
 	if (!expanded || sources.length === 0) return [];
 	const shown = sources.slice(0, Math.max(1, limit));
@@ -435,10 +446,11 @@ export function createWebResearchToolDefinition(pi: ExtensionAPI, getSettings: (
 			if (rawOutputPath) {
 				await writeQueued(rawOutputPath, JSON.stringify(buildRawSidecar(response, rawOutputPath), null, 2));
 			}
-			pi.appendEntry?.("pi-web-tools.web_research", { query: prepared.query, outputPath, rawOutputPath, metadata: response.metadata, sources: response.results.length });
+			const metadata = researchDetailsMetadata(response.metadata);
+			pi.appendEntry?.("pi-web-tools.web_research", { query: prepared.query, outputPath, rawOutputPath, metadata, sources: response.results.length });
 			return {
 				content: [{ type: "text", text: outputPath ? `Exa deep research complete. Report: ${outputPath}\nSources: ${response.results.length}${rawOutputPath ? `\nRaw metadata: ${rawOutputPath}` : ""}` : report }],
-				details: { outputPath, rawOutputPath, sources: response.results, metadata: response.metadata, raw: response.raw },
+				details: { outputPath, rawOutputPath, sources: response.results.map((result) => toResultRef(result)), metadata },
 			};
 		},
 	};

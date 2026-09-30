@@ -208,6 +208,7 @@ function request(target, command, options = {}) {
 		const socket = net.createConnection(target.socketPath);
 		let buffer = "";
 		let settled = false;
+		let paused = false;
 		const wantId = command.id;
 
 		socket.setEncoding("utf8");
@@ -225,7 +226,16 @@ function request(target, command, options = {}) {
 				if (!line) continue;
 
 				if (options.stream) {
-					process.stdout.write(`${line}\n`);
+					// Read no more from the bridge than stdout can take: a slow reader
+					// of this CLI must not grow its memory, or the bridge's.
+					if (!process.stdout.write(`${line}\n`) && !paused) {
+						paused = true;
+						socket.pause();
+						process.stdout.once("drain", () => {
+							paused = false;
+							socket.resume();
+						});
+					}
 					continue;
 				}
 
@@ -245,7 +255,12 @@ function request(target, command, options = {}) {
 		});
 		socket.on("error", reject);
 		socket.on("close", () => {
-			if (!settled && !options.stream) reject(new Error("Socket closed before response"));
+			if (settled) return;
+			// A stream ends only when the bridge closes it: the Pi session ended,
+			// or this reader fell too far behind and was disconnected. Neither is
+			// a clean end, so the stream exits non-zero.
+			if (options.stream) reject(new Error("bridge-stream-closed\nThe bridge closed the stream: the Pi session ended, or this reader left more than 8 MiB unread and was disconnected."));
+			else reject(new Error("Socket closed before response"));
 		});
 	});
 }
@@ -264,7 +279,8 @@ async function main() {
 	const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
 	if (command === "stream") {
-		await request(target, { id, type: "subscribe", enabled: true }, { stream: true });
+		// The stream's end is always an error with a stable first line.
+		await request(target, { id, type: "subscribe", enabled: true }, { stream: true }).catch((error) => die(error.message));
 		return;
 	}
 

@@ -13,7 +13,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { AgentConfig } from "./agents.js";
 import { sanitizeCwdSnapshotText, setGitExecFileForTests as setSnapshotGitExecFileForTests, snapshotCwdGitState } from "./cwd-snapshot.js";
-import { getFinalOutput, stringifyError } from "./format.js";
+import { getFinalOutput, stringifyError, textFromMessageContent } from "./format.js";
 import { safeFileName } from "./names.js";
 import { unknownAgentRefusal } from "./messages.js";
 import {
@@ -25,7 +25,10 @@ import {
 	writePromptToTempFile,
 } from "./pane.js";
 import {
+	fullOutputDir,
 	oneShotTranscriptPath,
+	openRuntimeLane,
+	transcriptDir,
 } from "./paths.js";
 import { randomHex } from "./random.js";
 import {
@@ -69,6 +72,14 @@ export type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => vo
 type SpawnProcess = typeof spawn;
 let spawnProcess: SpawnProcess = spawn;
 const MAX_RESULT_DIAGNOSTICS = 12;
+/** Assistant messages a one-shot result keeps for its display and final
+ *  answer. The transcript holds every message. */
+export const MAX_RESULT_MESSAGES = 20;
+/** Characters of child stderr a one-shot result keeps: the end of it. */
+export const MAX_RESULT_STDERR_CHARS = 64 * 1024;
+/** Transcript bytes waiting to be written at which the runner stops reading
+ *  the child's output until the writer catches up. */
+export const TRANSCRIPT_PENDING_MAX_BYTES = 8 * 1024 * 1024;
 const BG_EXCLUDED_TOOLS = ["complete_subagent"];
 const BG_EXCLUDED_TOOL_SET = new Set(BG_EXCLUDED_TOOLS.map(normalizedPiToolName));
 const BG_TIMEOUT_KILL_GRACE_MS = 5_000;
@@ -90,6 +101,39 @@ export function setSingleAgentSpawnForTests(spawner?: SpawnProcess): void {
 
 export function setGitExecFileForTests(execFileOverride?: Parameters<typeof setSnapshotGitExecFileForTests>[0]): void {
 	setSnapshotGitExecFileForTests(execFileOverride);
+}
+
+/**
+ * Keep `message` in a result's message list as a bounded preview. Only
+ * assistant messages are kept, because only they are displayed or read for the
+ * final answer; each keeps its text and tool calls, with tool-call arguments
+ * bounded as tool details bound them. The newest MAX_RESULT_MESSAGES are kept.
+ * When none of those carries text, the newest earlier one that does is kept
+ * ahead of them, so the final answer survives a long run of tool calls.
+ * `droppedMessages` counts the messages no longer in the list.
+ */
+export function retainResultMessage(result: Pick<SingleResult, "messages" | "droppedMessages">, message: Message): void {
+	if (message.role !== "assistant") return;
+	const content = message.content
+		.filter((part) => part.type === "text" || part.type === "toolCall")
+		.map((part) => part.type === "toolCall" ? { ...part, arguments: sanitizeDetailValue(part.arguments) as typeof part.arguments } : part);
+	const all = [...result.messages, { ...message, content }];
+	if (all.length <= MAX_RESULT_MESSAGES) {
+		result.messages.push(all.at(-1)!);
+		return;
+	}
+	const hasText = (candidate: Message) => textFromMessageContent(candidate.content) !== "";
+	const window = all.slice(-MAX_RESULT_MESSAGES);
+	const older = all.slice(0, -MAX_RESULT_MESSAGES);
+	const pinned = window.some(hasText) ? undefined : older.reverse().find(hasText);
+	result.droppedMessages = (result.droppedMessages ?? 0) + older.length - (pinned ? 1 : 0);
+	result.messages.splice(0, result.messages.length, ...(pinned ? [pinned] : []), ...window);
+}
+
+/** Append child stderr to a result, keeping the last MAX_RESULT_STDERR_CHARS. */
+function appendResultStderr(result: Pick<SingleResult, "stderr">, text: string): void {
+	const stderr = result.stderr + text;
+	result.stderr = stderr.length > MAX_RESULT_STDERR_CHARS ? stderr.slice(-MAX_RESULT_STDERR_CHARS) : stderr;
 }
 
 function appendResultDiagnostic(result: Pick<SingleResult, "diagnostics">, diagnostic: string): void {
@@ -263,13 +307,14 @@ export async function writeFullOutputArtifact(
 	label: string,
 	text: string,
 ): Promise<{ error?: string; path?: string }> {
-	const dir = path.join(runtimeRoot, "outputs", safeFileName(agentName || "subagent"));
+	const dir = path.join(fullOutputDir(runtimeRoot), safeFileName(agentName || "subagent"));
 	const filePath = path.join(
 		dir,
 		`${Date.now()}-${randomHex(8)}-${safeFileName(label || "output")}.txt`,
 	);
 	try {
 		await withFileMutationQueue(filePath, async () => {
+			openRuntimeLane(fullOutputDir(runtimeRoot));
 			await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 });
 			await fs.promises.writeFile(filePath, text, { encoding: "utf-8", mode: 0o600 });
 		});
@@ -415,18 +460,35 @@ export function detailsWithTruncation(details: SubagentDetails, prepared: Prepar
  * concurrent `appendFile` calls on one path complete in any order and a
  * transcript whose records are out of order misreports the last assistant
  * text. A failed write never blocks the next one.
+ *
+ * `append` returns false once the bytes waiting to be written pass
+ * `maxPendingBytes`, as a stream's write() does; the caller stops producing
+ * records until `drained()` settles.
  */
 export function createTranscriptAppender(
 	transcriptPath: string,
 	appendFile: (path: string, data: string) => Promise<void> = (p, data) => fs.promises.appendFile(p, data, { encoding: "utf-8" }),
 	onError: (error: unknown) => void = () => undefined,
-): { append: (record: Record<string, unknown>) => void; settled: () => Promise<void> } {
+	maxPendingBytes = TRANSCRIPT_PENDING_MAX_BYTES,
+): { append: (record: Record<string, unknown>) => boolean; drained: () => Promise<void>; settled: () => Promise<void> } {
 	let chain: Promise<void> = Promise.resolve();
+	let pendingBytes = 0;
+	let drainWaiters: Array<() => void> = [];
 	return {
 		append(record) {
 			const line = `${JSON.stringify({ ts: new Date().toISOString(), ...record })}\n`;
-			chain = chain.then(() => appendFile(transcriptPath, line)).catch((error) => onError(error));
+			const bytes = Buffer.byteLength(line, "utf8");
+			pendingBytes += bytes;
+			chain = chain.then(() => appendFile(transcriptPath, line)).catch((error) => onError(error)).finally(() => {
+				pendingBytes -= bytes;
+				if (pendingBytes > maxPendingBytes) return;
+				const waiters = drainWaiters;
+				drainWaiters = [];
+				for (const resolve of waiters) resolve();
+			});
+			return pendingBytes <= maxPendingBytes;
 		},
+		drained: () => pendingBytes <= maxPendingBytes ? Promise.resolve() : new Promise<void>((resolve) => { drainWaiters.push(resolve); }),
 		settled: () => chain,
 	};
 }
@@ -628,7 +690,20 @@ async function runSingleAgentAttempt(
 	const transcript = createTranscriptAppender(transcriptPath, undefined, (error) =>
 		appendResultDiagnostic(currentResult, `transcript write failed (${transcriptPath}): ${stringifyError(error)}`),
 	);
-	const appendTranscript = transcript.append;
+	// A child that writes faster than its transcript can is paused until the
+	// writer catches up, so the queue of unwritten records stays bounded. Both
+	// output streams feed records, so both are paused together.
+	let pausedForTranscript = false;
+	let childOutputs: NodeJS.ReadableStream[] = [];
+	const appendTranscript = (record: Record<string, unknown>) => {
+		if (transcript.append(record) || pausedForTranscript || childOutputs.length === 0) return;
+		pausedForTranscript = true;
+		for (const stream of childOutputs) stream.pause();
+		void transcript.drained().then(() => {
+			pausedForTranscript = false;
+			for (const stream of childOutputs) stream.resume();
+		});
+	};
 
 	const currentResult: SingleResult = {
 		agent: agentName,
@@ -670,6 +745,7 @@ async function runSingleAgentAttempt(
 	};
 
 	try {
+		openRuntimeLane(transcriptDir(runtimeRoot));
 		await fs.promises.mkdir(path.dirname(transcriptPath), { recursive: true, mode: 0o700 });
 		await fs.promises.writeFile(transcriptPath, "", { encoding: "utf-8", mode: 0o600 });
 		if (agent.systemPrompt.trim()) {
@@ -741,6 +817,7 @@ async function runSingleAgentAttempt(
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
 			});
+			childOutputs = [proc.stdout, proc.stderr].filter((stream): stream is NonNullable<typeof stream> => stream != null);
 			const keepFullTranscript = transcriptFullStreamEnabled();
 			let buffer = "";
 			let processClosed = false;
@@ -960,7 +1037,7 @@ async function runSingleAgentAttempt(
 				if (keepFullTranscript && !latestFilteredMessageUpdate) {
 					if (partialMessage) {
 						const reconstructed = { type: "message_update", message: partialMessage };
-						appendTranscript({ stream: "stdout", raw: JSON.stringify(reconstructed), event: reconstructed, buffered: true, reason, partialMessage });
+						appendTranscript({ stream: "stdout", event: reconstructed, buffered: true, reason, partialMessage });
 					}
 					emitDiagnostic();
 					if (partialMessage || diagnostic) resetPartialAssistantMessage(partialMessageState);
@@ -972,7 +1049,6 @@ async function runSingleAgentAttempt(
 					: latestFilteredMessageUpdate;
 				appendTranscript({
 					stream: "stdout",
-					raw: JSON.stringify(flushedEvent),
 					event: flushedEvent,
 					buffered: true,
 					reason,
@@ -1093,7 +1169,7 @@ async function runSingleAgentAttempt(
 					const transcriptEvent = eventName === "agent_start"
 						? withAgentStartTranscriptMetadata(normalized.event, { agent: agent.name, model: selectedModel, args })
 						: normalized.event;
-					appendTranscript({ stream: "stdout", raw: JSON.stringify(transcriptEvent), event: transcriptEvent });
+					appendTranscript({ stream: "stdout", event: transcriptEvent });
 				}
 				const payload = normalized.payload;
 
@@ -1128,7 +1204,7 @@ async function runSingleAgentAttempt(
 				}
 				if (eventName === "message_end" && payload.message) {
 					const msg = payload.message as Message;
-					currentResult.messages.push(msg);
+					retainResultMessage(currentResult, msg);
 
 					if (msg.role === "assistant") {
 						if (sawSessionCompact && contentHasTextPart(msg.content)) postCompactAssistantHasText = true;
@@ -1156,7 +1232,7 @@ async function runSingleAgentAttempt(
 					const errorText = typeof payload.error === "string" ? payload.error : JSON.stringify(payload.error ?? payload ?? event);
 					currentResult.errorEnvelope = rawEnvelope;
 					currentResult.errorMessage = errorText;
-					currentResult.stderr += `${rawEnvelope}\n`;
+					appendResultStderr(currentResult, `${rawEnvelope}\n`);
 					emitUpdate();
 				}
 
@@ -1176,7 +1252,7 @@ async function runSingleAgentAttempt(
 			proc.stderr.on("data", (data) => {
 				if (resolved) return;
 				const text = data.toString();
-				currentResult.stderr += text;
+				appendResultStderr(currentResult, text);
 				appendTranscript({ stream: "stderr", text });
 			});
 

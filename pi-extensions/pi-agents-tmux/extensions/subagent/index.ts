@@ -94,8 +94,14 @@ import {
 	completionPath,
 	doneDir,
 	inboxDir,
+	piPackageRuntimeRoots,
+	openRuntimeLane,
 	processingDir,
+	RUNTIME_LANE_FOLDERS,
+	RUNTIME_LANE_REFRESH_MS,
+	setRuntimeLaneCwd,
 } from "./paths.js";
+import { pruneLanes } from "../../scripts/lane-retention.js";
 import { randomHex } from "./random.js";
 import {
 	createAgentEndWatchdog,
@@ -184,6 +190,7 @@ import {
 	recordTaskDispatchFailure,
 	refreshTaskDiagnostics,
 	taskNeedsSummaryBackfill,
+	resetPaneCompletionDedup,
 	updateTaskRegistry,
 	upsertTaskRecord,
 	writePaneRegistry,
@@ -209,6 +216,7 @@ import {
 	INSTALL_SYMBOL,
 	MAX_CONCURRENCY,
 	type PaneCompletionMessageDetails,
+	PACKAGE_ID,
 	type PaneRegistry,
 	type PaneTaskRegistry,
 	type PaneTaskRecord,
@@ -498,6 +506,19 @@ export default function (pi: ExtensionAPI) {
 	(globalThis as unknown as Record<PropertyKey, unknown>)[STATUSLINE_SYMBOL] = statuslineBridge;
 	let pendingChildCompletion: { agent: string; taskId: string; status: string; outboxFile: string } | undefined;
 	let completionPoller: ReturnType<typeof setInterval> | undefined;
+	let runtimeLaneRefresh: ReturnType<typeof setInterval> | undefined;
+	/** Write the owning session's record into each runtime lane under
+	 *  `runtimeRoot`, making a lane a prune removed. */
+	const recordRuntimeLanes = (runtimeRoot: string) => {
+		for (const folder of RUNTIME_LANE_FOLDERS) {
+			const lane = path.join(runtimeRoot, folder);
+			try {
+				openRuntimeLane(lane);
+			} catch (error) {
+				console.warn(`pi-agents-tmux lane-record-failed=${lane}\n${stringifyError(error)}`);
+			}
+		}
+	};
 	let completionPollInFlight = false;
 	let childInboxPoller: ReturnType<typeof setInterval> | undefined;
 	let childTitlePoller: ReturnType<typeof setInterval> | undefined;
@@ -1371,6 +1392,8 @@ export default function (pi: ExtensionAPI) {
 		if (completionPoller) clearInterval(completionPoller);
 		if (childInboxPoller) clearInterval(childInboxPoller);
 		if (childTitlePoller) clearInterval(childTitlePoller);
+		if (runtimeLaneRefresh) clearInterval(runtimeLaneRefresh);
+		runtimeLaneRefresh = undefined;
 		usageTranscriptVersionsByTask.clear();
 		transcriptTails.clear();
 		taskRegistryReader.clear();
@@ -1378,6 +1401,26 @@ export default function (pi: ExtensionAPI) {
 
 		const runtimeRoot = runtimeDirForContext(ctx);
 		retryMarkerRuntimeRoot = runtimeRoot;
+		// Transcripts and saved full outputs follow the lane retention rule. The
+		// session that owns the runtime root is the one writer of each lane's
+		// record: it records every lane here, before a child agent sharing the
+		// root can write into one, every RUNTIME_LANE_REFRESH_MS while it is
+		// live, and on each of its own writes. The refresh keeps a live owner's
+		// record younger than the prune's age limit, so no prune removes the
+		// lane while the owner runs, and one that did is made again with its
+		// record. A child records nothing.
+		if (!childAgentName) {
+			setRuntimeLaneCwd(ctx.cwd);
+			for (const root of piPackageRuntimeRoots()) {
+				for (const folder of RUNTIME_LANE_FOLDERS) {
+					const pruned = pruneLanes(root, [PACKAGE_ID, folder]);
+					for (const failure of pruned.failed) console.warn(`pi-agents-tmux lane-prune-failed=${failure.path}\n${failure.error}`);
+				}
+			}
+			recordRuntimeLanes(runtimeRoot);
+			runtimeLaneRefresh = setInterval(() => recordRuntimeLanes(runtimeRoot), RUNTIME_LANE_REFRESH_MS);
+			runtimeLaneRefresh.unref?.();
+		}
 
 		if (childAgentName) {
 			if (!childOwnsVisiblePane) {
@@ -1678,6 +1721,8 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", async () => {
 		if (completionPoller) clearInterval(completionPoller);
 		if (childInboxPoller) clearInterval(childInboxPoller);
+		if (runtimeLaneRefresh) clearInterval(runtimeLaneRefresh);
+		runtimeLaneRefresh = undefined;
 		await drainTranscriptUsagePersistences();
 		if (dashboardCtx) setMiniDashboardWidget(dashboardCtx, SUBAGENT_WIDGET_KEY, MINI_DASHBOARD_RANK.AGENTS, undefined);
 		completionPoller = undefined;
@@ -1687,6 +1732,8 @@ export default function (pi: ExtensionAPI) {
 		transcriptTails.clear();
 		taskRegistryReader.clear();
 		appliedRegistryRecords.clear();
+		resetPaneCompletionDedup();
+		setRuntimeLaneCwd(undefined);
 
 		idleStallWatchdog.stop();
 		currentRuntimeRoot = undefined;

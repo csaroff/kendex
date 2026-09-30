@@ -2,6 +2,11 @@
 
 ## Consumer-impacting changes
 
+### 2.1.0
+
+- New task logs go into one directory per session in the task directory's `lanes/` folder. A session's log directory is deleted once its working directory is gone (a merged worktree), and any log older than 5 days is deleted, when the next session starts. The prune reads only `lanes/`, and in it only real directories this user owns that the package marked as its own, so other folders in the task directory are never touched. Logs written before 2.1.0 stay where they are and are not deleted by the prune, `clear` or the task bound.
+- A task's process handle and in-memory output are released once it has exited and its last log write has finished; `log` and exit wakes read the end of the log file instead. A task whose last log write failed or stalled keeps its in-memory output as the record, and a log that cannot be read shows `[log unreadable: <error>]` instead of empty output. At most 50 finished tasks are kept: past that, the oldest finished task is removed with its log. `clear` now deletes the logs of the tasks it removes. A forked session keeps the logs of tasks it copied from the original session. The task list is released when a session ends; the next session restores it from the saved snapshots.
+
 ### 2.0.4
 
 - A task that prints a lot no longer makes Pi write the task log synchronously, save the full task state and redraw the widget for every output chunk. Slow task log writes no longer block Pi; the task waits on its output instead.

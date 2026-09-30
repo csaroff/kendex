@@ -23,6 +23,7 @@ import {
 	SESSION_SEARCH_STATUS_KEY,
 	SESSION_TITLE_SYNC_INTERVAL_MS,
 	STATUS_KEY,
+	THINKING_TIMER_MAX_DURATIONS,
 	THINKING_TIMER_STORE_SYMBOL,
 	TMUX_SESSION_TITLE_BORDER_FORMAT,
 } from "./qol/constants.js";
@@ -39,6 +40,7 @@ import { imageContentForPath, resolveSubmittedImagePaths } from "./qol/images.js
 import {
 	clearTmuxWindowMark,
 	notifyQuestionOpened,
+	resetQolNotificationCooldowns,
 	sendQolNotification,
 	type QolNotificationService,
 } from "./qol/notifications.js";
@@ -61,13 +63,15 @@ import {
 } from "./qol/session-rename.js";
 import { createScheduleController, getScheduleArgumentCompletions } from "./qol/schedule.js";
 import {
+	clearSessionSearchPendingAction,
 	consumePendingSessionSearchContext,
 	openQolSessionSearch,
-	qolSessionSearchPendingActions,
 	refreshQolSessionSearchCache,
+	releaseQolSessionSearchCache,
 	renderSessionSearchContextMessage,
 	runSessionSearchResumeOrFork,
 	sessionSearchShortcut,
+	takeSessionSearchPendingAction,
 } from "./qol/session-search/index.js";
 import { installSettingsCacheRefresh, recordProjectTrust } from "./qol/package-config.js";
 import { settingBoolean, settingNumber, settingString } from "./qol/settings.js";
@@ -249,9 +253,22 @@ export default function qol(pi: ExtensionAPI): void {
 		const duration = Math.max(0, endTimeMs - start);
 		thinkingTimerStore.starts.delete(key);
 		thinkingTimerStore.durations.set(key, duration);
+		for (const oldest of thinkingTimerStore.durations.keys()) {
+			if (thinkingTimerStore.durations.size <= THINKING_TIMER_MAX_DURATIONS) break;
+			thinkingTimerStore.durations.delete(oldest);
+		}
 		const label = thinkingTimerStore.labels.get(key);
 		if (label) label.setText(thinkingTimerLabel(thinkingTimerStore.theme, duration, thinkingTimerStore.cwd));
 		if (thinkingTimerStore.starts.size === 0) stopThinkingTimerTicker();
+	};
+
+	// A label is held only to tick it while its block runs. A finished block's
+	// label already shows its final time, and a redraw of that message labels
+	// it again from `durations`.
+	const releaseFinishedThinkingLabels = () => {
+		for (const key of thinkingTimerStore.labels.keys()) {
+			if (!thinkingTimerStore.starts.has(key)) thinkingTimerStore.labels.delete(key);
+		}
 	};
 
 	const clearIdleCompactionTimer = () => {
@@ -650,7 +667,8 @@ export default function qol(pi: ExtensionAPI): void {
 		}
 		startQuestionSubscription(ctx);
 		void attemptAutoRename(ctx);
-		if (settingBoolean("sessionSearch.enabled", true, ctx.cwd)) {
+		// A headless session has no search overlay to open, so it loads no index.
+		if (ctx.hasUI && settingBoolean("sessionSearch.enabled", true, ctx.cwd)) {
 			if (sessionSearchWarmupTimer) clearTimeout(sessionSearchWarmupTimer);
 			sessionSearchWarmupTimer = setTimeout(() => {
 				sessionSearchWarmupTimer = undefined;
@@ -675,8 +693,11 @@ export default function qol(pi: ExtensionAPI): void {
 		clearQuestionSubscribeTimer();
 		if (sessionSearchWarmupTimer) clearTimeout(sessionSearchWarmupTimer);
 		sessionSearchWarmupTimer = undefined;
+		releaseQolSessionSearchCache();
+		clearSessionSearchPendingAction();
 		resetThinkingTimer(undefined);
 		clearTmuxWindowMark(pi);
+		resetQolNotificationCooldowns();
 		questionUnsubscribe?.();
 		questionUnsubscribe = undefined;
 		currentCtx = undefined;
@@ -746,6 +767,7 @@ export default function qol(pi: ExtensionAPI): void {
 		}
 	});
 	pi.on("agent_end", (event, ctx) => {
+		releaseFinishedThinkingLabels();
 		if (ctx.hasUI) {
 			void refreshStatusline(ctx);
 			requestRender();
@@ -905,13 +927,11 @@ export default function qol(pi: ExtensionAPI): void {
 		pi.registerCommand("search:resume-pending", {
 			description: "Run a pending session-search resume or fork action",
 			handler: async (args, ctx) => {
-				const id = args.trim();
-				const action = qolSessionSearchPendingActions.get(id);
+				const action = takeSessionSearchPendingAction(args.trim());
 				if (!action) {
 					ctx.ui.notify("No pending session-search resume/fork action found.", "warning");
 					return;
 				}
-				qolSessionSearchPendingActions.delete(id);
 				if (!(await runSessionSearchResumeOrFork(pi, ctx, action))) ctx.ui.notify("Session resume/fork is unavailable in this context.", "error");
 			},
 		});

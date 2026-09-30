@@ -5,9 +5,8 @@ import { settingNumber } from "../settings.js";
 import { stringifyError } from "../util.js";
 import {
 	getPendingSessionSearchMessage,
-	nextSessionSearchPendingActionId,
 	pinSessionModel,
-	qolSessionSearchPendingActions,
+	queueSessionSearchPendingAction,
 	refreshQolSessionSearchCache,
 	sessionDisplayName,
 	setPendingSessionSearchMessage,
@@ -17,12 +16,14 @@ import {
 	buildSessionSearchContextMessageWithLoader,
 	injectSessionSearchContext,
 } from "./context.js";
-import type { QolSessionPaletteAction, QolSessionSearchResult } from "./types.js";
+import type { QolSessionPaletteAction, QolSessionSearchLoad, QolSessionSearchResult } from "./types.js";
 
 export {
-	qolSessionSearchPendingActions,
+	clearSessionSearchPendingAction,
 	refreshQolSessionSearchCache,
+	releaseQolSessionSearchCache,
 	sessionSearchShortcut,
+	takeSessionSearchPendingAction,
 } from "./cache.js";
 export { renderSessionSearchContextMessage } from "./context.js";
 
@@ -31,8 +32,7 @@ function asCommandContext(ctx: ExtensionContext): (ExtensionContext & Partial<Ex
 }
 
 function queueSessionSearchCommandAction(ctx: ExtensionContext, action: QolSessionPaletteAction): void {
-	const id = nextSessionSearchPendingActionId();
-	qolSessionSearchPendingActions.set(id, action);
+	const id = queueSessionSearchPendingAction(action);
 	ctx.ui.setEditorText(`/search:resume-pending ${id}`);
 	ctx.ui.notify(`${sessionDisplayName(action.result!)} — press enter to ${action.type === "fork" ? "fork" : "resume"}`, "info");
 }
@@ -121,13 +121,21 @@ export async function openQolSessionSearch(pi: ExtensionAPI, ctx: ExtensionConte
 		ctx.ui.notify("Session search requires interactive UI", "warning");
 		return;
 	}
-	const sessions = await refreshQolSessionSearchCache(ctx);
+	// The overlay opens at once and fills in when the index is loaded: a
+	// released index takes a full read of every session file to load again.
+	const loading: Promise<QolSessionSearchLoad> = refreshQolSessionSearchCache(ctx).then(
+		(sessions) => ({ status: "ready", sessions }),
+		(error) => ({ status: "failed", error: stringifyError(error) }),
+	);
 	const releaseModalLock = acquirekendexModalLock();
 	let action: QolSessionPaletteAction | undefined;
 	try {
 		const currentModel = ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined;
-		action = await ctx.ui.custom<QolSessionPaletteAction>((tui, theme, _keybindings, done) =>
-			new QolSessionSearchComponent(done, tui, theme, sessions, ctx.cwd, initialQuery, currentModel), {
+		action = await ctx.ui.custom<QolSessionPaletteAction>((tui, theme, _keybindings, done) => {
+			const component = new QolSessionSearchComponent(done, tui, theme, { status: "loading" }, ctx.cwd, initialQuery, currentModel);
+			void loading.then((load) => component.setSessions(load));
+			return component;
+		}, {
 			overlay: true,
 			overlayOptions: {
 				anchor: "center",

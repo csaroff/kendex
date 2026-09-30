@@ -2,6 +2,12 @@
 
 ## Consumer-impacting changes
 
+### 3.2.0
+
+- A one-shot result keeps its last 20 assistant messages, plus the newest earlier one with text when those 20 carry only tool calls, so the final answer survives a long tool loop. Each keeps only its text and tool-call parts, with tool-call arguments cut to the tool-details bound (8,192 characters per string, 50 array items, 80 object fields, nesting depth 4). The result's new `droppedMessages` field counts the messages it no longer lists, and the expanded view shows that count. The result keeps the last 65,536 characters of the child's stderr. Tool-result and user messages are no longer held in the result; the transcript still records them.
+- Transcript records hold each event once: a record with an `event` no longer repeats it as a `raw` string. When more than 8 MiB of records wait to be written, the extension stops reading the child's stdout and stderr until the writer catches up.
+- Transcripts and saved full outputs (`outputs/`) follow the lane retention rule: a session's directory is deleted once its working directory is gone (a merged worktree), and any file in it older than 5 days is deleted, when the next session starts. A transcript directory written before 3.2.0 follows the rule only after its session starts again. A child agent sharing its parent's directory prunes nothing and does not rewrite the parent's record. Completion deduplication keys are cleared when a session ends.
+
 ### 3.1.1
 
 - The agent dashboard no longer rereads child transcripts while it draws: the widget render reads no transcript file, where before every frame read up to 96 KB per working row. Each working row's activity line and usage come from a per-transcript cache, which the usage poll advances by only the bytes a transcript gained since its last read; before, the poll parsed each growing transcript from its first byte. The activity line now moves at the poll interval (`completionPollMs`) instead of every frame, and a half-written transcript line no longer shows as raw JSON. The dashboard's registry sync re-reads the task registry only when the file's version changed, and skips finished task records that have not changed since it last applied them.

@@ -28,6 +28,11 @@ Restart Pi after installation. Use `kendex update-pi --check` to preview the ins
 
 The manager reads the skills Pi has discovered. You select a skill to preview it or insert its command into the editor. Changes to enabled skills go to Pi's settings. Changes to skills you own write their files to the chosen location.
 
+## Memory use
+
+- The skill list is loaded when `/skill` opens the manager and released when it closes. A session that never opens it, with or without a UI, loads nothing.
+- The list holds each skill's name, description and metadata. To get them, opening the list reads each skill's file, and the list keeps no skill's body. The manager reads a skill's body from its file again when it shows that skill.
+
 ## Settings
 
 The settings editor writes project values to `.pi/settings.json`. The default user file is `~/.pi/agent/settings.json`. `PI_CODING_AGENT_DIR` changes the user directory. Package values are stored under `kendex.extensionManager.config["@vanillagreen/pi-skills-manager"]`.

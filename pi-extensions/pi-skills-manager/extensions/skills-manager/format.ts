@@ -59,14 +59,7 @@ export function buildFrontmatterBlock(skill: SkillEntry): string {
 	return ["---", ...lines, "---"].join("\n");
 }
 
-export function buildSkillDocument(skill: SkillEntry): string {
-	const frontmatter = buildFrontmatterBlock(skill);
-	const content = skill.content.trim();
-	return content ? `${frontmatter}\n\n${content}\n` : `${frontmatter}\n`;
-}
-
-export function buildEditableSkillDocument(skill: SkillEntry, raw?: string): string {
-	const source = raw ?? buildSkillDocument(skill);
+export function buildEditableSkillDocument(source: string): string {
 	const parsed = parseFrontmatter<Record<string, unknown>>(source);
 	const frontmatter = { ...parsed.frontmatter };
 	delete frontmatter.name;
@@ -75,11 +68,16 @@ export function buildEditableSkillDocument(skill: SkillEntry, raw?: string): str
 	return content ? `${editableBlock}\n\n${content}\n` : `${editableBlock}\n`;
 }
 
-export function readSkillDocument(skill: SkillEntry): string {
+/** The body of one skill as the preview shows it, or why its file cannot be
+ *  read. Only the preview takes this: the editor saves what it opened over
+ *  the file, so it reads the file itself and opens nothing on a failure. */
+export type SkillBody = { kind: "body"; text: string } | { kind: "unreadable"; reason: string };
+
+export function readSkillBody(skill: SkillEntry): SkillBody {
 	try {
-		return readFileSync(skill.path, "utf8");
-	} catch {
-		return buildSkillDocument(skill);
+		return { kind: "body", text: stripFrontmatter(readFileSync(skill.path, "utf8")).trim() };
+	} catch (error) {
+		return { kind: "unreadable", reason: error instanceof Error ? error.message : String(error) };
 	}
 }
 
@@ -113,5 +111,5 @@ export function parseEditableSkillDocument(raw: string, expectedName: string): P
 }
 
 export function toUpdatedSkill(skill: SkillEntry, parsed: ParsedSkillDocument): SkillEntry {
-	return { ...skill, name: parsed.name, description: parsed.description, content: parsed.content, frontmatter: parsed.frontmatter };
+	return { ...skill, name: parsed.name, description: parsed.description, frontmatter: parsed.frontmatter };
 }

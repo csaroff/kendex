@@ -31,6 +31,12 @@ Restart Pi after installation. Use `kendex update-pi --check` to preview the ins
 - A session you subscribed to keeps sending you what it does next.
 - `pi-bridge history --raw` reads a saved event in full when it was too large to return inline. Streaming events are the exception: `message_update` arrives once per token and `tool_execution_update` once per partial tool result, and both are kept in reduced form only, so the finished value comes from `message_end` or `tool_execution_end`.
 
+## Memory use
+
+- The bridge holds at most 8 MiB of unsent data for one client, plus the line it is sending. A client that still leaves more unread when the next line is due is disconnected, and a session with a UI shows a `bridge-client-stalled=<bytes>` warning. One response larger than 8 MiB still reaches a client that reads it.
+- `pi-bridge stream` stops reading from the bridge while its own output is not yet written. When the bridge closes the stream (the session ended, or the reader was disconnected), it prints `bridge-stream-closed` and exits 1.
+- The activity list keeps at most 100 events, 1,048,576 characters of serialized events, and nothing older than one hour. One event larger than the character bound is still kept, alone. The list is shared by every session in one Pi process and is not cleared at session end; these bounds are what release it.
+
 ## Settings
 
 The settings editor writes project values to `.pi/settings.json`. The default user file is `~/.pi/agent/settings.json`. `PI_CODING_AGENT_DIR` changes the user directory. Package values are stored under `kendex.extensionManager.config["@vanillagreen/pi-session-bridge"]`.

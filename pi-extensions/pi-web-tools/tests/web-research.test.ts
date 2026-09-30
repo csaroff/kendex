@@ -2,9 +2,9 @@ import assert from "node:assert/strict";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
-import { applyResearchMode, buildRawSidecar, defaultRawOutputPath, displayWebResearchPath, expandSimpleGlob, prepareResearchInput, renderFindingsReport, renderWebResearchSourceTree, resolveOutputPath, runExaResearch } from "../src/tools/web-research.js";
+import { applyResearchMode, buildRawSidecar, createWebResearchToolDefinition, defaultRawOutputPath, displayWebResearchPath, expandSimpleGlob, prepareResearchInput, renderFindingsReport, renderWebResearchSourceTree, resolveOutputPath, runExaResearch } from "../src/tools/web-research.js";
 import { DEFAULT_SETTINGS } from "../src/settings.js";
-import { tempDir } from "./fixtures.js";
+import { detailsHold, tempDir } from "./fixtures.js";
 
 for (const { name, params, settings, expected } of [
 	{ name: "lite", params: { researchMode: "lite" }, settings: undefined, expected: { researchMode: "lite", type: "deep-lite", numResults: 15, textMaxCharacters: 10000, timeoutSeconds: 300, highlightsMaxCharacters: 600, highlightsPerUrl: 1 } },
@@ -78,3 +78,33 @@ for (const expanded of [false, true]) {
 for (const { path, expected } of [{ path: "/repo/tmp/findings.md", expected: "tmp/findings.md" }, { path: "/other/findings.md", expected: "/other/findings.md" }]) {
 	test(`research display path: ${path}`, () => assert.equal(displayWebResearchPath("/repo", path), expected));
 }
+
+test("web_research execute: details and session entry carry source refs and counts, not source text, raw response or context file text", async (t) => {
+	const requestBodies: string[] = [];
+	t.mock.method(globalThis, "fetch", async (_url: unknown, init: RequestInit) => {
+		requestBodies.push(String(init.body));
+		return new Response(JSON.stringify({ output: { content: "Research answer." }, results: [{ title: "T", url: "https://example.com/t", publishedDate: "2026-01-01", text: "research page text", highlights: ["research highlight"] }] }));
+	});
+	const cwd = tempDir(t);
+	writeFileSync(join(cwd, "context.md"), "private context file text");
+	const entries: unknown[] = [];
+	const tool = createWebResearchToolDefinition({ appendEntry(_type: string, data: unknown) { entries.push(data); } } as any, () => ({ ...DEFAULT_SETTINGS, warnings: [], apiKeys: { exa: "k" } }));
+	const result = await tool.execute("call", { query: "q", researchMode: "lite", contextFiles: ["context.md"] }, undefined, undefined, { cwd } as any);
+	const { sources, metadata, ...rest } = result.details;
+	const recorded = [result.details, ...entries];
+	assert.deepEqual({
+		rest: JSON.parse(JSON.stringify(rest)),
+		sources,
+		metadata,
+		entries: entries.length,
+		contextSent: requestBodies.some((body) => body.includes("private context file text")),
+		recordedText: ["research page text", "research highlight", "private context file text"].filter((text) => recorded.some((value) => detailsHold(value, text))),
+	}, {
+		rest: {},
+		sources: [{ title: "T", url: "https://example.com/t", publishedDate: "2026-01-01" }],
+		metadata: { researchMode: "lite", type: "deep-lite", queryCount: 1, sourceCount: 1, uniqueSourceCount: 1 },
+		entries: 1,
+		contextSent: true,
+		recordedText: [],
+	});
+});
