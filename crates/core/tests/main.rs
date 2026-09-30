@@ -64,6 +64,7 @@ mod installs_nowhere;
 mod instruction_shims;
 mod invariants;
 mod kinds;
+mod lane;
 mod left_out_by_own_line;
 mod lock_from_another_project;
 mod lock_record_branch;
