@@ -48,7 +48,66 @@ if [ -n "$old" ]; then
   git fetch --no-tags origin refs/heads/kendex/refresh
 fi
 git checkout -B kendex/refresh "$base"
-kendex refresh --scope project --yes --leave
+export KENDEX_UI=plain
+refresh_status=0
+refresh_output="$(kendex refresh --scope project --yes --leave 2>&1)" || refresh_status=$?
+printf '%s\n' "$refresh_output"
+if [ "$refresh_status" -ne 0 ]; then
+  printf 'refresh-error=refresh value=%s\n' "$refresh_status" >&2
+  exit "$refresh_status"
+fi
+# refresh has no JSON report. Fall back to blocked.rs's plain conflicts
+# section and holds.rs's records; verify cannot report discarded edits.
+# ledger.rs counts distinct kind/name items, not rows or harnesses.
+held_items=""
+held_keys=$'\n'
+held_count=0
+conflict_count=""
+conflict_section=no
+ledger_pattern=' · skipped ([1-9][0-9]*) items? on conflict( · |$)'
+while IFS= read -r line; do
+  case "$line" in
+    conflicts:) conflict_section=yes; continue ;;
+    '    '*) continue ;;
+    '  '*)
+      if [ "$conflict_section" = yes ]; then
+        case "$line" in
+          *': edited on disk and changed upstream — keep your edits as a fork, or apply with edits discarded' | \
+          *': edited on disk since install — keep it as a fork, or apply with edits discarded' | \
+          *': its files were edited on disk after another tool installed them — keep the edits as a fork, or apply with edits discarded' | \
+          *': changed upstream and on disk — kendex cannot tell your edits from the update; keep it as a fork or apply with edits discarded') ;;
+          *)
+            printf 'refresh-error=conflict-record value=%s\n' "${line#  }" >&2
+            exit 1 ;;
+        esac
+        held_items="$held_items- ${line#  }
+"
+        item="${line#  }"
+        item="${item%: *}"
+        item="${item% for *}"
+        case "$held_keys" in
+          *$'\n'"$item"$'\n'*) ;;
+          *) held_keys="$held_keys$item"$'\n'; held_count=$((held_count + 1)) ;;
+        esac
+      fi ;;
+    *) conflict_section=no ;;
+  esac
+  case "$line" in
+    *' · skipped '*' on conflict'*)
+      if [ -n "$conflict_count" ] || ! [[ "$line" =~ $ledger_pattern ]]; then
+        printf 'refresh-error=conflict-ledger value=%s\n' "$line" >&2
+        exit 1
+      fi
+      conflict_count="${BASH_REMATCH[1]}" ;;
+  esac
+done <<<"$refresh_output"
+if [ -n "$conflict_count" ] || [ "$held_count" -ne 0 ]; then
+  if [ "${conflict_count:-0}" != "$held_count" ]; then
+    printf 'refresh-error=conflict-count value=%s held=%s\n' "${conflict_count:-0}" "$held_count" >&2
+    exit 1
+  fi
+  kendex refresh --scope project --yes --leave --discard-edits
+fi
 TMP="$(mktemp -d)"
 trap 'rm -rf -- "${TMP:?}"' EXIT
 "$SCRIPT_DIR/adopt-refresh.sh" --templates-dir "$ROOT/.agents/skills/review-gate/templates" --workflow-edit-report "$TMP/workflow-edits"
@@ -108,6 +167,9 @@ fi
 printf -v body 'Generated kendex updates.\n\nChange class: `%s`.\n\nClassifier:\n```text\n%s\n```\n\n%s\n' "$class" "$class_line" "$merge_note"
 if [ -n "$workflow_edits" ]; then
   printf -v body '%s\n%s\n' "$body" "$workflow_edits"
+fi
+if [ -n "$conflict_count" ]; then
+  printf -v body '%s\nOverwritten hand-edited items (from refresh):\n%s' "$body" "$held_items"
 fi
 if [ "$state" = pushed ]; then
   git push "--force-with-lease=refs/heads/kendex/refresh:$old" origin HEAD:refs/heads/kendex/refresh
