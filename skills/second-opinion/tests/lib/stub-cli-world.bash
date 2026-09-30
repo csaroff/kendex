@@ -429,18 +429,19 @@ record_log() {
       json="$json$line"
       if [[ "$line" == "}" ]]; then
         in_json=""
-        printf '%s\n' "$json" | jq -r 'to_entries | map("\(.key)=\(.value)") | join(" ")'
+        # execution-fallback.test.sh pins invocation history separately.
+        printf '%s\n' "$json" | jq -r 'del(.attempts) | to_entries | map("\(.key)=\(.value)") | join(" ")'
         json=""
       fi
       continue
     fi
     case "$line" in
       "{") in_json=1; json="{" ;;
-      "{"*"}") printf '%s\n' "$line" | jq -r 'to_entries | map("\(.key)=\(.value)") | join(" ")' 2>/dev/null || printf '%s\n' "$line" ;;
+      "{"*"}") printf '%s\n' "$line" | jq -r 'del(.attempts) | to_entries | map("\(.key)=\(.value)") | join(" ")' 2>/dev/null || printf '%s\n' "$line" ;;
       # the plumbing, and the lane relays the dual-model suites pin
       "→ cmd:"*|"→ Response received"*|"["*"] "*) ;;
       # the instruction-file reports, pinned by review-prompt.test.sh alone
-      "second-opinion: instructions-"*) ;;
+      "second-opinion: instructions-"*|"second-opinion: attempt "*) ;;
       "→ second-opinion:"*) printf '%s\n' "${line% cwd=*}" ;;
       *) printf '%s\n' "$line" ;;
     esac
@@ -598,7 +599,7 @@ err_word() {
   case "$1" in
     -) ;;
     header:*) printf '→ second-opinion: target=claude mode=%s current=none\n' "$a" ;;
-    multi:*) printf '→ second-opinion: targets=%s mode=review (multi-lane) current=none\n' "$a" ;;
+    multi:*) printf '→ second-opinion: requested=%s mode=review (ordered lanes) current=none\n' "$a" ;;
     written) printf '→ Written: <out>\n' ;;
     union:*) printf '→ Written: <out> (union of %s lanes)\n' "$a" ;;
     # the gate: failed:<reason>:<where the record landed>[:<detail>], then the
