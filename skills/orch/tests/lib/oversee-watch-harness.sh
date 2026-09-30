@@ -1,13 +1,15 @@
 # Shared sandbox for the oversee-watch suites: the stub binaries every case
 # drives, the assertion library, and one `run_watch` entry point.
 #
-# oversee-watch reads GitHub (pr-watch, `gh pr list`, the open issues list),
-# Linear, the tmux panes of the lane windows, and the accounts through `lanes list`.
-# oversee_watch.sh covers GitHub and process-wide failures;
-# oversee_watch_triage.sh covers the tracker; oversee_watch_outside.sh covers
-# outside contributions; the three lane suites cover pane
-# behavior, prompt state, and spent-account banners; oversee_watch_accounts.sh
-# covers account events and the heartbeat roster. They share this sandbox.
+# oversee-watch reads GitHub (pr-watch, `gh pr list`, the open issues list,
+# the security alert lists), Linear, the tmux panes of the lane windows, and
+# the accounts through `lanes list`. oversee_watch.sh covers GitHub and
+# process-wide failures; oversee_watch_triage.sh covers the tracker;
+# oversee_watch_outside.sh covers outside contributions;
+# oversee_watch_security.sh covers security alerts; the three lane suites
+# cover pane behavior, prompt state, and spent-account banners;
+# oversee_watch_accounts.sh covers account events and the heartbeat roster.
+# They share this sandbox.
 #
 # Sourced, never run: the runners glob tests/*.sh, so nothing here executes on
 # its own. Sourcing it sets the shell options, builds $TMP_ROOT and the stub
@@ -57,8 +59,12 @@ CASE_REPO_ROOT="$(git -C "$TMP_ROOT/repo" rev-parse --show-toplevel)" \
 #   merged.json   body for `pr list --state merged` (default: []);
 #                 merged.<SLUG>.json answers that --repo alone, <SLUG> being
 #                 the repo with everything outside [A-Za-z0-9._-] as `_`
-#   open.txt      lines for `pr list --state open` (default: empty), with
-#                 open.<SLUG>.txt per repo the same way; --limit caps them
+#   open.txt      the open pull requests `pr list --state open` answers
+#                 (default: none), with open.<SLUG>.txt per repo the same way:
+#                 one `<number>\t<head>\t<title>[\t<author login>]` line
+#                 each, author octocat where absent. --limit caps them, and
+#                 each becomes the object gh lists, holding only the --json
+#                 fields, run through the call's own --jq filter as gh runs it
 #   repoview.txt  what `repo view` reports — the repository the watch resolves
 #                 when no --repo is given (default: owner/repo)
 #   auth-fail     present → keyring `auth status` fails
@@ -76,7 +82,27 @@ CASE_REPO_ROOT="$(git -C "$TMP_ROOT/repo" rev-parse --show-toplevel)" \
 #   refresh-log.<RUN>.err fails that log with the file's stderr.
 #   workflows.<SLUG>.json is the paginated workflow list (default: empty);
 #   workflows.<SLUG>.err fails that list with the file's stderr.
-# Every `auth status`, `pr list`, `run` and `api --paginate` call is logged to gh.calls.
+#   dependabot.json, code-scanning.json, secret-scanning.json
+#                 the page `api --paginate repos/<repo>/<kind>/alerts`
+#                 answers, the same way (default: []); <kind>-fail present →
+#                 that call fails, printing the file's own text, or an HTTP
+#                 502 line where it is empty
+#   dependabot-prs.json
+#                 the vulnerabilityAlerts nodes `api graphql` answers, with
+#                 dependabot-prs.<SLUG>.json per repo (default: []), all in
+#                 one page. The query's own vulnerabilityAlerts arguments
+#                 apply as GitHub applies them: `states:` drops each node
+#                 whose state it does not list, `first:` and `after:` read as
+#                 one page. Any other argument, a `states:` value that is not
+#                 an alert state, or a query with no vulnerabilityAlerts
+#                 field fails the call with a `stub: unmodeled-argument`
+#                 line, so a query change the stub does not model reddens
+#                 the suite instead of reading every node;
+#                 graphql-fail present → that call fails as gh fails a
+#                 GraphQL error, exit 1 with no HTTP status, printing the
+#                 file's own text, or a missing-permission line where empty
+# Every `auth status`, `pr list`, `run`, `api --paginate` and `api graphql`
+# call is logged to gh.calls.
 # `api user` (env-token preflight) succeeds for any token except one
 # starting with ghp_stale.
 cat > "$TMP_ROOT/bin/gh" <<'EOF'
@@ -116,8 +142,13 @@ case "${1:-} ${2:-}" in
     path="$3"; filter=""
     [[ "${4:-}" == --jq ]] && filter="$5"
     list="${path%%\?*}"; list="${list##*/}"
-    [[ -f "$STUB_DIR/$list-fail" ]] && { echo "HTTP 502: bad gateway" >&2; exit 1; }
-    repo="${path#repos/}"; repo="${repo%/"$list"*}"
+    tail="$list"
+    if [[ "$list" == alerts ]]; then list="${path%/alerts\?*}"; list="${list##*/}"; tail="$list/alerts"; fi
+    if [[ -f "$STUB_DIR/$list-fail" ]]; then
+      if [[ -s "$STUB_DIR/$list-fail" ]]; then cat "$STUB_DIR/$list-fail" >&2; else echo "HTTP 502: bad gateway" >&2; fi
+      exit 1
+    fi
+    repo="${path#repos/}"; repo="${repo%/"$tail"*}"
     [[ "$list" != workflows ]] || repo="${repo%/actions}"
     slug="$(printf '%s' "$repo" | tr -c 'A-Za-z0-9._-' '_')"
     [[ ! -f "$STUB_DIR/$list.$slug.err" ]] || { cat "$STUB_DIR/$list.$slug.err" >&2; exit 1; }
@@ -127,17 +158,63 @@ case "${1:-} ${2:-}" in
     elif [[ "$list" == workflows ]]; then jq -rn "{workflows: []} | ${filter:-.}"
     else jq -rn "[] | ${filter:-.}"; fi
     exit ;;
+  "api graphql")
+    printf '%s\n' "$*" >> "$STUB_DIR/gh.calls"
+    if [[ -f "$STUB_DIR/graphql-fail" ]]; then
+      if [[ -s "$STUB_DIR/graphql-fail" ]]; then cat "$STUB_DIR/graphql-fail" >&2; else echo "gh: Resource not accessible by integration" >&2; fi
+      exit 1
+    fi
+    owner=""; name=""; filter=""; query=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        -f) case "$2" in owner=*) owner="${2#owner=}" ;; name=*) name="${2#name=}" ;; query=*) query="${2#query=}" ;; esac; shift ;;
+        --jq) filter="$2"; shift ;;
+      esac
+      shift
+    done
+    [[ "$query" =~ vulnerabilityAlerts[[:space:]]*(\(([^\)]*)\))? ]] \
+      || { echo "stub: unmodeled-argument query=no-vulnerabilityAlerts" >&2; exit 2; }
+    args="${BASH_REMATCH[2]}" states='null'
+    arg_re='^[[:space:],]*([A-Za-z_]+)[[:space:]]*:[[:space:]]*(\[[^]]*\]|[^],[:space:]]+)(.*)$'
+    while [[ "$args" =~ $arg_re ]]; do
+      key="${BASH_REMATCH[1]}" value="${BASH_REMATCH[2]}" args="${BASH_REMATCH[3]}"
+      case "$key" in
+        first|after) ;;
+        states)
+          states='[]'
+          for state in ${value//[][,]/ }; do
+            case "$state" in
+              OPEN|FIXED|DISMISSED|AUTO_DISMISSED) states="$(jq -cn --argjson s "$states" --arg v "$state" '$s + [$v]')" ;;
+              *) echo "stub: unmodeled-argument states=$state" >&2; exit 2 ;;
+            esac
+          done ;;
+        *) echo "stub: unmodeled-argument $key=$value" >&2; exit 2 ;;
+      esac
+    done
+    [[ "$args" =~ ^[[:space:],]*$ ]] || { echo "stub: unmodeled-argument args=$args" >&2; exit 2; }
+    slug="$(printf '%s/%s' "$owner" "$name" | tr -c 'A-Za-z0-9._-' '_')"
+    src="$STUB_DIR/dependabot-prs.$slug.json"
+    [[ -f "$src" ]] || src="$STUB_DIR/dependabot-prs.json"
+    nodes='[]'
+    [[ ! -f "$src" ]] || nodes="$(cat "$src")"
+    jq -rn --argjson nodes "$nodes" --argjson states "$states" \
+      '{data: {repository: {vulnerabilityAlerts: {pageInfo: {hasNextPage: false, endCursor: null},
+        nodes: [$nodes[] | select($states == null or (.state as $s | $states | index($s)))]}}}}' \
+      | jq -r "${filter:-.}"
+    exit ;;
   "pr list")
     printf '%s\n' "$*" >> "$STUB_DIR/gh.calls"
     [[ -f "$STUB_DIR/list-fail" ]] && { echo "HTTP 502: bad gateway" >&2; exit 1; }
     [[ -f "$STUB_DIR/noisy" ]] && echo "Notice: something advisory" >&2
-    head=""; limit=""; state=""; repo=""
+    head=""; limit=""; state=""; repo=""; fields=""; filter=""
     while [[ $# -gt 0 ]]; do
       case "$1" in
         --head) head="$2"; shift ;;
         --limit) limit="$2"; shift ;;
         --state) state="$2"; shift ;;
         --repo) repo="$2"; shift ;;
+        --json) fields="$2"; shift ;;
+        --jq) filter="$2"; shift ;;
       esac
       shift
     done
@@ -155,11 +232,15 @@ case "${1:-} ${2:-}" in
       exit 0
     fi
     # --limit caps the page, as gh does; the fixture is newest first already.
-    src=""
+    src=/dev/null
     if [[ -f "$STUB_DIR/open.$slug.txt" ]]; then src="$STUB_DIR/open.$slug.txt"
     elif [[ -f "$STUB_DIR/open.txt" ]]; then src="$STUB_DIR/open.txt"; fi
-    [[ -z "$src" ]] || awk -v n="${limit:-0}" 'n == 0 || NR <= n' "$src"
-    exit 0 ;;
+    awk -v n="${limit:-0}" 'n == 0 || NR <= n' "$src" \
+      | jq -Rn --arg fields "$fields" '[inputs | split("\t")
+          | {number: (.[0] | tonumber), headRefName: .[1], title: .[2], author: {login: (.[3] // "octocat")}}
+          | with_entries(select(.key as $k | $fields | split(",") | any(. == $k)))]' \
+      | jq -r "${filter:-.}"
+    exit ;;
 esac
 printf 'unexpected gh call: %s\n' "$*" >&2
 exit 1
@@ -674,7 +755,7 @@ run_watch() {
   (cd "${WATCH_CWD:-$TMP_ROOT/repo}" \
     && PATH="$TMP_ROOT/bin:$PATH" \
        env -u GH_TOKEN -u GITHUB_TOKEN -u GH_BOT_TOKEN -u ORCH_STATE_DIR -u ORCH_LANE_HOST \
-           -u ORCH_WATCH_TAIL_LINES -u ORCH_WATCH_PREPARE_SECS -u ORCH_WATCH_START_STALL_SECS -u ORCH_OVERSEER_MARK_REPEAT -u LINEAR_TEAM -u ORCH_DIRECTIVE_UNREAD_SECS -u ORCH_EXTERNAL_TRIAGE \
+           -u ORCH_WATCH_TAIL_LINES -u ORCH_WATCH_PREPARE_SECS -u ORCH_WATCH_START_STALL_SECS -u ORCH_OVERSEER_MARK_REPEAT -u LINEAR_TEAM -u ORCH_DIRECTIVE_UNREAD_SECS -u ORCH_EXTERNAL_TRIAGE -u ORCH_SECURITY_ALERTS \
            -u ORCH_REPORT_EVERY_MINUTES -u ORCH_REPORT_EVERY_ISSUES -u ORCH_REPORT_UPCOMING \
            -u ORCH_REPORT_COLUMNS -u ORCH_PROGRESS_REPORT_DIR -u OVERSEE_WATCH_REPORT \
            -u OVERSEE_REPORT_WORKFLOW_STATE -u OVERSEE_REPORT_TRACKER -u OVERSEE_REPORT_GITHUB \
