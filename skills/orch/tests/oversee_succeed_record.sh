@@ -414,8 +414,8 @@ assert_eq "$BARE_MODEL|$RC|$(grep -m1 -o '^oversee-succeed: pi-account-unknown [
 # judged on the reading's.
 MODELCTL="$(mutant_scripts modelctl oversee-succeed)" || exit 1
 mutate_file "$MODELCTL/oversee-succeed" \
-  '"${OL_KNOWN_MODEL:-$reading_model}"' \
-  '"$reading_model"'
+  '  caller_model="${OL_KNOWN_MODEL:-${reading_model:-$flag_model}}"' \
+  '  : caller_model="${OL_KNOWN_MODEL:-${reading_model:-$flag_model}}"; caller_model="${reading_model:-$flag_model}"'
 new_caller claude
 reading "Fable 5.1"
 state "$(record "$CALLER_PANE" "$H/.claude" claude-opus-5)"
@@ -446,7 +446,7 @@ done
 # The control for the pair rule: a caller entry that keeps its own flags beside
 # the record's pair hands the successor two models.
 PAIRCTL="$(mutant_scripts pairctl lib/overseer-launch.sh)" || exit 1
-mutate_file "$PAIRCTL/lib/overseer-launch.sh" '  if [[ -z "$model" ]]; then' '  if true; then'
+mutate_file "$PAIRCTL/lib/overseer-launch.sh" '  if [[ -z "$model" && -z "$effort" ]]; then' '  if true; then'
 state "$(record "$CALLER_PANE" "$H/.eclaude" fable)"
 SUCCEED_BIN="$PAIRCTL/oversee-succeed" run_succeed "CLAUDE_CONFIG_DIR=$H/.claude" --print-launch-line -- "$BYPASS" --model opus --effort low
 assert_eq "$RC|$OUT" "0|env CLAUDE_CONFIG_DIR='$H/.eclaude' claude -n overseer --model fable --effort high $LEAD $BYPASS --model opus --effort low '$BRIEF'" \

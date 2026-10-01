@@ -125,9 +125,9 @@ new_caller() {
   read -r CALLER_PANE CALLER_WINDOW <<<"$spec"
   mkdir -p "$MAILBOX_DIR"
   if [[ "${1:-}" == codex ]]; then
-    lane_context_record "$MAILBOX_DIR" codex 100000 258400 gpt-5.6-sol "" "$SERVER_PID $CALLER_PANE"
+    lane_context_record "$MAILBOX_DIR" codex 100000 258400 "${2-gpt-5.6-sol}" "" "$SERVER_PID $CALLER_PANE"
   else
-    lane_context_record "$MAILBOX_DIR" claude 100000 1000000 claude-fable-5-1 "" "$SERVER_PID $CALLER_PANE"
+    lane_context_record "$MAILBOX_DIR" claude 100000 1000000 "${2-claude-fable-5-1}" "" "$SERVER_PID $CALLER_PANE"
   fi
 }
 
@@ -150,6 +150,7 @@ run_succeed() {
     ORCH_LANE_DIRS="${LANE_DIRS:-$H/.claude:$H/.eclaude:$H/.fclaude:$H/.codex:$H/.dcodex}" ORCH_LANES_USAGE_TTL=0 \
     ORCH_OVERSEER_WALL_MINUTES=0 ORCH_OVERSEER_SUCCESSOR_ACCOUNTS=0 ORCH_QUESTION_TOOL=overseer \
     ${pref[@]+"${pref[@]}"} "${SUCCEED_BIN:-$SUCCEED}" --wait-secs 20 "$@" -- "${CALLER_FLAGS[@]}" 2>&1)" || RC=$?
+  printf '%s\n' "$OUT" > "$TMP_ROOT/out"
 }
 # A claim from this suite's tmux server on a pane that stays live, on LANE.
 write_claim() { # ROW LANE
@@ -226,9 +227,9 @@ assert_eq "$RC|$(keyed successor-lane-spent | awk '{print $2, $4}')|$(caller_ope
   "control: a walled pick that keeps the walled account drops the Opus entry"
 seat claude 10 99 99
 
-# An entry naming no model, a bare tier rank or an empty field, is a setting
+# An entry naming no model, zero or an empty field, is a setting
 # to fix: refused with a keyed line before any pick, on a fleet with Opus room.
-for entry in 'claude:1:high' 'claude::high' 'codex:high' 'copilot:2:high'; do
+for entry in 'claude:0:high' 'claude::high' 'codex:high' 'copilot:0:high'; do
   new_caller
   run_succeed nomodelentry "$entry"
   assert_eq "$RC|$(keyed invalid-preference | awk '{print $2, $3}')|$(caller_open)|$(launched claude)" \
@@ -239,10 +240,10 @@ done
 # entry, which then fails somewhere other than the parse.
 RANKCTL="$(mutant_scripts rankctl lib/overseer-launch.sh)" || exit 1
 mutate_file "$RANKCTL/lib/overseer-launch.sh" \
-  '    [[ "$entry" =~ ^(claude|codex|copilot):[a-z][a-z0-9.-]*:[a-z]+$ \' \
-  '    [[ "$entry" =~ ^(claude|codex|copilot):([1-9][0-9]*|[a-z][a-z0-9.-]*):[a-z]+$ \'
+  '    elif ! [[ "$entry" =~ ^(claude|codex|copilot):[a-z][a-z0-9.-]*:[a-z]+$ \' \
+  '    elif ! [[ "$entry" =~ ^(claude|codex|copilot):([0-9]+|[a-z][a-z0-9.-]*):[a-z]+$ \'
 new_caller
-SUCCEED_BIN="$RANKCTL/oversee-succeed" run_succeed rankctl 'claude:1:high'
+SUCCEED_BIN="$RANKCTL/oversee-succeed" run_succeed rankctl 'claude:0:high'
 assert_eq "$(keyed invalid-preference)" "none" \
   "control: a parse that reads a bare number as a model admits the rank entry"
 
@@ -251,8 +252,8 @@ assert_eq "$(keyed invalid-preference)" "none" \
 # the same fleet the default ladder succeeds on.
 NOMODEL="$(mutant_scripts nomodel lib/overseer-launch.sh)" || exit 1
 mutate_file "$NOMODEL/lib/overseer-launch.sh" \
-  '  IFS=: read -r OL_ENTRY_HARNESS OL_ENTRY_MODEL OL_ENTRY_EFFORT <<<"$1"' \
-  '  IFS=: read -r OL_ENTRY_HARNESS _ OL_ENTRY_EFFORT <<<"$1"; OL_ENTRY_MODEL=""'
+  '  [[ -n "$OL_ENTRY_MODEL" ]] || OL_ENTRY_MODEL="${OL_WALK_CALLER_MODEL:-$OL_PREFERENCE_CALLER_MODEL}"' \
+  '  OL_ENTRY_MODEL=""'
 new_caller
 SUCCEED_BIN="$NOMODEL/oversee-succeed" run_succeed nomodel unset
 assert_eq "$RC|$(first_key)|$(caller_open)|$(launched claude)" \
@@ -348,6 +349,88 @@ mutate_file "$COPILOTCTL/lib/lane-launch.sh" '    claude | codex | copilot) prin
 copilot_row "$COPILOTCTL/oversee-succeed"
 assert_eq "$RC|$(first_key)|$(launched copilot)" "1|lanes-failed|none" \
   "control: with lanes judging no copilot pick the copilot entry refuses and opens nothing"
+
+# Numeric entries keep the observed launch model before account normalization,
+# or the flags-only model where the caller has no recorded model. The supplied
+# preference effort replaces the caller flags' low effort.
+mkdir -p "$H/.2copilot"
+cp "$H/.1copilot/"*.json "$H/.2copilot/"
+cp "$FIXTURE_DIR/.1copilot.json" "$FIXTURE_DIR/.2copilot.json"
+seat eclaude 10 10 10
+codex_seat codex 99
+codex_seat dcodex 20
+for row in \
+  'claude|observed|claude-fable-5-1|CLAUDE_CONFIG_DIR|eclaude|--effort|high|2' \
+  'codex|observed|gpt-5.6-sol|CODEX_HOME|dcodex|model_reasoning_effort=high|model_reasoning_effort=high|1' \
+  'claude|flags|claude-fable-5-1|CLAUDE_CONFIG_DIR|eclaude|--effort|high|2' \
+  'codex|flags|gpt-5.6-sol|CODEX_HOME|dcodex|model_reasoning_effort=high|model_reasoning_effort=high|1' \
+  'copilot|flags|gpt-5.3-codex|COPILOT_HOME|2copilot|--reasoning-effort|high|2' \
+  'pi|flags|pi-claude/claude-fable-5-1|CLAUDE_CONFIG_DIR|eclaude|--thinking|high|2'; do
+  IFS='|' read -r harness source model var successor effort_word effort_value effort_count <<<"$row"
+  permission=""
+  [[ "$harness" == pi ]] || permission="$(launch_choice_permission_write "$harness")" || exit 1
+  if [[ "$source" == observed ]]; then
+    new_caller "$harness"
+    CALLER_FLAGS=("$permission")
+  else
+    new_caller "$harness" ""
+    case "$harness" in
+      claude) CALLER_FLAGS=(--model "$model" --effort low "$BYPASS") ;;
+      codex) CALLER_FLAGS=(-m "$model" -c model_reasoning_effort=low "$permission") ;;
+      copilot) CALLER_FLAGS=(--model "$model" --reasoning-effort low "$permission") ;;
+      pi) CALLER_FLAGS=(--provider pi-claude --model claude-fable-5-1 --thinking low) ;;
+    esac
+  fi
+  caller_lane="$H/.$harness"
+  case "$harness" in pi) caller_lane="$H/.claude" ;; copilot) caller_lane="$H/.1copilot" ;; esac
+  # Copilot names its account from the launch record, never COPILOT_HOME in
+  # an external recovery process. Leave the model empty to exercise flags.
+  if [[ "$harness" == copilot ]]; then
+    jq -n --arg server "$SERVER_PID" --argjson start "$SERVER_START" --arg pane "$CALLER_PANE" \
+      --arg account "$caller_lane" \
+      '{issue_id: "oversee", overseer: {runtime: "tmux", generation: 1, server: $server,
+        server_start: $start, pane: $pane, harness: "copilot", account: $account,
+        home: $account, model: "", effort: "", cwd: null, launch_line: "recorded"}}' \
+      > "$TMP_ROOT/work/tmp/workflow-state-oversee.json"
+  fi
+  CALLER_LANE="$var=$caller_lane" LANE_DIRS="$H/.claude:$H/.eclaude:$H/.codex:$H/.dcodex:$H/.1copilot:$H/.2copilot" \
+    run_succeed "numeric-$harness-$source" "$harness:1:high" --walled-pane "$CALLER_PANE" --harness "$harness"
+  launch_home="$H/.$successor"
+  if [[ "$harness" == codex ]]; then
+    # The only private home under this account is the one this fixture opens.
+    # Discover it independently of the launch builder, then pin CODEX_HOME.
+    CODEX_LAUNCH_HOME="$(find "$H/.dcodex/lane-launch" -mindepth 2 -maxdepth 2 -type d -name home)" || exit 1
+    [[ -n "$CODEX_LAUNCH_HOME" && "$CODEX_LAUNCH_HOME" != *$'\n'* ]] || { echo 'fixture: codex-home=not-single' >&2; exit 1; }
+    launch_home="$CODEX_LAUNCH_HOME"
+  fi
+  assert_eq "$RC|$(caller_open)|$(launched "$harness")|$(grep -cx -e "$effort_word" -e "$effort_value" "$TMP_ROOT/argv.$harness")|$(grep '^preference-deprecated ' <<<"$OUT")" \
+    "0|no|$launch_home $model|$effort_count|preference-deprecated entry=$harness:1:high form=harness:model:effort" \
+    "numeric $harness preference keeps the $source model and supplied effort" "$TMP_ROOT/out"
+done
+# Normalizing the observed Codex model for account measurement must not erase
+# the model passed to its successor. A flags-only Codex caller covers the other
+# source of the same launch identity.
+permission="$(launch_choice_permission_write codex)" || exit 1
+for control in observed flags; do
+  NUMERICCTL="$(mutant_scripts "numeric-$control-ctl" oversee-succeed)" || exit 1
+  case "$control" in
+    observed)
+      mutate_file "$NUMERICCTL/oversee-succeed" '  OL_PREFERENCE_CALLER_MODEL="$caller_model"' '  : OL_PREFERENCE_CALLER_MODEL="$caller_model"; OL_PREFERENCE_CALLER_MODEL="$CALLER_MODEL"'
+      new_caller codex
+      CALLER_FLAGS=("$permission") ;;
+    flags)
+      mutate_file "$NUMERICCTL/oversee-succeed" '  caller_model="${OL_KNOWN_MODEL:-${reading_model:-$flag_model}}"' '  : caller_model="${OL_KNOWN_MODEL:-${reading_model:-$flag_model}}"; caller_model="${OL_KNOWN_MODEL:-$reading_model}"'
+      new_caller codex ""
+      CALLER_FLAGS=(-m gpt-5.6-sol -c model_reasoning_effort=low "$permission") ;;
+  esac
+  CALLER_LANE="CODEX_HOME=$H/.codex" SUCCEED_BIN="$NUMERICCTL/oversee-succeed" \
+    run_succeed "numeric-$control-ctl" 'codex:1:high' --walled-pane "$CALLER_PANE" --harness codex
+  assert_eq "$RC|$(launched codex)|$(grep -cx 'model_reasoning_effort=high' "$TMP_ROOT/argv.codex")" \
+    "0|$CODEX_LAUNCH_HOME |1" "control: dropping the $control model breaks numeric launch identity"
+done
+CALLER_FLAGS=("$BYPASS")
+seat eclaude 10 99 10
+codex_seat dcodex 99
 
 # A codex overseer under a permission posture no claude word matches, the
 # setting unset: the ladder's claude entries are skipped before their picks,

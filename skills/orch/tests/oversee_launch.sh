@@ -259,7 +259,6 @@ assert_eq "$RC|$(keyed overseer-not-working "$OUT" | sed -n 1p | sed 's/session=
 for row in \
   "ORCH_OVERSEER_PREFERENCE=|preference-empty setting=ORCH_OVERSEER_PREFERENCE|an empty preference" \
   "ORCH_OVERSEER_PREFERENCE=claude:Opus:high|invalid-preference entry=claude:Opus:high|an entry outside the shape" \
-  "ORCH_OVERSEER_PREFERENCE=claude:1:high|invalid-preference entry=claude:1:high|an entry naming no model, a tier rank" \
   "ORCH_OVERSEER_PREFERENCE=claude:claude-sonnet-4-6:high|model-window-unknown entry=claude:claude-sonnet-4-6:high model=claude-sonnet-4-6|a claude model the adapter names no window for" \
   "ORCH_TMUX_SESSION=|session-unresolved consulted=--session,ORCH_TMUX_SESSION|no session named" \
   "ORCH_TMUX_SESSION=fleetz|tmux-session-missing session=fleetz server=$SOCKET|a session tmux does not hold" \
@@ -471,8 +470,8 @@ tm kill-window -t "$(recorded window)"
 # opens nothing.
 COPILOTFIRSTCTL="$(mutant_scripts copilotfirstctl lib/overseer-launch.sh)" || exit 1
 mutate_file "$COPILOTFIRSTCTL/lib/overseer-launch.sh" \
-  '    [[ "$entry" =~ ^(claude|codex|copilot):[a-z][a-z0-9.-]*:[a-z]+$ \' \
-  '    [[ "$entry" =~ ^(claude|codex):[a-z][a-z0-9.-]*:[a-z]+$ \'
+  '    elif ! [[ "$entry" =~ ^(claude|codex|copilot):[a-z][a-z0-9.-]*:[a-z]+$ \' \
+  '    elif ! [[ "$entry" =~ ^(claude|codex):[a-z][a-z0-9.-]*:[a-z]+$ \'
 copilot_first_row "$COPILOTFIRSTCTL/oversee"
 assert_eq "$RC|$(sed -n 1p <<<"$OUT" | awk '{print $2, $3}')|$(overseers)" "1|invalid-preference entry=copilot:gpt-5.3-codex:high|0" \
   "control: a preference parse naming no copilot refuses the copilot entry and opens nothing"
@@ -910,6 +909,38 @@ assert_eq "$RC|$(recorded harness)|$(recorded account)|$(sed -n 1p "$TMP_ROOT/ar
   "0|codex|$H/.codex|home=codex-account|$(codex_words | tr '\n' ';')$BRIEF;" \
   "a first launch on a codex entry carries the table's model, bypass, settings, compaction and question-tool words"
 tm kill-window -t "$(recorded window)"
+
+# Committed consumer settings still emit the numeric account form. A first
+# launch has no caller model, so the harness keeps its default model.
+LAUNCH_PREF=claude:1:high run_oversee -- launch --wait-secs 20
+assert_eq "$RC|$(sed -n '/^preference-deprecated /p' <<<"$OUT")|$(overseers)|$(recorded harness)|$(recorded account)|$(recorded model)|$(recorded effort)|$(recorded_argv)" \
+  "0|preference-deprecated entry=claude:1:high form=harness:model:effort|1|claude|$H/.claude|none|high|lane=$H/.claude;-n;overseer;--effort;high;$BYPASS;$QUESTION_OFF;$BRIEF;" \
+  "a numeric preference warns once and launches on the picked account at the supplied effort"
+assert_contains "$OUT" "oversee: overseer-launched session=" "the numeric preference reaches a recorded launch"
+tm kill-window -t "$(recorded window)"
+# Restoring the numeric refusal must turn that warning-and-launch row red.
+NUMERICCTL="$(mutant_scripts numericctl lib/overseer-launch.sh)" || exit 1
+mutate_file "$NUMERICCTL/lib/overseer-launch.sh" \
+  '    if [[ "$entry" =~ ^(claude|codex|copilot|pi):[1-9][0-9]*:[a-z]+$ ]]; then' \
+  '    if false && [[ "$entry" =~ ^(claude|codex|copilot|pi):[1-9][0-9]*:[a-z]+$ ]]; then'
+LAUNCH_PREF=claude:1:high OVERSEE_BIN="$NUMERICCTL/oversee" run_oversee -- launch --wait-secs 20
+assert_eq "$RC|$(sed -n 1p <<<"$OUT")|$(overseers)" \
+  "1|oversee: invalid-preference entry=claude:1:high|0" \
+  "control: numeric refusal turns the warning-and-launch assertion red"
+# With no caller model, effort still needs flag writing and permission
+# assembly. Each control removes one rule from the numeric launch above.
+for row in \
+  $'effortctl\tlib/lane-launch.sh\t  [[ -n "$2" || -n "$3" ]] || return 0\t  [[ -n "$2" ]] || return 0\tnone\t1' \
+  $'empty-modelctl\tlib/overseer-launch.sh\t  if [[ -z "$model" && -z "$effort" ]]; then\t  if [[ -z "$model" ]]; then\thigh\t0'; do
+  IFS=$'\t' read -r name file old new effort permissions <<<"$row"
+  EFFORTCTL="$(mutant_scripts "$name" "$file")" || exit 1
+  mutate_file "$EFFORTCTL/$file" "$old" "$new"
+  LAUNCH_PREF=claude:1:high OVERSEE_BIN="$EFFORTCTL/oversee" run_oversee -- launch --wait-secs 20
+  assert_eq "$RC|$(recorded effort)|$(overseers)|$(grep -cxF -- "$BYPASS" "$TMP_ROOT/argv.claude" || true)" \
+    "0|$effort|1|$permissions" \
+    "control: $name turns the numeric launch assertion red"
+  tm kill-window -t "$(recorded window)"
+done
 
 printf 'pass: %d   fail: %d\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

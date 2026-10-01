@@ -112,6 +112,55 @@ TMP="$(mktemp -d)"
 trap 'rm -rf -- "${TMP:?}"' EXIT
 "$SCRIPT_DIR/adopt-refresh.sh" --templates-dir "$ROOT/.agents/skills/review-gate/templates" --workflow-edit-report "$TMP/workflow-edits"
 workflow_edits="$(cat "$TMP/workflow-edits")"
+settings_report=""
+# The release-installed parser must judge its own settings, including on a
+# first install. It reads and prints data without the refresh app credential.
+# Only the preserved default-branch code consumes its output or publishes.
+if [ -e "$ROOT/.agents/skills/orch" ] || [ -L "$ROOT/.agents/skills/orch" ]; then
+  if ! env -i PATH="$PATH" HOME="$HOME" bash -s -- "$SCRIPT_DIR" "$ROOT" >"$TMP/settings.json" <<'SETTINGS_PARSE'
+set -euo pipefail
+source "$1/lib/settings.sh"
+source "$2/.agents/skills/orch/scripts/lib/kendex-env.sh"
+source "$2/.agents/skills/orch/scripts/lib/overseer-launch.sh"
+KENDEX_ENV_FILE="$(rg_setting KENDEX_ENV_FILE "" "")"
+kendex_private_env_file private_file "$2"
+preference="$(rg_setting ORCH_OVERSEER_PREFERENCE "$OL_DEFAULT_PREFERENCE" "$private_file")"
+parse_status=0
+ol_preference_entries "$preference" || parse_status=$?
+[ "$parse_status" -le 1 ] || exit "$parse_status"
+jq -cn --argjson refused_count "${#OL_REFUSED_ENTRIES[@]}" --args \
+  '{refused: $ARGS.positional[:$refused_count], deprecated: $ARGS.positional[$refused_count:]}' \
+  -- ${OL_REFUSED_ENTRIES[@]+"${OL_REFUSED_ENTRIES[@]}"} \
+  ${OL_DEPRECATED_ENTRIES[@]+"${OL_DEPRECATED_ENTRIES[@]}"}
+SETTINGS_PARSE
+  then
+    printf 'refresh-error=settings-extraction value=%s\n' "$ROOT/.agents/skills/orch" >&2
+    exit 1
+  fi
+  # The parser exports the existing report object as one compact JSON line.
+  # Refused entries can contain arbitrary text; validation checks data shape,
+  # never re-implements the preference grammar.
+  settings_lines=0
+  settings_output=valid
+  while IFS= read -r line || [ -n "$line" ]; do
+    settings_lines=$((settings_lines + 1))
+    if [ "$settings_lines" -ne 1 ] || ! jq -e -s '
+      length == 1 and (.[0] | type == "object" and
+        keys == ["deprecated", "refused"] and
+        (.refused | type == "array") and (.deprecated | type == "array") and
+        all(.refused[], .deprecated[]; type == "string"))
+    ' <<<"$line" >/dev/null; then
+      settings_output=invalid
+    fi
+  done <"$TMP/settings.json"
+  if [ "$settings_lines" -ne 1 ] || [ "$settings_output" = invalid ]; then
+    printf 'refresh-error=settings-output value=%s\n' "$ROOT/.agents/skills/orch" >&2
+    exit 1
+  fi
+  settings_report="$(python3 "$SCRIPT_DIR/refresh-report.py" --settings <"$TMP/settings.json")"
+else
+  printf 'refresh-settings=orch-absent value=%s\n' "$ROOT/.agents/skills/orch"
+fi
 kendex verify --scope project
 git add -A
 if git diff --cached --quiet; then
@@ -170,6 +219,9 @@ if [ -n "$workflow_edits" ]; then
 fi
 if [ -n "$conflict_count" ]; then
   printf -v body '%s\nOverwritten hand-edited items (from refresh):\n%s' "$body" "$held_items"
+fi
+if [ -n "$settings_report" ]; then
+  printf -v body '%s\n%s\n' "$body" "$settings_report"
 fi
 if [ "$state" = pushed ]; then
   git push "--force-with-lease=refs/heads/kendex/refresh:$old" origin HEAD:refs/heads/kendex/refresh
