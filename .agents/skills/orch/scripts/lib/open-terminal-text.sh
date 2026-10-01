@@ -15,6 +15,7 @@ ot_message() { # REASON FIELD=VALUE...
   case "$reason" in
     missing-value) text='The option requires a value.' ;;
     helper-missing) text='The required helper is not executable.' ;;
+    entry-permission-untransferable) text='The caller permissions cannot transfer to this harness. The preference walk skips this entry.' ;;
     items-missing) text='Specify a work item.' ;;
     tracker-invalid) text='The tracker must be linear or github.' ;;
     command-missing) text='Select a harness or a custom command.' ;;
@@ -40,6 +41,8 @@ ot_message() { # REASON FIELD=VALUE...
     lane-separator) text='A tab or newline in the lane path cannot be stored in a claim.' ;;
     lane-harness-missing) text='Select a harness for automatic lane selection.' ;;
     lane-unavailable) text='No lane meets the usage threshold. Wait for a reset, raise the threshold or select a lane. The keyed lanes: line above names what each lane was and, where a threshold applied, the threshold.' ;;
+    invalid-preference) text='ORCH_LANE_PREFERENCE uses the ORCH_OVERSEER_PREFERENCE grammar in kendex.settings.toml.example § Fleet. The named entry is invalid. Nothing was launched.' ;;
+    preference-command-invalid) text='A model-free --cmd using ORCH_LANE_PREFERENCE must name the plain harness as its first word. The remaining arguments must suit the selected harness. Name an explicit model to keep an arbitrary shell command unchanged.' ;;
     lane-resolution-failed) text='The lanes helper failed to select an account.' ;;
     copilot-pool-walled) text='Every Pi account this launch could spend is at or above the usage threshold on its Copilot pool, as the lane host'"'"'s accounts row reads it or, where no row reads it, as ORCH_LANE_COPILOT_POOL states it. Nothing was launched. A pool the host read reopens at the reset its record names as binding_resets_at; a stated reading moves only when the owner restates it. The keyed lanes: line above names the pool and the threshold.' ;;
     lane-provider-unmeasured) text='Nothing measures the account this Pi launch spends: its model names no provider, or a provider other than pi-claude/ (a Claude seat) and github-copilot/ (the Copilot pool), the two whose accounts are judged. Nothing was launched: an unmeasured account is not one with room. Spell the model pi-claude/<model> or github-copilot/<model>, or pass --provider beside a bare --model.' ;;
@@ -207,13 +210,9 @@ Options:
                     refused as brief-quoted. A brief written inline must
                     balance its own quotes, and one that leaves a quote open
                     is refused as cmd-unbalanced-quote.
-                    It is the WHOLE command: it is rendered verbatim and no
-                    launch flag is appended to it, so a --cmd launch names its
-                    own model, reasoning effort, permission posture and
-                    question-tool words (see --launch-flags) inside the
-                    command. --launch-flags beside it reach nothing and are
-                    refused as launch-flags-unreachable, rather than gating and
-                    recording a model the harness never runs.
+                    Command selection and settings follow lane-directive.md
+                    § Lane preference. --launch-flags beside --cmd are refused
+                    as launch-flags-unreachable. Put caller flags inside --cmd.
   --brief-file PATH The brief a --cmd command places as {brief}: the file's
                     text less its trailing newlines, the one route for a brief
                     holding any quote, `$` or backtick. The two come as a pair:
@@ -402,13 +401,13 @@ Options:
                     (handoff.md § 2).
   --launch-flags S  Flags for the harness command THIS LAUNCHER BUILDS, chosen
                     per task by the caller (model, effort, permission posture).
-                    They reach a harness only through that command, so a --cmd
-                    launch, whose command is rendered verbatim, names those
-                    words inside the command instead and these flags beside it
-                    are refused as launch-flags-unreachable. Plain
+                    They reach a harness only through that command. A --cmd
+                    launch puts caller flags inside --cmd; these flags beside
+                    it are refused as launch-flags-unreachable. Plain
                     flag words only — the string is interpolated into a
-                    shell-executed launch command. Nothing is hardcoded here or
-                    in settings. A harness row that names an unattended
+                    shell-executed launch command. Harness, model and effort
+                    selection follow lane-directive.md § Lane preference.
+                    A harness row that names an unattended
                     permission posture warns when the flags carry none of its
                     spellings, because a prompting mode stalls the lane at its
                     first tool call. A --cmd launch carries its own argv and is
@@ -509,9 +508,9 @@ Options:
                     run the start brief in the same call when none exists.
                     These hosted no-command relaunches count as launched only
                     after the pane shows a harness screen, including a fresh
-                    start after a harness switch. A --cmd relaunch renders its
-                    template verbatim: no session lookup, no harness-switch
-                    check and no start brief after it. Before the
+                    start after a harness switch. A --cmd relaunch follows
+                    lane-directive.md § Lane preference: no session lookup,
+                    harness-switch check or start brief. Before the
                     worktree step an existing tree is asked whether its pull
                     request merged (`worktree merged`). A merged item keeps its
                     tree as it stands and is reported as worktree-reuse-merged

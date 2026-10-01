@@ -21,7 +21,7 @@ Requires jq, Bash 3.2, flock, setsid and timeout or gtimeout; the included SSH h
 - `oversee-report` writes the overseer's status reports; `oversee-cycle` times each merge against its class target.
 - `open-terminal --relaunch` resumes a stopped lane's own agent session, on the same account or another, and workflow state and handoff files let a lane or overseer continue where it stopped.
 - Each review finding is fixed, filed as an issue or declined by the rules in [references/finding-disposition.md](references/finding-disposition.md), settings cap the review and CI-fix rounds, and `branch-size-check` compares the branch's added lines with the issue's expected size.
-- [references/secret-value.ere](references/secret-value.ere) holds a pattern of secret values: GitHub and Slack tokens and private-key headers, for a package or a fleet script to refuse to send text or a file that matches it. Its header says how to read it.
+- [references/secret-value.ere](references/secret-value.ere) matches GitHub and Slack tokens and private-key headers for scripts to refuse to send matching text or files. Its header states how to read it.
 - Lanes run on Claude Code, Codex, OpenCode, Pi and Copilot CLI, remotely and in a fleet on all but OpenCode (Copilot fleets local); account selection, succession and preference entries cover all but OpenCode.
 
 Dependabot security updates open the fleet's fix pull requests; an organization owner turns them on for every repository through an organization security configuration.
@@ -60,6 +60,7 @@ Non-secret settings go in committed `kendex.settings.toml` under `[env]`; secret
 | `ORCH_HANDOFF_CONTEXT_PCT` | Earlier handoff percentage (1 to 100, capped at 90); strict comparison and independent token limit: [context rule](references/oversee-events.md#judgement-rules) | `90` |
 | `ORCH_HANDOFF_HEADROOM_PCT` | Account headroom at or below which `lanes context` marks a live lane for handoff and the `lane-mail-check` turn-end hook refuses that lane's turn end, read against the binding bucket | `3` |
 | `ORCH_OVERSEER_PREFERENCE` | Comma-separated `harness:model:effort` entries `oversee launch` and `oversee-succeed` try in order; grammar: [kendex.settings.toml.example](kendex.settings.toml.example) § Fleet. Empty names none | `claude:fable:high,claude:claude-opus-5-5:high,codex:gpt-6-astra:high,codex:gpt-5.6-sol:high` |
+| `ORCH_LANE_PREFERENCE` | Default-model order; explicit models keep the caller's route. [Lane preference](references/lane-directive.md#lane-preference) | unset |
 | Owner-ask settings | `ORCH_QUESTION_TOOL`, `ORCH_ASK_WAIT_MINUTES`: [kendex.settings.toml.example](kendex.settings.toml.example) § Talking to you | |
 | `ORCH_OVERSEER_SUCCESSION` | `on` lets `oversee-succeed` launch the successor overseer; `off` launches none and turns off the account-mark turn-end refusals, not the context one. A live overseer asks the user to start the next session; `oversee-watch --help` states the rest | `on` |
 | `ORCH_OVERSEER_DEAD_PASSES` | Watch passes that read the overseer exited or walled before it is reported: `oversee-watch --help` | `2` |
