@@ -7,7 +7,7 @@ every root on its machine and routes each message event by its channel. The
 relay opens the connection with SLACK_APP_TOKEN, acknowledges each envelope
 by its envelope_id as soon as its loop reads it, before the delivery, then
 routes a message event to the root bound to its channel: a top-level
-message, or a reply under a bound thread that `live` accepts. The loop is
+message, or an owner reply in any thread. The loop is
 one thread, so an envelope that waits behind a download, a catch-up, the
 mailbox posts or a 429 wait past Slack's three seconds is sent again, and
 the journal skips the repeat by its stamp.
@@ -16,13 +16,15 @@ An event moves no position. It writes no `seen` or `thread` line; the
 catch-up writes both, and a start with no seeds writes the `seen` line of
 the binding moment. The catch-up runs on the first poll after every connect
 and reconnect, and on the next poll after an event whose delivery was
-refused. It reads the
+refused. Each root keeps refused live events in memory and retries them on
+every poll, independently of the history lookback, until delivery succeeds.
+It reads the
 channel's history from the journal's position or SLACK_THREAD_DAYS back,
 whichever is older, delivers the top-level messages past the position, and
 reads the thread of every open ask and of every live parent whose latest
 reply moved. So a message sent while the relay was disconnected, one whose
 envelope never arrived, and one acknowledged before a stop cut its delivery
-off all land on a catch-up, and lane-mail's delivery id judges any repeat.
+off land on a catch-up within that lookback, and lane-mail's delivery id judges any repeat.
 The connection opens before the catch-up reads, so no message falls between
 them.
 
@@ -92,7 +94,7 @@ from store import (
 )
 from websocket import Closed, WebSocket
 
-ROUTED_SUBTYPES = {None, "file_share"}
+ROUTED_SUBTYPES = {None, "file_share", "thread_broadcast"}
 # Seconds the relay waits for Slack's `hello` on a new connection.
 HELLO_SECONDS = 10
 # Seconds of silence on the connection before it pings, and as many again
@@ -184,6 +186,9 @@ class RootRelay:
         self.last_ok: Optional[float] = None
         self.post_failed: Optional[Refusal] = None
         self.names: Dict[str, str] = {}
+        # Socket Mode acknowledges before delivery. History cannot recover
+        # an old-thread reply, so its root retains the event until handled.
+        self.pending_live: Dict[str, Dict] = {}
         # False until a catch-up has read the channel since the last connect
         # or the last refused event delivery.
         self.caught_up = False
@@ -230,6 +235,8 @@ class RootRelay:
     def poll(self, bot_user: str) -> None:
         self.ready()
         self.post_failed = None
+        for message in list(self.pending_live.values()):
+            self.on_message(message, bot_user)
         if not self.caught_up:
             self.catch_up(bot_user)
         self.mark_seen()
@@ -250,10 +257,30 @@ class RootRelay:
         self.last_ok = self.clock()
 
     def live(self, thread: Thread) -> bool:
-        """Whether a reply under `thread` is routed: under an open ask
-        always, under any other while its parent is younger than
-        SLACK_THREAD_DAYS."""
+        """Whether catch-up re-reads a known thread within its lookback."""
         return thread.open or float(thread.ts) >= self.settings.horizon(self.clock())
+
+    def parent_context(self, thread_ts: str) -> Dict:
+        """Read a parent's small context once, persisting it across restarts."""
+        thread = self.state.threads.get(thread_ts)
+        if thread is not None and thread.parent is not None:
+            return thread.parent
+        messages = self.api.get("conversations.replies", channel=self.channel, ts=thread_ts, limit=1)["messages"]
+        if not messages or str(messages[0]["ts"]) != thread_ts:
+            raise Refusal("slack-api-failed", f"conversations.replies parent={thread_ts} missing")
+        message = messages[0]
+        envelope = thread.envelope if thread is not None and thread.kind in {"ask", "notice"} else ""
+        parent = self.parent_of(message, "bot" if message.get("bot_id") else "owner", envelope)
+        self.journal.append(t="parent", ts=thread_ts, parent=parent)
+        return parent
+
+    def parent_of(self, message: Dict, author: str, envelope: str = "") -> Dict:
+        """The bounded parent pointer an owner directive carries."""
+        parent = {"ts": str(message["ts"]), "author": author,
+                  "excerpt": " ".join(str(message.get("text") or "")[:300].splitlines())}
+        if envelope:
+            parent["envelope"] = envelope
+        return parent
 
     def catch_up(self, bot_user: str) -> None:
         """The history read the module docstring states. The read reaches
@@ -270,6 +297,9 @@ class RootRelay:
             self.bind_file_share(message)
             self.handle(message, bot_user)
         replied = {str(m["ts"]): float(m["latest_reply"]) for m in messages if m.get("latest_reply")}
+        for thread_ts in replied:
+            if thread_ts not in self.state.threads:
+                self.parent_context(thread_ts)
         for thread in list(self.state.threads.values()):
             if thread.open or self.live(thread) and replied.get(thread.ts, 0.0) > float(thread.seen):
                 self.read_replies(thread, bot_user)
@@ -278,31 +308,32 @@ class RootRelay:
         self.caught_up = True
 
     def on_message(self, message: Dict, bot_user: str) -> None:
-        """One message event off the connection, routed as the catch-up
-        routes it: a reply only under a bound thread `live` accepts."""
-        self.ready()
+        """One live message event, without a thread-age or parent-origin gate."""
         ts = str(message["ts"])
+        self.pending_live[ts] = message
+        self.ready()
         thread_ts = str(message.get("thread_ts") or ts)
-        if thread_ts != ts:
-            thread = self.state.threads.get(thread_ts)
-            if thread is None or not self.live(thread):
-                return
-        else:
+        if thread_ts == ts:
             self.bind_file_share(message)
         self.handle(message, bot_user)
+        self.pending_live.pop(ts)
         self.mark_seen()
 
     def bind_file_share(self, message: Dict) -> None:
         for item in message.get("files") or []:
             file_id = str(item.get("id", ""))
             if file_id in self.state.pending_files:
-                self.journal.append(t="bound", file=file_id, id=self.state.pending_files[file_id], ts=message["ts"])
+                envelope = self.state.pending_files[file_id]
+                self.journal.append(t="bound", file=file_id, id=envelope, ts=message["ts"],
+                                    parent=self.parent_of(message, "bot", envelope))
 
     def read_replies(self, thread: Thread, bot_user: str) -> None:
+        # Binding owns the lower boundary; thread.seen owns delivery progress.
+        oldest = max(thread.seen, self.binding.bound_at, key=float)
         replies = list(
-            self.api.paged("conversations.replies", "messages", channel=self.channel, ts=thread.ts, oldest=thread.seen)
+            self.api.paged("conversations.replies", "messages", channel=self.channel, ts=thread.ts, oldest=oldest)
         )
-        replies = [r for r in replies if r["ts"] != thread.ts and float(r["ts"]) > float(thread.seen)]
+        replies = [r for r in replies if r["ts"] != thread.ts and float(r["ts"]) > float(oldest)]
         replies.sort(key=lambda m: float(m["ts"]))
         for reply in replies:
             self.handle(reply, bot_user)
@@ -345,7 +376,8 @@ class RootRelay:
                 self.api.post("chat.postMessage", channel=self.channel, thread_ts=thread_ts, text=RECORDED)
                 return
             self.api.post("chat.postMessage", channel=self.channel, thread_ts=thread_ts, text=ALREADY)
-        envelope = self.mail.send_directive(text, delivery)
+        parent = self.parent_context(thread_ts) if thread_ts != ts else None
+        envelope = self.mail.send_directive(text, delivery, parent)
         self.journal.append(t="in", channel=self.channel, ts=ts, kind="directive", id=envelope, thread=thread_ts)
 
     def react(self, method: str, ts: str, name: str) -> bool:
@@ -580,7 +612,8 @@ class RootRelay:
             if data is not None:
                 return self.api.upload(Path(attach).name, data, self.channel, text, thread_ts)
             body_arg = "markdown_text" if len(text) <= MARKDOWN_LIMIT else "text"
-            return str(self.api.post("chat.postMessage", channel=self.channel, thread_ts=thread_ts, **{body_arg: text})["ts"])
+            return str(self.api.post("chat.postMessage", channel=self.channel, thread_ts=thread_ts,
+                                     **{body_arg: text})["ts"])
         except Refusal as err:
             self.post_refused(err, envelope, kind)
             return None
@@ -601,7 +634,8 @@ class RootRelay:
         ts = self._send(envelope, "ask", "\n\n".join(lines), None)
         if ts is None:
             return False
-        self._out(envelope, "ask", "open", thread=ts)
+        self._out(envelope, "ask", "open", thread=ts,
+                  parent=self.parent_of({"ts": ts, "text": "\n\n".join(lines)}, "bot", str(envelope["id"])))
         return True
 
     def post_notice(self, envelope: Dict) -> None:
@@ -614,7 +648,9 @@ class RootRelay:
         if attach:
             self._out(envelope, "notice", "file", file=landed)
         else:
-            self._out(envelope, "notice", "resolved", thread=thread_ts or landed)
+            fields = {} if thread_ts else {"parent": self.parent_of(
+                {"ts": landed, "text": envelope.get("text", "")}, "bot", str(envelope["id"]))}
+            self._out(envelope, "notice", "resolved", thread=thread_ts or landed, **fields)
 
     def post_answer(self, envelope: Dict) -> None:
         ask_id = str(envelope.get("re", ""))
@@ -718,22 +754,27 @@ class Relay:
                 root.poll(self.bot_user)
                 root.record_status(True, "", self.connection, self.since, self.connection_error)
             except Exception as err:
-                if isinstance(err, Refusal) and err.key == "slack-auth-failed":
-                    raise
-                error = f"{err.key}={err.value}" if isinstance(err, Refusal) else f"{type(err).__name__}: {err}"
-                status_error = ""
-                try:
-                    root.record_status(False, error, self.connection, self.since, self.connection_error)
-                except Exception as status_err:
-                    # A broken root can also refuse its status write. Keep the
-                    # poll's single diagnostic and continue to the next root.
-                    status_error = f" status={type(status_err).__name__}: {status_err}"
-                failure = Refusal(err.key, f"{err.value} root={root.path}{status_error}") if isinstance(err, Refusal) else Refusal(
-                    "root-poll-failed", f"{root.path} cause={error}{status_error}"
-                )
-                print_refusal(failure)
+                self.root_failed(root, err)
                 clean = False
         return clean
+
+    def root_failed(self, root: RootRelay, err: Exception) -> None:
+        """Record one root's failure without letting its status write stop
+        other roots. A dead token still stops the shared relay."""
+        if isinstance(err, Refusal) and err.key == "slack-auth-failed":
+            raise err
+        error = f"{err.key}={err.value}" if isinstance(err, Refusal) else f"{type(err).__name__}: {err}"
+        status_error = ""
+        try:
+            root.record_status(False, error, self.connection, self.since, self.connection_error)
+        except Exception as status_err:
+            # A broken root can also refuse its status write. Keep the
+            # primary diagnostic and continue serving the other roots.
+            status_error = f" status={type(status_err).__name__}: {status_err}"
+        failure = Refusal(err.key, f"{err.value} root={root.path}{status_error}") if isinstance(err, Refusal) else Refusal(
+            "root-poll-failed", f"{root.path} cause={error}{status_error}"
+        )
+        print_refusal(failure)
 
     def run(self, once: bool) -> int:
         """`--once` is one poll of every root with no connection, its
@@ -840,11 +881,11 @@ class Relay:
 
     def envelope(self, socket: WebSocket, text: str) -> None:
         """One envelope: acknowledged by its envelope_id before anything
-        else, since the catch-up delivers what a stop after the
-        acknowledgement cuts off, and the journal skips an envelope Slack
+        else, since the catch-up covers a stop after the acknowledgement
+        within its lookback, and the journal skips an envelope Slack
         sent again. A `disconnect` drops the connection for a
         new one; a message event goes to the root bound to its channel, and
-        a refused delivery leaves that root's catch-up due; every other
+        a refused delivery stays pending in its root and leaves its catch-up due; every other
         envelope stops at the acknowledgement."""
         try:
             envelope = json.loads(text)
@@ -866,7 +907,5 @@ class Relay:
         try:
             root.on_message(event, self.bot_user)
         except Refusal as err:
-            if err.key == "slack-auth-failed":
-                raise
-            print_refusal(err)
+            self.root_failed(root, err)
             root.caught_up = False

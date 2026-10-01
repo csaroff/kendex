@@ -6,9 +6,9 @@
 # `connect` and shown connected, an owner message landing from its event
 # alone, its eyes mark set and its envelope acknowledged, the first reply in
 # an ask's thread landing as the answer, a reply under a thread past
-# SLACK_THREAD_DAYS left unrouted, two roots on one relay each receiving its
+# SLACK_THREAD_DAYS routed from its event, two roots on one relay each receiving its
 # own channel's events and neither an unbound channel's, an event whose
-# delivery lane-mail refused landing through the next history read, an
+# delivery lane-mail refused landing through the next poll, an
 # envelope lost with its connection delivered by the history read of the
 # reconnect, journaled `disconnect` and `reconnect`, a reconnect whose history
 # read Slack refused delivering on a later poll, Slack's `disconnect` envelope
@@ -18,12 +18,12 @@
 # only on a connect or after a refused read or delivery, so between them a
 # message lands by its event alone. A positive row waits up to twenty
 # seconds; the `events`, `catch-up`, `re-arm` and `read-due` controls wait
-# three, which tells the event path, or the re-armed read of the next poll,
+# three, which tells the event path, or the pending retry of the next poll,
 # from no path at all. The controls: no acknowledgement, the token type and
 # the app token's scope no longer refusing the token, events unread, routing
 # by channel gone, an unbound channel's event routed to the first root, no
-# history read on reconnect, no history read after a refused delivery or a
-# refused read, the thread-age check gone from the event path, the
+# history read on reconnect, no retry of a refused live delivery, no history
+# read after a refused read, the obsolete thread-age check restored on the event path, the
 # connection error kept past a reconnect, and a journal of connection lines
 # alone read as seeded.
 set -uo pipefail
@@ -114,7 +114,7 @@ answer() { [ -f "$(sk_box "$ROOT")/to-lane.jsonl" ] && jq -r 'select(.kind == "a
 assert_eq "$(awaited answer)" "$ASK C001:$R1 yes" "the first reply in the ask's thread lands from its event as the answer"
 sk_relay_stop
 
-# --- a reply under a thread past SLACK_THREAD_DAYS: not routed -----------------------------
+# --- a live reply under an old thread is routed -------------------------------------------
 BETA="$(sk_new_root beta)"
 sk_bind "$BETA"
 sk_rebind_at "$BETA" "$(python3 -c 'import time; print("%.6f" % (time.time() - 9 * 86400))')"
@@ -124,9 +124,125 @@ sk_poll "$BETA"
 relay "$BETA"
 OR="$(sk_inject C002 U001 'under the old one' "$OLD")"
 YR="$(sk_inject C002 U001 'under the young one' "$YOUNG")"
-assert_eq "$(landed "$BETA" "C002:$YR")|$(landed "$BETA" "C002:$OR")" "under the young one|" \
-  "a reply event under a young thread lands, and one under a thread past SLACK_THREAD_DAYS does not"
+assert_eq "$(landed "$BETA" "C002:$YR")|$(landed "$BETA" "C002:$OR")" "under the young one|under the old one" \
+  "reply events under young and old threads both land"
 sk_relay_stop
+
+# --- refused old-thread events stay pending outside the reconnect lookback -------
+# Parent reads and lane-mail send are real transient refusals. The control
+# disables only the pending retry, leaving routine history recovery intact.
+while read -r failure mutant tries want_count; do
+  RETRY_ROOT="$(sk_new_root "old-retry-$failure-$mutant")"
+  sk_bind "$RETRY_ROOT"
+  RETRY_CH="$(sk_channel "$RETRY_ROOT")"
+  RETRY_PARENT="$(sk_inject "$RETRY_CH" U001 'Old retry topic.' '' "\"ts\": \"$(python3 -c 'import time; print("%.6f" % (time.time() - 8 * 86400))')\"")"
+  if [ "$failure" = mail ]; then
+    rm -- "${RETRY_ROOT:?}/.agents/skills/orch/scripts"
+    mkdir -p "$RETRY_ROOT/.agents/skills/orch/scripts"
+    cat > "$RETRY_ROOT/.agents/skills/orch/scripts/lane-mail" <<EOF
+#!/usr/bin/env bash
+if [ -e "$RETRY_ROOT/tmp/send-refused" ]; then
+  case " \$* " in *" send "*) echo 'lane-mail: send-refused' >&2; exit 2 ;; esac
+fi
+exec "$SK_LANE_MAIL" "\$@"
+EOF
+    chmod +x "$RETRY_ROOT/.agents/skills/orch/scripts/lane-mail"
+  fi
+  if [ "$mutant" = retry ]; then
+    sk_mutant old-live-retry relay.py 'for message in list\(self\.pending_live\.values\(\)\):' 'for message in []:'
+  fi
+  relay "$RETRY_ROOT"
+  if [ "$failure" = parent ]; then
+    sk_ctl /_test/fault '{"method":"conversations.replies","error":"internal_error","times":100}' >/dev/null
+    WANT_ERROR='slack-api-failed=conversations.replies error=internal_error'
+  else
+    touch "$RETRY_ROOT/tmp/send-refused"
+    WANT_ERROR='lane-mail-failed=lane-mail: send-refused'
+  fi
+  RETRY_REPLY="$(sk_inject "$RETRY_CH" U001 'Retry this old thread.' "$RETRY_PARENT")"
+  assert_eq "$(awaited jq -r 'select(.last_poll_ok == false) | .last_error' "$RETRY_ROOT/tmp/slack/status.json")" \
+    "$WANT_ERROR" "$failure: an old-thread live refusal stays visible in status"
+  if [ "$failure" = parent ]; then
+    sk_ctl /_test/faults-reset >/dev/null
+  else
+    rm -- "${RETRY_ROOT:?}/tmp/send-refused"
+  fi
+  RETRY_TEXT="$(landed "$RETRY_ROOT" "$RETRY_CH:$RETRY_REPLY" "$tries")"
+  if [ -f "$(sk_box "$RETRY_ROOT")/to-lane.jsonl" ]; then
+    RETRY_POINTER="$(jq -s --arg d "$RETRY_CH:$RETRY_REPLY" --arg ts "$RETRY_PARENT" \
+      '[.[] | select(.delivery_id == $d and .text == "Retry this old thread." and .thread_ts == $ts and .parent == {ts:$ts,author:"owner",excerpt:"Old retry topic."})] | length' "$(sk_box "$RETRY_ROOT")/to-lane.jsonl")"
+  else
+    RETRY_POINTER=0
+  fi
+  assert_eq "$RETRY_POINTER|$([ -z "$RETRY_TEXT" ] || printf 'landed')|$(awaited jq -r 'select(.last_poll_ok == true) | .last_poll_ok' "$RETRY_ROOT/tmp/slack/status.json")" \
+    "$want_count|$([ "$want_count" = 0 ] || printf 'landed')|true" \
+    "$failure/$mutant: old-thread retry carries its delivery id and parent once; disabling pending retry loses it"
+  sk_relay_stop
+  sk_bin_reset
+done <<'ROWS'
+parent none 200 1
+mail none 200 1
+parent retry 30 0
+ROWS
+
+# --- a live refusal and a secondary status error share the poll's containment ---
+# lane-mail refuses the send and makes status.json a directory in the same
+# call. The control narrows the shared catch so this filesystem error escapes.
+while read -r mode tries want; do
+  STATUS_ROOT="$(sk_new_root "live-status-$mode")"
+  STATUS_HEALTHY="$(sk_new_root "live-status-healthy-$mode")"
+  sk_bind "$STATUS_ROOT"
+  sk_bind "$STATUS_HEALTHY"
+  STATUS_CH="$(sk_channel "$STATUS_ROOT")"
+  STATUS_HC="$(sk_channel "$STATUS_HEALTHY")"
+  STATUS_PARENT="$(sk_inject "$STATUS_CH" U001 'Old status topic.' '' "\"ts\": \"$(python3 -c 'import time; print("%.6f" % (time.time() - 8 * 86400))')\"")"
+  rm -- "$STATUS_ROOT/.agents/skills/orch/scripts"
+  mkdir -p "$STATUS_ROOT/.agents/skills/orch/scripts"
+  cat > "$STATUS_ROOT/.agents/skills/orch/scripts/lane-mail" <<EOF
+#!/usr/bin/env bash
+if [ -e "$STATUS_ROOT/tmp/send-refused" ]; then
+  case " \$* " in *" send "*)
+    rm -- "$STATUS_ROOT/tmp/send-refused" "$STATUS_ROOT/tmp/slack/status.json" || exit 2
+    mkdir "$STATUS_ROOT/tmp/slack/status.json" || exit 2
+    echo 'lane-mail: send-refused' >&2; exit 2 ;;
+  esac
+fi
+exec "$SK_LANE_MAIL" "\$@"
+EOF
+  chmod +x "$STATUS_ROOT/.agents/skills/orch/scripts/lane-mail"
+  if [ "$mode" = control ]; then
+    sk_mutant secondary-status relay.py 'except Exception as status_err:' 'except RuntimeError as status_err:'
+  fi
+  relay "$STATUS_ROOT" --root "$STATUS_HEALTHY"
+  touch "$STATUS_ROOT/tmp/send-refused"
+  STATUS_REPLY="$(sk_inject "$STATUS_CH" U001 'Retry after status failure.' "$STATUS_PARENT")"
+  assert_eq "$(awaited python3 -c 'from pathlib import Path; import sys; p = Path(sys.argv[1]); print(p if p.is_dir() else "", end="")' "$STATUS_ROOT/tmp/slack/status.json")" \
+    "$STATUS_ROOT/tmp/slack/status.json" "$mode: the live send refusal also breaks its status write"
+  STATUS_NEXT="$(sk_inject "$STATUS_HC" U001 'Other root still receives.')"
+  STATUS_TEXT="$(landed "$STATUS_HEALTHY" "$STATUS_HC:$STATUS_NEXT" "$tries")"
+  if [ "$mode" = production ]; then
+    assert_has "$(sed -n '1p' "$SK_TMP/relay.err")" \
+      "slack: lane-mail-failed=lane-mail: send-refused root=$STATUS_ROOT status=IsADirectoryError:" \
+      "the primary live refusal retains its cause and names the secondary status error"
+  fi
+  rmdir "$STATUS_ROOT/tmp/slack/status.json"
+  STATUS_RETRIED="$(landed "$STATUS_ROOT" "$STATUS_CH:$STATUS_REPLY" "$tries")"
+  # Count exact delivery values, including the old reply's parent pointer.
+  if [ -f "$(sk_box "$STATUS_ROOT")/to-lane.jsonl" ]; then
+    STATUS_COUNTS="$(jq -s --arg d "$STATUS_CH:$STATUS_REPLY" --arg ts "$STATUS_PARENT" \
+      '[.[] | select(.delivery_id == $d and .text == "Retry after status failure." and .thread_ts == $ts and .parent == {ts:$ts,author:"owner",excerpt:"Old status topic."})] | length' "$(sk_box "$STATUS_ROOT")/to-lane.jsonl")" || exit 1
+  else
+    # No mailbox is created when the control stops before any delivery.
+    STATUS_COUNTS=0
+  fi
+  assert_eq "$STATUS_COUNTS|$STATUS_RETRIED|$STATUS_TEXT" \
+    "$want" "$mode: status failure containment keeps pending delivery and other-root progress; removing it fails the same instrument"
+  sk_relay_stop
+  sk_bin_reset
+done <<'ROWS'
+production 200 1|Retry after status failure.|Other root still receives.
+control 30 0||
+ROWS
 
 # --- two roots on one relay: each channel's event lands in its own mailbox ------------------
 # IOTA is bound, so the app is in its channel and Slack sends its events,
@@ -148,7 +264,7 @@ assert_eq "$(landed "$ZETA" "$ZC:$TZ")|$(landed "$ETA" "$EC:$TE")|$(texts "$ZETA
   "two roots on one relay: each channel's event lands in its own root's mailbox, not the other's and not an unbound channel's"
 sk_relay_stop
 
-# --- an event whose delivery lane-mail refused: the next history read lands it ---------------
+# --- an event whose delivery lane-mail refused: the next poll lands it ---------------
 # THETA's lane-mail refuses one `send` while tmp/send-refused stands, and
 # removes the file as it refuses.
 THETA="$(sk_new_root theta)"
@@ -167,7 +283,7 @@ TC="$(sk_channel "$THETA")"
 relay "$THETA"
 touch "$THETA/tmp/send-refused"
 TT="$(sk_inject "$TC" U001 'refused once')"
-assert_eq "$(landed "$THETA" "$TC:$TT")" "refused once" "an event whose delivery lane-mail refused lands through the next poll's history read"
+assert_eq "$(landed "$THETA" "$TC:$TT")" "refused once" "an event whose delivery lane-mail refused lands through the next poll's pending retry"
 assert_has "$(cat "$SK_TMP/relay.err")" "slack: lane-mail-failed=lane-mail: send-refused" "the refused event delivery is printed"
 sk_relay_stop
 
@@ -301,13 +417,6 @@ assert_eq "$(landed "$ZETA" "$ZC:$TI")" "unbound, routed anyway" "control: an un
 sk_relay_stop
 sk_bin_reset
 
-sk_mutant re-arm relay.py 'print_refusal\(err\)\n            root\.caught_up = False' 'print_refusal(err)'
-relay "$THETA"
-touch "$THETA/tmp/send-refused"
-TT2="$(sk_inject "$TC" U001 'refused, never read again')"
-assert_eq "$(landed "$THETA" "$TC:$TT2" 30)" "" "control: no history read after a refused delivery, its message does not land within the short bound"
-sk_relay_stop
-sk_bin_reset
 
 sk_mutant catch-up relay.py 'root\.journal\.append\(t=kind, at=self\.since\)\n            root\.caught_up = False' 'root.journal.append(t=kind, at=self.since)'
 EPS="$(sk_new_root eps)"
@@ -324,10 +433,10 @@ sk_relay_stop
 sk_ctl /_test/faults-reset >/dev/null
 sk_bin_reset
 
-sk_mutant event-age relay.py 'if thread is None or not self\.live\(thread\):' 'if thread is None:'
+sk_mutant event-age relay.py '        if thread_ts == ts:\n            self.bind_file_share\(message\)' '        if thread_ts != ts and (thread_ts not in self.state.threads or not self.live(self.state.threads[thread_ts])):\n            return\n        if thread_ts == ts:\n            self.bind_file_share(message)'
 relay "$BETA"
 OR2="$(sk_inject C002 U001 'late under the old one' "$OLD")"
-assert_eq "$(landed "$BETA" "C002:$OR2")" "late under the old one" "control: the thread-age check gone from events, a reply under the old thread lands"
+assert_eq "$(landed "$BETA" "C002:$OR2")" "" "control: the obsolete live age gate loses the old-thread reply"
 sk_relay_stop
 sk_bin_reset
 

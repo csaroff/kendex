@@ -30,6 +30,7 @@ assert_eq "$RC=$(last C777)" "0=top | UBOT | <@U001> <@U002> Alert." "--channel 
 
 sk_run -- post --root "$ROOT" --text 'In the thread.' --thread "$TS"
 assert_eq "$RC=$(last C001)" "0=$TS | UBOT | In the thread." "--thread replies under the message"
+assert_eq "$(sk_state '.messages.C001[-1].reply_broadcast')" "false" "a plain thread post does not broadcast"
 
 sk_run -- post --root "$ROOT" --text 'Lane 3 recovered.' --update "$TS"
 assert_eq "$RC=$OUT" "0=slack: updated=$TS channel=C001" "--update edits the message at that ts"
@@ -44,6 +45,7 @@ line two" "the file's bytes are uploaded"
 assert_eq "$(last C001)" "top | UBOT | The report." "the share carries the text as its comment"
 
 # --- refusals, one row per rule -----------------------------------------------
+
 BEFORE="$(sk_state '.messages.C001 | length')"
 sk_run -- post --root "$ROOT" --text 'key xoxb-0123456789-abcdefghij'
 assert_eq "$RC=$ERR1" "2=slack: secret-value=text" "text matching the secret-value pattern is refused"
@@ -76,6 +78,10 @@ sk_run -- post --root "$BARE" --text 'no binding needed' --channel C777
 assert_eq "$RC=$(last C777)" "0=top | UBOT | no binding needed" "--channel needs no binding"
 
 # --- controls, one per check ------------------------------------------------------
+sk_mutant thread-only verbs.py 'markdown_text=body, thread_ts=thread\)' 'markdown_text=body, thread_ts=thread, reply_broadcast=True)'
+sk_run -- post --root "$ROOT" --text 'In the thread.' --thread "$TS"
+assert_eq "$(sk_state '.messages.C001[-1].reply_broadcast')" "true" "control: broadcasting a thread post breaks the thread-only assertion"
+sk_bin_reset
 sk_mutant secret verbs.py 'secret_check\(body\.encode\(\), "text"\)' 'secret_check(b"", "text")'
 sk_run -- post --root "$ROOT" --text 'key xoxb-0123456789-abcdefghij'
 assert_eq "$RC" "0" "control: the text check gone, the token posts"

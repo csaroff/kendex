@@ -22,6 +22,7 @@ Usage: slack setup [--root ROOT] [--name NAME | --take CHANNEL_ID]
        slack post [--root ROOT] [--channel ID] --text TEXT [--mention]
                   [--file PATH] [--thread TS] [--update TS]
        slack compact [--root ROOT]...
+       slack thread TS [--root ROOT] [--limit N]
        slack install --root ROOT [--root ROOT]... [--print]
 
 Relays one checkout's overseer mailbox to one private Slack channel and back,
@@ -63,9 +64,12 @@ post      one message to the bound channel, or --channel for another, its
           --mention prefixes every owner; --file uploads the file with the
           text as its comment instead, in Slack's mrkdwn and outside the
           12,000-character cap;
-          --thread replies in a thread; --update edits the message at that
+          --thread replies only in a thread; --update edits the message at that
           ts. Text and file bytes are refused when they match the
           secret-value pattern
+thread    print the requested thread as plain text, oldest first; TS names
+          its root or a reply; --limit caps the messages printed, otherwise
+          all cursor pages are read. No thread is read by default
 compact   drop journal lines resolved or ignored longer ago than
           SLACK_THREAD_DAYS; open questions and positions stay. The relay runs
           it once a day; a root whose relay is running is refused
@@ -131,9 +135,14 @@ def build() -> Parser:
     p.add_argument("--file")
     p.add_argument("--mention", action="store_true")
     p.add_argument("--thread")
+
     p.add_argument("--update")
     p = verbs.add_parser("compact", add_help=False)
     p.add_argument("--root", action="append")
+    p = verbs.add_parser("thread", add_help=False)
+    p.add_argument("ts")
+    p.add_argument("--root")
+    p.add_argument("--limit", type=int)
     p = verbs.add_parser("install", add_help=False)
     p.add_argument("--root", action="append")
     p.add_argument("--print", action="store_true")
@@ -167,6 +176,10 @@ def run(argv: List[str]) -> int:
         return verbs.post(root, args.channel, args.text, args.file, args.mention, args.thread, args.update)
     if args.verb == "compact":
         return verbs.compact_roots(roots_of(args.root or []))
+    if args.verb == "thread":
+        if args.limit is not None and args.limit < 1:
+            raise Refusal("usage", "--limit must be positive")
+        return verbs.thread(roots_of([args.root] if args.root else [])[0], args.ts, args.limit)
     if args.verb == "install":
         if not args.root:
             raise Refusal("usage", "install needs at least one --root")
