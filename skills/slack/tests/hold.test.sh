@@ -20,7 +20,7 @@ echo "=== slack listen: the master hold ==="
 
 MASTER="$SK_TMP/master-live"
 HOLD="SLACK_MASTER_FILE=$MASTER"
-aged() { python3 -c 'import os, sys, time; t = time.time() - int(sys.argv[2]); os.utime(sys.argv[1], (t, t))' "$MASTER" "$1"; } # SECONDS
+aged() { sk_age_file "$MASTER" "$1"; } # SECONDS
 fresh() { touch -- "$MASTER" && aged 10; }
 stale() { aged 600; } # the default SLACK_MASTER_MAX_AGE: the hold ends as this runs
 count() { sk_state "[(.messages.${1} // [])[] | select(.text | contains(\"$2\"))] | length"; } # CHANNEL TEXT
@@ -223,6 +223,142 @@ invalid_auth slack-auth-failed 2 0
 token_revoked slack-auth-failed 2 0
 ROWS
 
+# --- root-local settings through the real launcher and one two-root poll ----------
+# The installed unit runs in the first root. The control replaces the caller
+# snapshot with the loaded process environment, recreating the launch-root leak.
+while read -r name first control a_posts a_held; do
+  A="$(sk_new_root "pair-$name-a")"
+  B="$(sk_new_root "pair-$name-b")"
+  sk_bind "$A"
+  sk_bind "$B"
+  FILE="$B/tmp/master-live"
+  touch -- "$FILE"
+  sk_age_file "$FILE" 10
+  printf '[env]\nSLACK_MASTER_FILE = "%s"\nSLACK_MASTER_MAX_AGE = "600"\n' "$FILE" > "$B/kendex.settings.toml"
+  if [ "$first" = A ]; then FIRST="$A"; SECOND="$B"; else FIRST="$B"; SECOND="$A"; fi
+  SK_RUN_FROM="$FIRST"
+  sk_run -- listen --once --root "$FIRST" --root "$SECOND"
+  assert_eq "$RC" "0" "$name: both roots seed in one process"
+  notice "$A" "pair-$name-a" "Pair notice $name A."
+  notice "$B" "pair-$name-b" "Pair notice $name B."
+  case "$control" in
+    leak) sk_mutant process-presence settings.py 'env=CALLER_ENV' 'env=dict(os.environ)' ;;
+    launch) sk_mutant caller-snapshot ../slack 'export _KENDEX_SLACK_CALLER_ENV="\$_slack_caller_env"' 'export _KENDEX_SLACK_CALLER_ENV="$(python3 -c '\''import json, os; print(json.dumps(dict(os.environ)))'\'')"' ;;
+  esac
+  sk_run -- listen --once --root "$FIRST" --root "$SECOND"
+  assert_eq "$RC=$(count "$(sk_channel "$A")" "Pair notice $name A.")=$(count "$(sk_channel "$B")" "Pair notice $name B.")" \
+    "0=$a_posts=0" "$name: only roots with a fresh configured file hold (control must hold A)"
+  sk_run -- listen --status --root "$A" --root "$B"
+  assert_has "$OUT" "slack-relay=$B state=ok" "$name: B has its own status row"
+  assert_has "$OUT" "held-by=master" "$name: status reports the master hold"
+  assert_eq "$(jq -r 'if .held_by == "" then "none" else .held_by end' "$A/tmp/slack/status.json")=$(jq -r .held_by "$B/tmp/slack/status.json")" \
+    "$a_held=master" "$name: the hold belongs to B only, unless the control leaks"
+  sk_bin_reset
+  sk_age_file "$FILE" 900
+  sk_run -- listen --once --root "$FIRST" --root "$SECOND"
+  assert_eq "$RC=$(count "$(sk_channel "$A")" "Pair notice $name A.")=$(count "$(sk_channel "$B")" "Pair notice $name B.")" \
+    "0=1=1" "$name: stale B posts on the next poll and A never repeats"
+  SK_RUN_FROM=""
+done <<'ROWS'
+A-first A real 1 none
+B-first B real 1 none
+B-first-control B leak 0 master
+B-first-launcher-control B launch 0 master
+ROWS
+
+# Both files have the same age, but each root has its own freshness bound.
+A="$(sk_new_root ages-a)"
+B="$(sk_new_root ages-b)"
+for R in "$A" "$B"; do sk_bind "$R"; done
+printf '[env]\nSLACK_MASTER_FILE = "%s"\nSLACK_MASTER_MAX_AGE = "3600"\n' "$MASTER" > "$A/kendex.settings.toml"
+printf '[env]\nSLACK_MASTER_FILE = "%s"\nSLACK_MASTER_MAX_AGE = "600"\n' "$MASTER" > "$B/kendex.settings.toml"
+fresh
+SK_RUN_FROM="$A"
+sk_run -- listen --once --root "$A" --root "$B"
+notice "$A" ages-a 'Age notice A.'
+notice "$B" ages-b 'Age notice B.'
+aged 900
+sk_run -- listen --once --root "$A" --root "$B"
+assert_eq "$RC=$(count "$(sk_channel "$A")" 'Age notice A.')=$(count "$(sk_channel "$B")" 'Age notice B.')" \
+  "0=0=1" "different root age bounds hold A while B posts"
+aged 4000
+sk_run -- listen --once --root "$A" --root "$B"
+assert_eq "$RC=$(count "$(sk_channel "$A")" 'Age notice A.')=$(count "$(sk_channel "$B")" 'Age notice B.')" \
+  "0=1=1" "A resumes at its own bound and B never repeats"
+SK_RUN_FROM=""
+
+# Each source is loaded by kendex_load_project_env. Tokens and owners in a
+# served root must not replace the process settings from the launch checkout.
+# Private files permit bare assignments. The export control keeps their shell
+# values but prevents the Python child from receiving them.
+while read -r name source file age caller control posts; do
+  R="$(sk_new_root "settings-$name")"
+  sk_bind "$R"
+  sk_poll "$R"
+  mkdir -p "$R/.kendex"
+  case "$file" in
+    relative) FILE="tmp/master-live"; touch -- "$R/$FILE"; sk_age_file "$R/$FILE" 900 ;;
+    tilde) FILE="~/master-live"; touch -- "$SK_TMP/home/master-live"; sk_age_file "$SK_TMP/home/master-live" 900 ;;
+    absent) FILE="" ;;
+    *) FILE="$MASTER"; fresh; aged 900 ;;
+  esac
+  printf '[env]\nSLACK_BOT_TOKEN = "wrong-root-token"\nSLACK_OWNERS = "wrong@example.test"\nSLACK_API_URL = "http://invalid.test"\n' > "$R/kendex.settings.toml"
+  case "$source" in
+    local|private|named) printf 'SLACK_MASTER_FILE = "%s"\nSLACK_MASTER_MAX_AGE = "600"\n' "$FILE" >> "$R/kendex.settings.toml" ;;
+  esac
+  case "$source" in
+    local) printf '[env]\nSLACK_MASTER_MAX_AGE = "%s"\n' "$age" > "$R/.kendex/settings.toml" ;;
+    private) printf '[env]\nSLACK_MASTER_MAX_AGE = "600"\n' > "$R/.kendex/settings.toml"; printf 'SLACK_MASTER_MAX_AGE=%s\n' "$age" > "$R/.env.local" ;;
+    named) printf 'SLACK_MASTER_MAX_AGE=%s\n' "$age" > "$R/private.env"; printf 'KENDEX_ENV_FILE = "private.env"\n' >> "$R/kendex.settings.toml" ;;
+    private-only) printf 'SLACK_MASTER_FILE=%s\nSLACK_MASTER_MAX_AGE=%s\n' "$FILE" "$age" > "$R/.env.local" ;;
+    named-only) printf 'SLACK_MASTER_FILE=%s\nSLACK_MASTER_MAX_AGE=%s\n' "$FILE" "$age" > "$R/private.env"; printf 'KENDEX_ENV_FILE = "private.env"\n' >> "$R/kendex.settings.toml" ;;
+    private-age) printf 'SLACK_MASTER_MAX_AGE=%s\n' "$age" > "$R/.env.local" ;;
+    named-age) printf 'SLACK_MASTER_MAX_AGE=%s\n' "$age" > "$R/private.env"; printf 'KENDEX_ENV_FILE = "private.env"\n' >> "$R/kendex.settings.toml" ;;
+  esac
+  case "$control" in
+    export) sk_mutant presence-export settings.py 'export (SLACK_MASTER_FILE="\$\{SLACK_MASTER_FILE-\}" SLACK_MASTER_MAX_AGE="\$\{SLACK_MASTER_MAX_AGE-\}")' '\1' ;;
+  esac
+  notice "$R" "settings-$name" "Settings notice $name."
+  case "$caller" in
+    age) sk_poll "$R" SLACK_MASTER_MAX_AGE=600 ;;
+    file) sk_poll "$R" "SLACK_MASTER_FILE=$SK_TMP/no-master" ;;
+    empty) sk_poll "$R" SLACK_MASTER_FILE= ;;
+    configured-file) sk_poll "$R" "SLACK_MASTER_FILE=$FILE" ;;
+    *) sk_poll "$R" ;;
+  esac
+  assert_eq "$RC=$(count "$(sk_channel "$R")" "Settings notice $name.")" "0=$posts" \
+    "$name: root settings and caller precedence apply only to presence"
+  sk_bin_reset
+done <<'ROWS'
+relative local relative 3600 none real 0
+tilde private tilde 3600 none real 0
+named named absolute 3600 none real 0
+caller-age private absolute 3600 age real 1
+caller-file local absolute 3600 file real 1
+caller-empty private absolute 3600 empty real 1
+root-empty local absent 3600 none real 1
+private-only private-only absolute 3600 none real 0
+named-only named-only absolute 3600 none real 0
+private-age private-age absolute 3600 configured-file real 0
+named-age named-age absolute 3600 configured-file real 0
+private-caller-age private-only absolute 3600 age real 1
+private-caller-file private-only absolute 3600 file real 1
+private-caller-empty private-only absolute 3600 empty real 1
+private-export-control private-only absolute 3600 none export 1
+private-age-export-control private-age absolute 3600 configured-file export 1
+ROWS
+
+R="$(sk_new_root invalid-age)"
+sk_bind "$R"
+printf '[env]\nSLACK_MASTER_MAX_AGE = "invalid"\n' > "$R/kendex.settings.toml"
+sk_run -- listen --once --root "$A" --root "$R"
+assert_eq "$RC=$ERR1" "2=slack: setting-invalid=SLACK_MASTER_MAX_AGE=invalid root=$R" \
+  "invalid root age refuses at start and names that root even without a file"
+printf '[env]\nSLACK_MASTER_FILE = []\n' > "$R/kendex.settings.toml"
+sk_run -- listen --once --root "$A" --root "$R"
+assert_eq "$RC" "2" "an unreadable root setting refuses startup instead of disabling its hold"
+assert_has "$ERR1" "slack: setting-invalid=root=$R settings-reader=" "the root settings failure names its root and reader"
+
 # --- controls, one mutant per rule --------------------------------------------------
 # held ROOT — a bound root with a notice written under a fresh file and polled.
 
@@ -234,7 +370,7 @@ held() {
   sk_poll "$1" "$HOLD"
 }
 
-sk_mutant hold relay.py 'if touched is not None and now - touched < self\.settings\.master_max_age:' 'if False:'
+sk_mutant hold relay.py 'if touched is not None and now - touched < self\.presence\.master_max_age:' 'if False:'
 BETA="$(sk_new_root beta)"
 held "$BETA"
 assert_eq "$(count "$(sk_channel "$BETA")" 'Held in beta.')" "1" "control: the hold check gone, a notice posts under a fresh file"
@@ -284,7 +420,7 @@ fresh
 sk_unposted "$ETA" "$MASTER"
 sk_master_read "$ETA" 3
 aged 1000000000
-sk_mutant age-stamp relay.py 'at = format_at\(self.clock\(\)\)' 'at = format_at(self.master_touched() + self.settings.master_max_age)'
+sk_mutant age-stamp relay.py 'at = format_at\(self.clock\(\)\)' 'at = format_at(self.master_touched() + self.presence.master_max_age)'
 sk_poll "$ETA" "$HOLD"
 sk_bin_reset
 sk_run -- compact --root "$ETA"
@@ -309,7 +445,7 @@ assert_eq "$(resumed_asks "$PI")" "$PI_ASK" "control: every routed ask journaled
 sk_bin_reset
 
 
-sk_mutant age settings.py '_positive_int\("SLACK_MASTER_MAX_AGE", DEFAULT_MASTER_MAX_AGE\)' 'DEFAULT_MASTER_MAX_AGE'
+sk_mutant age settings.py '_positive_int\("SLACK_MASTER_MAX_AGE", DEFAULT_MASTER_MAX_AGE, values, root\)' 'DEFAULT_MASTER_MAX_AGE'
 IOTA="$(sk_new_root iota)"
 sk_bind "$IOTA"
 sk_poll "$IOTA" "$HOLD"
