@@ -1,0 +1,1 @@
+- Pi agents share a child limit, cancel pane preparation, and drain stalled commands on shutdown. Inbox failures restore tasks.

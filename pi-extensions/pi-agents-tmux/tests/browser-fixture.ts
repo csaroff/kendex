@@ -4,6 +4,7 @@
 // Nothing here plants a defect; a row that needs one builds it inline.
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
+import { execFileSync } from "node:child_process";
 import { spyOn } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -98,6 +99,38 @@ export async function assertMissingArtifactStatus(runtime: typeof import("../ext
 	fs.unlinkSync(inboxFile);
 	const refreshed = await runtime.refreshTaskDiagnostics(root, queued);
 	assert.equal(refreshed.record.status, "unknown");
+}
+
+/** Immutable pre-change components, also fetched by the existing CI suite. */
+export const BENCHMARK_BASELINE = "f8b9eff8b1aaf7c8698fdead68c00f6eb7c12382";
+
+/** Load baseline components from git objects without changing a checkout. */
+export async function importMainRuntime(repo = resolve(import.meta.dir, "../../..")): Promise<{
+	pane: typeof import("../extensions/subagent/pane.js");
+	dispatch: typeof import("../extensions/subagent/dispatch.js");
+	runner: typeof import("../extensions/subagent/runner.js");
+	config: typeof import("../extensions/subagent/package-config.js");
+	ref: string;
+}> {
+	const root = tempRuntime();
+	const env = { PATH: "/usr/bin:/bin", HOME: root, TMPDIR: root };
+	const ref = execFileSync("git", ["rev-parse", `${BENCHMARK_BASELINE}^{commit}`], { cwd: repo, env, encoding: "utf8" }).trim();
+	const archive = execFileSync("git", ["archive", ref, "pi-extensions/pi-agents-tmux/extensions", "pi-extensions/pi-agents-tmux/scripts", "pi-extensions/pi-agents-tmux/package.json"], { cwd: repo, env, maxBuffer: 16 * 1024 * 1024 });
+	execFileSync("tar", ["-x", "-C", root], { input: archive, env });
+	const pkg = join(root, "pi-extensions/pi-agents-tmux");
+	fs.symlinkSync(resolve(import.meta.dir, "../node_modules"), join(pkg, "node_modules"), "dir");
+	const runtime = join(pkg, "extensions/subagent");
+	const paneFile = join(runtime, "pane.ts");
+	const before = "cwd: options?.cwd, shell: false";
+	const source = fs.readFileSync(paneFile, "utf8");
+	// Main lacks a capture env option. Instrument only its child environment so
+	// both measured components run the same isolated faux bridge workload.
+	assert.equal(source.split(before).length - 1, 1, "main capture environment instrumentation must match once");
+	fs.writeFileSync(paneFile, source.replace(before, "cwd: options?.cwd, env: options?.env, shell: false"));
+	return {
+		pane: await import(join(runtime, "pane.ts")), dispatch: await import(join(runtime, "dispatch.ts")),
+		runner: await import(join(runtime, "runner.ts")), config: await import(join(runtime, "package-config.ts")), ref,
+	};
 }
 
 /** Count reads of registry content through both Node file APIs, without replacing their behavior. */

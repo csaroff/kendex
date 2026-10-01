@@ -64,6 +64,7 @@ export function createHarness(env: { childAgent?: string; childPane?: string; tm
 		titleSpawnCalls.push({ command, args: [...(args ?? [])] });
 		const proc = new EventEmitter() as any;
 		proc.unref = () => undefined;
+		queueMicrotask(() => proc.emit("close", 0));
 		return proc;
 	}) as any);
 	return { cwd, piUserDir, titles: [], titleSpawnCalls, previousEnv };
@@ -88,6 +89,7 @@ export async function installExtension(harness: Harness, options: {
 	handlers?: Map<string, SessionHandler[]>;
 	appendEntry?: (customType: string, data: unknown) => void;
 	registerTool?: (tool: any) => void;
+	sendUserMessage?: (prompt: string, options: { deliverAs: string }) => Promise<void>;
 } = {}): Promise<(event: unknown, ctx: ExtensionContext) => Promise<void>> {
 	const handlers = options.handlers ?? new Map<string, SessionHandler[]>();
 	const bus = new EventEmitter();
@@ -98,13 +100,14 @@ export async function installExtension(harness: Harness, options: {
 		getThinkingLevel: () => undefined,
 		on: (event: string, handler: SessionHandler) => {
 			handlers.set(event, [...(handlers.get(event) ?? []), handler]);
+			return () => handlers.set(event, (handlers.get(event) ?? []).filter((registered) => registered !== handler));
 		},
 		registerCommand: () => undefined,
 		registerMessageRenderer: () => undefined,
 		registerShortcut: () => undefined,
 		registerTool: options.registerTool ?? (() => undefined),
 		sendMessage: () => undefined,
-		sendUserMessage: async () => undefined,
+		sendUserMessage: options.sendUserMessage ?? (async () => undefined),
 	} as any;
 	const url = new URL("../extensions/subagent/index.ts", import.meta.url);
 	url.searchParams.set("t", `${Date.now()}-${Math.random().toString(36).slice(2)}`);
