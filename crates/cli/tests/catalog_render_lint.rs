@@ -52,6 +52,19 @@ fn scoped_command(
         // Include extensionless scripts and hooks. The shipped extractor
         // decides which installed files have a comment grammar.
         .env("COMMIT_GUARDS_COMMENT_PATHS", scope)
+        // A source-only control must not parse shell code as Markdown.
+        .env(
+            "COMMIT_GUARDS_MD_REFS_PATHS",
+            if scope == "*" {
+                "*.md"
+            } else if scope.ends_with(".md") {
+                scope
+            } else {
+                "__no_markdown__"
+            },
+        )
+        .env("COMMIT_GUARDS_MD_REFS_SOURCE_PATHS", scope)
+        .env("COMMIT_GUARDS_SETTINGS_FILE", "/dev/null")
         .output()
         .unwrap()
 }
@@ -297,6 +310,137 @@ fn installed_catalog_passes_comment_and_prose_lanes() {
     let scripts = project.join(".claude/skills/commit-guards/scripts");
     each_lane_names_its_own_planted_defect(&home, &project, &scripts);
     every_staged_path_passes_both_lanes(&home, &project, &scripts);
+    let references = command(
+        &home,
+        &project,
+        &scripts.join("md-refs"),
+        &["--all", "--strict"],
+    );
+    assert_reference_coverage(&references, &staged_paths(&project));
+    success(references);
+    install_reference_controls(&home, &project, &scripts);
+}
+
+/// The source scan admits every staged path, including Markdown that it
+/// cannot parse as source. Markdown is judged separately. Counts plus the
+/// hook and extensionless controls reject a scan that admits too few files.
+fn assert_reference_coverage(output: &Output, staged: &[String]) {
+    let said = String::from_utf8_lossy(&output.stdout);
+    let summary = said
+        .lines()
+        .find_map(|line| line.strip_prefix("md-refs: summary="))
+        .unwrap_or_else(|| panic!("reference scan has no summary: {output:?}"));
+    let count = |name: &str| {
+        summary
+            .split_whitespace()
+            .find_map(|field| {
+                field
+                    .strip_prefix(name)
+                    .and_then(|value| value.parse::<usize>().ok())
+            })
+            .unwrap_or_else(|| panic!("reference scan has no {name} count: {summary}"))
+    };
+    assert!(!staged.is_empty(), "installed catalog staged no files");
+    assert_eq!(
+        count("sources=") + count("skipped="),
+        staged.len(),
+        "{summary}"
+    );
+    assert_eq!(
+        count("markdown="),
+        staged.iter().filter(|path| path.ends_with(".md")).count(),
+        "{summary}"
+    );
+}
+
+/// A source-layout citation can resolve before installation and be dead in
+/// a consumer. The complete tree is scanned once above. Controls use that
+/// scanner on one citing file, with a coverage count for each run.
+#[allow(clippy::unwrap_used)]
+fn install_reference_controls(home: &Path, project: &Path, scripts: &Path) {
+    let callers = [
+        (".claude/hooks/lane-mail-check.sh", "# "),
+        (
+            ".claude/skills/commit-guards/scripts/install-git-hooks",
+            "# ",
+        ),
+        (".claude/skills/orch/SKILL.md", ""),
+    ];
+    let target = "skills/orch/references/oversee-events.md";
+    assert!(
+        !project.join("skills").exists(),
+        "consumer has a source tree"
+    );
+    for (relative, prefix) in callers {
+        let path = project.join(relative);
+        let original = fs::read_to_string(&path).unwrap();
+        let citation = format!("{prefix}`{target} § Judgement rules`\n");
+        fs::write(&path, format!("{original}\n{citation}")).unwrap();
+        fs::create_dir_all(project.join("skills/orch/references")).unwrap();
+        fs::write(project.join(target), "# Events\n\n## Judgement rules\n").unwrap();
+        success(command(home, project, Path::new("git"), &["add", "-A"]));
+        let expected_paths = [relative.to_owned()];
+        let output = scoped_command(
+            home,
+            project,
+            &scripts.join("md-refs"),
+            &["--all", "--strict"],
+            relative,
+        );
+        assert_reference_coverage(&output, &expected_paths);
+        success(output);
+
+        success(command(
+            home,
+            project,
+            Path::new("git"),
+            &["rm", "-f", "--", target],
+        ));
+        let output = scoped_command(
+            home,
+            project,
+            &scripts.join("md-refs"),
+            &["--all", "--strict"],
+            relative,
+        );
+        assert_reference_coverage(&output, &expected_paths);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let expected = format!("md-refs: citation-target={relative}:");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(&expected),
+            "{output:?}"
+        );
+
+        // The installed hook names the skill section in prose rather than
+        // pretending the consumer carries the catalog's source path.
+        fs::write(
+            &path,
+            format!("{original}\n{prefix}Orch skill, Oversee events, Judgement rules.\n"),
+        )
+        .unwrap();
+        success(command(
+            home,
+            project,
+            Path::new("git"),
+            &["add", "--", relative],
+        ));
+        let output = scoped_command(
+            home,
+            project,
+            &scripts.join("md-refs"),
+            &["--all", "--strict"],
+            relative,
+        );
+        assert_reference_coverage(&output, &expected_paths);
+        success(output);
+        fs::write(path, original).unwrap();
+        success(command(
+            home,
+            project,
+            Path::new("git"),
+            &["add", "--", relative],
+        ));
+    }
 }
 
 #[test]
