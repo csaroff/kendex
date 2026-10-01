@@ -64,6 +64,10 @@ printf '%s\n' "$*" >>"$TEST_STATE/kendex"
 case "$1" in
   refresh)
     printf '%s\n' "$TEST_CONTENT" >rendered.txt
+    if [ -n "$TEST_REFRESH_SKILL" ]; then
+      rm -rf -- .agents/skills/review-gate
+      cp -R "$TEST_REFRESH_SKILL" .agents/skills/review-gate
+    fi
     case "$TEST_ORCH_MODE" in
       keep) ;;
       absent) rm -rf -- .agents/skills/orch ;;
@@ -520,6 +524,51 @@ done
 unset FRESH_ORCH ORCH_MODE
 rm -f -- "$repo/.env.local" "$repo/private.env"
 
+# Scripts from the consumer's committed pre-platform checkout must adopt
+# refreshed catalog data before its PR can bring the new scripts. Fixtures
+# are verbatim renders from 672eb6013185427ba9cb109fece86dbe08f668b5.
+sandbox
+repo="$DIR"
+git -C "$repo" branch -M main
+cp "$TEST_DIR/fixtures/pre-platform/"*.sh "$repo/.agents/skills/review-gate/scripts/"
+chmod +x "$repo/.agents/skills/review-gate/scripts/"*.sh
+# The old validator checks the engine's tracked path, never its body.
+printf '#!/usr/bin/env bash\nexit 1\n' >"$repo/.agents/skills/review-gate/scripts/review-writer.sh"
+cp "$SKILL_DIR/templates/review-gate-writer.yml" "$repo/.github/workflows/review-gate-writer.yml"
+record_adoption "$repo" .github/workflows/review-gate-writer.yml .agents/skills/review-gate/templates/review-gate-writer.yml
+cp "$TMP/case.1/.agents/skills/harness-ci/scripts/change-class" "$repo/.agents/skills/harness-ci/scripts/change-class"
+commit "$repo"
+git init --bare -q "$TMP/legacy-remote"
+git --git-dir="$TMP/legacy-remote" config gc.auto 0
+git --git-dir="$TMP/legacy-remote" config maintenance.auto false
+git -C "$repo" remote add origin "$TMP/legacy-remote"
+git -C "$repo" push -q origin main
+git -C "$repo" worktree add --detach "$TMP/legacy-trusted" HEAD
+runner="$TMP/legacy-trusted/.agents/skills/review-gate/scripts/refresh-consumer.sh"
+for bridge in retained missing; do
+  reset_default
+  REFRESH_SKILL="$TMP/catalog-$bridge"
+  cp -R "$SKILL_DIR" "$REFRESH_SKILL"
+  if [ "$bridge" = missing ]; then
+    rm -- "$REFRESH_SKILL/templates/review-gate-writer.yml"
+  fi
+  : >"$TMP/state/pr"
+  : >"$TMP/state/creates"
+  : >"$TMP/state/calls"
+  run_refresh legacy pass standard
+  if [ "$bridge" = retained ]; then
+    if [ "$RC" -eq 0 ] && grep -qxF 'refresh-state=pushed pr=1 class=standard' <<<"$OUT" &&
+        [ -s "$TMP/state/creates" ] && [ ! -e "$repo/.agents/skills/review-gate/scripts/validate-workflow.sh" ]; then
+      ok 'pre-platform refresh opens its PR against the current catalog'
+    else bad 'pre-platform refresh bridge' "$OUT"; fi
+  elif [ "$RC" -eq 2 ] &&
+      grep -qxF "review-gate-error=template-missing value=$repo/.agents/skills/review-gate/templates/review-gate-writer.yml" <<<"$OUT" &&
+      [ ! -s "$TMP/state/creates" ] && ! grep -qE '^api --method (POST|PATCH)|^pr merge ' "$TMP/state/calls"; then
+    ok 'control: removing the bridge fails old refresh at template-missing'
+  else bad 'pre-platform bridge removal control' "$OUT"; fi
+done
+unset REFRESH_SKILL
+
 # The shipped workflow preserves a trusted checkout before refresh replaces
 # catalog files. Real adoption must read new template bytes without executing
 # refreshed adoption code, including for a renamed writer. Only orch's read-only
@@ -545,20 +594,22 @@ printf '\n# fresh refresh template\n' >>"$TMP/fresh-templates/kendex-refresh.yml
 : >"$TMP/state/creates"
 HOSTILE=1
 run_refresh refreshed pass render
+warning_count="$(awk '/^refresh-warning=legacy-writer / { count++ } END { print count + 0 }' <<<"$OUT")" || exit 1
 if [ "$RC" -eq 0 ] && [ ! -e "$TMP/state/hostile" ] &&
-    [ ! -e "$repo/.github/workflows/gate.yml" ] &&
+    retirement_matches "$repo" .github/workflows/gate.yml .agents/skills/review-gate/templates/review-gate-writer.yml preserved &&
+    [ "$warning_count" -eq 1 ] && grep -qxF 'refresh-warning=legacy-writer value=.agents/skills/review-gate/templates/review-gate-writer.yml' <<<"$OUT" &&
     cmp -s "$repo/.github/workflows/kendex-refresh.yml" "$TMP/fresh-templates/kendex-refresh.yml" &&
     python3 - "$repo" <<'INVENTORY'
 import hashlib,json,sys
 from pathlib import Path
 root=Path(sys.argv[1]); entries=json.loads((root/'.kendex-generated.json').read_text())
-assert {e['path'] for e in entries}=={'.github/workflows/kendex-refresh.yml'}
-for entry in entries:
+assert {e['path'] for e in entries}=={'.github/workflows/kendex-refresh.yml', '.github/workflows/gate.yml'}
+for entry in (e for e in entries if e['path'] == '.github/workflows/kendex-refresh.yml'):
  assert entry['templateHash']=='sha256:'+hashlib.sha256((root/entry['path']).read_bytes()).hexdigest()
  assert (root/entry['path']).read_bytes()==(root/entry['template']).read_bytes()
 INVENTORY
-then ok 'trusted adoption reads fresh templates and removes a renamed retired workflow without executing refreshed code'
-else bad 'trusted adoption boundary and fresh data' "$OUT"; fi
+then ok 'automatic adoption reads fresh templates and keeps the retired writer and record without executing refreshed code'
+else bad 'automatic adoption boundary and fresh data' "$OUT"; fi
 # A hand edit committed on the default branch must reach the rolling body's
 # own section, even when adoption produces the same rolling tree as before.
 reset_default

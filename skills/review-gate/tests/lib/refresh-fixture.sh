@@ -29,7 +29,7 @@ run_refresh_command() {
 run_refresh() { # CONTENT VERIFY CLASS
   local result=0
   rm -f -- "${TMP:?}/state/auth"
-  OUT="$(cd "$repo" && env -i PATH="$TMP/bin:$PATH" HOME="$TMP/home" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GH_TOKEN=test-token GITHUB_TOKEN=other-test-token TEST_SECRET=private-test-value GH_REPO=acme/test REFRESH_APP_SLUG=lanes TEST_STATE="$TMP/state" TEST_REAL_GIT="$REAL_GIT" TEST_CONTENT="$1" TEST_VERIFY="$2" TEST_CLASS="$3" TEST_MEASURED="${MEASURED:-true}" TEST_REASON="${CLASS_REASON:-cause=renders-match-their-sources}" TEST_CLASS_EXIT="${CLASS_EXIT:-0}" TEST_HOSTILE="${HOSTILE:-}" TEST_FRESH_ORCH="${FRESH_ORCH:-}" TEST_ORCH_MODE="${ORCH_MODE:-keep}" TEST_FRESH_TEMPLATES="$TMP/fresh-templates" TEST_GH_SHIM="$TMP/standard-gh" GH_SHIM_FIXTURES="$FIXTURES" bash "$runner" 2>&1)" || result=$?
+  OUT="$(cd "$repo" && env -i PATH="$TMP/bin:$PATH" HOME="$TMP/home" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GH_TOKEN=test-token GITHUB_TOKEN=other-test-token TEST_SECRET=private-test-value GH_REPO=acme/test REFRESH_APP_SLUG=lanes TEST_STATE="$TMP/state" TEST_REAL_GIT="$REAL_GIT" TEST_CONTENT="$1" TEST_VERIFY="$2" TEST_CLASS="$3" TEST_MEASURED="${MEASURED:-true}" TEST_REASON="${CLASS_REASON:-cause=renders-match-their-sources}" TEST_CLASS_EXIT="${CLASS_EXIT:-0}" TEST_HOSTILE="${HOSTILE:-}" TEST_FRESH_ORCH="${FRESH_ORCH:-}" TEST_ORCH_MODE="${ORCH_MODE:-keep}" TEST_REFRESH_SKILL="${REFRESH_SKILL:-}" TEST_FRESH_TEMPLATES="$TMP/fresh-templates" TEST_GH_SHIM="$TMP/standard-gh" GH_SHIM_FIXTURES="$FIXTURES" bash "$runner" 2>&1)" || result=$?
   RC="$result"
 }
 
@@ -78,6 +78,32 @@ inventory = root / ".kendex-generated.json"
 entries = json.loads(inventory.read_text())
 entries.append({"path": path, "template": template, "templateHash": "sha256:" + hashlib.sha256((root / path).read_bytes()).hexdigest()})
 inventory.write_text(json.dumps(entries) + "\n")
+PY
+}
+
+# The committed writer and record are independent expected values for both
+# automatic preservation and explicit trusted retirement.
+retirement_matches() { # ROOT PATH TEMPLATE preserved|removed
+  [ "$RC" -eq 0 ] || return 1
+  python3 - "$@" <<'PY'
+import json
+from pathlib import Path
+import subprocess
+import sys
+root = Path(sys.argv[1])
+path, owner, disposition = sys.argv[2:]
+before = json.loads(subprocess.check_output(["git", "show", "HEAD:.kendex-generated.json"], cwd=root, text=True))
+expected = [e for e in before if isinstance(e, dict) and e["template"] == owner]
+assert len(expected) == 1 and expected[0]["path"] == path
+after = json.loads((root / ".kendex-generated.json").read_text())
+actual = [e for e in after if isinstance(e, dict) and e["template"] == owner]
+if disposition == "preserved":
+    assert actual == expected
+    assert (root / path).read_bytes() == subprocess.check_output(["git", "show", "HEAD:" + path], cwd=root)
+elif disposition == "removed":
+    assert actual == [] and not (root / path).exists()
+else:
+    raise AssertionError("unknown retirement disposition: " + disposition)
 PY
 }
 
