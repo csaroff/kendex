@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use crate::model::HarnessId;
+
 pub mod delivery;
 pub mod spec;
 
@@ -24,12 +26,13 @@ pub struct HookSource {
     pub timeout: Option<u32>,
     /// Harness allowlist; `None` = every harness.
     pub harnesses: Option<Vec<String>>,
-    /// The hooks this one cannot work without, by name, from its own
-    /// catalog: a wrapper that only runs another hook from beside itself
-    /// names that hook, and the hook run names its wrappers. The engine's
-    /// dependency walk installs them together and refuses a scope that
-    /// keeps one removed.
+    /// Companion hooks from the same catalog. A companion is required only
+    /// on harnesses its own header allows. A removed or disabled companion
+    /// withholds this hook where that companion is required.
     pub requires: Vec<String>,
+    /// Skills required on every harness this hook uses, from the same
+    /// catalog. The dependency walk installs their own dependencies too.
+    pub requires_skills: Vec<String>,
     pub script: String,
 }
 
@@ -46,6 +49,7 @@ pub fn parse_hook(text: &str) -> Result<HookSource, String> {
         timeout: None,
         harnesses: None,
         requires: Vec::new(),
+        requires_skills: Vec::new(),
         script: text.to_owned(),
     };
     for line in text.lines() {
@@ -78,11 +82,15 @@ pub fn parse_hook(text: &str) -> Result<HookSource, String> {
             "timeout" => hook.timeout = value.parse().ok(),
             "harnesses" => {
                 let list = names(value);
+                if let Some(unknown) = list.iter().find(|name| HarnessId::parse(name).is_none()) {
+                    return Err(format!("unknown hook harness: {unknown}"));
+                }
                 if !list.is_empty() {
                     hook.harnesses = Some(list);
                 }
             }
             "requires" => hook.requires = names(value),
+            "requires-skills" => hook.requires_skills = names(value),
             _ => {}
         }
     }
@@ -288,9 +296,8 @@ pub fn command_stem(command: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::HarnessId;
 
-    const SCRIPT: &str = "#!/usr/bin/env bash\n# ---\n# name: guard\n# event: PreToolUse\n# matcher: Bash\n# description: block dangerous commands\n# timeout: 10\n# harnesses: [claude-code, codex]\n# requires: [\"judge\", helper]\n# ---\nexit 0\n";
+    const SCRIPT: &str = "#!/usr/bin/env bash\n# ---\n# name: guard\n# event: PreToolUse\n# matcher: Bash\n# description: block dangerous commands\n# timeout: 10\n# harnesses: [claude-code, codex]\n# requires: [\"judge\", helper]\n# requires-skills: [\"commit-guards\", orch]\n# ---\nexit 0\n";
 
     #[test]
     fn parses_v1_comment_frontmatter() {
@@ -300,6 +307,7 @@ mod tests {
         assert_eq!(hook.matcher.as_deref(), Some("Bash"));
         assert_eq!(hook.timeout, Some(10));
         assert_eq!(hook.requires, ["judge", "helper"]);
+        assert_eq!(hook.requires_skills, ["commit-guards", "orch"]);
         let spec = HookSpec::from(hook);
         assert!(spec.applies_to(HarnessId::Claude));
         assert!(spec.applies_to(HarnessId::Codex));
@@ -313,18 +321,57 @@ mod tests {
         assert!(parse_hook("# ---\n# name: x\n# ---\n").is_err());
     }
 
+    #[test]
+    fn harness_lists_accept_known_ids_and_aliases_but_reject_unknown_entries() {
+        for (line, expected) in [
+            ("", Ok(None)),
+            ("# harnesses: []\n", Ok(None)),
+            (
+                "# harnesses: [claude, codex, opencode, cursor, pi, gemini, copilot, antigravity]\n",
+                Ok(Some(vec![
+                    "claude",
+                    "codex",
+                    "opencode",
+                    "cursor",
+                    "pi",
+                    "gemini",
+                    "copilot",
+                    "antigravity",
+                ])),
+            ),
+            (
+                "# harnesses: [\"claude-code\", gemini-cli, github-copilot, agy]\n",
+                Ok(Some(vec![
+                    "claude-code",
+                    "gemini-cli",
+                    "github-copilot",
+                    "agy",
+                ])),
+            ),
+            ("# harnesses: [copliot]\n", Err(())),
+            ("# harnesses: [claude, copliot]\n", Err(())),
+        ] {
+            let header = format!("# ---\n# name: x\n# event: Stop\n{line}# ---\n");
+            let actual = parse_hook(&header)
+                .map(|hook| hook.harnesses)
+                .map_err(|_| ());
+            let expected = expected
+                .map(|list| list.map(|names| names.into_iter().map(str::to_owned).collect()));
+            assert_eq!(actual, expected, "{line:?}");
+        }
+    }
+
     /// A header with no `requires:` line, and one whose list is empty,
     /// both declare no companion: nothing is guessed from the body.
     #[test]
     fn a_hook_without_a_requires_line_needs_nothing() {
         for header in [
             "# ---\n# name: x\n# event: Stop\n# ---\n",
-            "# ---\n# name: x\n# event: Stop\n# requires: []\n# ---\n",
+            "# ---\n# name: x\n# event: Stop\n# requires: []\n# requires-skills: []\n# ---\n",
         ] {
-            assert!(
-                parse_hook(header).unwrap().requires.is_empty(),
-                "{header:?}"
-            );
+            let hook = parse_hook(header).unwrap();
+            assert!(hook.requires.is_empty(), "{header:?}");
+            assert!(hook.requires_skills.is_empty(), "{header:?}");
         }
     }
 

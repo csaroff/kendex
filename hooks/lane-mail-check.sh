@@ -9,6 +9,7 @@
 # timeout: 30
 # harnesses: [claude, codex, pi, copilot, opencode, cursor]
 # requires: [lane-mail-deliver, lane-mail-halt]
+# requires-skills: [orch]
 # ---
 
 set -euo pipefail
@@ -27,10 +28,6 @@ set -euo pipefail
 # further model request, and PI_SUBAGENT_CHILD_AGENT dispatches no turn_end.
 # Gemini, Antigravity, OpenCode and Cursor provide no held wake check.
 
-# The session-start-row, session-end-row and stop-failure-row hooks require
-# this one, and it names none of them back: two run on Claude Code alone, and a
-# companion that does not run on a harness withholds the hook requiring it
-# there, which would take this judge off Codex, Pi and Copilot.
 
 # Names are matched by byte ranges below, so the locale decides the match.
 export LC_ALL=C
