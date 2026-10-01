@@ -17,12 +17,15 @@ catch-up writes both, and a start with no seeds writes the `seen` line of
 the binding moment. The catch-up runs on the first poll after every connect
 and reconnect, and on the next poll after an event whose delivery was
 refused. Each root keeps refused live events in memory and retries them on
-every poll, independently of the history lookback, until delivery succeeds.
+every poll, independently of the history lookback, until delivery succeeds
+or Slack reports that their parent no longer exists.
 It reads the
 channel's history from the journal's position or SLACK_THREAD_DAYS back,
 whichever is older, delivers the top-level messages past the position, and
-reads the thread of every open ask and of every live parent whose latest
-reply moved. So a message sent while the relay was disconnected, one whose
+reads every open ask and every recently active thread, including parents
+older than the history lookback. A refused thread read does not block the
+other threads or outbound mail; a temporary refusal leaves catch-up due
+on the next poll. So a message sent while the relay was disconnected, one whose
 envelope never arrived, and one acknowledged before a stop cut its delivery
 off land on a catch-up within that lookback, and lane-mail's delivery id judges any repeat.
 The connection opens before the catch-up reads, so no message falls between
@@ -237,7 +240,13 @@ class RootRelay:
         self.ready()
         self.post_failed = None
         for message in list(self.pending_live.values()):
-            self.on_message(message, bot_user)
+            try:
+                self.on_message(message, bot_user)
+            except Refusal as err:
+                if err.key != "slack-api-failed" or err.error != "thread_not_found":
+                    raise
+                self.thread_refused(err, str(message.get("thread_ts") or message["ts"]))
+                self.pending_live.pop(str(message["ts"]))
         if not self.caught_up:
             self.catch_up(bot_user)
         self.mark_seen()
@@ -259,7 +268,7 @@ class RootRelay:
 
     def live(self, thread: Thread) -> bool:
         """Whether catch-up re-reads a known thread within its lookback."""
-        return thread.open or float(thread.ts) >= self.settings.horizon(self.clock())
+        return not thread.missing and (thread.open or max(float(thread.ts), thread.active) >= self.settings.horizon(self.clock()))
 
     def parent_context(self, thread_ts: str) -> Dict:
         """Read a parent's small context once, persisting it across restarts."""
@@ -268,7 +277,7 @@ class RootRelay:
             return thread.parent
         messages = self.api.get("conversations.replies", channel=self.channel, ts=thread_ts, limit=1)["messages"]
         if not messages or str(messages[0]["ts"]) != thread_ts:
-            raise Refusal("slack-api-failed", f"conversations.replies parent={thread_ts} missing")
+            raise Refusal("slack-api-failed", f"conversations.replies parent={thread_ts} missing", error="thread_not_found")
         message = messages[0]
         envelope = thread.envelope if thread is not None and thread.kind in {"ask", "notice"} else ""
         parent = self.parent_of(message, "bot" if message.get("bot_id") else "owner", envelope)
@@ -298,15 +307,37 @@ class RootRelay:
             self.bind_file_share(message)
             self.handle(message, bot_user)
         replied = {str(m["ts"]): float(m["latest_reply"]) for m in messages if m.get("latest_reply")}
-        for thread_ts in replied:
+        complete = True
+        for thread_ts in dict.fromkeys([*replied, *self.state.threads]):
             if thread_ts not in self.state.threads:
-                self.parent_context(thread_ts)
-        for thread in list(self.state.threads.values()):
-            if thread.open or self.live(thread) and replied.get(thread.ts, 0.0) > float(thread.seen):
-                self.read_replies(thread, bot_user)
+                try:
+                    self.parent_context(thread_ts)
+                except Refusal as err:
+                    complete = self.thread_refused(err, thread_ts) and complete
+                    continue
+            thread = self.state.threads[thread_ts]
+            if self.live(thread) and (
+                thread.open or thread.ts not in replied or replied[thread.ts] > float(thread.seen)
+            ):
+                complete = self.read_replies(thread, bot_user) and complete
         if new:
             self.journal.append(t="seen", ts=new[-1]["ts"])
-        self.caught_up = True
+        self.caught_up = complete
+
+    def thread_refused(self, err: Refusal, thread_ts: str) -> bool:
+        """Report one thread's refusal without stopping the root. Slack's
+        thread_not_found closes only the journal's ask, not lane-mail's ask.
+        Authentication failure still stops the relay, not just one thread.
+        Returns whether the refusal needs no later catch-up retry."""
+        if err.key == "slack-auth-failed":
+            raise err
+        thread = self.state.threads.get(thread_ts)
+        envelope = thread.envelope if thread is not None else ""
+        notice("thread-read-failed", f"ts={thread_ts} id={envelope} reason={err.key} {err.value}")
+        missing = err.key == "slack-api-failed" and err.error == "thread_not_found"
+        if missing and thread is not None and thread.open:
+            self.journal.append(t="resolved", id=thread.envelope, reason="thread_not_found")
+        return missing
 
     def on_message(self, message: Dict, bot_user: str) -> None:
         """One live message event, without a thread-age or parent-origin gate."""
@@ -328,18 +359,23 @@ class RootRelay:
                 self.journal.append(t="bound", file=file_id, id=envelope, ts=message["ts"],
                                     parent=self.parent_of(message, "bot", envelope))
 
-    def read_replies(self, thread: Thread, bot_user: str) -> None:
+    def read_replies(self, thread: Thread, bot_user: str) -> bool:
+        """Read one thread; return whether catch-up can finish without retry."""
         # Binding owns the lower boundary; thread.seen owns delivery progress.
         oldest = max(thread.seen, self.binding.bound_at, key=float)
-        replies = list(
-            self.api.paged("conversations.replies", "messages", channel=self.channel, ts=thread.ts, oldest=oldest)
-        )
+        try:
+            replies = list(
+                self.api.paged("conversations.replies", "messages", channel=self.channel, ts=thread.ts, oldest=oldest)
+            )
+        except Refusal as err:
+            return self.thread_refused(err, thread.ts)
         replies = [r for r in replies if r["ts"] != thread.ts and float(r["ts"]) > float(oldest)]
         replies.sort(key=lambda m: float(m["ts"]))
         for reply in replies:
             self.handle(reply, bot_user)
         if replies:
             self.journal.append(t="thread", ts=thread.ts, seen=replies[-1]["ts"])
+        return True
 
     def handle(self, message: Dict, bot_user: str) -> None:
         ts = str(message["ts"])
@@ -598,11 +634,12 @@ class RootRelay:
     def post_refused(self, err: Refusal, envelope: Dict, kind: str) -> None:
         """Slack's refusal of one post, by key: a lost response is journaled
         unknown and never repeated; a dead token stops the relay; anything
-        else fails this poll and leaves the envelope for the next."""
+        else journals retry, fails this poll and leaves the envelope for the next."""
         if err.key == "slack-response-lost":
             self._out(envelope, kind, "unknown")
             print_refusal(err)
             return
+        self._out(envelope, kind, "retry", reason=err.key)
         if err.key == "slack-auth-failed":
             raise err
         if self.post_failed is None:
@@ -611,8 +648,9 @@ class RootRelay:
     def _send(self, envelope: Dict, kind: str, text: str, thread_ts: Optional[str], attach: str = "") -> Optional[str]:
         """The one outbound rule: the text and any attached file pass the
         secret-value check, a refusal there journaled refused and printed;
-        then the file is uploaded with the text as its comment, or the text
-        posted as standard Markdown, Slack's refusal to `post_refused`. A
+        then an in-flight line is synced before the file is uploaded with
+        the text as its comment, or the text posted as standard Markdown.
+        Slack's refusal goes to `post_refused`. A
         text past the `markdown_text` cap goes as `text`, Slack's mrkdwn,
         its Markdown marks shown literally: an ask or an answer the owner
         never sees would stand at its deadline unread. Returns the message
@@ -626,6 +664,7 @@ class RootRelay:
             self._out(envelope, kind, "refused", reason=err.key)
             print_refusal(err)
             return None
+        self._out(envelope, kind, "inflight")
         try:
             if data is not None:
                 return self.api.upload(Path(attach).name, data, self.channel, text, thread_ts)
@@ -657,7 +696,7 @@ class RootRelay:
 
     def post_notice(self, envelope: Dict) -> None:
         ref = envelope.get("ref")
-        thread_ts = self.state.by_envelope.get(str(ref)) if ref else None
+        thread_ts = self.state.post_thread(str(ref)) if ref else None
         attach = str(envelope.get("attach") or "")
         landed = self._send(envelope, "notice", envelope.get("text", ""), thread_ts, attach)
         if landed is None:
@@ -671,16 +710,19 @@ class RootRelay:
 
     def post_answer(self, envelope: Dict) -> None:
         ask_id = str(envelope.get("re", ""))
-        thread_ts = self.state.by_envelope.get(ask_id)
-        if thread_ts is None:
+        if ask_id not in self.state.by_envelope:
             self.skipped.add(str(envelope["id"]))
             return
+        thread_ts = self.state.post_thread(ask_id)
         if envelope.get("by") == "default":
             text = f"No answer by the deadline: {envelope.get('text', '')} stands."
         else:
             text = f"Answered in the chat: {envelope.get('text', '')}"
-        if self._send(envelope, "answer", text, thread_ts) is not None:
-            self._out(envelope, "answer", "resolved", thread=thread_ts)
+        landed = self._send(envelope, "answer", text, thread_ts)
+        if landed is not None:
+            fields = {} if thread_ts else {"parent": self.parent_of(
+                {"ts": landed, "text": text}, "bot", str(envelope["id"]))}
+            self._out(envelope, "answer", "resolved", thread=thread_ts or landed, **fields)
 
 
     # -- the record --status reads --------------------------------------------

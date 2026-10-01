@@ -1,0 +1,1 @@
+- Slack records posts before sending, avoids repeats after lost responses or stops, redirects posts from deleted asks to the channel, and recovers replies in recently active old threads.

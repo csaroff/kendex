@@ -142,6 +142,7 @@ class Thread:
     open: bool = False
     parent: Optional[Dict] = None
     active: float = 0.0
+    missing: bool = False
 
 
 
@@ -169,6 +170,14 @@ class State:
     ignored: Set[str] = field(default_factory=set)
     directives: Set[str] = field(default_factory=set)
     marks: Dict[str, str] = field(default_factory=dict)
+
+    def post_thread(self, envelope_id: str) -> Optional[str]:
+        """Select an outbound thread without discarding its journal provenance.
+        A known-missing thread sends later posts to the channel instead."""
+        thread_ts = self.by_envelope.get(envelope_id)
+        if thread_ts is None:
+            return None
+        return None if self.threads[thread_ts].missing else thread_ts
 
     def apply(self, line: Dict) -> None:
         kind = line.get("t")
@@ -203,11 +212,14 @@ class State:
             env_id = str(line["id"])
             state = line["state"]
             parse_at(str(line["at"]))  # the age `compact` judges the line by
-            if state == "unknown":
+            if state in ("inflight", "unknown"):
                 self.unknown[env_id] = str(line["kind"])
                 self.carried.add(env_id)
                 return
             self.unknown.pop(env_id, None)
+            if state == "retry":
+                self.carried.discard(env_id)
+                return
             self.carried.add(env_id)
             if state == "refused":
                 self.refused[env_id] = str(line["reason"])
@@ -228,6 +240,8 @@ class State:
             thread_ts = self.by_envelope.get(str(line["id"]))
             if thread_ts in self.threads:
                 self.threads[thread_ts].open = False
+                if line.get("reason") == "thread_not_found":
+                    self.threads[thread_ts].missing = True
         elif kind == "bound":
             env_id = self.pending_files.pop(str(line["file"]), str(line["id"]))
             thread_ts = str(line["ts"])
@@ -327,6 +341,10 @@ def compact(root: Path, cutoff_ts: float) -> int:
             drop = aged
         elif kind == "in" and old:
             drop = line["kind"] == "ignored" or not (pending or str(line.get("thread", "")) in live)
+        elif kind == "out" and line["state"] == "inflight":
+            # A later outcome owns retention; its redundant pre-send line
+            # must not become unknown when that outcome leaves the journal.
+            drop = str(line["id"]) not in state.unknown
         elif aged and line["state"] == "file":
             drop = True
         elif aged and line["state"] in ("open", "resolved"):
