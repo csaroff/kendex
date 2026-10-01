@@ -2,8 +2,8 @@
 # Tests for how `lanes pick` spreads launches across accounts: every verdict
 # charges each live claim on an account its expected burn, so an account whose
 # room the lanes already on it will spend is dropped as a walled one is, by the
-# chooser and by the named form alike; ties among the fewest claims break on
-# that projected room; and the bare chooser never returns an overseer seat, an
+# chooser and by the named form alike; selection charges that projected room;
+# and the bare chooser never returns an overseer seat, an
 # account a fleet state records as its overseer's. The network layer is the
 # fetch stub lib/lanes-fixture.sh writes, so every row runs offline.
 #
@@ -190,21 +190,37 @@ table \
   "a lone seat whose claims project past the threshold is dropped the way a walled one is|ORCH_LANE_DIRS=$H/.aclaude;ORCH_LANE_BURN_PCT_PER_HOUR=30|claim:a:3||$PICK|rc=3 walled=1 unmeasured=0" \
   "a named lane whose claims project past the threshold is refused under --projected on the chooser's rule|$ALL_DIRS;ORCH_LANE_BURN_PCT_PER_HOUR=30|claim:a:3||pick --lane $H/.aclaude --harness claude --projected --json|rc=3 wall=20 claims=3 projected_headroom_pct=-10 key=pick-lane-walled,lane=$H/.aclaude,wall=20,bucket=session,max-pct=95,projected-headroom=-10" \
   "the most-room seat whose claims project past the threshold is skipped, even for one with less room and more claims|ORCH_LANE_DIRS=$H/.aclaude:$H/.bclaude|claim:a:1;claim:b:2|a:20:5|$PICK|rc=0 config_dir=$H/.bclaude projected_headroom_pct=60" \
+  "both readings have room but their claims project past the threshold|ORCH_LANE_DIRS=$H/.aclaude:$H/.bclaude;ORCH_LANE_BURN_PCT_PER_HOUR=30|claim:a:3;claim:b:4||$PICK|rc=3 walled=2 unmeasured=0" \
   "the pick names the projection it chose on|$ALL_DIRS|claim:a:1;claim:b:1;claim:c:1||$PICK|rc=0 config_dir=$H/.aclaude claims=1 burn_pct_per_lane_hour=5 projected_headroom_pct=75" \
   "a named lane judged without --projected reads the wall, as a lane's own handoff mark and a lane close ask|ORCH_LANE_DIRS=$H/.aclaude;ORCH_LANE_BURN_PCT_PER_HOUR=30|claim:a:4||pick --lane $H/.aclaude --harness claude --min-headroom-pct 3 --json|rc=0 wall=20 projected_headroom_pct=-40 key=none" \
   "--projected is refused without --lane, the chooser judging the projection always|$ALL_DIRS|||$PICK --projected|rc=1 key=unknown-option,arg1=--projected" \
   "a weekly-bound account is charged the default by its window's length and stays a candidate|ORCH_LANE_DIRS=$H/.wclaude|claim:w:2||$PICK|rc=0 config_dir=$H/.wclaude binding_bucket=weekly" \
   "a burn of 0 charges a claim nothing|ORCH_LANE_DIRS=$H/.aclaude;ORCH_LANE_BURN_PCT_PER_HOUR=0|claim:a:3||pick --lane $H/.aclaude --harness claude --projected --json|rc=0 projected_headroom_pct=80" \
-  "a measured rate is shared out across the claims on the account|ORCH_LANE_DIRS=$H/.aclaude|claim:a:2|a:20:15|pick --lane $H/.aclaude --harness claude --json|rc=0 usage_rate_state=measured burn_pct_per_lane_hour=15 projected_headroom_pct=50" \
+  "each claim inherits the measured account rate|ORCH_LANE_DIRS=$H/.aclaude|claim:a:2|a:20:15|pick --lane $H/.aclaude --harness claude --json|rc=0 usage_rate_state=measured burn_pct_per_lane_hour=30 projected_headroom_pct=20" \
   "a measured rate with nothing claimed charges nothing and names the default burn|ORCH_LANE_DIRS=$H/.aclaude||a:20:15|pick --lane $H/.aclaude --harness claude --json|rc=0 burn_pct_per_lane_hour=5 projected_headroom_pct=80" \
   "the listing carries the projection beside the verdict of the reading, whose wall lifts at its reset|ORCH_LANE_DIRS=$H/.aclaude;ORCH_LANE_BURN_PCT_PER_HOUR=30|claim:a:3||list --harness claude --json|rc=0 [0].verdict=room [0].projected_headroom_pct=-10"
+
+# open-terminal records claims and re-picks before cached usage refreshes.
+# A cached six-point hourly burn leaves 74 room with one claim, then 68
+# with two. The idle competitor keeps 70. Both samples stay unchanged.
+table \
+  "one measured claim still leaves more projected room than the idle account|ORCH_LANE_DIRS=$H/.aclaude:$H/.bclaude|claim:a:1|a:20:19|$PICK|rc=0 config_dir=$H/.aclaude projected_headroom_pct=74" \
+  "another claim on the same measured samples sends the chooser to the idle account|ORCH_LANE_DIRS=$H/.aclaude:$H/.bclaude|claim:a:2|a:20:19|$PICK|rc=0 config_dir=$H/.bclaude projected_headroom_pct=70" \
+  "the named projection charges the added measured claim too|ORCH_LANE_DIRS=$H/.aclaude|claim:a:2|a:20:19|pick --lane $H/.aclaude --harness claude --projected --json|rc=0 claims=2 burn_pct_per_lane_hour=6 projected_headroom_pct=68" \
+  "enough claims wall the named measured projection|ORCH_LANE_DIRS=$H/.aclaude|claim:a:13|a:20:19|pick --lane $H/.aclaude --harness claude --projected --json|rc=3 projected_headroom_pct=2"
+
+CTRL="$(mutant_scripts mutant-rate-divided lib/lane-model.sh)" || exit 1
+mutate_file "$CTRL/lib/lane-model.sh" 'then .usage_rate_pct_per_min * 60' 'then (.usage_rate_pct_per_min * 60) / .claims'
+LANES_UNDER_TEST="$CTRL/lanes" table \
+  "control: dividing by current claims keeps stacking launches on cached measured room|ORCH_LANE_DIRS=$H/.aclaude:$H/.bclaude|claim:a:2|a:20:19|$PICK|rc=0 config_dir=$H/.aclaude projected_headroom_pct=74" \
+  "control: the divided rate also admits a named launch whose claims spend its room|ORCH_LANE_DIRS=$H/.aclaude|claim:a:13|a:20:19|pick --lane $H/.aclaude --harness claude --projected --json|rc=0 projected_headroom_pct=74"
 
 # Control: a verdict read off the wall alone keeps the account the lanes on it
 # will spend, in both pick forms.
 CTRL="$(mutant_scripts mutant-wall-only lib/lane-model.sh)" || exit 1
 mutate_file "$CTRL/lib/lane-model.sh" 'else 100 - .projected_headroom_pct' 'else .wall'
 LANES_UNDER_TEST="$CTRL/lanes" table \
-  "control: judged on the wall alone, the most-room seat is picked for its fewer claims|ORCH_LANE_DIRS=$H/.aclaude:$H/.bclaude|claim:a:1;claim:b:2|a:20:5|$PICK|rc=0 config_dir=$H/.aclaude" \
+  "control: judged on the wall alone, the chooser admits both spent projections and picks the less spent one|ORCH_LANE_DIRS=$H/.aclaude:$H/.bclaude;ORCH_LANE_BURN_PCT_PER_HOUR=30|claim:a:3;claim:b:4||$PICK|rc=0 config_dir=$H/.aclaude projected_headroom_pct=-10" \
   "control: judged on the wall alone, the lone seat is picked|ORCH_LANE_DIRS=$H/.aclaude;ORCH_LANE_BURN_PCT_PER_HOUR=30|claim:a:3||$PICK|rc=0 walled=null unmeasured=null" \
   "control: judged on the wall alone, the named lane has room|$ALL_DIRS;ORCH_LANE_BURN_PCT_PER_HOUR=30|claim:a:3||pick --lane $H/.aclaude --harness claude --projected --json|rc=0 wall=20 claims=3 projected_headroom_pct=-10 key=none"
 
@@ -235,7 +251,7 @@ mutate_file "$CTRL/lanes" 'return 6' ':'
 LANES_UNDER_TEST="$CTRL/lanes" table \
   "control: without the refusal the unread store reaches the judge|ORCH_LANE_DIRS=$H/.aclaude|store:file||pick --lane $H/.aclaude --harness claude --projected --json|rc=5"
 
-echo "=== among the fewest claims, the most projected room wins ==="
+echo "=== selection charges projected room, not the reading ==="
 # a and b carry one claim each. a reads more room, 80 to b's 70, but its
 # measured rate of half a point a minute projects 50 against b's default 65.
 table \
@@ -248,8 +264,8 @@ claude_usage 30 10 5 Opus > "$FIXTURE_DIR/.bclaude.json"
 
 # Control: ordered on the reading once the claims tie, the seat the lanes on it
 # are spending fastest is returned.
-CTRL="$(mutant_scripts mutant-rank-wall lanes)" || exit 1
-mutate_file "$CTRL/lanes" 'sort_by([.claims, (0 - .projected_headroom_pct), .wall])' 'sort_by([.claims, .wall])'
+CTRL="$(mutant_scripts mutant-rank-wall lib/lane-model.sh)" || exit 1
+mutate_file "$CTRL/lib/lane-model.sh" 'sort_by([(0 - .selection_score), .claims, (0 - .projected_headroom_pct), .wall])' 'sort_by([.wall])'
 LANES_UNDER_TEST="$CTRL/lanes" table \
   "control: ranked on the reading, the tie goes to the seat burning fastest|ORCH_LANE_DIRS=$H/.aclaude:$H/.bclaude|claim:a:1;claim:b:1|a:20:15|$PICK|rc=0 config_dir=$H/.aclaude projected_headroom_pct=50"
 
@@ -257,7 +273,7 @@ echo "=== the chooser never returns an overseer seat ==="
 # a has the most room and no claim, so only the seat rule keeps it out.
 table \
   "the seat this checkout's fleet records for its overseer is never returned|$ALL_DIRS|own:a||$PICK|rc=0 config_dir=$H/.bclaude" \
-  "a peer fleet's overseer seat, found through its lane's claim, is never returned|$ALL_DIRS|peer:a;claim:b:1:peer||$PICK|rc=0 config_dir=$H/.cclaude" \
+  "a peer fleet's overseer seat is omitted while the remaining accounts compete on projected room|$ALL_DIRS|peer:a;claim:b:1:peer||$PICK|rc=0 config_dir=$H/.bclaude" \
   "--for-overseer keeps the seat, for a pick that seats an overseer|$ALL_DIRS|own:a||$PICK --for-overseer|rc=0 config_dir=$H/.aclaude" \
   "a claim naming a fleet state that is gone holds no seat|$ALL_DIRS|claim:b:1:gone||$PICK|rc=0 config_dir=$H/.aclaude" \
   "a fleet state that cannot be read refuses the pick, naming the step and the state|$ALL_DIRS|own:broken||$PICK|rc=1 seatrefusal=named" \

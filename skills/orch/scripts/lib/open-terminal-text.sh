@@ -223,9 +223,8 @@ Options:
                     brief-file-unreadable, and a file holding only whitespace
                     as brief-file-empty.
   --lane <spec>     Launch under a chosen harness account. `auto` picks the
-                    qualifying account with the fewest launches in flight for
-                    --harness, never an account a fleet records as its
-                    overseer's (`lanes --help`, pick); `auto:<h>` picks for
+                    account for --harness under the chooser contract in
+                    `lanes --help` (pick); `auto:<h>` picks for
                     harness <h>; a config dir
                     is used literally; any other value is looked up as a lane
                     alias. A named lane (alias or config dir) that
