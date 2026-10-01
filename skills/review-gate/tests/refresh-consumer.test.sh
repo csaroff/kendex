@@ -72,7 +72,7 @@ case "$1" in
     esac
     if [ -n "${TEST_HOSTILE:-}" ]; then
       cp "$TEST_FRESH_TEMPLATES/"*.yml .agents/skills/review-gate/templates/
-      for path in adopt-refresh.sh validate-standard.sh validate-workflow.sh lib/diagnostics.sh lib/settings.sh lib/standard.sh; do
+      for path in adopt-refresh.sh validate-standard.sh lib/diagnostics.sh lib/settings.sh lib/standard.sh; do
         printf '#!/usr/bin/env bash\nprintf "executed=%%s\\n" "$0" >>"$TEST_STATE/hostile"\nexit 89\n' >".agents/skills/review-gate/scripts/$path"
       done
     fi
@@ -210,7 +210,6 @@ run_refresh stale pass render
 if [ "$RC" -eq 0 ] && ! grep -qxF '## Settings' "$TMP/state/body"; then ok 'control: dropped Settings append turns the deprecated-entry assertion red'; else bad 'Settings append control' "$OUT"; fi
 reset_default
 cp "$TMP/settings-runner" "$runner"
-printf '[env]\nREVIEW_GATE_CONTEXT = "Review gate"\n' >"$repo/kendex.settings.toml"
 commit "$repo"
 git -C "$repo" push -q origin main
 # The setting-fixture commits changed the rolling head used by later rows.
@@ -528,8 +527,8 @@ rm -f -- "$repo/.env.local" "$repo/private.env"
 sandbox
 repo="$DIR"
 git -C "$repo" branch -M main
-git -C "$repo" mv .github/workflows/review-gate-writer.yml .github/workflows/gate.yml
-printf '[]\n' >"$repo/.kendex-generated.json"
+printf 'retired workflow\n' >"$repo/.github/workflows/gate.yml"
+record_adoption "$repo" .github/workflows/gate.yml .agents/skills/review-gate/templates/review-gate-writer.yml
 printf 'current\n' >"$repo/rendered.txt"
 cp "$TMP/case.1/.agents/skills/harness-ci/scripts/change-class" "$repo/.agents/skills/harness-ci/scripts/change-class"
 commit "$repo"
@@ -541,26 +540,24 @@ git -C "$repo" push -q origin main
 git -C "$repo" worktree add --detach "$TMP/trusted" HEAD
 runner="$TMP/trusted/.agents/skills/review-gate/scripts/refresh-consumer.sh"
 cp -R "$repo/.agents/skills/review-gate/templates" "$TMP/fresh-templates"
-file_edit "$TMP/fresh-templates" review-gate-writer.yml 1 '^    timeout-minutes: 15$' \
-  's/^    timeout-minutes: 15$/    timeout-minutes: 16/'
 printf '\n# fresh refresh template\n' >>"$TMP/fresh-templates/kendex-refresh.yml"
 : >"$TMP/state/pr"
 : >"$TMP/state/creates"
 HOSTILE=1
 run_refresh refreshed pass render
 if [ "$RC" -eq 0 ] && [ ! -e "$TMP/state/hostile" ] &&
-    cmp -s "$repo/.github/workflows/gate.yml" "$TMP/fresh-templates/review-gate-writer.yml" &&
+    [ ! -e "$repo/.github/workflows/gate.yml" ] &&
     cmp -s "$repo/.github/workflows/kendex-refresh.yml" "$TMP/fresh-templates/kendex-refresh.yml" &&
     python3 - "$repo" <<'INVENTORY'
 import hashlib,json,sys
 from pathlib import Path
 root=Path(sys.argv[1]); entries=json.loads((root/'.kendex-generated.json').read_text())
-assert {e['path'] for e in entries}=={'.github/workflows/gate.yml','.github/workflows/kendex-refresh.yml'}
+assert {e['path'] for e in entries}=={'.github/workflows/kendex-refresh.yml'}
 for entry in entries:
  assert entry['templateHash']=='sha256:'+hashlib.sha256((root/entry['path']).read_bytes()).hexdigest()
  assert (root/entry['path']).read_bytes()==(root/entry['template']).read_bytes()
 INVENTORY
-then ok 'trusted adoption reads fresh templates and records a renamed writer without executing refreshed code'
+then ok 'trusted adoption reads fresh templates and removes a renamed retired workflow without executing refreshed code'
 else bad 'trusted adoption boundary and fresh data' "$OUT"; fi
 # A hand edit committed on the default branch must reach the rolling body's
 # own section, even when adoption produces the same rolling tree as before.
@@ -606,9 +603,6 @@ else bad 'trusted adoption control' "$OUT"; fi
 sandbox
 repo="$DIR"
 git -C "$repo" branch -M main
-rm -- "${repo:?}/.github/workflows/review-gate-writer.yml"
-settings "$repo" REVIEW_GATE_WRITER optional
-settings "$repo" REVIEW_GATE_MODE off
 printf '[]\n' >"$repo/.kendex-generated.json"
 printf 'current\n' >"$repo/rendered.txt"
 cp "$TMP/case.1/.agents/skills/harness-ci/scripts/change-class" "$repo/.agents/skills/harness-ci/scripts/change-class"
