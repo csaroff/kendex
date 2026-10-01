@@ -122,7 +122,38 @@ sk_new_root() {
   printf '%s' "$root"
 }
 sk_box() { printf '%s/tmp/lane-mail/overseer' "$1"; }     # ROOT
+# sk_event_filter ROOT JQ — a lane-mail producer with changed event fields.
+sk_event_filter() {
+  rm -- "$1/.agents/skills/orch/scripts"
+  mkdir -p "$1/.agents/skills/orch/scripts"
+  python3 - "$1/.agents/skills/orch/scripts/lane-mail" "$SK_LANE_MAIL" "$2" <<'PY'
+import pathlib, shlex, sys
+path, mail, expression = pathlib.Path(sys.argv[1]), shlex.quote(sys.argv[2]), shlex.quote(sys.argv[3])
+path.write_text(f'#!/usr/bin/env bash\nset -o pipefail\nif [ "$1" = events ]; then\n  {mail} "$@" | jq -c {expression}\nelse\n  exec {mail} "$@"\nfi\n')
+path.chmod(0o755)
+PY
+}
 sk_journal() { printf '%s/tmp/slack/journal.jsonl' "$1"; } # ROOT
+# sk_legacy_warnings ROOT EXPECTED: read older lane-mail events twice in one process;
+# print the diagnostics and fail unless each position warning appears once.
+sk_legacy_warnings() {
+  env -i PATH="$PATH" HOME="$SK_TMP/home" LANG=C PYTHONDONTWRITEBYTECODE=1 \
+    python3 - "${SK_BIN%/*}/lib" "$1" "$2" <<'PY'
+import contextlib, io, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from mailbox import LaneMail
+mail = LaneMail(Path(sys.argv[2]))
+warnings = io.StringIO()
+with contextlib.redirect_stderr(warnings):
+    mail.events()
+    mail.events()
+output = warnings.getvalue()
+sys.stdout.write(output)
+expected = sys.argv[3] + "\n"
+sys.exit(0 if output == expected else 1)
+PY
+}
 sk_lm() { ( cd "$1" && shift && env -u ORCH_ASK_WAIT_MINUTES "$SK_LANE_MAIL" "$@" ); } # ROOT ARGS...
 sk_text() { printf '%s\n' "$2" > "$SK_TMP/$1.txt"; printf '%s' "$SK_TMP/$1.txt"; }   # NAME CONTENT
 
@@ -139,6 +170,12 @@ sk_run() {
   ERR1="$(sed -n '1p' "$SK_TMP/err")"
 }
 sk_bind() { sk_run -- setup --root "$1"; }                 # ROOT
+# sk_help_field: the help command succeeds and advertises the envelope key.
+sk_help_field() {
+  sk_run -- --help
+  [ "$RC=$ERR" = "0=" ] || return 1
+  case "$OUT" in *"envelope-field=ROOT id=ID field=FIELD"*) return 0 ;; *) return 1 ;; esac
+}
 # sk_relay_start ROOT [--root ROOT]... [VAR=VALUE]... — a relay on its Socket
 # Mode connection over every ROOT in the background, polling every second
 # unless a VAR says otherwise, its pid in SK_BG_PIDS, its stdout and stderr in
