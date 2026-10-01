@@ -1,0 +1,1 @@
+- **Breaking:** Pi fleet lanes refuse pi-hooks without mail wake. Repair the reported root and scope on the lane machine per the refusal; retry hosted launches with `--relaunch`.

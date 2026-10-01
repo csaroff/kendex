@@ -24,18 +24,16 @@ Use `get_subagent_result` for the context check above or as a recovery/status re
 
 ## Lane mailbox wake (Pi)
 
-A Pi lane whose installed `pi-hooks` lists the lane mail wake among its extensions arms no mailbox monitor ([watch-delivery.md § Lane mailbox monitor](watch-delivery.md#lane-mailbox-monitor)): its launch brief and relaunch line carry no arm line, and the package starts a turn in the idle lane when mail other than an answer lands, or when the session settles with such mail unread, by running the `lane-mail-deliver` hook's judge, and the turn opens with what that judge hands over after a tool call: `lane-mail-check: unread=[N]` and the envelopes, already marked read. Act on every directive it carries; a halt among them names the `lane-mail inbox` command that reads it. A turn opening on any other `lane-mail-check:` line is the judge's refusal, which the lane clears as it would after a tool call. What the package does is its [README](https://github.com/vanillagreencom/kendex/blob/main/pi-extensions/pi-hooks/README.md) § Lane mail wake.
+A Pi lane uses the `pi-hooks` lane mail wake and arms no mailbox monitor ([watch-delivery.md § Lane mailbox monitor](watch-delivery.md#lane-mailbox-monitor)): its launch brief and relaunch line carry no arm line, and the package starts a turn in the idle lane when mail other than an answer lands, or when the session settles with such mail unread, by running the `lane-mail-deliver` hook's judge, and the turn opens with what that judge hands over after a tool call: `lane-mail-check: unread=[N]` and the envelopes, already marked read. Act on every directive it carries; a halt among them names the `lane-mail inbox` command that reads it. A turn opening on any other `lane-mail-check:` line is the judge's refusal, which the lane clears as it would after a tool call. What the package does is its [README](https://github.com/vanillagreencom/kendex/blob/main/pi-extensions/pi-hooks/README.md) § Lane mail wake.
 
-## Lane mailbox monitor (Pi)
+`open-terminal` refuses a fleet launch with `pi-mail-wake-missing` if the selected `pi-hooks` lists no lane mail wake. Its `root`, `scope` and `location` fields name the deciding install. Repair it on the lane machine, on the host for `location=hosted`:
 
-A Pi lane whose installed `pi-hooks` lists no lane mail wake arms its mailbox monitor ([watch-delivery.md § Lane mailbox monitor](watch-delivery.md#lane-mailbox-monitor)) through the `pi-background-tasks` output wake that [§ Standing watch (Pi)](#standing-watch-pi) also uses. `open-terminal` reads that list at a fleet launch, prints `pi-mail-wake-missing` naming the carrier's version, and puts the arm line in the lane's brief and relaunch line; a lane whose brief or relaunch line carries no arm line arms nothing.
+| Scope | Recovery |
+|---|---|
+| `global` | Set `PI_CODING_AGENT_DIR` to the reported `root`; resolve a home-relative host root under that host home. Run `kendex update-pi --scope global`. |
+| `project` | Run `kendex update-pi --scope project` from the project containing `root`. In a linked worktree, `update-pi` refuses project writes and has no `--project-path` option. Have the install owner replace the carrier at `root/packages/@vanillagreen/pi-hooks` from its updated declared source. A global update does not repair this project carrier. |
 
-| Step | Call |
-|------|------|
-| Arm | `bg_task action: "spawn"` on `lane-mail watch --item [ISSUE_ID]`, with `notifyOnOutput: true`, `notifyMode: "always"` and `notifyOnExit: true`. Keep the pid the spawn returns. |
-| Wake | Run the `lane-mail inbox` command the announcement prints, and act on every directive it prints. The inbox is the read; the wake's inline tail only says mail landed. |
-| Re-arm | At the "wake budget exhausted" notice, stop the monitor with `bg_status action: "stop"` on the kept pid, then spawn a new one. |
-| Exit | An exit with code 2 is a refused watch: follow the refusal rule of [watch-delivery.md § Lane mailbox monitor](watch-delivery.md#lane-mailbox-monitor) and spawn nothing. At every other exit wake, `bg_status action: "list"`, and spawn a new monitor only when the list does not show the kept pid as running. |
+Repeat the original launch after repair. A hosted `create` already owns the item, so add `--relaunch`. `tests/open-terminal-harness-gate.sh` covers local recovery fields; `tests/open-terminal-record.sh` covers hosted recovery fields.
 
 ## Standing watch (Pi)
 
