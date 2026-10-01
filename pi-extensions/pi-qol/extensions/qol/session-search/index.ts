@@ -42,12 +42,12 @@ export async function runSessionSearchResumeOrFork(pi: ExtensionAPI, ctx: Extens
 	const commandCtx = asCommandContext(ctx);
 	if (typeof commandCtx.switchSession !== "function") return false;
 	const targetTitle = sessionDisplayName(action.result);
-	const selectedMessage = action.type === "fork" ? action.message : undefined;
 	const currentModel = action.keepCurrentModel ? ctx.model : undefined;
 	const currentThinking = action.keepCurrentModel && typeof pi.getThinkingLevel === "function" ? pi.getThinkingLevel() : undefined;
-	if (currentModel) pinSessionModel(action.result.path, currentModel, currentThinking);
 	let replacementStarted = false;
 	try {
+		const selectedMessage = action.type === "fork" ? action.message : undefined;
+		if (currentModel) pinSessionModel(action.result.path, currentModel, currentThinking);
 		const result = await commandCtx.switchSession(action.result.path, {
 			withSession: async (replacementCtx: any) => {
 				replacementStarted = true;
@@ -68,7 +68,7 @@ export async function runSessionSearchResumeOrFork(pi: ExtensionAPI, ctx: Extens
 		});
 		if (result.cancelled) ctx.ui.notify(selectedMessage ? "Fork cancelled" : "Resume cancelled", "info");
 	} catch (error) {
-		if (!replacementStarted) ctx.ui.notify(`${selectedMessage ? "Fork" : "Resume"} failed: ${stringifyError(error)}`, "error");
+		if (!replacementStarted) ctx.ui.notify(`${action.type === "fork" ? "Fork" : "Resume"} failed: ${stringifyError(error)}`, "error");
 	}
 	return true;
 }
@@ -129,11 +129,18 @@ export async function openQolSessionSearch(pi: ExtensionAPI, ctx: ExtensionConte
 	);
 	const releaseModalLock = acquirekendexModalLock();
 	let action: QolSessionPaletteAction | undefined;
+	let component: QolSessionSearchComponent | undefined;
 	try {
 		const currentModel = ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined;
 		action = await ctx.ui.custom<QolSessionPaletteAction>((tui, theme, _keybindings, done) => {
-			const component = new QolSessionSearchComponent(done, tui, theme, { status: "loading" }, ctx.cwd, initialQuery, currentModel);
-			void loading.then((load) => component.setSessions(load));
+			component = new QolSessionSearchComponent((selected) => {
+				if (selected.type === "copy") {
+					ctx.ui.setEditorText(selected.message!.text);
+					ctx.ui.notify("Copied selected prompt into the editor", "info");
+				}
+				done(selected);
+			}, tui, theme, { status: "loading" }, ctx.cwd, initialQuery, currentModel);
+			void loading.then((load) => component?.setSessions(load));
 			return component;
 		}, {
 			overlay: true,
@@ -144,17 +151,12 @@ export async function openQolSessionSearch(pi: ExtensionAPI, ctx: ExtensionConte
 			},
 		});
 	} finally {
+		component?.dispose();
 		releaseModalLock();
 	}
 	if (!action || action.type === "cancel" || !action.result) return;
 	if (action.type === "resume" || action.type === "fork") {
 		if (!(await runSessionSearchResumeOrFork(pi, ctx, action))) queueSessionSearchCommandAction(ctx, action);
-		return;
-	}
-	if (action.type === "copy") {
-		const text = action.message?.text || action.result.firstMessage;
-		ctx.ui.setEditorText(text);
-		ctx.ui.notify("Copied selected prompt into the editor", "info");
 		return;
 	}
 	if (action.type === "summarize") {

@@ -39,7 +39,7 @@ import {
 	QolEditor,
 } from "./qol/editor.js";
 import { runHandoff } from "./qol/handoff.js";
-import { imageContentForPath, resolveSubmittedImagePaths } from "./qol/images.js";
+import { imageContentsForPaths, resolveSubmittedImagePaths } from "./qol/images.js";
 import {
 	clearTmuxWindowMark,
 	notifyQuestionOpened,
@@ -847,15 +847,24 @@ export default function qol(pi: ExtensionAPI): void {
 		if (event?.toolName === "tasks_write") maybeNotifyTaskCompletion(ctx, event.details?.state);
 	});
 
-	pi.on("input", async (event) => {
+	pi.on("input", async (event, ctx) => {
 		clearTmuxWindowMark(pi);
 		if (event.source === "extension") return { action: "continue" };
 		const text = event.text ?? "";
-		const paths = currentCtx?.cwd ? resolveSubmittedImagePaths(text, currentCtx.cwd) : [];
+		const paths = resolveSubmittedImagePaths(text, ctx.cwd);
 		if (paths.length === 0) return { action: "continue" };
-		const images = paths.map(imageContentForPath).filter(Boolean);
-		if (images.length === 0) return { action: "continue" };
-		return { action: "transform", images: [...(event.images ?? []), ...images], text: event.text };
+		try {
+			const images = await imageContentsForPaths(paths, event.images ?? []);
+			return { action: "transform", images: [...(event.images ?? []), ...images], text: event.text };
+		} catch (error) {
+			const message = `Image submission refused: ${stringifyError(error)}`;
+			ctx.ui.notify(message, "error");
+			// Print and JSON modes reserve stderr for diagnostics; input exceptions
+			// would let Pi continue submission instead of refusing the image.
+			if (!ctx.hasUI) console.error(message);
+			if (ctx.hasUI && ctx.ui.getEditorText() === "") ctx.ui.setEditorText(text);
+			return { action: "handled" };
+		}
 	});
 
 	if (settingBoolean("enableSessionNameCommand", true)) {

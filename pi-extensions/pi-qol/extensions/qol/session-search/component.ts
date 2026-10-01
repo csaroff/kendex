@@ -5,17 +5,18 @@ import { SESSION_SEARCH_OVERLAY_HEIGHT_RATIO } from "../constants.js";
 import { settingNumber } from "../settings.js";
 import {
 	defaultSessionSearchScope,
+	canonicalPathForSessionSearch,
+	prepareQolSessionSearchSessions,
 	modelLabel,
 	sameModel,
-	sameSessionSearchProject,
 	sessionModelInfo,
 	sessionResumeTitle,
 	shortPathForUi,
 	userMessagesForResult,
+	sessionUserMessageForAction,
 	type QolModelInfo,
 } from "./cache.js";
 import {
-	buildPromptSnippet,
 	formatSessionSearchDate,
 	parseSessionSearchQuery,
 	promptRecencyTime,
@@ -121,6 +122,11 @@ export class QolSessionSearchComponent {
 	private contextConfirmState: QolSessionContextConfirmState | undefined;
 	private forkConfirmState: QolSessionForkConfirmState | undefined;
 	private confirmModelState: QolSessionConfirmModelState | undefined;
+	private readonly indexController = new AbortController();
+	private queryController: AbortController | undefined;
+	private debounceTimer: ReturnType<typeof setTimeout> | undefined;
+	private currentSessions: QolSessionSearchSession[] = [];
+	private searchStatus: { status: "searching" | "action" } | { status: "ready" } | { status: "failed"; error: string } = { status: "ready" };
 
 
 	constructor(
@@ -132,7 +138,22 @@ export class QolSessionSearchComponent {
 		initialQuery = "",
 		currentModel: QolModelInfo | undefined = undefined,
 	) {
-		this.done = done;
+		this.done = async (action) => {
+			try {
+				if (action.type === "copy" || action.type === "fork") {
+					this.screen = "search";
+					this.searchStatus = { status: "action" };
+					this.tui.requestRender();
+					action = { ...action, message: await sessionUserMessageForAction(action.result!, action.message, this.indexController.signal) };
+				}
+				if (this.indexController.signal.aborted) return;
+				this.dispose(); done(action);
+			} catch (error) {
+				if (this.indexController.signal.aborted) return;
+				this.searchStatus = { status: "failed", error: `${action.type === "copy" ? "Copy" : "Fork"} failed: ${String(error)}` };
+				this.tui.requestRender();
+			}
+		};
 		this.tui = tui;
 		this.theme = theme;
 		this.sessions = sessions;
@@ -140,24 +161,53 @@ export class QolSessionSearchComponent {
 		this.currentModel = currentModel;
 		const query = initialQuery.trim();
 		const scope = defaultSessionSearchScope(cwd);
-		const scopedSessions = this.sessionsForScope(scope);
 		this.searchState = {
 			cursor: query.length,
 			query,
-			results: searchQolSessionHits(scopedSessions, query, cwd),
+			results: [],
 			selected: 0,
 			scope,
-			total: scopedSessions.length,
+			total: 0,
 		};
+		if (sessions.status === "ready") this.setSessions(sessions);
 	}
 
 	invalidate(): void {}
 
+	/** Pi disposes a completed custom overlay. Late loads cannot redraw it. */
+	dispose(): void {
+		this.indexController.abort();
+		this.queryController?.abort();
+		if (this.debounceTimer) clearTimeout(this.debounceTimer);
+		this.debounceTimer = undefined;
+		this.currentSessions = [];
+		this.sessions = { status: "loading" };
+		this.searchState.results = [];
+	}
+
 	/** Show the index once its load settles; the overlay opens before that. */
 	setSessions(sessions: QolSessionSearchLoad): void {
-		this.sessions = sessions;
-		this.updateResults(false);
-		this.tui.requestRender();
+		const signal = this.indexController.signal;
+		if (signal.aborted) return;
+		if (sessions.status !== "ready") {
+			this.sessions = sessions;
+			this.tui.requestRender();
+			return;
+		}
+		this.sessions = { status: "loading" };
+		void Promise.all([
+			prepareQolSessionSearchSessions(sessions.sessions, signal),
+			canonicalPathForSessionSearch(this.cwd),
+		]).then(([prepared, cwd]) => {
+			if (signal.aborted) return;
+			this.sessions = { status: "ready", sessions: prepared };
+			this.currentSessions = prepared.filter((session) => session.canonicalCwd === cwd);
+			this.updateResults(false);
+		}, (error: unknown) => {
+			if (signal.aborted) return;
+			this.sessions = { status: "failed", error: String(error) };
+			this.tui.requestRender();
+		});
 	}
 
 	private maxOverlayRows(): number {
@@ -205,6 +255,7 @@ export class QolSessionSearchComponent {
 	}
 
 	handleInput(data: string): void {
+		if (this.searchStatus.status === "action") return matchesKey(data, "escape") ? this.done({ type: "cancel" }) : undefined;
 		if (this.screen === "messages" && this.messagesState) this.handleMessagesInput(data);
 		else if (this.screen === "actions" && this.actionState) this.handleActionInput(data);
 		else if (this.screen === "confirmContext" && this.contextConfirmState) this.handleContextConfirmInput(data);
@@ -224,16 +275,33 @@ export class QolSessionSearchComponent {
 	private sessionsForScope(scope = this.searchState.scope): QolSessionSearchSession[] {
 		if (this.sessions.status !== "ready") return [];
 		if (scope === "all") return this.sessions.sessions;
-		return this.sessions.sessions.filter((session) => sameSessionSearchProject(session.cwd, this.cwd));
+		return this.currentSessions;
 	}
 
 	private updateResults(resetSelection = true): void {
+		if (this.debounceTimer) clearTimeout(this.debounceTimer);
+		this.debounceTimer = undefined;
+		this.queryController?.abort();
+		if (this.indexController.signal.aborted || this.sessions.status !== "ready") return;
+		const controller = new AbortController();
+		this.queryController = controller;
 		const state = this.searchState;
 		const scopedSessions = this.sessionsForScope(state.scope);
-		state.results = searchQolSessionHits(scopedSessions, state.query, this.cwd);
+		state.results = [];
+		this.searchStatus = { status: "searching" };
 		state.total = scopedSessions.length;
 		if (resetSelection) state.selected = 0;
-		this.clampSelection();
+		void searchQolSessionHits(scopedSessions, state.query, this.cwd, controller.signal).then((results) => {
+			if (controller.signal.aborted || this.indexController.signal.aborted) return;
+			state.results = results;
+			this.searchStatus = { status: "ready" };
+			this.clampSelection();
+			this.tui.requestRender();
+		}, (error: unknown) => {
+			if (controller.signal.aborted || this.indexController.signal.aborted) return;
+			this.searchStatus = { status: "failed", error: String(error) };
+			this.tui.requestRender();
+		});
 	}
 
 	private toggleScope(): void {
@@ -244,7 +312,11 @@ export class QolSessionSearchComponent {
 	private updateQuery(query: string, cursor: number): void {
 		this.searchState.query = query;
 		this.searchState.cursor = Math.max(0, Math.min(cursor, query.length));
-		this.updateResults(true);
+		this.queryController?.abort();
+		this.searchState.results = [];
+		this.searchStatus = { status: "searching" };
+		if (this.debounceTimer) clearTimeout(this.debounceTimer);
+		this.debounceTimer = setTimeout(() => this.updateResults(true), 20);
 	}
 
 	private selectedMessageIndex(messages: QolSessionUserMessage[], query: string): number {
@@ -628,6 +700,10 @@ export class QolSessionSearchComponent {
 			lines.push(row(muted("Loading sessions…")));
 		} else if (this.sessions.status === "failed") {
 			lines.push(row(muted(`Could not load sessions: ${this.sessions.error.split("\n")[0]}`)));
+		} else if (this.searchStatus.status === "failed") {
+			lines.push(row(muted(`Search failed: ${this.searchStatus.error.split("\n")[0]}`)));
+		} else if (this.searchStatus.status === "searching" || this.searchStatus.status === "action") {
+			lines.push(row(muted(this.searchStatus.status === "action" ? "Loading prompt…  Esc cancel" : "Searching…")));
 		} else if (state.results.length === 0) {
 			lines.push(row(muted(state.query.trim() ? "No prompts match your search" : "No prompts found")));
 		} else {
