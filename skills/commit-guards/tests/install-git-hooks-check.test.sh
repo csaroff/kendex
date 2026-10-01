@@ -25,6 +25,9 @@ REARM_WT=""
 CND="commit-guards git hooks: unknown="
 UNVERIFIED="helper-unverified=kendex-guards"
 STUB='#!/bin/sh\n# kendex commit-guards git hooks\nexit 0\n'
+# A current version does not license a stub: its bytes must still verify.
+STAMP="$(sed -n '/^# kendex-guards-helper-version=/p' "$R/.git/hooks/kendex-guards")"
+STUB="$STUB$STAMP\n"
 HELPER_NOEXEC="$RW:ours['<repo>/.agents/skills/commit-guards/scripts']"
 rebake() { edit "$R/.git/hooks/kendex-guards" "s|^installed_scripts=.*|installed_scripts=$1|"; }
 
@@ -71,7 +74,7 @@ run_rows \
   "a symlink at the helper path is not a regular file, whatever it points at|fx_helper_symlink||check||rc=1 ${NA}helper-not-file=kendex-guards$REARM|helper=symlink-><root>/helper-target[ours['<repo>/.agents/skills/commit-guards/scripts']] pre-commit=$SHIM_PRE commit-msg=$SHIM_MSG pre-push=$SHIM_PUSH hooksPath=<unset>" \
   "a file without the marker was not written by this installer|fx_helper_foreign||check||rc=1 ${NA}helper-foreign=kendex-guards$REARM|helper=$X:#!/bin/sh~exit 0 pre-commit=$SHIM_PRE commit-msg=$SHIM_MSG pre-push=$SHIM_PUSH hooksPath=<unset>" \
   "a helper without its execute bit blocks every commit, so it is not armed|fx_helper_noexec||check||rc=1 ${NA}helper-disabled=kendex-guards$REARM|helper=$HELPER_NOEXEC pre-commit=$SHIM_PRE commit-msg=$SHIM_MSG pre-push=$SHIM_PUSH hooksPath=<unset>" \
-  "a marker-carrying stub in place of the helper is unverifiable, not armed|fx_helper_stub||check||rc=2 $CND$UNVERIFIED|helper=$X:#!/bin/sh~# kendex commit-guards git hooks~exit 0 pre-commit=$SHIM_PRE commit-msg=$SHIM_MSG pre-push=$SHIM_PUSH hooksPath=<unset>" \
+  "a marker-carrying stub with the current stamp is unverifiable, not armed|fx_helper_stub||check||rc=2 $CND$UNVERIFIED|helper=$X:#!/bin/sh~# kendex commit-guards git hooks~exit 0~$STAMP pre-commit=$SHIM_PRE commit-msg=$SHIM_MSG pre-push=$SHIM_PUSH hooksPath=<unset>" \
   "and that stub really does let a violation through every guard|fx_helper_stub_commit|$ONE|commit|feat: add b|rc=0|" \
   "from the arming checkout, a scripts directory whose pre-commit program is gone is unverifiable|fx_lane_missing||check||rc=2 $CND$UNVERIFIED|" \
   "a provably missing shim outranks an unverifiable helper, and both are named|fx_drift_and_unknown||check||rc=1 $NA$UNVERIFIED; hook-missing=pre-commit$REARM|"
@@ -240,6 +243,66 @@ run_rows \
   "control: re-arming the moved checkout reads armed|fx_moved_rearmed||check||rc=0 $ARMED_CHECK|$FRESH" \
   "a recorded place other than where this project keeps its scripts is drift|fx_rel_elsewhere||check||rc=1 $NA$MOVED$REARM|" \
   "a payload on the recorded place is unverifiable|fx_rel_payload||check||rc=2 $CND$UNVERIFIED|"
+
+echo "=== a pulled render leaves an older helper until the installer re-arms it ==="
+# Removing the stamp reproduces the helper body written by the unstamped
+# installer. A pulled render changes the payload but leaves the installed
+# helper and its installer-generated stamp untouched.
+fx_previous_helper() {
+  armed "${1:-previous-helper}"
+  assert_eq "the previous body removes one stamp" "1" \
+    "$(grep -c '^# kendex-guards-helper-version=' "$R/.git/hooks/kendex-guards")"
+  edit "$R/.git/hooks/kendex-guards" '/^# kendex-guards-helper-version=/d'
+}
+fx_older_stamp() {
+  armed "${1:-older-stamp}"
+  local body="$R/.agents/skills/commit-guards/scripts/lib/helper-body.sh" matches=""
+  matches="$(grep -cFx 'mode="${1-}"' "$body")" || return 1
+  assert_eq "the pulled render changes one payload line" "1" "$matches"
+  edit "$body" 's/^mode="${1-}"$/mode="${1:-}"/'
+}
+fx_helper_rearmed() {
+  fx_older_stamp rearmed-stamp
+  install_in "$R"
+  assert_eq "re-arming replaces the older helper" "0" "$RC"
+}
+fx_wt_previous_helper() {
+  worktree_of wt-previous-helper
+  edit "$R/.git/hooks/kendex-guards" '/^# kendex-guards-helper-version=/d'
+}
+fx_bare_previous_helper() {
+  R="$TMP/bare-host.git"
+  git -c init.defaultBranch=main init -q --bare "$R"
+  git -C "$R" config user.email test@example.com
+  git -C "$R" config user.name test
+  W="$TMP/bare-host-wt"
+  git -C "$R" worktree add -q -b bm "$W"
+  mkdir -p "$W/.agents/skills"
+  cp -R "$GG_SKILL_TEMPLATE" "$W/.agents/skills/commit-guards"
+  ln -s "$SKILL_DIR/../doc-limits" "$W/.agents/skills/doc-limits"
+  install_in "$W"
+  assert_eq "the bare-host worktree arms its shared hooks" "0" "$RC"
+  edit "$R/hooks/kendex-guards" '/^# kendex-guards-helper-version=/d'
+}
+# Freeze the copied installer's stamp at the installed version after pulling
+# a changed payload. The older-stamp row's exact drift assertion then fails:
+# byte verification reports unknown and loses the main-checkout remedy.
+fx_blind_version() {
+  fx_older_stamp blind-helper
+  local body="$R/.agents/skills/commit-guards/scripts/lib/helper-body.sh" stamp="" matches=""
+  stamp="$(sed -n 's/^# kendex-guards-helper-version=//p' "$R/.git/hooks/kendex-guards")" || return 1
+  matches="$(grep -cFx '  version="$(helper_payload | cksum)" || return 1' "$body")" || return 1
+  assert_eq "the version control freezes one checksum" "1" "$matches"
+  edit "$body" "s/^  version=.*$/  version=\"$stamp\"/"
+}
+OUTDATED="helper-outdated=kendex-guards fix=.agents/skills/commit-guards/scripts/install-git-hooks (run from the main checkout)"
+run_rows \
+  "the previous helper body is drift with its main-checkout installer|fx_previous_helper||check||rc=1 $NA$OUTDATED|" \
+  "a pulled payload change makes the installed stamp outdated with its main-checkout installer|fx_older_stamp||check||rc=1 $NA$OUTDATED|$FRESH" \
+  "control: the current helper body reads armed after re-arming|fx_helper_rearmed||check||rc=0 $ARMED_CHECK|" \
+  "a worktree names the main-checkout installer, not its own absolute path|fx_wt_previous_helper||check-wt||rc=1 $NA$OUTDATED|" \
+  "a bare-host worktree names this checkout because there is no main checkout|fx_bare_previous_helper||check-wt||rc=1 ${NA}helper-outdated=kendex-guards fix=.agents/skills/commit-guards/scripts/install-git-hooks (run from this checkout)|" \
+  "must-fail: a frozen stamp loses the pulled-render drift and remedy|fx_blind_version||check||rc=2 $CND$UNVERIFIED|$FRESH"
 
 echo "=== usage ==="
 fx_fresh() { R="$(new_repo fresh)"; }
