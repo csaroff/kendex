@@ -1,3 +1,4 @@
+import { isTerminalTaskStatus, isTaskActive, isTaskTurnFinished, normalizePaneTaskStatus, taskStatus } from "./outcomes.js";
 /**
  * Agent delegation tool — delegate tasks to specialized agents.
  *
@@ -178,7 +179,6 @@ import {
 	createTaskId,
 	emitSubagentEvent,
 	inferTaskRecordKind,
-	isTerminalTaskStatus,
 	latestTaskRecord,
 	markTaskNeedsCompletion,
 	normalizeUsageStats,
@@ -255,14 +255,6 @@ function launchInventory(cwd: string, scope: AgentScope, allowed: AgentConfig[])
 	return { allowed, project, user };
 }
 
-function collectRequestedAgentNames(params: Record<string, any>): Set<string> {
-	const requested = new Set<string>();
-	if (Array.isArray(params.chain)) for (const step of params.chain) if (typeof step?.agent === "string") requested.add(step.agent);
-	if (Array.isArray(params.tasks)) for (const task of params.tasks) if (typeof task?.agent === "string") requested.add(task.agent);
-	if (typeof params.agent === "string") requested.add(params.agent);
-	return requested;
-}
-
 type FollowUpTask = { taskId: string; outboxFile: string; taskFile?: string };
 
 interface PersistedSubagentRuntimeState {
@@ -277,7 +269,7 @@ function latestRecordTimestamp(record: PaneTaskRecord | undefined): string {
 }
 
 function isLiveDashboardStatus(status: SubagentDashboardItem["status"] | undefined): boolean {
-	return status === "queued" || status === "running" || status === "waiting";
+	return taskStatus(status).phase === "working";
 }
 
 function timestampMs(value: string | undefined): number {
@@ -641,10 +633,7 @@ export default function (pi: ExtensionAPI) {
 			return Object.values(records).filter(
 				(record) =>
 					record?.taskId &&
-					record.status !== "completed" &&
-					record.status !== "failed" &&
-					record.status !== "blocked" &&
-					record.status !== "needs_completion",
+					isTaskActive(record.status),
 			);
 		},
 		outboxExists: defaultOutboxExists,
@@ -811,6 +800,7 @@ export default function (pi: ExtensionAPI) {
 			const deliverAs = typeof event.deliverAs === "string" ? event.deliverAs : existing?.deliverAs;
 			records[taskId] = {
 				...existing,
+				reuseNotice: typeof event.reuseNotice === "string" ? event.reuseNotice : existing?.reuseNotice,
 				taskId,
 				agent,
 				task: typeof event.task === "string" ? event.task : existing?.task ?? "",
@@ -924,9 +914,10 @@ export default function (pi: ExtensionAPI) {
 		// updaters in parallel/single/chain mode (updateOneshotDashboard, the
 		// post-await dashboard refreshes) write only status/message/usage and
 		// would otherwise blow away the startedAt set by subagents:started —
-		// without which appendBgChatMessages cannot emit a delegation row.
+		// The Monitor reads these timestamps for task duration.
 		dashboardState.items[key] = {
 			...item,
+			reuseNotice: item.reuseNotice ?? existing?.reuseNotice,
 			startedAt: item.startedAt ?? existing?.startedAt,
 			completedAt: item.completedAt ?? existing?.completedAt,
 			sessionMode: item.sessionMode ?? existing?.sessionMode,
@@ -1028,6 +1019,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		updateDashboard({
 			agent: record.agent,
+			reuseNotice: record.reuseNotice ?? existing?.reuseNotice,
 			artifacts: kind === "pane" ? Boolean(record.completionArchivePath || record.outboxFile || record.transcriptPath || record.processingFile || record.doneFile) : Boolean(record.transcriptPath),
 			bridge: existing?.bridge,
 			completedAt: record.completedAt,
@@ -1241,12 +1233,9 @@ export default function (pi: ExtensionAPI) {
 		const eventEffort = normalizeReasoningEffort(event.effort) ?? existing?.effort;
 		const sessionMode = normalizeEventSessionMode(event.sessionMode) ?? existing?.sessionMode;
 		const sessionKey = normalizeEventSessionKey(event.sessionKey) ?? existing?.sessionKey;
-		const eventSummary = normalizeSummaryText(typeof event.summary === "string" ? event.summary : typeof event.finalOutput === "string" ? event.finalOutput : typeof event.error === "string" ? event.error : undefined);
+		const eventSummary = normalizeSummaryText(typeof event.error === "string" ? event.error : typeof event.summary === "string" ? event.summary : typeof event.finalOutput === "string" ? event.finalOutput : undefined);
 		const kind = event.mode === "oneshot" ? "oneshot" : event.mode === "pane" ? "pane" : existing?.kind ?? "pane";
-		const payloadStatus = ((): PaneTaskStatus => {
-			const raw = event.status;
-			return raw === "queued" || raw === "running" || raw === "completed" || raw === "blocked" || raw === "failed" || raw === "needs_completion" ? raw : "unknown";
-		})();
+		const payloadStatus = normalizePaneTaskStatus(event.status);
 		const eventStatus = payloadStatus === "unknown" ? status : payloadStatus;
 		const effectiveStatus = dashboardStatusFor(eventStatus, kind);
 		persistTaskEvent(event, eventStatus);
@@ -1256,7 +1245,7 @@ export default function (pi: ExtensionAPI) {
 			bridge: existing?.bridge,
 			completedAt: typeof event.timestamp === "string" ? event.timestamp : new Date().toISOString(),
 			kind,
-			message: eventSummary ?? (isTerminalTaskStatus(eventStatus) || eventStatus === "needs_completion" ? completionBodyWithoutPromptEcho(existing?.message, existing?.task) : existing?.message),
+			message: eventSummary ?? (isTaskTurnFinished(eventStatus) ? completionBodyWithoutPromptEcho(existing?.message, existing?.task) : existing?.message),
 			paneId: kind === "pane" ? existing?.paneId ?? (typeof event.paneId === "string" ? event.paneId : undefined) : undefined,
 			sessionMode,
 			sessionKey,
@@ -1311,7 +1300,7 @@ export default function (pi: ExtensionAPI) {
 			let outboxFile = taskId ? completionPath(runtimeRoot, childAgentName, taskId) : "";
 			if (!taskId) {
 				const records = Object.values(await readTaskRegistry(runtimeRoot))
-					.filter((record) => record.agent === childAgentName && (record.status === "queued" || record.status === "running"))
+					.filter((record) => record.agent === childAgentName && (taskStatus(record.status).phase === "working"))
 					.sort((a, b) => (b.updatedAt ?? b.createdAt).localeCompare(a.updatedAt ?? a.createdAt));
 				const record = records[0];
 				if (!record) return { content: [{ type: "text", text: "No active agent task file or bridge follow-up task is being processed." }], details: {}, isError: true };
@@ -1342,8 +1331,8 @@ export default function (pi: ExtensionAPI) {
 		renderResult(result, _options, theme, _context) {
 			const details = result.details as { agent?: string; status?: string; outboxFile?: string } | undefined;
 			const agent = details?.agent ?? childAgentName ?? "agent";
-			const statusWord = details?.status === "failed" ? "failed" : details?.status === "blocked" ? "blocked" : "completed";
-			const tone = details?.status === "failed" || details?.status === "blocked" ? "error" : "success";
+			const statusWord = normalizePaneTaskStatus(details?.status);
+			const tone = taskStatus(statusWord).tone;
 			return wrappedText(agentStatusLine(theme, agent, statusWord, tone, theme.fg("muted", " · reported")));
 		},
 	});
@@ -1351,8 +1340,8 @@ export default function (pi: ExtensionAPI) {
 	pi.registerMessageRenderer("subagent-self-completion", (message, options, theme) => {
 		const details = message.details as { agent?: string; status?: string; outboxFile?: string } | undefined;
 		const agent = details?.agent ?? "unknown";
-		const statusWord = details?.status === "failed" ? "failed" : details?.status === "blocked" ? "blocked" : "completed";
-		const tone = details?.status === "failed" || details?.status === "blocked" ? "error" : "success";
+		const statusWord = normalizePaneTaskStatus(details?.status);
+		const tone = taskStatus(statusWord).tone;
 		const tail = statusWord === "completed" ? theme.fg("muted", " · now waiting") : "";
 		const headline = agentStatusLine(theme, agent, statusWord, tone, tail);
 		if (options?.expanded && details?.outboxFile) {
@@ -1598,7 +1587,7 @@ export default function (pi: ExtensionAPI) {
 			const records = await readTaskRegistry(runtimeRoot);
 			for (const record of Object.values(records)) {
 				if (!record?.taskId || record.agent !== childAgentName) continue;
-				if (isTerminalTaskStatus(record.status) || record.status === "needs_completion") continue;
+				if (isTaskTurnFinished(record.status)) continue;
 				agentEndWatchdog.onAgentEnd({ runtimeRoot, agentName: childAgentName, taskId: record.taskId });
 			}
 		} catch (err) {
@@ -1858,7 +1847,6 @@ export default function (pi: ExtensionAPI) {
 		formatTaskRecordResult,
 		inferTaskRecordKind,
 		isFollowUpDelivery,
-		isTerminalTaskStatus,
 		latestTaskRecord,
 		paneExists,
 		paneSessionBelongsToRuntime,
@@ -2092,6 +2080,7 @@ export default function (pi: ExtensionAPI) {
 			const parentSessionId = runtimeSessionId(ctx);
 			const runtimeRoot = sessionRuntimeDir(parentSessionId);
 
+			params = { ...params, chain: params.chain?.filter((item) => item.agent && item.task), tasks: params.tasks?.filter((item) => item.agent && item.task) };
 			const hasChain = (params.chain?.length ?? 0) > 0;
 			const hasTasks = (params.tasks?.length ?? 0) > 0;
 			const hasSingle = Boolean(params.agent && params.task);
@@ -2114,7 +2103,11 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			const requestedAgentNames = collectRequestedAgentNames(params as Record<string, any>);
+			const requestedAgentNames = new Set(
+				hasChain ? params.chain!.map((step) => step.agent)
+					: hasTasks ? params.tasks!.map((task) => task.agent)
+						: [params.agent!],
+			);
 			const inventoryError = validateAgentInventory(requestedAgentNames, launchInventory(ctx.cwd, agentScope, agents), agentScope);
 			if (inventoryError) {
 				const mode = hasChain ? "chain" : hasTasks ? "parallel" : "single";
@@ -2148,7 +2141,8 @@ export default function (pi: ExtensionAPI) {
 			if (params.chain && params.chain.length > 0) {
 				return runChainDispatch({
 					agents,
-					chain: params.chain as Array<{ agent: string; task: string; cwd?: string; sessionKey?: string }>,
+					chain: params.chain,
+					sameSession: params.sameSession,
 					cwd: ctx.cwd,
 					forceSpawn: params.forceSpawn ?? false,
 					makeDetails,
@@ -2182,7 +2176,8 @@ export default function (pi: ExtensionAPI) {
 					resumeSession: params.resumeSession,
 					runtimeRoot,
 					signal,
-					tasks: params.tasks as Array<{ agent: string; task: string; cwd?: string; sessionKey?: string }>,
+					tasks: params.tasks,
+					sameSession: params.sameSession,
 					updateDashboard,
 				});
 			}
@@ -2205,6 +2200,7 @@ export default function (pi: ExtensionAPI) {
 					resumeSession: params.resumeSession,
 					runtimeRoot,
 					sessionKey: params.sessionKey,
+					sameSession: params.sameSession,
 					signal,
 					task: params.task,
 					updateDashboard,

@@ -16,6 +16,7 @@ import { sanitizeCwdSnapshotText, setGitExecFileForTests as setSnapshotGitExecFi
 import { getFinalOutput, stringifyError, textFromMessageContent } from "./format.js";
 import { safeFileName } from "./names.js";
 import { unknownAgentRefusal } from "./messages.js";
+import { singleResultIsError, singleResultStatus } from "./outcomes.js";
 import {
 	getPiInvocation,
 	PI_SUBAGENT_CHILD_PANE_ENV,
@@ -43,6 +44,7 @@ import {
 } from "./settings.js";
 import {
 	guardReusedSessionBudget,
+	prepareContextHandoff,
 	isContextLengthExceededEnvelope,
 	resolveBgSession,
 	resultHasContextLengthExceeded,
@@ -164,7 +166,7 @@ interface AgentStartTranscriptMetadata {
 
 function transcriptMetadataArgs(args: string[]): string[] {
 	const sanitized = [...args];
-	if (sanitized.at(-1)?.startsWith("Task: ")) sanitized.pop();
+	if (sanitized.at(-1)?.startsWith("@")) sanitized.pop();
 	return sanitized;
 }
 
@@ -425,9 +427,9 @@ export async function prepareSingleResultForReturn(
 	limits?: ResultLimits,
 ): Promise<PreparedSingleResult> {
 	const finalOutput = getFinalOutput(result.messages);
-	const isError = result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
-	const rawText = textOverride ?? (finalOutput || (isError ? result.errorMessage || result.stderr : finalOutput));
-	const direction = isError && !finalOutput ? "tail" : "head";
+	const isError = singleResultIsError(result);
+	const rawText = textOverride ?? (isError ? result.errorMessage || result.stderr || finalOutput : finalOutput);
+	const direction = isError ? "tail" : "head";
 	const output = rawText
 		? await truncateForToolResult(rawText, runtimeRoot, cwd, result.agent, label, direction, limits)
 		: { text: rawText };
@@ -515,6 +517,7 @@ export async function runSingleAgent(
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
 	sessionKey?: string,
 	deadline: BgDeadline = "bg-task-timeout",
+	sameSession = false,
 ): Promise<SingleResult> {
 	const agent = agents.find((a) => a.name === agentName);
 
@@ -536,14 +539,21 @@ export async function runSingleAgent(
 	const selectedModel = selectedModelForAgent(agent, parentModel, defaultCwd);
 	const selectedThinking = selectedThinkingLevelForAgent(parentThinkingLevel, defaultCwd);
 	const selectedEffort = selectedEffortForAgent(agent, selectedModel, selectedThinking);
-	const firstSession = resolveBgSession(runtimeRoot, agent.name, sessionKey);
+	let firstSession = resolveBgSession(runtimeRoot, agent.name, sessionKey);
 	await fs.promises.mkdir(path.dirname(firstSession.path), { recursive: true, mode: 0o700 }).catch(() => undefined);
 
 	const budgetGuard = firstSession.explicit
 		? await guardReusedSessionBudget(firstSession.path, agent.name, selectedModel, cwd ?? defaultCwd)
 		: undefined;
-	if (budgetGuard && !budgetGuard.ok) {
-		const errorMessage = budgetGuard.warning ?? `Refusing reused session for ${agent.name}: estimated context budget exceeded.`;
+	let reuseNotice: string | undefined;
+	if (budgetGuard && !budgetGuard.ok && !sameSession) {
+		const handoff = await prepareContextHandoff(task, budgetGuard.estimate);
+		task = handoff.task;
+		reuseNotice = handoff.notice;
+		firstSession = { ...resolveBgSession(runtimeRoot, agent.name, `handoff-${Date.now().toString(36)}-${randomHex(4)}`), mode: "fresh" };
+	}
+	if (budgetGuard && !budgetGuard.ok && sameSession) {
+		const errorMessage = [budgetGuard.warning ?? `Refusing reused session for ${agent.name}: estimated context budget exceeded.`, budgetGuard.migrationWarning].filter(Boolean).join("\n");
 		return {
 			agent: agentName,
 			agentSource: agent.source,
@@ -585,10 +595,16 @@ export async function runSingleAgent(
 		firstSession,
 		1,
 		deadline,
+		[reuseNotice, budgetGuard?.migrationWarning].filter(Boolean).join("\n") || undefined,
 	);
-	if (budgetGuard?.warning) first.stderr = [budgetGuard.warning, first.stderr].filter(Boolean).join("\n");
 
-	if (!resultHasContextLengthExceeded(first)) return first;
+	if (first.stopReason === "aborted" || !resultHasContextLengthExceeded(first)) return first;
+	if (sameSession) {
+		const diagnostic = `Context length exceeded for ${agent.name} session ${firstSession.key}; exact-session request cannot retry in a fresh session. Start a fresh agent without sameSession.`;
+		first.errorMessage = [first.errorMessage || first.stderr, diagnostic].filter(Boolean).join("\n");
+		first.stderr = [first.stderr, diagnostic].filter(Boolean).join("\n");
+		return first;
+	}
 
 	const retrySession = resolveBgSession(runtimeRoot, agent.name);
 	const warning = `Context length exceeded for ${agent.name} session ${firstSession.key}; retrying once with fresh session ${retrySession.key}.`;
@@ -626,10 +642,11 @@ export async function runSingleAgent(
 		retrySession,
 		2,
 		deadline,
+		first.reuseNotice,
 	);
 	const attempts = [summarizeAttempt(first), summarizeAttempt(retry)];
 	retry.attempts = attempts;
-	const retryFailed = retry.exitCode !== 0 || retry.stopReason === "error" || retry.stopReason === "aborted" || resultHasContextLengthExceeded(retry);
+	const retryFailed = singleResultIsError(retry) || resultHasContextLengthExceeded(retry);
 	if (!retryFailed) {
 		retry.stderr = [warning, retry.stderr].filter(Boolean).join("\n");
 		return retry;
@@ -668,6 +685,7 @@ async function runSingleAgentAttempt(
 	session: BgSessionSelection,
 	attempt: number,
 	deadline: BgDeadline,
+	reuseNotice?: string,
 ): Promise<SingleResult> {
 	const args: string[] = ["--mode", "json", "-p", "--name", agent.name, "--session", session.path];
 	if (selectedModel) args.push("--model", selectedModel);
@@ -681,8 +699,7 @@ async function runSingleAgentAttempt(
 	if (selectedTools && selectedTools.length > 0) args.push("--tools", selectedTools.join(","));
 	else if (inheritedActiveTools.length > 0) args.push("--no-tools");
 
-	let tmpPromptDir: string | null = null;
-	let tmpPromptPath: string | null = null;
+	const tmpPromptDirs: string[] = [];
 	const oneShotTaskId = createTaskId(agent.name);
 	const transcriptPath = oneShotTranscriptPath(runtimeRoot, agent.name, oneShotTaskId);
 	// A dropped record leaves the transcript incomplete for whoever reads the
@@ -706,11 +723,12 @@ async function runSingleAgentAttempt(
 	};
 
 	const currentResult: SingleResult = {
+		reuseNotice,
 		agent: agentName,
 		agentSource: agent.source,
 		task,
 		kind: "oneshot",
-		sessionMode: session.explicit ? "resumed" : "fresh",
+		sessionMode: session.mode,
 		// -1 = still running. Real exit code is set after proc.close; streaming
 		// partials must not look completed to callers that key on exitCode.
 		exitCode: -1,
@@ -750,12 +768,15 @@ async function runSingleAgentAttempt(
 		await fs.promises.writeFile(transcriptPath, "", { encoding: "utf-8", mode: 0o600 });
 		if (agent.systemPrompt.trim()) {
 			const tmp = await writePromptToTempFile(agent.name, agent.systemPrompt);
-			tmpPromptDir = tmp.dir;
-			tmpPromptPath = tmp.filePath;
-			args.push("--append-system-prompt", tmpPromptPath);
+			tmpPromptDirs.push(tmp.dir);
+			args.push("--append-system-prompt", tmp.filePath);
 		}
 
-		args.push(`Task: ${task}`);
+		// Pi's JSON CLI accepts @absolute-file user input. A handoff can exceed
+		// the operating system's per-argument limit even within model context.
+		const tmpTask = await writePromptToTempFile(agent.name, `Task: ${task}`);
+		tmpPromptDirs.push(tmpTask.dir);
+		args.push(`@${tmpTask.filePath}`);
 		let wasAborted = false;
 		let timedOut = false;
 
@@ -769,6 +790,7 @@ async function runSingleAgentAttempt(
 		const invocation = getPiInvocation(args);
 
 		emitSubagentEvent(pi, "subagents:started", {
+			reuseNotice,
 			mode: "oneshot",
 			agent: agent.name,
 			taskId: oneShotTaskId,
@@ -1321,6 +1343,7 @@ async function runSingleAgentAttempt(
 
 		currentResult.exitCode = exitCode;
 		if (wasAborted) {
+			currentResult.status = "stopped";
 			currentResult.stopReason = "aborted";
 			currentResult.errorMessage = "Agent was aborted";
 			const summary = "Agent was aborted before completion.";
@@ -1329,7 +1352,7 @@ async function runSingleAgentAttempt(
 				agent: agent.name,
 				taskId: oneShotTaskId,
 				task,
-				status: "aborted",
+				status: "stopped",
 				summary,
 				runtimeRoot,
 				transcriptPath,
@@ -1343,7 +1366,7 @@ async function runSingleAgentAttempt(
 				ephemeralSession: session.ephemeral,
 				attempt,
 			});
-			throw new Error("Agent was aborted");
+			return currentResult;
 		}
 		if (
 			currentResult.needsCompletionReason === "compact-then-empty" &&
@@ -1384,15 +1407,17 @@ async function runSingleAgentAttempt(
 			}
 			return currentResult;
 		}
-		const failed = exitCode !== 0 || currentResult.stopReason === "error" || currentResult.stopReason === "aborted";
+		const status = singleResultStatus(currentResult);
+		const failed = singleResultIsError(currentResult);
 		const finalOutput = getFinalOutput(currentResult.messages);
 		emitSubagentEvent(pi, failed ? "subagents:failed" : "subagents:completed", {
+			reuseNotice,
 			mode: "oneshot",
 			agent: agent.name,
 			taskId: oneShotTaskId,
 			task,
-			status: failed ? "failed" : "completed",
-			...(finalOutput ? { summary: finalOutput, finalOutput } : {}),
+			status,
+			...(failed ? { summary: currentResult.errorMessage || currentResult.stderr || finalOutput } : finalOutput ? { summary: finalOutput, finalOutput } : {}),
 			runtimeRoot,
 			transcriptPath,
 			model: currentResult.model,
@@ -1411,6 +1436,6 @@ async function runSingleAgentAttempt(
 		await transcript.settled();
 		// recursive+force removal so the session tmp dir is reclaimed
 		// on child failure/refusal paths too, not only after a clean unlink.
-		if (tmpPromptDir) removePromptTempDir(tmpPromptDir);
+		for (const dir of tmpPromptDirs) removePromptTempDir(dir);
 	}
 }

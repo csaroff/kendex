@@ -1,5 +1,8 @@
+import { isTaskTurnFinished, taskStatus } from "./outcomes.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Container } from "@earendil-works/pi-tui";
+import { discoverAgents } from "./agents.js";
+import { selectedModelForAgent } from "./settings.js";
 import {
 	addArtifactPathSection,
 	addWrappedSection,
@@ -8,6 +11,8 @@ import {
 	wrappedText,
 } from "./format.js";
 import { sanitizeCwdSnapshot } from "./cwd-snapshot.js";
+import { readLastAssistantTextFromTranscript } from "./format.js";
+import { bgSessionPath, guardReusedSessionBudget } from "./sessions.js";
 import {
 	GetSubagentResultParams,
 	SteerSubagentParams,
@@ -43,7 +48,6 @@ export function registerPaneSupportTools(deps: PaneSupportToolDeps): void {
 		formatTaskRecordResult,
 		inferTaskRecordKind,
 		isFollowUpDelivery,
-		isTerminalTaskStatus,
 		latestTaskRecord,
 		paneExists,
 		paneSessionBelongsToRuntime,
@@ -70,7 +74,7 @@ export function registerPaneSupportTools(deps: PaneSupportToolDeps): void {
 		renderShell: "self",
 		name: "get_subagent_result",
 		label: "Get Agent Result",
-		description: "Retrieve status/results for persistent pane agent tasks by taskId or latest agent task. Use waitFor: \"idle\" to wait for pane isIdle transition without shell polling. This is a recovery/status tool for pane tasks and does not change orchestration ownership.",
+		description: "Retrieve task status/results by taskId or latest agent task. With agent and sessionKey, read the background context guard for the next dispatch; pass its cwd and agentScope. Use waitFor: \"idle\" to wait for pane isIdle transition without shell polling. This tool does not change orchestration ownership.",
 		parameters: GetSubagentResultParams,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			if (!params.taskId && !params.agent) {
@@ -101,6 +105,20 @@ export function registerPaneSupportTools(deps: PaneSupportToolDeps): void {
 					isError: waited.isError,
 				};
 			}
+			if (params.sessionKey) {
+				if (!params.agent) return { content: [{ type: "text", text: "Provide agent with sessionKey." }], details: {}, isError: true };
+				const agent = discoverAgents(ctx.cwd, params.agentScope ?? "project").agents.find((agent) => agent.name === params.agent);
+				if (!agent) return { content: [{ type: "text", text: `No agent profile found for ${params.agent}.` }], details: {}, isError: true };
+				const parentModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+				const model = selectedModelForAgent(agent, parentModel, ctx.cwd);
+				const sessionPath = bgSessionPath(runtimeRoot, params.agent, params.sessionKey);
+				const contextBudget = await guardReusedSessionBudget(sessionPath, params.agent, model, params.cwd ?? ctx.cwd);
+				const summary = contextBudget.estimate.exists ? await readLastAssistantTextFromTranscript(sessionPath) : undefined;
+				return {
+					content: [{ type: "text", text: JSON.stringify({ agent: params.agent, sessionKey: params.sessionKey, contextBudget, summary }) }],
+					details: { agent: params.agent, sessionKey: params.sessionKey, contextBudget, summary } satisfies GetSubagentResultDetails,
+				};
+			}
 			const deadline = Date.now() + Math.max(0, Math.floor(params.timeoutMs ?? 30000));
 			let record: PaneTaskRecord | undefined;
 			let diagnostics: string[] = [];
@@ -114,7 +132,7 @@ export function registerPaneSupportTools(deps: PaneSupportToolDeps): void {
 					record = refreshed.record;
 					diagnostics = refreshed.diagnostics;
 				}
-				if (!params.wait || (record && (isTerminalTaskStatus(record.status) || record.status === "needs_completion"))) break;
+				if (!params.wait || (record && (isTaskTurnFinished(record.status)))) break;
 				if (Date.now() >= deadline) break;
 				await new Promise((resolve) => setTimeout(resolve, 500));
 			} while (true);
@@ -128,12 +146,14 @@ export function registerPaneSupportTools(deps: PaneSupportToolDeps): void {
 				record = backfilled.record;
 			}
 			const finalRecord = record as PaneTaskRecord;
+			const pane = finalRecord.paneId ? (await readPaneRegistry(runtimeRoot))[finalRecord.agent] as PaneRegistryEntry | undefined : undefined;
+			const contextBudget = finalRecord.transcriptPath ? await guardReusedSessionBudget(finalRecord.transcriptPath, finalRecord.agent, pane?.model ?? finalRecord.model, pane?.cwd ?? params.cwd ?? ctx.cwd) : undefined;
 			updateDashboardFromTaskRecord({ ...finalRecord, updatedAt: new Date().toISOString() }, runtimeRoot);
 			await persistRuntimeSnapshot(ctx, runtimeRoot);
 			const diagnosticBlock = params.verbose && diagnostics.length > 0 ? `\n\n### Artifact diagnostics\n${diagnostics.map((line) => `- ${line}`).join("\n")}` : "";
 			return {
-				content: [{ type: "text", text: `${formatTaskRecordResult(finalRecord, params.verbose ?? false)}${diagnosticBlock}` }],
-				details: { agent: finalRecord.agent, paneId: finalRecord.paneId, summary: finalRecord.summary, status: finalRecord.status, taskId: finalRecord.taskId, notes: finalRecord.notes, cwdSnapshot: sanitizeCwdSnapshot(finalRecord.cwdSnapshot), diagnostics: finalRecord.diagnostics, completionMessageEmitted } satisfies GetSubagentResultDetails,
+				content: [{ type: "text", text: `${formatTaskRecordResult(finalRecord, params.verbose ?? false)}${diagnosticBlock}${contextBudget ? `\nContext budget: ${JSON.stringify(contextBudget)}` : ""}` }],
+				details: { agent: finalRecord.agent, paneId: finalRecord.paneId, summary: finalRecord.summary, status: finalRecord.status, taskId: finalRecord.taskId, notes: finalRecord.notes, cwdSnapshot: sanitizeCwdSnapshot(finalRecord.cwdSnapshot), diagnostics: finalRecord.diagnostics, completionMessageEmitted, contextBudget } satisfies GetSubagentResultDetails,
 			};
 		},
 		renderCall(_args, _theme, _context) {
@@ -145,7 +165,7 @@ export function registerPaneSupportTools(deps: PaneSupportToolDeps): void {
 			if (context?.isError) return wrappedText(`${theme.fg("error", ICONS.times)} ${theme.fg("toolTitle", "Agent result lookup failed")}\n${theme.fg("muted", raw)}`);
 			if (details?.completionMessageEmitted) return new Container();
 			const target = details?.agent ? details.agent : "unknown";
-			const tone = details?.status === "completed" ? "success" : details?.status === "failed" ? "error" : "warning";
+			const tone = taskStatus(details?.status).tone;
 			return wrappedText(agentStatusLine(theme, target, details?.status ?? "result", tone));
 		},
 	});

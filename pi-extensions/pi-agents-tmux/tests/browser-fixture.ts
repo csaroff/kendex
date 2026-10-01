@@ -6,9 +6,10 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import { spyOn } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type { AgentConfig } from "../extensions/subagent/agents.js";
 import type { AgentBrowserUiState, AgentPaneStatus, PaneTaskRecord, SubagentDashboardItem } from "../extensions/subagent/types.js";
+import { PANE_LAUNCHER_VERSION } from "../extensions/subagent/types.js";
 import { tempRuntime } from "./single-agent-fixture.js";
 import { clearPackageConfigCache } from "../extensions/subagent/package-config.js";
 import { taskRegistryPath } from "../extensions/subagent/paths.js";
@@ -45,13 +46,58 @@ export async function importRuntimeCopy(fileName: string, before: string, after:
 		modified = next;
 	}
 	assert.notEqual(modified, original);
-	const source = modified.replace(/from "(\.{1,2}\/[^\"]+)\.js"/g, (_match, name: string) => `from ${JSON.stringify(resolve(runtimeDir, `${name}.ts`))}`);
+	const source = modified.replace(/from "(\.{1,2}\/[^\"]+)\.js"/g, (_match, name: string) => `from ${JSON.stringify(resolve(dirname(join(runtimeDir, fileName)), `${name}.ts`))}`);
 	const copyDir = tempRuntime();
 	// Bare imports resolve from the copy, outside the package's dependency tree.
 	fs.symlinkSync(resolve(import.meta.dir, "../node_modules"), join(copyDir, "node_modules"), "dir");
 	const copy = join(copyDir, fileName);
+	mkdirSync(dirname(copy), { recursive: true });
 	writeFileSync(copy, source);
 	return import(copy);
+}
+
+/** Check duplicate queueing through the existing pane transport, without launching Pi. */
+export async function assertQueuedPaneDedup(runtime: typeof import("../extensions/subagent/pane.js")): Promise<void> {
+	const root = tempRuntime();
+	// The real Linux cwd check reads this process, whose cwd remains alive.
+	const cwd = fs.realpathSync(process.cwd());
+	const paneId = "%42";
+	const previousTmux = process.env.TMUX;
+	process.env.TMUX = join(root, "tmux.sock") + ",0,0";
+	runtime.setPaneExecCaptureForTests(async (command, args) => {
+		assert.equal(command, "tmux");
+		assert.equal(args[0], "display-message", "queue must reuse the seeded pane");
+		const format = args.at(-1);
+		if (format === "#S") return { code: 0, stdout: "test\n", stderr: "" };
+		assert.equal(args[args.indexOf("-t") + 1], paneId);
+		if (format === "#{pane_id}") return { code: 0, stdout: `${paneId}\n`, stderr: "" };
+		assert.equal(format, "#{pane_pid}");
+		return { code: 0, stdout: `${process.pid}\n`, stderr: "" };
+	});
+	try {
+		const tasks = await import("../extensions/subagent/tasks.js");
+		const profile = agent("scout", true);
+		await tasks.writePaneRegistry(root, { scout: { agent: "scout", paneId, cwd, windowName: "scout", sessionFile: join(root, "session.jsonl"), promptFile: "", launcherFile: "", launcherVersion: PANE_LAUNCHER_VERSION, startedAt: "2026-05-14T05:00:00Z" } });
+		await tasks.writeTaskRegistry(root, { active: record("scout", "active", "2026-05-14T05:00:00Z", { status: "running", kind: "pane", paneId, task: "map files" }) });
+		const result = await runtime.queuePersistentPaneTask(root, "test", cwd, profile, "map files", undefined, undefined, undefined, { events: { emit() {} } } as unknown as Parameters<typeof runtime.queuePersistentPaneTask>[8]);
+		assert.deepEqual([result.taskId, result.duplicate], ["active", true], "working task must remain the only queued task");
+	} finally {
+		runtime.setPaneExecCaptureForTests();
+		if (previousTmux === undefined) delete process.env.TMUX;
+		else process.env.TMUX = previousTmux;
+	}
+}
+
+/** A reset removes a queued pane's handoff file; the diagnostics reader must stop calling it queued. */
+export async function assertMissingArtifactStatus(runtime: typeof import("../extensions/subagent/tasks.js")): Promise<void> {
+	const root = tempRuntime();
+	const inboxFile = join(root, "handoff.md");
+	const queued = record("scout", "queued", "2026-05-14T05:00:00Z", { status: "queued", kind: "pane", paneId: "%1", inboxFile });
+	writeFileSync(inboxFile, "map files");
+	await runtime.writeTaskRegistry(root, { queued });
+	fs.unlinkSync(inboxFile);
+	const refreshed = await runtime.refreshTaskDiagnostics(root, queued);
+	assert.equal(refreshed.record.status, "unknown");
 }
 
 /** Count reads of registry content through both Node file APIs, without replacing their behavior. */
@@ -241,6 +287,9 @@ export const theme = {
 	fg: (_tone: string, text: string) => text,
 	inverse: (text: string) => text,
 };
+
+/** Observe semantic colors without an ANSI-dependent assertion. */
+export const toneTheme = { ...theme, fg: (tone: string, text: string) => `<${tone}>${text}</${tone}>` };
 
 export function stripAnsi(text: string): string {
 	return text.replace(/\x1b\[[0-9;]*m/g, "");

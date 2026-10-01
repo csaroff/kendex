@@ -12,6 +12,7 @@ import {
 	type OnUpdateCallback,
 } from "./runner.js";
 import { createOneShotSessionKey } from "./sessions.js";
+import { singleResultIsError, singleResultStatus } from "./outcomes.js";
 import { resultLimits, settingNumber, splitResultLimits } from "./settings.js";
 import { readTaskRegistry } from "./tasks.js";
 import {
@@ -27,6 +28,7 @@ export interface DispatchItem {
 	agent: string;
 	cwd?: string;
 	sessionKey?: string;
+	sameSession?: boolean;
 	task?: string;
 }
 
@@ -54,6 +56,7 @@ interface DispatchFlowContext {
 	pi: ExtensionAPI;
 	removeDashboardAgent: (agentName: string) => void;
 	resumeSession?: string;
+	sameSession?: boolean;
 	runtimeRoot: string;
 	signal?: AbortSignal;
 	updateDashboard: (item: SubagentDashboardItem) => void;
@@ -79,11 +82,17 @@ function oneShotDeadline(agent: AgentConfig | undefined): BgDeadline {
 }
 
 /**
- * Heads the tool result with one `pane-fallback reason=no-tmux` line when a
+ * Reports explicit session keys outside answer truncation, then adds one
+ * `pane-fallback reason=no-tmux` line when a
  * pane agent ran headless, and names each such task the way a queued pane
  * task is named, so a caller stores the same `Task ID:` in both modes.
  */
 function withPaneFallbackNotice(result: ToolTextResult, lane: PaneLane, agents: AgentConfig[]): ToolTextResult {
+	const sessions = result.details.results.flatMap((item, index) => item.sessionKeyExplicit && item.sessionKey ? [`Session: agent=${item.agent}${result.details.mode === "chain" ? ` step=${item.step ?? index + 1}` : result.details.mode === "parallel" ? ` item=${index + 1}` : ""} sessionKey=${item.sessionKey}`] : []);
+	if (sessions.length) {
+		const [first, ...rest] = result.content;
+		result = { ...result, content: [{ type: "text", text: `${sessions.join("\n")}\n\n${first?.text ?? ""}` }, ...rest] };
+	}
 	if (lane.kind === "pane") return result;
 	const fellBack = result.details.results.filter((item) => agents.find((agent) => agent.name === item.agent)?.pane);
 	if (fellBack.length === 0) return result;
@@ -170,30 +179,22 @@ export function formatInventoryValidationError(validation: InventoryValidationRe
 	].join("\n");
 }
 
-function singleResultStatus(result: SingleResult): "running" | "completed" | "failed" | "needs_completion" {
-	if (result.status === "needs_completion") return "needs_completion";
-	if (result.exitCode === -1) return "running";
-	if (result.exitCode === 0) return "completed";
-	return "failed";
-}
-
-function singleResultIsError(result: SingleResult): boolean {
-	return singleResultStatus(result) === "failed" || result.stopReason === "error" || result.stopReason === "aborted";
-}
-
 function singleResultNeedsCompletion(result: SingleResult): boolean {
 	return singleResultStatus(result) === "needs_completion";
 }
 
 function dashboardMessageForOneShotResult(result: SingleResult, persistedSummary?: string): string {
+	const status = singleResultStatus(result);
+	if (singleResultIsError(result)) return result.errorMessage || result.stderr || getFinalOutput(result.messages) || COMPLETION_SUMMARY_UNAVAILABLE;
 	const persisted = normalizeSummaryText(persistedSummary);
-	if (persisted) return persisted;
+	if (persisted) return [result.reuseNotice, persisted].filter(Boolean).join("\n");
 	const finalOutput = getFinalOutput(result.messages);
-	if (finalOutput.trim()) return finalOutput;
+	if (finalOutput.trim()) return [result.reuseNotice, finalOutput].filter(Boolean).join("\n");
 	return singleResultStatus(result) === "running" ? result.task : COMPLETION_SUMMARY_UNAVAILABLE;
 }
 
 function dashboardMessageProvenanceForOneShotResult(result: SingleResult, persistedSummary?: string): SubagentDashboardItem["messageProvenance"] {
+	if (singleResultStatus(result) === "refused" || result.errorMessage || result.stderr) return "diagnostic";
 	if (normalizeSummaryText(persistedSummary) || getFinalOutput(result.messages).trim()) return "persisted";
 	return singleResultStatus(result) === "running" ? "task-echo-fallback" : "placeholder";
 }
@@ -223,7 +224,7 @@ export function parallelResultLimits(cwd: string, count: number): ResultLimits {
 export function formatPreparedParallelSection(prepared: PreparedSingleResult): string {
 	const r = prepared.result;
 	const status = singleResultStatus(r);
-	const text = singleResultNeedsCompletion(r) ? prepared.text || needsCompletionMessage(r) : prepared.text || "(no output)";
+	const text = singleResultNeedsCompletion(r) ? prepared.text || needsCompletionMessage(r) : singleResultIsError(r) ? r.errorMessage || r.stderr || prepared.text || "(no output)" : [r.reuseNotice, prepared.text || "(no output)"].filter(Boolean).join("\n");
 	const metadata = [
 		r.taskId ? `Task: ${r.taskId}` : undefined,
 		r.transcriptPath ? `Transcript: ${r.transcriptPath}` : undefined,
@@ -310,12 +311,14 @@ async function chainDispatch(
 					flow.makeDetails("chain"),
 					step.sessionKey,
 					oneShotDeadline(stepAgent),
+					step.sameSession ?? flow.sameSession,
 				);
 		results.push(result);
-		if (!runsInPane(stepAgent, lane)) {
+		if (!runsInPane(stepAgent, lane) || singleResultStatus(result) === "refused") {
 			flow.updateDashboard({
+				reuseNotice: result.reuseNotice,
 				agent: result.agent,
-				kind: "oneshot",
+				kind: result.kind ?? "oneshot",
 				message: await dashboardMessageForCompletedOneShotResult(flow.runtimeRoot, result),
 				messageProvenance: dashboardMessageProvenanceForOneShotResult(result, await persistedSummaryForOneShotResult(flow.runtimeRoot, result)),
 				model: result.model,
@@ -385,7 +388,7 @@ async function chainDispatch(
 	const last = preparedResults[preparedResults.length - 1];
 	const details = flow.makeDetails("chain")(preparedResults.map((prepared) => prepared.result));
 	return {
-		content: [{ type: "text", text: last.text || "(no output)" }],
+		content: [{ type: "text", text: [...results.map((result) => result.reuseNotice).filter(Boolean), last.text || "(no output)"].join("\n") }],
 		details: detailsWithTruncation(details, last),
 	};
 }
@@ -421,8 +424,8 @@ async function parallelDispatch(
 
 	const emitParallelUpdate = () => {
 		if (flow.onUpdate) {
-			const running = allResults.filter((r) => r.exitCode === -1).length;
-			const done = allResults.filter((r) => r.exitCode !== -1).length;
+			const running = allResults.filter((r) => singleResultStatus(r) === "running").length;
+			const done = allResults.length - running;
 			const updateResults = allResults.map((result) => {
 				const rawOutput = getFinalOutput(result.messages);
 				return {
@@ -446,8 +449,9 @@ async function parallelDispatch(
 		const updateOneshotDashboard = async (item: SingleResult, usePersistedSummary = false) => {
 			const persistedSummary = usePersistedSummary ? await persistedSummaryForOneShotResult(flow.runtimeRoot, item) : undefined;
 			flow.updateDashboard({
+				reuseNotice: item.reuseNotice,
 				agent: item.agent,
-				kind: "oneshot",
+				kind: item.kind ?? "oneshot",
 				message: dashboardMessageForOneShotResult(item, persistedSummary),
 				messageProvenance: dashboardMessageProvenanceForOneShotResult(item, persistedSummary),
 				model: item.model,
@@ -503,9 +507,10 @@ async function parallelDispatch(
 						flow.makeDetails("parallel"),
 						t.sessionKey,
 						oneShotDeadline(taskAgent),
+						t.sameSession ?? flow.sameSession,
 					);
 			allResults[index] = result;
-			if (!runsInPane(taskAgent, lane)) await updateOneshotDashboard(result, true);
+			if (!runsInPane(taskAgent, lane) || singleResultStatus(result) === "refused") await updateOneshotDashboard(result, true);
 			emitParallelUpdate();
 			return result;
 		} catch (error) {
@@ -598,11 +603,13 @@ async function singleDispatch(
 				flow.makeDetails("single"),
 				flow.sessionKey,
 				oneShotDeadline(agent),
+				flow.sameSession,
 			);
-	if (!runsInPane(agent, lane)) {
+	if (!runsInPane(agent, lane) || singleResultStatus(result) === "refused") {
 		flow.updateDashboard({
+			reuseNotice: result.reuseNotice,
 			agent: result.agent,
-			kind: "oneshot",
+			kind: result.kind ?? "oneshot",
 			message: await dashboardMessageForCompletedOneShotResult(flow.runtimeRoot, result),
 			messageProvenance: dashboardMessageProvenanceForOneShotResult(result, await persistedSummaryForOneShotResult(flow.runtimeRoot, result)),
 			model: result.model,
@@ -633,7 +640,7 @@ async function singleDispatch(
 		prepared.result.errorMessage = prepared.text || errorMsg;
 		const details = flow.makeDetails("single")([prepared.result]);
 		return {
-			content: [{ type: "text", text: `Agent ${result.stopReason || "failed"}: ${prepared.text || "(no output)"}` }],
+			content: [{ type: "text", text: `Agent ${singleResultStatus(result)}: ${prepared.text || "(no output)"}` }],
 			details: detailsWithTruncation(details, prepared),
 			isError: true,
 		};
@@ -641,7 +648,7 @@ async function singleDispatch(
 	const prepared = await prepareSingleResultForReturn(result, flow.runtimeRoot, flow.cwd, "single");
 	const details = flow.makeDetails("single")([prepared.result]);
 	return {
-		content: [{ type: "text", text: prepared.text || "(no output)" }],
+		content: [{ type: "text", text: [result.reuseNotice, prepared.text || "(no output)"].filter(Boolean).join("\n") }],
 		details: detailsWithTruncation(details, prepared),
 	};
 }

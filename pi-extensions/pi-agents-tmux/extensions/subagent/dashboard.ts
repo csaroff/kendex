@@ -1,6 +1,7 @@
+import { taskStatus } from "./outcomes.js";
 import * as path from "node:path";
 import { type Theme } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import {
 	ansiGreen,
 	ansiMagenta,
@@ -46,22 +47,19 @@ export function dashboardStatusFor(rawStatus: PaneTaskStatus | "running" | "wait
 }
 
 export function isDashboardWorkingStatus(status: SubagentDashboardItem["status"]): boolean {
-	return status === "running" || status === "queued" || status === "waiting";
+	return taskStatus(status).phase === "working";
 }
 
 export function isDashboardAnimatingStatus(status: SubagentDashboardItem["status"]): boolean {
-	return status === "running";
+	return taskStatus(status).animate === true;
 }
 
 export function isDashboardAttentionStatus(status: SubagentDashboardItem["status"]): boolean {
-	return status === "failed" || status === "blocked" || status === "needs_completion" || status === "unknown";
+	return taskStatus(status).rank === 1;
 }
 
 function dashboardStatusRank(status: SubagentDashboardItem["status"]): number {
-	if (isDashboardWorkingStatus(status)) return 0;
-	if (isDashboardAttentionStatus(status)) return 1;
-	if (status === "completed") return 2;
-	return 3;
+	return taskStatus(status).rank;
 }
 
 export function sortDashboardItems(items: SubagentDashboardItem[]): SubagentDashboardItem[] {
@@ -118,27 +116,15 @@ function workingSpinnerFrame(): string {
 export function dashboardStatusIcon(status: SubagentDashboardItem["status"], theme: Theme, options: { animateSpinners?: boolean } = {}): string {
 	const animateSpinners = options.animateSpinners ?? true;
 	const ascii = glyphStyle() === "ascii";
-	if (status === "completed") return theme.fg("success", ascii ? glyphs().ok : ICONS.check);
-	if (status === "failed") return theme.fg("error", ascii ? glyphs().fail : ICONS.times);
-	if (status === "blocked") return theme.fg("error", ascii ? glyphs().fail : ICONS.times);
-	if (status === "needs_completion") return theme.fg("warning", ascii ? glyphs().warn : ICONS.warning);
-	if (status === "running") return theme.fg("warning", animateSpinners ? workingSpinnerFrame() : ICONS.cog);
-	if (status === "waiting") return theme.fg("warning", ICONS.clock);
-	if (status === "queued") return theme.fg("warning", ICONS.clock);
-	if (status === "unknown") return theme.fg("warning", ascii ? glyphs().warn : ICONS.warning);
-	return theme.fg("accent", ascii ? glyphs().bullet.trim() : ICONS.circleFilled);
+	const presentation = taskStatus(status);
+	if (isDashboardAnimatingStatus(status)) return theme.fg(presentation.tone, animateSpinners ? workingSpinnerFrame() : presentation.icon);
+	const icon = !ascii ? presentation.icon : presentation.icon === ICONS.check ? glyphs().ok : presentation.icon === ICONS.times ? glyphs().fail : presentation.icon === ICONS.warning ? glyphs().warn : presentation.icon;
+	return theme.fg(presentation.tone, icon);
 }
 
 export function dashboardStatusText(item: SubagentDashboardItem, theme: Theme): string {
-	if (item.status === "completed") return theme.fg("success", "completed");
-	if (item.status === "failed") return theme.fg("error", "failed");
-	if (item.status === "blocked") return theme.fg("warning", "blocked");
-	if (item.status === "needs_completion") return theme.fg("warning", "needs completion");
-	if (item.status === "running") return theme.fg("warning", "working");
-	if (item.status === "waiting") return theme.fg("warning", "waiting");
-	if (item.status === "queued") return theme.fg("warning", "queued");
-	if (item.status === "unknown") return theme.fg("warning", "stale");
-	return theme.fg("accent", item.status);
+	const presentation = taskStatus(item.status);
+	return theme.fg(presentation.tone, item.status === "waiting" ? "waiting" : presentation.label);
 }
 
 /**
@@ -306,7 +292,7 @@ export function renderDashboardWidgetLines(state: SubagentDashboardState, theme:
 		return any ? total : undefined;
 	};
 	const dotSep = theme.fg("dim", " · ");
-	if (working === 0 && state.mode === "compact") {
+	if (items.every((item) => item.status === "completed" && !item.reuseNotice) && state.mode === "compact") {
 		const aggregated = aggregateDashboardUsage(items);
 		const usageParts = aggregated ? formatUsageStatsForDashboard(aggregated) : [];
 		const body = usageParts.length > 0
@@ -339,6 +325,13 @@ export function renderDashboardWidgetLines(state: SubagentDashboardState, theme:
 			}
 		}
 		lines.push(`${branch}${dashboardStatusIcon(item.status, theme, { animateSpinners })} ${name}${dotSep}${rowParts.join(dotSep)}`);
+		if (taskStatus(item.status).diagnostic || item.reuseNotice) {
+			const message = outgoingDashboardMessage(item);
+			if (message || item.reuseNotice) {
+				const preview = oneLinePreview(item.reuseNotice && !message?.includes(item.reuseNotice) ? [item.reuseNotice, message].filter(Boolean).join("\n") : message ?? item.reuseNotice!, 512);
+				lines.push(...wrapTextWithAnsi(theme.fg("toolOutput", preview), Math.max(1, width - 8)).map((line) => `    ${line}`));
+			}
+		}
 		if (state.mode === "expanded" && !state.collapsed) {
 			lines.push(...expandedDashboardMessageLines(item, subagentStem(theme, index === shown.length - 1 && items.length <= shown.length, cwd), theme, width, cwd));
 		}
