@@ -2,6 +2,10 @@
 
 ## Consumer-impacting changes
 
+### 2.1.2
+
+- The dashboard reads only a bounded log tail without blocking Pi, preserves configured character limits for Unicode output, reuses unchanged tails for each task, and reuses command layouts between frames. A notification regex that exceeds its execution deadline is disabled and reported once to the agent, including in headless sessions. Exit notifications mark omitted log output. Notifications, the dashboard and log tools share a limit of four disk reads at once.
+
 ### 2.1.1
 
 - Session startup keeps fresh task logs when their working directory exists and its name ends in whitespace. Cleanup previously trimmed the name and could delete these files.

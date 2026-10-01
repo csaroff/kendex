@@ -110,22 +110,10 @@ function resolveTerminationReason(
 	return "self-exit";
 }
 
-// Replay 'exit' wakeups for any restored task that hit terminal state
-// without an exit notification. Returns the number of tasks replayed.
-// selectMissedExits gates on (status != running, notifyOnExit, exitNotified === false)
-// so cross-session leaks are filtered upstream.
+/** Replay pending terminal exits through the same sender as live completion. */
 export function replayMissedExitsLifecycle(
 	tasks: Iterable<ManagedTask>,
 	hooks: LifecycleHooks,
-): number {
-	let replayed = 0;
-	for (const task of selectMissedExits(tasks)) {
-		const notified = hooks.sendTaskEvent("exit", task);
-		if (!notified) continue;
-		task.exitNotified = true;
-		hooks.rememberSnapshot(task);
-		replayed += 1;
-	}
-	if (replayed > 0) hooks.persistSnapshots();
-	return replayed;
+): void {
+	for (const task of selectMissedExits(tasks)) sendExitWakeLifecycle(task, hooks);
 }
