@@ -22,7 +22,7 @@ ASSERT_LIB_LOADED=1
 
 # Key fixtures must not select a developer's app from the process or project.
 # OAuth cases pass their own app pair in the child's explicit environment.
-export LINEAR_CLIENT_ID="" LINEAR_CLIENT_SECRET=""
+export LINEAR_APP_TOKEN="" LINEAR_CLIENT_ID="" LINEAR_CLIENT_SECRET=""
 
 ASSERT_COUNT=0
 ASSERT_FAILURES=0
@@ -246,6 +246,7 @@ assert_fail() {
 run_oauth_request() {
 	local command="$PROJECT/request" action=()
 	if [[ "$1" == auth-check ]]; then command="$LINEAR"; action=(auth-check); fi
+	if [[ "$1" == auth-mint ]]; then command="$LINEAR"; action=(auth-mint); fi
 	if [[ "$1" == cache-fetch ]]; then command="$LINEAR"; action=(cache attachments fetch TEAM-1); fi
 	if [[ "$1" == cache-read ]]; then command="$LINEAR"; action=(cache attachments list TEAM-1); fi
 	shift
@@ -254,8 +255,9 @@ run_oauth_request() {
 		"$@" bash "$command" "${action[@]}" 2>"$LOG/error") && RC=0 || RC=$?
 }
 
-# Run the OAuth suite with repository redirects emitted by Git for normal and
-# linked caller worktrees. The child flag prevents recursive isolation probes.
+# Run the OAuth fixture setup with repository redirects emitted by Git for
+# normal and linked caller worktrees. The child stops before OAuth requests,
+# whose explicit environment already removes the caller's Git redirects.
 run_oauth_git_redirects() {
 	local suite="$1" root="$2" kind caller base git_dir common_dir work_tree index_file rc
 	local before after
