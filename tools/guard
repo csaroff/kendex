@@ -20,6 +20,8 @@
 # not part of any finding. Each finding still opens with its keyed line, and
 # the offending lines a rule collected follow that line rather than precede
 # it.
+# The final validate: line reports the repository scans to
+# dev-validate-run --record; it comes after any nested guard's report.
 set -uo pipefail
 # Resolved before the cd below: the sibling tools this script runs live
 # beside it, not necessarily in the repository it judges.
@@ -390,6 +392,8 @@ lane_on() { # LANE — tools/ci-job-set's name for it
   grep -Fxq -- "$1=false" <<<"$lanes" || refuse lane-unknown "$1"
   return 1
 }
+
+reported_lanes=guard-scans
 
 # The staged bot-instructions check is a lane of the commit-guards chain that
 # runs this script; --full judges the working tree, which the chain does not.
@@ -1543,4 +1547,5 @@ if [ "$ui_changed" -eq 1 ] && [ -f ui/package.json ]; then
   fi
 fi
 
+printf 'validate: lanes=%s selection=all\n' "$reported_lanes"
 exit $fail
