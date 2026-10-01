@@ -78,7 +78,7 @@ sk_run -- post --root "$BARE" --text 'no binding needed' --channel C777
 assert_eq "$RC=$(last C777)" "0=top | UBOT | no binding needed" "--channel needs no binding"
 
 # --- controls, one per check ------------------------------------------------------
-sk_mutant thread-only verbs.py 'markdown_text=body, thread_ts=thread\)' 'markdown_text=body, thread_ts=thread, reply_broadcast=True)'
+sk_mutant thread-only verbs.py '\*\*\{body_arg: body\}, thread_ts=thread\)' '**{body_arg: body}, thread_ts=thread, reply_broadcast=True)'
 sk_run -- post --root "$ROOT" --text 'In the thread.' --thread "$TS"
 assert_eq "$(sk_state '.messages.C001[-1].reply_broadcast')" "true" "control: broadcasting a thread post breaks the thread-only assertion"
 sk_bin_reset
@@ -87,13 +87,13 @@ sk_run -- post --root "$ROOT" --text 'key xoxb-0123456789-abcdefghij'
 assert_eq "$RC" "0" "control: the text check gone, the token posts"
 sk_bin_reset
 
-sk_mutant body-arg verbs.py 'channel=channel, markdown_text=body, thread_ts=thread' 'channel=channel, text=body, thread_ts=thread'
+sk_mutant body-arg verbs.py 'channel=channel, \*\*\{body_arg: body\}, thread_ts=thread' 'channel=channel, text=body, thread_ts=thread'
 sk_run -- post --root "$ROOT" --text 'Lane 4 stalled.'
 MTS="${OUT#slack: posted=}"; MTS="${MTS%% *}"
 assert_eq "$RC=$(arg_of C001 "$MTS")" "0=text" "control: the body sent as text, Slack renders mrkdwn"
 sk_bin_reset
 
-sk_mutant length verbs.py '    markdown_checked\(body, "text"\)\n' ''
+sk_mutant length verbs.py 'markdown_checked\(body, "text"\)' 'markdown_checked("", "text")'
 sk_run -- post --root "$ROOT" --text "$LONG"
 assert_eq "$ERR1" "slack: slack-api-failed=chat.postMessage error=msg_blocks_too_long" \
   "control: the length check gone, a text past the cap reaches Slack, which refuses it"
