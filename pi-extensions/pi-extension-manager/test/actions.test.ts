@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { spawnSync as realSpawnSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -99,7 +99,7 @@ test("npm update and uninstall execution use configured npmCommand and scope-loc
 		packages: ["npm:@scope/pkg"],
 	});
 	writePackage(packageDir, "@scope/pkg");
-	const inv = buildInventory({} as never, { cwd: project } as never);
+	const inv = await buildInventory({} as never, { cwd: project } as never);
 	const item = inv.packages.find((pkg) => pkg.packageName === "@scope/pkg")!;
 	item.updateAvailable = true;
 	item.updateSource = "npm";
@@ -147,7 +147,7 @@ test("invalid npmCommand is surfaced in npm action plans", async () => {
 	mkdirSync(join(project, ".pi"), { recursive: true });
 	writeJson(join(userPi, "settings.json"), { npmCommand: "npm", packages: ["npm:@scope/bad-command"] });
 	writePackage(packageDir, "@scope/bad-command");
-	const inv = buildInventory({} as never, { cwd: project } as never);
+	const inv = await buildInventory({} as never, { cwd: project } as never);
 	const item = inv.packages.find((pkg) => pkg.packageName === "@scope/bad-command")!;
 	item.updateAvailable = true;
 	item.updateSource = "npm";
@@ -180,7 +180,7 @@ test("npm uninstall strips the APPEND_SYSTEM.md block before npm runs", async ()
 	// npm fails; the append-system spawn passes through to the real node.
 	const seen = await useSandboxedSpawn({ status: 1, stdout: "", stderr: "npm ERR! network", error: undefined, signal: null, output: [], pid: 0 });
 
-	const inv = buildInventory({} as never, { cwd: project } as never);
+	const inv = await buildInventory({} as never, { cwd: project } as never);
 	const item = inv.packages.find((pkg) => pkg.packageName === "@scope/appendpkg")!;
 	const plan = planUninstall(item, inv, { cwd: project } as never)!;
 	const outcome = runUninstall(plan, inv);
@@ -216,11 +216,11 @@ test("toggling a package under the kendex packages/ layout writes and removes it
 	const ctx = { cwd: project, isProjectTrusted: () => true, ui: { notify() {} } } as never;
 	await useSandboxedSpawn();
 
-	const off = buildInventory({} as never, ctx);
+	const off = await buildInventory({} as never, ctx);
 	toggleItem({} as never, ctx, off, off.packages.find((pkg) => pkg.packageName === "@scope/clonepkg")!);
 	expect(existsSync(target) ? readFileSync(target, "utf8") : "").not.toContain("Append pkg instructions");
 
-	const on = buildInventory({} as never, ctx);
+	const on = await buildInventory({} as never, ctx);
 	toggleItem({} as never, ctx, on, on.packages.find((pkg) => pkg.packageName === "@scope/clonepkg")!);
 	expect(readFileSync(target, "utf8")).toContain("Append pkg instructions");
 });
@@ -231,14 +231,36 @@ test("append-system launch failures expose the action and script path", async ()
 	writeFileSync(join(packageDir, "scripts", "append-system.mjs"), "");
 	spawnSyncMock.mockImplementation(() => ({ status: null, stdout: "", stderr: "", error: new Error("node unavailable"), signal: null, output: [], pid: 0 }));
 	await useSpawnMock();
-	const warning = spyOn(console, "warn").mockImplementation(() => {});
-	try {
-		const { syncAppendSystemForPackage } = await import("../extensions/manager/append-system.ts");
-		syncAppendSystemForPackage({ kind: "package", packageName: "@scope/append", packageDir } as never, false);
-		expect(warning).toHaveBeenCalledTimes(1);
-		expect(String(warning.mock.calls[0]![0]).split("\n")[0]).toBe(`pi-extension-manager: append-system-launch=install:${join(packageDir, "scripts", "append-system.mjs")}`);
-	} finally {
-		warning.mockRestore();
+	const { syncAppendSystemForPackage } = await import("../extensions/manager/append-system.ts");
+	expect(() => syncAppendSystemForPackage({ kind: "package", packageName: "@scope/append", packageDir } as never, false)).toThrow(`pi-extension-manager: append-system-launch=install:${join(packageDir, "scripts", "append-system.mjs")}`);
+});
+
+test("failed instruction scripts keep toggle and orphan settings unchanged", async () => {
+	const { buildInventory } = await import("../extensions/manager/inventory.ts");
+	const { planUninstall, runUninstall, toggleItem } = await import("../extensions/manager/actions.ts");
+	for (const action of ["disable", "enable", "orphan"] as const) {
+		const project = join(rootTmp, action);
+		const packageDir = join(project, ".pi", "packages", "blocked");
+		const source = "./packages/blocked";
+		const settingsPath = join(project, ".pi", "settings.json");
+		writeJson(settingsPath, { packages: action === "enable" ? [{ source, extensions: [] }] : [source] });
+		writeAppendSystemPackage(packageDir, "@scope/blocked");
+		expect(runVendoredScript(packageDir, "install").status).toBe(0);
+		const appendPath = join(project, ".pi", "APPEND_SYSTEM.md");
+		const instructionsBefore = readFileSync(appendPath, "utf8");
+		writeFileSync(join(packageDir, "scripts", "append-system.mjs"), "process.exit(7);\n");
+		await useSandboxedSpawn();
+		const ctx = { cwd: project, isProjectTrusted: () => true, ui: { notify() {} } } as never;
+		const inv = await buildInventory({} as never, ctx);
+		const item = inv.packages.find((pkg) => pkg.packageName === "@scope/blocked")!;
+		const diskBefore = readFileSync(settingsPath, "utf8");
+		const memoryBefore = JSON.stringify(inv);
+		expect(() => action === "orphan"
+			? runUninstall(planUninstall(item, inv, ctx)!, inv)
+			: toggleItem({} as never, ctx, inv, item)).toThrow("pi-extension-manager: append-system-exit=");
+		expect(readFileSync(settingsPath, "utf8")).toBe(diskBefore);
+		expect(JSON.stringify(inv)).toBe(memoryBefore);
+		expect(readFileSync(appendPath, "utf8")).toBe(instructionsBefore);
 	}
 });
 

@@ -4,13 +4,12 @@ import { join, resolve, sep } from "node:path";
 import { stringifyError } from "./format.js";
 import { host } from "./host.js";
 import { expandHome } from "./package-config.js";
-import { asRecord, loadSettingsFiles, mergedManagerState } from "./settings.js";
+import { asRecord, getOrCreateRecord, loadSettingsFiles, managerStateFrom, mergedManagerState } from "./settings.js";
 import {
 	gitPackageDirCandidates,
 	isNewer,
 	loadNpmCache,
 	loadSourceIndex,
-	npmInstalledVersion,
 	npmPackageNameFromSource,
 	readPackageVersionFromDir,
 	readSourceRepoVersion,
@@ -27,6 +26,8 @@ import {
 	type SettingType,
 } from "./types.js";
 
+const MAX_INVENTORY_ITEMS = 10_000;
+
 function readPackageManifest(dir: string): { manifest?: PackageManifest; error?: string } {
 	try {
 		const path = join(dir, "package.json");
@@ -37,8 +38,8 @@ function readPackageManifest(dir: string): { manifest?: PackageManifest; error?:
 	}
 }
 
-function readNpmPackageManifest(npmName: string, scope: Scope, baseDir: string, cwd: string): { dir?: string; manifest?: PackageManifest; error?: string } {
-	const dir = resolveNpmPackageDir(npmName, scope, baseDir, cwd);
+function readNpmPackageManifest(signal: AbortSignal, npmName: string, scope: Scope, baseDir: string, cwd: string): { dir?: string; manifest?: PackageManifest; error?: string } {
+	const dir = resolveNpmPackageDir(signal, npmName, scope, baseDir, cwd);
 	if (!dir) return { error: `package source not found: npm:${npmName}` };
 	return { dir, ...readPackageManifest(dir) };
 }
@@ -228,7 +229,6 @@ function npmUpdateCommand(item: InventoryItem, npmName: string): string {
 
 export function applyUpdateMetadata(items: InventoryItem[], settingsFiles: SettingsFile[], cwd: string): void {
 	if (!host.packageActions) return;
-	const sourceIndex = loadSourceIndex(settingsFiles);
 	const npmCache = loadNpmCache();
 	for (const item of items) {
 		if (item.kind !== "package" || !item.packageName) continue;
@@ -239,7 +239,6 @@ export function applyUpdateMetadata(items: InventoryItem[], settingsFiles: Setti
 		if (npmName) {
 			item.installSource = "npm";
 			item.npmName = npmName;
-			item.installedVersion = item.installedVersion ?? npmInstalledVersion(npmName, cwd);
 			const latest = npmCache[npmName]?.version;
 			if (latest) {
 				item.latestVersion = latest;
@@ -250,7 +249,7 @@ export function applyUpdateMetadata(items: InventoryItem[], settingsFiles: Setti
 			continue;
 		}
 
-		const sourceEntry = sourceIndex[item.packageName];
+		const sourceEntry = loadSourceIndex(settingsFiles.filter((file) => file.scope === item.scope))[item.packageName];
 		if (sourceEntry?.sourceRepo) {
 			item.installSource = "kendex";
 			item.sourceRepo = sourceEntry.sourceRepo;
@@ -266,9 +265,9 @@ export function applyUpdateMetadata(items: InventoryItem[], settingsFiles: Setti
 	}
 }
 
-export function buildInventory(_pi: ExtensionAPI, ctx: ExtensionContext): Inventory {
+export async function buildInventory(pi: ExtensionAPI, ctx: ExtensionContext): Promise<Inventory> {
+	const signal = inventorySession(pi).controller.signal;
 	const settingsFiles = loadSettingsFiles(ctx);
-	const managerState = mergedManagerState(settingsFiles);
 	const items: InventoryItem[] = [];
 	const auditLines: string[] = [];
 	const seenPackages = new Map<string, InventoryItem>();
@@ -291,7 +290,7 @@ export function buildInventory(_pi: ExtensionAPI, ctx: ExtensionContext): Invent
 				manifest = read.manifest;
 				brokenError = read.error;
 			} else if (npmName) {
-				const read = readNpmPackageManifest(npmName, file.scope, file.baseDir, ctx.cwd);
+				const read = readNpmPackageManifest(signal, npmName, file.scope, file.baseDir, ctx.cwd);
 				packageDir = read.dir ?? normalized.resolved;
 				manifest = read.manifest ?? { name: npmName, description: "External npm package source" };
 				brokenError = read.error;
@@ -305,12 +304,14 @@ export function buildInventory(_pi: ExtensionAPI, ctx: ExtensionContext): Invent
 			}
 
 			const packageName = manifest?.name ?? fallbackName;
-			const pkgId = `package:${packageName}`;
+			// Persisted ids share the registration's scope and source, never its physical target.
+			const pkgId = `package:${file.scope}:${normalized.source}:${packageName}`;
 			const packageItem: InventoryItem = {
 				brokenError,
 				description: manifest?.description ?? "Pi package",
 				displayName: packageDisplayName(manifest ?? {}, packageName),
 				id: pkgId,
+				installationId: pkgId,
 				installedVersion: typeof manifest?.version === "string" ? manifest.version : undefined,
 				kind: "package",
 				packageDir,
@@ -343,7 +344,8 @@ export function buildInventory(_pi: ExtensionAPI, ctx: ExtensionContext): Invent
 						description: `Entrypoint from ${packageName}`,
 						displayName: extPath,
 						entrypoint: extPath,
-						id: `extension:${packageName}:${extPath}`,
+						id: `extension:${pkgId}:${extPath}`,
+						installationId: pkgId,
 						kind: "extension module",
 						packageDir,
 						packageName,
@@ -376,8 +378,33 @@ export function buildInventory(_pi: ExtensionAPI, ctx: ExtensionContext): Invent
 	}
 	applyUpdateMetadata(items, settingsFiles, ctx.cwd);
 
+	if (installed === undefined) {
+		// Read the pre-3.0.4 stored ids through 3.0.x; 3.1.0 can remove this migration.
+		let legacyFound = false;
+		for (const file of settingsFiles) {
+			const disabled = new Set(managerStateFrom(file.json).disabledItems);
+			const migrated = new Set(disabled);
+			let fileLegacyFound = false;
+			for (const item of items) {
+				if (item.scope !== file.scope || !item.packageName) continue;
+				const oldId = item.kind === "package" ? `package:${item.packageName}` : item.entrypoint ? `extension:${item.packageName}:${item.entrypoint}` : undefined;
+				if (!oldId || !disabled.has(oldId)) continue;
+				migrated.delete(oldId);
+				migrated.add(item.id);
+				fileLegacyFound = true;
+			}
+			if (fileLegacyFound) {
+				const manager = getOrCreateRecord(getOrCreateRecord(file.json, "kendex"), "extensionManager");
+				manager.disabledItems = [...migrated];
+				legacyFound = true;
+			}
+		}
+		if (legacyFound) console.warn("pi-extension-manager: legacy-disabled-ids=3.0.x\nStored toggles use old ids. Saving a toggle writes scoped ids.");
+	}
+	const managerState = mergedManagerState(settingsFiles);
 	if (installed === undefined) applyDisableState(items, managerState);
 	host.decorateItems(items, settingsFiles);
+	if (items.length > MAX_INVENTORY_ITEMS) throw new Error(`inventory-limit: items=${items.length} limit=${MAX_INVENTORY_ITEMS}`);
 	items.sort(compareInventoryItems);
 	return { auditLines, cwd: ctx.cwd ?? process.cwd(), items, managerState, packages: items.filter((item) => item.kind === "package"), settingsFiles };
 }
@@ -391,4 +418,42 @@ export function npmCandidatesFromInventory(inventory: Inventory): { name: string
 		if (npmName) out.push({ name: item.packageName, npmName });
 	}
 	return out;
+}
+
+interface InventorySession {
+	controller: AbortController;
+	inventory?: Inventory;
+}
+const sessions = new WeakMap<ExtensionAPI, InventorySession>();
+
+/** The current session owns commands, root memoization, and one inventory snapshot. */
+export function inventorySession(pi: ExtensionAPI): InventorySession {
+	let session = sessions.get(pi);
+	if (!session) {
+		session = { controller: new AbortController() };
+		sessions.set(pi, session);
+	}
+	return session;
+}
+
+/** Refresh only at session, popup-open, or mutation boundaries. */
+export async function refreshInventory(pi: ExtensionAPI, ctx: ExtensionContext): Promise<Inventory> {
+	const session = inventorySession(pi);
+	await host.prepare(ctx.cwd);
+	const inventory = await buildInventory(pi, ctx);
+	if (!session.controller.signal.aborted) session.inventory = inventory;
+	return inventory;
+}
+
+/** Release every session resource on shutdown or replacement. */
+export function closeInventorySession(pi: ExtensionAPI): void {
+	const session = sessions.get(pi);
+	session?.controller.abort();
+	if (session) session.inventory = undefined;
+}
+
+/** Replace the closed session owner at the host's session-start boundary. */
+export function startInventorySession(pi: ExtensionAPI): void {
+	closeInventorySession(pi);
+	sessions.set(pi, { controller: new AbortController() });
 }

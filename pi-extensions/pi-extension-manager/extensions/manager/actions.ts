@@ -71,12 +71,12 @@ function ensureWorkingDir(key: string, cwd: string): { ok: true } | { ok: false;
 export function planUninstall(item: InventoryItem, inventory: Inventory, ctx: ExtensionCommandContext | ExtensionContext): UninstallPlan | undefined {
 	if (!host.packageActions) return undefined;
 	if (item.kind !== "package" || !item.packageName) return undefined;
-	const sourceIndex = loadSourceIndex(inventory.settingsFiles);
+	const sourceIndex = loadSourceIndex(inventory.settingsFiles.filter((file) => file.scope === item.scope));
 	const scopeFlag = item.scope === "user" ? " --global" : "";
 	if (sourceIndex[item.packageName]) {
 		return {
 			item,
-			method: { kind: "kendex", packageName: item.packageName, scope: item.scope },
+			method: { kind: "kendex", packageName: item.packageName, scope: item.scope, cwd: ctx.cwd },
 			command: `kendex remove ${item.packageName}${scopeFlag}`,
 			description: "Installed via kendex — runs the kendex remove command (deletes the package directory, the settings.json entry, and the source-index entry).",
 		};
@@ -128,7 +128,7 @@ export function runUninstall(plan: UninstallPlan, inventory: Inventory): { ok: b
 	if (plan.method.kind === "kendex") {
 		const args = ["remove", plan.method.packageName];
 		if (plan.method.scope === "user") args.push("--global");
-		const result = runCommand("kendex", args);
+		const result = runCommand("kendex", args, { cwd: plan.method.cwd });
 		if (result.error) return { ok: false, message: launchFailure("kendex-uninstall-launch", "kendex", result.error) };
 		if ((result.status ?? 1) !== 0) {
 			return { ok: false, message: exitFailure("kendex-uninstall-exit", result) };
@@ -152,10 +152,9 @@ export function runUninstall(plan: UninstallPlan, inventory: Inventory): { ok: b
 		const stripped = removePackageEntryFromSettings(plan.item, inventory.settingsFiles);
 		return { ok: true, message: managerNotice("npm-uninstalled", plan.method.npmName, `Uninstall succeeded${stripped ? "; removed Pi settings entry." : " (no settings entry to remove)."}`) };
 	}
-	const stripped = removePackageEntryFromSettings(plan.item, inventory.settingsFiles);
-	// Orphan branch: the settings.json strip is the only other cleanup, so
-	// remove this package's APPEND_SYSTEM.md block too.
+	// A returned script failure must leave saved and in-memory settings intact.
 	removeAppendSystemBlockForUninstall(plan.item);
+	const stripped = removePackageEntryFromSettings(plan.item, inventory.settingsFiles);
 	return stripped
 		? { ok: true, message: managerNotice("settings-entry-removed", plan.item.sourceName, `Removed the entry from ${plan.item.scope} settings.json.`) }
 		: { ok: false, message: managerNotice("settings-entry-missing", plan.item.sourceName, `No matching entry exists in ${plan.item.scope} settings.json.`) };
@@ -168,7 +167,7 @@ export function planUpdate(item: InventoryItem, inventory: Inventory, ctx: Exten
 		const scopeFlag = item.scope === "user" ? " --global" : "";
 		return {
 			item,
-			method: { kind: "kendex", packageName: item.packageName, sourceRepo: item.sourceRepo, scope: item.scope },
+			method: { kind: "kendex", packageName: item.packageName, sourceRepo: item.sourceRepo, scope: item.scope, cwd: ctx.cwd },
 			command: `kendex add ${item.sourceRepo}${scopeFlag} --pi-extension ${item.packageName} --harness pi -y`,
 			description: "Installed via kendex — copies the selected package from its tracked source repo into the same Pi scope.",
 		};
@@ -192,7 +191,7 @@ export function runUpdate(plan: UpdatePlan): { ok: boolean; message: string } {
 		const args = ["add", plan.method.sourceRepo];
 		if (plan.method.scope === "user") args.push("--global");
 		args.push("--pi-extension", plan.method.packageName, "--harness", "pi", "-y");
-		const result = runCommand("kendex", args);
+		const result = runCommand("kendex", args, { cwd: plan.method.cwd });
 		if (result.error) return { ok: false, message: launchFailure("kendex-update-launch", "kendex", result.error) };
 		if ((result.status ?? 1) !== 0) {
 			return { ok: false, message: exitFailure("kendex-update-exit", result) };
@@ -284,18 +283,18 @@ export function toggleItem(_pi: ExtensionAPI, ctx: ExtensionCommandContext | Ext
 	}
 	const scope = defaultWriteScope(item, inventory.settingsFiles, inventory.managerState);
 	const file = findSettingsFile(inventory.settingsFiles, scope);
-	const disabled = new Set(inventory.managerState.disabledItems);
-	const currentlyDisabled = item.state === "disabled" || disabled.has(item.id);
+	const currentlyDisabled = item.state === "disabled" || inventory.managerState.disabledItems.includes(item.id);
 	const willDisable = !currentlyDisabled;
-	if (willDisable) disabled.add(item.id);
-	else disabled.delete(item.id);
+	if (item.kind === "package" && item.packageName) syncAppendSystemForPackage(item, willDisable);
 	updateManagerState(file, (state) => {
+		const disabled = new Set(state.disabledItems);
+		if (willDisable) disabled.add(item.id);
+		else disabled.delete(item.id);
 		state.disabledItems = [...disabled].sort();
 	});
 
 	if (item.kind === "package" && item.packageName) {
 		const changed = setPackageFiltered(item, inventory.settingsFiles, willDisable);
-		syncAppendSystemForPackage(item, willDisable);
 		ctx.ui.notify(managerNotice("package-toggle-saved", item.id, changed ? "Package setting updated. Run /reload or restart Pi to apply module loading changes." : "Item toggle saved. Reload may be required."), "warning");
 		return;
 	}

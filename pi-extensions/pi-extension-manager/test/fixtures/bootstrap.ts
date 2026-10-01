@@ -30,7 +30,8 @@ const unused = () => { throw new Error("Bootstrap must not render a popup"); };
 mock.module("@earendil-works/pi-tui", () => ({ matchesKey: unused, truncateToWidth: unused, visibleWidth: unused, wrapTextWithAnsi: unused }));
 const { default: extensionManager } = await import("../../extensions/extension-manager.ts");
 const commands = new Map<string, { handler(args: string, ctx: unknown): Promise<void> }>();
-const api = { registerCommand: (name: string, command: { handler(args: string, ctx: unknown): Promise<void> }) => commands.set(name, command), registerShortcut() {}, on() {} };
+const events = new Map<string, (event: unknown, ctx: unknown) => Promise<void>>();
+const api = { registerCommand: (name: string, command: { handler(args: string, ctx: unknown): Promise<void> }) => commands.set(name, command), registerShortcut() {}, on(name: string, handler: (event: unknown, ctx: unknown) => Promise<void>) { events.set(name, handler); } };
 await extensionManager(api as never);
 const manager = kind === "omp" ? "kendex:extensions" : "extensions";
 assert.deepEqual([...commands.keys()], mode === "disabled" ? [manager, `${manager}:enable`] : [manager, `${manager}:settings`]);
@@ -72,4 +73,5 @@ if (kind === "omp" && mode === "enabled") {
 	assert.deepEqual([...commands.keys()], [manager, `${manager}:settings`]);
 	assert.equal(readFileSync(projectPath, "utf8"), projectBefore);
 }
+
 if (kind === "omp") assert.equal(existsSync(join(agent, "settings.json")), false);

@@ -3,7 +3,7 @@ import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tu
 import { planUninstall, planUpdate, runUninstall, runUpdate, toggleItem } from "./actions.js";
 import { filteredItems, packageExtensions } from "./filters.js";
 import { ansiGreen, ansiRed, ansiYellow, isPlainSearchInput, kindLabel, managerNotice, scopeFilterLabel } from "./format.js";
-import { applyUpdateMetadata, buildInventory, npmCandidatesFromInventory } from "./inventory.js";
+import { applyUpdateMetadata, inventorySession, refreshInventory, npmCandidatesFromInventory } from "./inventory.js";
 import { compactPath } from "./paths.js";
 import { glyphs } from "./glyphs.js";
 import { host } from "./host.js";
@@ -241,10 +241,11 @@ function createManagerComponent(
 	requestRender: () => void,
 	getLayout: () => PopupLayout,
 	done: (value: ManagerAction) => void,
+	signal: AbortSignal,
 ) {
 	const states = ["all", "active", "inactive"];
 	const scopes = ["all", "user", "project", "temporary"];
-	kickNpmUpdateCheck(npmCandidatesFromInventory(inventory), () => {
+	void kickNpmUpdateCheck(npmCandidatesFromInventory(inventory), signal, () => {
 		applyUpdateMetadata(inventory.items, inventory.settingsFiles, ctx.cwd);
 		requestRender();
 	});
@@ -400,17 +401,23 @@ export async function openManager(pi: ExtensionAPI, ctx: ExtensionCommandContext
 	try {
 		let ui = makeInitialUiState();
 		while (true) {
-			await host.prepare(ctx.cwd);
-			const inventory = buildInventory(pi, ctx as ExtensionContext);
-			const action = await ctx.ui.custom<ManagerAction>(
-				(tui, theme, _keybindings, done) => createManagerComponent(ctx, inventory, ui, theme, () => tui.requestRender(), () => managerLayout(tui.terminal.rows), done),
-				{ overlay: true, overlayOptions: { anchor: "center", maxHeight: DEFAULT_MAX_HEIGHT, width: DEFAULT_WIDTH_PERCENT } },
-			);
+			const inventory = await refreshInventory(pi, ctx as ExtensionContext);
+			const popup = new AbortController();
+			const signal = AbortSignal.any([popup.signal, inventorySession(pi).controller.signal]);
+			let action: ManagerAction;
+			try {
+				action = await ctx.ui.custom<ManagerAction>(
+					(tui, theme, _keybindings, done) => createManagerComponent(ctx, inventory, ui, theme, () => tui.requestRender(), () => managerLayout(tui.terminal.rows), done, signal),
+					{ overlay: true, overlayOptions: { anchor: "center", maxHeight: DEFAULT_MAX_HEIGHT, width: DEFAULT_WIDTH_PERCENT } },
+				);
+			} finally {
+				popup.abort();
+			}
 
 			if (!action || action.type === "close") return;
 			if (action.type === "toggle-item") {
 				const item = inventory.items.find((candidate) => candidate.id === action.itemId);
-				if (item) toggleItem(pi, ctx, inventory, item);
+				if (item) await toggleItem(pi, ctx, inventory, item);
 				continue;
 			}
 			if (action.type === "update-package") {
@@ -467,6 +474,8 @@ export async function openManager(pi: ExtensionAPI, ctx: ExtensionCommandContext
 				continue;
 			}
 		}
+	} catch (error) {
+		ctx.ui.notify(managerNotice("manager-action-failed", ctx.cwd, String(error)), "error");
 	} finally {
 		releaseModalLock();
 	}

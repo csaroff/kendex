@@ -2,6 +2,13 @@
 
 ## Consumer-impacting changes
 
+### 3.0.4
+
+- npm version requests have a total deadline, a response byte limit and error handling. Closing the package popup or ending the session cancels its pending version requests.
+- Failed instruction scripts keep package-toggle and orphan-uninstall settings unchanged. Package commands retain synchronous execution; a hung update, removal or npm directory lookup can still freeze the terminal.
+- Pi package actions and extension lists keep user and project installations separate. Moving a project retains its disabled module state and the next enable removes its saved exclusion. Stored toggles from earlier versions remain readable with a migration warning through 3.0.x.
+- Command completion reuses installed package labels. Popup searches reuse package children and scoped settings instead of rebuilding them on each redraw.
+
 ### 3.0.3
 
 - Built-in extension selectors (`builtin:<name>` and `-builtin:<name>`) no longer appear as extension-setting rows. Manage built-ins through `pi config`; configured extension paths remain listed.

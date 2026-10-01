@@ -24,9 +24,8 @@ function runAppendSystemScript(packageDir: string | undefined, action: "install"
 	// A package-supplied script runs on Pi's TUI thread at every toggle, so the
 	// wait is bounded.
 	const result = runCommand("node", [script, action], { cwd: packageDir, killSignal: "SIGKILL", timeout: APPEND_SYSTEM_TIMEOUT_MS });
-	// Best-effort, like the script itself: never block a toggle or uninstall
-	// on an APPEND_SYSTEM.md write.
-	if (result.error) console.warn(managerNotice("append-system-launch", `${action}:${script}`, String(result.error)));
+	if (result.error) throw new Error(managerNotice("append-system-launch", `${action}:${script}`, String(result.error)));
+	if ((result.status ?? 1) !== 0) throw new Error(managerNotice("append-system-exit", `${action}:${script}`, result.stderr.trim() || result.stdout.trim() || `termination ${result.status ?? result.signal ?? "unknown"}`));
 }
 
 export function syncAppendSystemForPackage(item: InventoryItem, willDisable: boolean): void {

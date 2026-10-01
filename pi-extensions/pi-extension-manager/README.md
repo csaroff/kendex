@@ -34,6 +34,12 @@ Restart the host after installation.
 
 On OMP the manager cannot toggle a plugin's modules, update or uninstall a plugin, or edit another extension's settings. Use OMP's own controls for those actions, for a plugin's optional features, and for a project override that stops a plugin being enabled. The manager also does not run a Pi package's commands or its append-system scripts on OMP.
 
+## Resource limits
+
+- Package updates, removals and npm directory lookups run synchronously without a deadline. A hung command can freeze the terminal. Package instruction scripts retain their existing 10-second bound and also block the terminal while they run.
+- Each npm version request has a total 4-second deadline and a 256 KiB response limit. Closing the package browser cancels requests it started. Session shutdown cancels startup requests.
+- The session keeps one inventory with at most 10,000 package and extension rows. Opening a popup or completing a package action refreshes it. Completion labels, package children and scoped setting values reuse that snapshot. Shutdown releases it. Reopen settings to read a change made outside the manager.
+
 ## Settings
 
 Open `/extensions:settings` on Pi or `/kendex:extensions:settings` on OMP. Values are stored under `kendex.extensionManager.config["@vanillagreen/pi-extension-manager"]`.
