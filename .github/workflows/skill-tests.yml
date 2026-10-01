@@ -900,7 +900,7 @@ jobs:
           fi
           exit "$fail"
 
-      # A review-gate template reaches every consumer when it merges, and its
+      # The review-gate writer template reaches consumers when it merges. Its
       # install step runs the installer at KENDEX_INSTALLER_SHA before a
       # credentialed step, so a pull request may not move that commit off the
       # one its release tag names. This checkout holds no tags; the tool reads
@@ -1596,6 +1596,9 @@ jobs:
         if: github.event_name != 'push'
         timeout-minutes: 10
         run: cargo test -p ${{ matrix.crate }} --locked --no-fail-fast
+        env:
+          GH_TOKEN: ""
+          GITHUB_TOKEN: ${{ matrix.crate == 'kendex-cli' && github.token || '' }}
 
   # The app ships on macOS. tools/guard --full checks the core and CLI Apple
   # targets at development completion; these shards execute the tests on the
@@ -1725,6 +1728,9 @@ jobs:
       - name: test
         if: github.event_name != 'push'
         timeout-minutes: ${{ matrix.leg == 'render-lint' && 25 || 12 }}
+        env:
+          GH_TOKEN: ""
+          GITHUB_TOKEN: ${{ matrix.crate == 'kendex-cli' && matrix.leg == 'rest' && github.token || '' }}
         run: |
           set -u
           rc=0
