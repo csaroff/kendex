@@ -158,6 +158,12 @@ Follow [dev SKILL.md § Reflect](../SKILL.md#reflect). Complete every repository
 
 ## 5. Validate
 
+Stage the final edits before running these checks, using the index policy in [§ 7. Commit](#7-commit).
+
+```bash
+git -C [WORKTREE_PATH] add -A
+```
+
 The validation gate is this complete list:
 
 - The affected suite passes. It consists of installed preflight and doc-limits gates, the delegation's required verification commands in their § 2.4 normalized form, and Visual QA under the current workflow's rule below.
@@ -181,7 +187,12 @@ Run preflight when installed (`test -x .agents/skills/preflight/scripts/prefligh
 Use the same orch job runner route for doc-limits when installed (`test -x .agents/skills/doc-limits/scripts/doc-limits`):
 
 ```bash
-.agents/skills/doc-limits/scripts/doc-limits
+if doc_limits_base=$(git merge-base HEAD origin/main); then
+  .agents/skills/doc-limits/scripts/doc-limits --against "$doc_limits_base"
+else
+  printf '%s\n' 'doc-limits: growth check did not run: no merge base with origin/main'
+  .agents/skills/doc-limits/scripts/doc-limits
+fi
 ```
 
 Run the delegation's required verification commands through their route in [dev SKILL.md § Long-Running Validation](../SKILL.md#long-running-validation). Then run `DEV_VALIDATE_CMD` through `dev-validate-run`. Record the full validation result in the completion artifact for submit to reuse on the same contents.
