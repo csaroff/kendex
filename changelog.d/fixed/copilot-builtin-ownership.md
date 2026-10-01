@@ -1,0 +1,1 @@
+- List Copilot's built-in servers and switch them on or off per scope. Enable or disable any installed package from the CLI.

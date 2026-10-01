@@ -15,14 +15,14 @@ pub mod pi;
 mod caps;
 pub mod models;
 pub use caps::{
-    CANONICAL_SEPARATOR, Enforcement, FormatCaps, KindCaps, McpTransport, NameRule, OpSupport,
-    canonical_name, capabilities, format_caps, installable, installs_here, namespace_separator,
-    pi_listener, rendered_name,
+    CANONICAL_SEPARATOR, COPILOT_BUILTIN_MCPS, Enforcement, FormatCaps, KindCaps, McpTransport,
+    NameRule, OpSupport, canonical_name, capabilities, format_caps, installable, installs_here,
+    namespace_separator, pi_listener, rendered_name,
 };
 
 /// What a hook label may claim for this harness at this scope. The static
 /// row says what the mechanism supports; Pi's enforcement is real only
-/// while the pi-hooks carrier is registered somewhere Pi loads, so every
+/// while an enabled pi-hooks carrier is registered somewhere Pi loads, so every
 /// surface that labels an installation reads this instead of the row.
 pub fn hook_enforcement(
     env: &crate::env::Env,

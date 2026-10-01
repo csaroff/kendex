@@ -56,6 +56,52 @@ fn copilot_hook_commands_are_reconciled_by_script_path() {
 }
 
 #[test]
+fn json_array_member_is_lossless_idempotent_and_refuses_wrong_shapes() {
+    let edit = |present| ConfigEdit::SetJsonArrayMember {
+        key: "disabledMcpServers".into(),
+        name: "githubiq".into(),
+        present,
+    };
+    let before = json!({"theme": "dark", "disabledMcpServers": ["other"]});
+    let text = format!("{before}\n");
+    let off = edit(true).apply(&text).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&off).unwrap(),
+        json!({"theme":"dark", "disabledMcpServers":["other", "githubiq"]})
+    );
+    assert_eq!(edit(true).apply(&off).unwrap(), off);
+    let on = edit(false).apply(&off).unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&on).unwrap(), before);
+    assert_eq!(edit(false).apply(&on).unwrap(), on);
+    // Copilot's settings reader accepts user comments and trailing commas,
+    // but the shared JSON editor cannot preserve them.
+    for text in [
+        "// settings\n{\"disabledMcpServers\":[\"githubiq\"]}\n",
+        "{\"disabledMcpServers\":[\"githubiq\"],}\n",
+    ] {
+        for present in [true, false] {
+            assert!(
+                edit(present).apply(text).is_err(),
+                "non-strict JSON edit must refuse"
+            );
+            assert!(
+                edit(present).in_sync(text).is_err(),
+                "non-strict JSON sync must refuse"
+            );
+        }
+    }
+    for value in [json!(false), json!(["other", 7])] {
+        for present in [true, false] {
+            assert!(
+                edit(present)
+                    .apply(&json!({"disabledMcpServers":value}).to_string())
+                    .is_err()
+            );
+        }
+    }
+}
+
+#[test]
 fn owned_hook_templates_are_reconciled_by_script_path() {
     use crate::engine::targets::{HookTarget, hook_target};
     use crate::env::{Env, FakeOs};

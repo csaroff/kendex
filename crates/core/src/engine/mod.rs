@@ -95,15 +95,15 @@ pub fn registered_in(
     env: &crate::env::Env,
     scope: &crate::model::Scope,
     entry: &crate::lock::LockEntry,
-) -> Vec<std::path::PathBuf> {
+) -> Result<Vec<std::path::PathBuf>> {
     let mut files: Vec<std::path::PathBuf> = owned::installed(env, scope, entry)
-        .edits
+        .edits?
         .into_iter()
         .map(|(path, _)| path)
         .collect();
     files.sort();
     files.dedup();
-    files
+    Ok(files)
 }
 
 /// Every file path one lock entry put on this machine — what a cheap
@@ -180,13 +180,6 @@ pub fn plan_scope(
     let safety = scoring::run(scope, &state);
     let (mut drift, mut ops) = (Vec::new(), Vec::<PlannedOp>::new());
     let (mut new_lock, readings) = fresh_lock(env, &manifest, lock, &state);
-    drift.extend(crate::pi_ext::record_matching_manifest(
-        env,
-        scope,
-        &manifest,
-        &mut new_lock,
-        crate::pi_ext::RecordBasis::Recorded,
-    )?);
     let mut written = written::Written::default();
     let mut kept = item_plan::KeptAsIs::default();
     let mut config_edits = config_edits::ConfigEditPlan::default();
@@ -234,6 +227,16 @@ pub fn plan_scope(
         &mut scope_notes,
     )?;
 
+    // Orphan retention copies old entries; carrier comparison must finalize
+    // the retained Pi records after that pass, including native enablement.
+    drift.extend(crate::pi_ext::record_matching_manifest(
+        env,
+        scope,
+        &manifest,
+        &mut new_lock,
+        crate::pi_ext::RecordBasis::Recorded,
+        Some(&mut ops),
+    )?);
     stale::stale_instruction_rows(env, scope, lock, &new_lock, &state.items, &mut config_edits)?;
     plan_config_edits(config_edits, &mut ops)?;
     let set_changes = set_changes(lock, &new_lock);

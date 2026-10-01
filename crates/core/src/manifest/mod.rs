@@ -37,10 +37,42 @@ pub const LOCAL_SOURCE_NAME: &str = "local";
 /// the person owns.
 pub const INPLACE_SOURCE_NAME: &str = "in-place";
 
-/// Whether a source name is one of the reserved ones, which read from the
-/// scope's own roots whatever a declaration under that name says.
+/// Harness-shipped MCP servers controlled through native settings, not a catalog.
+pub const BUILTIN_SOURCE_NAME: &str = "builtin";
+
+/// Whether a source name is reserved for scope-owned content or a native
+/// switch rather than a subscription the user can rebind.
 pub fn is_reserved_source(name: &str) -> bool {
-    name == LOCAL_SOURCE_NAME || name == INPLACE_SOURCE_NAME
+    name == LOCAL_SOURCE_NAME || name == INPLACE_SOURCE_NAME || name == BUILTIN_SOURCE_NAME
+}
+
+/// A catalog subscription cannot occupy a scope-owned or native source name.
+pub(crate) fn check_source_alias(name: &str) -> crate::error::Result<()> {
+    if is_reserved_source(name) {
+        return Err(crate::error::CoreError::SourceRefInvalid {
+            reference: name.to_owned(),
+            reason: "reserved source name cannot name a catalog subscription".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Allocate a catalog alias from a reference without rebinding a source.
+pub(crate) fn catalog_alias(manifest: &Manifest, reference: &str) -> String {
+    let trimmed = reference.trim_end_matches('/');
+    let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+    let base = trimmed
+        .rsplit(['/', ':'])
+        .next()
+        .filter(|segment| !segment.is_empty())
+        .unwrap_or("source");
+    let mut name = base.to_owned();
+    let mut counter = 2;
+    while is_reserved_source(&name) || manifest.sources.contains_key(&name) {
+        name = format!("{base}-{counter}");
+        counter += 1;
+    }
+    name
 }
 
 /// The directory that source reads, inside a project.

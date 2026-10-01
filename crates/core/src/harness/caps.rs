@@ -158,6 +158,10 @@ const fn format_defaults() -> FormatCaps {
     }
 }
 
+/// Copilot CLI's native servers, enabled by default. Source: Copilot CLI
+/// 1.0.90 `--help`, under `--disable-builtin-mcps`.
+pub const COPILOT_BUILTIN_MCPS: &[&str] = &["github-mcp-server", "githubiq"];
+
 pub const fn format_caps(harness: HarnessId) -> FormatCaps {
     match harness {
         // Claude's three transports are the ones the MCP writer emits.
@@ -373,7 +377,7 @@ pub fn capabilities(harness: HarnessId, kind: ItemKind) -> KindCaps {
         // mechanism supports; the surfaces that label an installation read
         // carrier reality through `pi_ext::carrier::enforcement`, which
         // downgrades to advisory wherever no settings layer Pi loads
-        // registers the carrier.
+        // registers an enabled carrier.
         (Pi, Hook) => enforced(managed(BOTH)),
         // A prompt template is one `prompts/<name>.md` per command at either
         // scope, read with the same `description` and `argument-hint` keys
