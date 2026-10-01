@@ -1,0 +1,1 @@
+- Overseer handoffs replace old state and bound resume reads. Live self-succession refuses missing or stale generations. Dead and walled recovery remain available.
