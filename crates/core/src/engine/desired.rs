@@ -278,6 +278,7 @@ pub enum RefusalKind {
 
 #[derive(Debug, Default)]
 pub struct DesiredState {
+    pub(super) agent_names: crate::source::agent_names::Uses,
     pub declaration_status: super::DeclarationStatus,
     pub items: Vec<Desired>,
     /// Sources that could not be read (pending remotes, missing paths) and
@@ -464,7 +465,10 @@ fn compute(
     hold_upstream_skills: bool,
     held: Option<&hold::HeldPins>,
 ) -> Result<DesiredState> {
-    let mut state = DesiredState::default();
+    let mut state = DesiredState {
+        agent_names: crate::source::agent_names::Uses::new(manifest),
+        ..DesiredState::default()
+    };
     let mut updated_manifest = manifest.clone();
     let mut manifest_changed = false;
     // Everything is planned from the closure — what was declared, what the

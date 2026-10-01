@@ -19,11 +19,15 @@ use super::discover::{self, CatalogMode, Discovery};
 use super::meta::MarketplaceMeta;
 use super::plugin_registry::{self, CatalogFinding, Registry};
 
+pub(crate) mod agent_names;
+
 /// Source-side layout + mapping tables, read leniently — source catalogs are
 /// v1-format repos (no schema key) and stay valid forever. What is not
 /// lenient is the control file itself: see the module note.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SourceConfig {
+    /// Resolved provenance, supplied by `source_config_for` for local lookup.
+    pub(crate) provenance: String,
     pub agent_dirs: Vec<String>,
     pub skill_dirs: Vec<String>,
     pub agent_skills: BTreeMap<String, Vec<String>>,
@@ -190,6 +194,7 @@ pub fn source_config_for(sealed: &SealedSource, provenance: &str) -> Result<Sour
         false => crate::source::repo_leaf(provenance),
     };
     let mut config = source_config(sealed, display)?;
+    config.provenance = provenance.to_owned();
     // The reserved sources share one shape — `skills/<name>` under the
     // root — so both read explicitly rather than by discovery.
     if (provenance == crate::manifest::LOCAL_SOURCE_NAME
@@ -342,6 +347,11 @@ pub fn find_item(
     kind: ItemKind,
     name: &str,
 ) -> Option<PathBuf> {
+    let name = if kind == ItemKind::Agent {
+        agent_names::resolve(name, &config.provenance)
+    } else {
+        name
+    };
     // A name that cannot be a file is not on offer, whoever asks — a bundle
     // member or a dependency is not checked anywhere else.
     if crate::names::item_problem(name).is_some() {
