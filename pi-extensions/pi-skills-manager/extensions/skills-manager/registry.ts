@@ -1,4 +1,5 @@
-import { readFileSync, rmSync } from "node:fs";
+import { readFileSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import { basename, dirname } from "node:path";
 import {
 	DefaultPackageManager,
@@ -85,12 +86,25 @@ export function skillStorageTarget(skill: SkillEntry): string {
 	return basename(skill.path).toLowerCase() === "skill.md" ? dirname(skill.path) : skill.path;
 }
 
+/**
+ * Removes a skill's directory, or its file when it is not a SKILL.md, through
+ * an awaited `rm`, so the dialog can show its deleting state and Pi keeps
+ * rendering between filesystem batches. On Node, `rm` settles unlinks in
+ * bursts, so a directory of thousands of files can still pause Pi briefly.
+ * Resolves true once the removal finished and was reported; a failed removal
+ * is reported and resolves false.
+ */
 export async function deleteSkill(ctx: ExtensionContext, skill: SkillEntry): Promise<boolean> {
 	if (!isDeletableSkill(skill)) {
 		ctx.ui.notify("Only your own project and global skills can be deleted", "warning");
 		return false;
 	}
-	rmSync(skillStorageTarget(skill), { recursive: true, force: true });
+	try {
+		await rm(skillStorageTarget(skill), { recursive: true, force: true });
+	} catch (error) {
+		ctx.ui.notify(`Cannot delete skill ${skill.name}: ${error instanceof Error ? error.message : String(error)}`, "error");
+		return false;
+	}
 	ctx.ui.notify(`Deleted skill: ${skill.name}`, "info");
 	return true;
 }
