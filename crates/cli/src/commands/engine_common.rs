@@ -92,6 +92,9 @@ pub(super) fn warning_lines(
 ) -> Vec<String> {
     let mut lines = Vec::new();
     for warning in warnings {
+        if ui::report::is_run_model_warning(&warning.message) {
+            continue;
+        }
         let target = match warning.harness {
             Some(harness) => format!("{} ({})", warning.name, harness.display_name()),
             None => warning.name.clone(),
@@ -249,6 +252,9 @@ pub fn confirm_and_apply(
 /// an earlier run left uncommitted, and `run again with --commit` has to
 /// mean something. The empty plan itself writes nothing.
 pub fn apply_report(env: &Env, report: &EngineReport) -> Result<usize, Box<dyn std::error::Error>> {
+    for warning in &report.warnings {
+        ui::report::run_model_warning(&warning.message);
+    }
     let applied = match report.plan.is_empty() {
         true => 0,
         false => {
