@@ -1,0 +1,1 @@
+- Consumer refresh resolves outdated automatic review threads without filing them upstream. Live findings on paths no single package claims stay open for the consumer to answer.
