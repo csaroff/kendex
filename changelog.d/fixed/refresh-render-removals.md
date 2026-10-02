@@ -1,0 +1,1 @@
+- Keep skill-load checks installed with released engines. Refuse render classification for deletions without trusted whole-file ownership proof.

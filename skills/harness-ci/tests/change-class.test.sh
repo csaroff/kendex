@@ -92,6 +92,8 @@ set_verifier() { # MODE
   case "$1" in
     clean) echo 0 >"$KENDEX_STUB_STATUS"
       document unchanged ok 0 >"$KENDEX_STUB_LEDGER" ;;
+    retired-registry) echo 0 >"$KENDEX_STUB_STATUS"
+      document unchanged ok 0 | jq '.rows |= map(select(.kind != "hook"))' >"$KENDEX_STUB_LEDGER" ;;
     foreign-changed) echo 0 >"$KENDEX_STUB_STATUS"
       document changed ok 0 >"$KENDEX_STUB_LEDGER" ;;
     foreign-unknown) echo 0 >"$KENDEX_STUB_STATUS"
@@ -203,6 +205,75 @@ render-root-is-one-subsystem|small|dirty|runtime/one.ts:30 .agents/runtime/two.t
 excluded-path|standard|dirty|.github/workflows/ci.yml:3
 CASES
 require_rows change-class-table "$table_rows"
+
+# Refresh retires whole artifacts and shared registrations. The released
+# verify interface cannot prove whole-file ownership at the base, so neither
+# inventory absence nor a surviving head tree can authorize a deletion.
+removed_repo=$(new_repo removed-render)
+commit_paths "$removed_repo" 'recorded renders' .codex/agents/rust.md .agents/skills/orch/app.ts
+# Hook registration removal preserves unrelated user settings in this file.
+mkdir -p "$removed_repo/.pi"
+printf '{"userGuard":"keep"}\n' >"$removed_repo/.pi/settings.json"
+git -C "$removed_repo" add .pi/settings.json
+git -C "$removed_repo" commit -q -m 'a shared registry with user settings'
+removed_base=$(git -C "$removed_repo" rev-parse HEAD)
+removed_rows=0
+while IFS='|' read -r label path inventory verifier want cause; do
+  removed_rows=$((removed_rows + 1))
+  git -C "$removed_repo" checkout -q -B removal "$removed_base"
+  rm -- "$removed_repo/$path"
+  if [ "$inventory" = absent ]; then
+    jq --arg path "$path" 'map(select(. != $path))' "$removed_repo/.kendex-generated.json" \
+      >"$SANDBOX/removed-inventory"
+    mv -- "$SANDBOX/removed-inventory" "$removed_repo/.kendex-generated.json"
+  fi
+  git -C "$removed_repo" add -A
+  git -C "$removed_repo" commit -q -m "$label"
+  set_verifier "$verifier"
+  PATH="$stub_bin:$PATH" assert_class "$label" "$want" --repo "$removed_repo" --event pull_request \
+    --base "$removed_base" --head HEAD
+  if [ "$cause" != - ]; then
+    removed_err=$(PATH="$stub_bin:$PATH" "$CHANGE_CLASS" --repo "$removed_repo" \
+      --event pull_request --base "$removed_base" --head HEAD 2>&1 >/dev/null)
+    assert_eq "$label names the refusal" "cause=$cause path=$path" \
+      "$(sed -n 's/^class: class=standard measured=false //p' <<<"$removed_err")"
+    if [ "$verifier" = retired-registry ]; then
+      unsanctioned_head=$(git -C "$removed_repo" rev-parse HEAD)
+    fi
+  fi
+done <<'REMOVALS'
+retired render with no base whole-file proof|.codex/agents/rust.md|absent|clean|standard|render-retirement-unproved
+retired file under a surviving skill tree has no base proof|.agents/skills/orch/app.ts|absent|clean|standard|render-retirement-unproved
+retired shared registry still holds user settings|.pi/settings.json|absent|retired-registry|standard|render-retirement-unproved
+a deletion still named in the head inventory|.codex/agents/rust.md|retained|clean|standard|render-path-unowned
+a deletion under a tree still named in the head inventory|.agents/skills/orch/app.ts|retained|clean|standard|render-path-unowned
+verify refuses an unsanctioned deletion|.codex/agents/rust.md|absent|dirty|standard|-
+REMOVALS
+require_rows change-class-removals "$removed_rows"
+
+# Must-fail control: keep the refusal text but allow unproved retirement.
+removal_mutant="$SANDBOX/removal-mutant.sh"
+[ ! -L "$CHANGE_CLASS" ] || { echo 'removal-control: source=symlink' >&2; exit 2; }
+perl -e '
+  local $/;
+  my $text = <>;
+  my $old = q{RENDER_REFUSAL="cause=render-retirement-unproved path=$path"
+          return 1};
+  my $count = () = $text =~ /\Q$old\E/g;
+  die "removal-control: anchor=$count\n" unless $count == 1;
+  my $changed = $text;
+  my $replacement = $old;
+  $replacement =~ s/return 1/continue/;
+  $changed =~ s/\Q$old\E/$replacement/;
+  die "removal-control: mutation=unchanged\n" if $changed eq $text;
+  print $changed;
+' "$CHANGE_CLASS" >"$removal_mutant"
+removal_class=$(plant "$SANDBOX/removal-control" change-class "$removal_mutant")
+set_verifier retired-registry
+control_out=$(PATH="$stub_bin:$PATH" "$removal_class" --repo "$removed_repo" \
+  --event pull_request --base "$removed_base" --head "$unsanctioned_head" 2>/dev/null)
+assert_eq "the removal control turns the retired shared/user deletion row red" \
+  change_class=render "$control_out"
 
 # `standard` is two answers in one word, and `measured=` is the only thing
 # that separates them. Both shapes, from the same fixtures the table above
@@ -1649,7 +1720,7 @@ TOML
   # which removes both. The base is laid by hand because no kendex this suite
   # runs renders tests/; the head is what `kendex refresh` wrote above. The
   # removed paths are listed at the base, so harness-only reads them as
-  # generated, and the skill's tree position owns them.
+  # generated. The head tree cannot prove ownership at the base.
   git -C "$consumer" checkout -q -B carried-tests refreshed
   mkdir -p "$consumer/.claude/skills/demo/tests"
   cp "$catalog/skills/demo/tests/demo.test.sh" "$consumer/.claude/skills/demo/tests/demo.test.sh"
@@ -1667,8 +1738,8 @@ TOML
     "$(git -C "$consumer" diff --name-only "$carried_base" HEAD | tr '\n' ' ' | sed 's/ $//')"
   carried_err="$(classify_stderr --repo "$consumer" --event pull_request \
     --base "$carried_base" --head HEAD)"
-  assert_eq "a refresh that drops rendered tests/ is a render" \
-    "class=render measured=true cause=renders-match-their-sources" \
+  assert_eq "a refresh that drops rendered tests/ needs base ownership proof" \
+    "class=standard measured=false cause=render-retirement-unproved path=.claude/skills/demo/tests/demo.test.sh" \
     "$(printf '%s\n' "$carried_err" | sed -n 's/^class: //p')"
   git -C "$consumer" checkout -q refreshed
 
