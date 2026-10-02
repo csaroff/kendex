@@ -14,15 +14,15 @@ HOOK="${HOOK_UNDER_TEST:-$(cd "$TEST_DIR/.." && pwd)/block-unsafe-rm.sh}"
 
 PASS=0
 FAIL=0
-TMP_ROOT="$(mktemp -d)"
-trap 'rm -rf "$TMP_ROOT"' EXIT
+TMP_ROOT="$(mktemp -d)" || { echo 'block-unsafe-rm: scratch=mktemp-failed' >&2; exit 1; }
+[[ -d $TMP_ROOT && ! -L $TMP_ROOT ]] || { echo 'block-unsafe-rm: scratch=not-a-directory' >&2; exit 1; }
+TMP_ROOT="$(cd -- "$TMP_ROOT" && pwd -P)" || { echo 'block-unsafe-rm: scratch=resolve-failed' >&2; exit 1; }
+trap 'rm -rf -- "${TMP_ROOT:?}"' EXIT
 ERR_FILE="$TMP_ROOT/stderr"
 BASH_BIN="$(command -v bash)"
 
-assert_eq() {
-  if [ "$1" = "$2" ]; then PASS=$((PASS + 1)); printf '  ok    %s\n' "$3"
-  else FAIL=$((FAIL + 1)); printf '  FAIL  %s\n        expected: %s\n        got:      %s\n' "$3" "$2" "$1"; fi
-}
+# shellcheck source=lib/assert.sh
+. "$TEST_DIR/lib/assert.sh"
 assert_contains() {
   if grep -qF -- "$2" "$ERR_FILE"; then PASS=$((PASS + 1)); printf '  ok    %s\n' "$3"
   else FAIL=$((FAIL + 1)); printf '  FAIL  %s\n        wanted: %s\n        in:\n%s\n' "$3" "$2" "$(cat "$ERR_FILE")"; fi
@@ -38,14 +38,17 @@ json_for() {
 
 run_hook() { # command -> rc, stderr in ERR_FILE
   set +e
-  json_for "$1" | "$BASH_BIN" "$HOOK" >/dev/null 2>"$ERR_FILE"
+  json_for "$1" | env TMPDIR=/home/method/dev/.scratch/agents TMP=/shared/tmp/// \
+    TEMP='/shared/te(mp).+' AGENT_TMPDIR=/shared/agent HOME=/shared/home \
+    "$BASH_BIN" "$HOOK" >/dev/null 2>"$ERR_FILE"
   rc=$?
   set -e
 }
 
 run_payload() { # raw-json -> rc, stderr in ERR_FILE
   set +e
-  printf '%s' "$1" | "$BASH_BIN" "$HOOK" >/dev/null 2>"$ERR_FILE"
+  printf '%s' "$1" | env -u TMPDIR -u TMP -u TEMP -u AGENT_TMPDIR HOME="${PAYLOAD_HOME-}" \
+    "$BASH_BIN" "$HOOK" >/dev/null 2>"$ERR_FILE"
   rc=$?
   set -e
 }
@@ -59,6 +62,132 @@ PAYLOAD_TOOLS=jq,cat
 
 # shellcheck source=lib/payload-rows.sh
 . "$TEST_DIR/lib/payload-rows.sh"
+
+shared_rows() {
+  first_table 'incident guarded TMPDIR root|command|2|block-unsafe-rm: refused=shared-root|rm -rf -- "${TMPDIR:?}"
+incident literal glob|command|2|block-unsafe-rm: refused=shared-root|rm -rf -- /home/method/dev/.scratch/agents/tmp.*
+bare TMPDIR glob|command|2|block-unsafe-rm: refused=shared-root|rm -rf "$TMPDIR"/*
+guarded HOME glob|command|2|block-unsafe-rm: refused=shared-root|rm -rf "${HOME:?}/"*
+TMP alternative|command|2|block-unsafe-rm: refused=shared-root|rm -rf ${TMP:-x}
+TEMP braced root|command|2|block-unsafe-rm: refused=shared-root|rm -rf ${TEMP}
+bare HOME|command|2|block-unsafe-rm: refused=shared-root|rm -rf $HOME
+operator AGENT_TMPDIR|command|2|block-unsafe-rm: refused=shared-root|rm -rf "${AGENT_TMPDIR:?empty}"
+direct bracket glob|command|2|block-unsafe-rm: refused=shared-root|rm -rf "${TMPDIR:?}"/tmp.[ab]
+direct question glob|command|2|block-unsafe-rm: refused=shared-root|rm -rf "$TMPDIR"/tmp.?
+guarded dot segment glob|command|2|block-unsafe-rm: refused=shared-root|rm -rf "${TMPDIR:?}/./"*
+guarded parent segment glob|command|2|block-unsafe-rm: refused=shared-root|rm -rf "${TMPDIR:?}/x/../"*
+bare dot segment glob|command|2|block-unsafe-rm: refused=shared-root|rm -rf "$TMPDIR"/./*
+bare parent segment glob|command|2|block-unsafe-rm: refused=shared-root|rm -rf "$TMPDIR"/x/../*
+literal dot segment glob|command|2|block-unsafe-rm: refused=shared-root|rm -rf /shared/home/./*
+literal parent segment glob|command|2|block-unsafe-rm: refused=shared-root|rm -rf /shared/home/x/../*
+quoted literal parent segment|command|2|block-unsafe-rm: refused=shared-root|rm -rf "/shared/home/x/../tmp.AbC123"
+dot segment at operand end|command|2|block-unsafe-rm: refused=shared-root|rm -rf /shared/home/private/.
+parent segment at operand end|command|2|block-unsafe-rm: refused=shared-root|rm -rf "${HOME:?}/private/.."
+literal root|command|2|block-unsafe-rm: refused=shared-root|rm -rf /shared/home
+literal hidden glob|command|2|block-unsafe-rm: refused=shared-root|rm -rf /shared/home/.*
+literal glob trailing slash|command|2|block-unsafe-rm: refused=shared-root|rm -rf /shared/home/tmp.*/
+quoted literal root|command|2|block-unsafe-rm: refused=shared-root|rm -rf "/shared/home/"
+later literal glob|command|2|block-unsafe-rm: refused=shared-root|rm -rf /literal/path /shared/agent/*
+single quoted literal|command|2|block-unsafe-rm: refused=shared-root|rm -rf '\''/shared/home'\''
+environment trailing slashes|command|2|block-unsafe-rm: refused=shared-root|rm -rf /shared/tmp/tmp.*
+environment regex characters|command|2|block-unsafe-rm: refused=shared-root|rm -rf "/shared/te(mp).+"/*
+nonrecursive shared root|command|2|block-unsafe-rm: refused=shared-root|rm /shared/home
+private directory same call|command|0|-|d=$(mktemp -d); rm -rf -- "${d:?}"
+longer TMPDIR name|command|0|-|rm -rf "${TMPDIRX:?}/x"
+different HOME name|command|0|-|rm -rf "${MY_HOME:?}/x"
+guarded named child|command|0|-|rm -rf "${TMPDIR:?}/tmp.AbC123"
+literal named child|command|0|-|rm -rf /home/method/dev/.scratch/agents/tmp.AbC123
+literal nested glob|command|0|-|rm -rf /shared/home/private/*
+literal dotted child|command|0|-|rm -rf /shared/home/private./tmp.AbC123
+literal hidden child|command|0|-|rm -rf /shared/home/.private/tmp.AbC123
+guarded nested glob|command|0|-|rm -rf "${TMPDIR:?}/private"/*
+literal sibling prefix|command|0|-|rm -rf /shared/home-other/*
+literal regex mismatch|command|0|-|rm -rf /shared/tempX/tmp.*
+redirection is not operand|command|0|-|rm -rf /literal/path > /shared/home
+single quoted variable|command|0|-|rm -rf '\''${HOME:?}'\''
+'
+}
+shared_rows
+skill_load_control shared-variable "$HOOK" 'SHARED_RE="${RM_EDGE}rm${SKIP}${GAP}+${SHARED_ROOT}"' \
+  "SHARED_RE='a^'" HOOK shared_rows 'incident guarded TMPDIR root'
+skill_load_control shared-literal "$HOOK" '${literal_root}${literal_end}"' \
+  "SHARED_RE='a^'" HOOK shared_rows 'incident literal glob'
+skill_load_control shared-dot-segments "$HOOK" '${CROSSABLE}*)?"' \
+  "SHARED_DOT='a^'" HOOK shared_rows 'guarded dot segment glob' \
+  'guarded parent segment glob' 'literal dot segment glob' 'literal parent segment glob'
+
+# Agents redirect cleanup output and copy descriptors in Bash tool calls.
+# Each operator crosses its whole target before the scan resumes at operands.
+redirection_rows() {
+  local name operator crossed target tail gap spacing
+  while read -r name operator crossed target tail; do
+    for spacing in adjacent spaced; do
+      gap=''; [ "$spacing" != spaced ] || gap=' '
+      first_table "\
+redirection $name $spacing variable|command|2|block-unsafe-rm: refused=shared-root|rm -rf /safe ${operator}${gap}${crossed} \"\${TMPDIR:?}\"${tail}
+redirection $name $spacing literal|command|2|block-unsafe-rm: refused=shared-root|rm -rf /safe ${operator}${gap}${crossed} /shared/home/*${tail}
+redirection $name $spacing empty variable|command|2|block-unsafe-rm: refused=recursive-rm|rm -rf /safe ${operator}${gap}${crossed} \$CACHE/file${tail}
+redirection $name $spacing named child|command|0|-|rm -rf /safe ${operator}${gap}${crossed} \"\${TMPDIR:?}/tmp.AbC123\"${tail}
+redirection $name $spacing safe target|command|0|-|rm -rf /safe ${operator}${gap}${target}${tail}
+"
+    done
+  done <<'FORMS'
+output > /dev/null /shared/home
+numbered-output 2> /dev/null /shared/home
+append >> /dev/null /shared/home
+numbered-append 2>> /dev/null /shared/home
+input < /dev/null /shared/home
+read-write <> /dev/null /shared/home
+clobber >| /dev/null /shared/home
+combined-output &> /dev/null /shared/home
+combined-append \046>> /dev/null /shared/home
+copy-output >& 1 $FD
+numbered-copy-output 2>& 1 $FD
+copy-input <& 0 $FD
+move-output 2>& 1- 1-
+close-output 2>& - -
+here-string <<< ignored "$HOME"
+here-document << EOF EOF \nEOF
+tab-here-document <<- EOF EOF \nEOF
+named-descriptor \173log\175> /dev/null /shared/home
+FORMS
+  first_table 'redirection touching operand|command|2|block-unsafe-rm: refused=shared-root|rm -rf /safe>/dev/null "${TMPDIR:?}"
+multiple redirections|command|2|block-unsafe-rm: refused=shared-root|rm -rf /safe > /dev/null 2>&1 /shared/home/*
+quoted target with space|command|0|-|rm -rf /safe > "/log $HOME"
+single quoted target with space|command|0|-|rm -rf /safe > '\''/log $HOME'\''
+escaped space in target|command|0|-|rm -rf /safe > /log\\ $HOME
+quoted target then protected operand|command|2|block-unsafe-rm: refused=shared-root|rm -rf /safe > "/log $HOME" "${TMPDIR:?}"
+redirection semicolon boundary|command|0|-|rm -rf /safe 2>/dev/null; echo $HOME
+redirection and boundary|command|0|-|rm -rf /safe 2>/dev/null && echo $HOME
+redirection or boundary|command|0|-|rm -rf /safe 2>/dev/null || echo $HOME
+redirection pipe boundary|command|0|-|rm -rf /safe 2>/dev/null | echo $HOME
+redirection newline boundary|command|0|-|rm -rf /safe 2>/dev/null\necho $HOME
+redirection later command refused|command|2|block-unsafe-rm: refused=shared-root|rm -rf /safe 2>/dev/null; rm -rf "${TMPDIR:?}"
+'
+}
+redirection_rows
+skill_load_control redirection-crossing "$HOOK" 'SKIP="(${GAP}+${WORD}|${GAP}*${REDIRECT}${GAP}*${WORD})*"' \
+  'SKIP="(${GAP}+${WORD})*"' HOOK redirection_rows \
+  'redirection numbered-output adjacent variable' 'redirection numbered-output adjacent literal'
+skill_load_control redirection-target "$HOOK" 'SKIP="(${GAP}+${WORD}|${GAP}*${REDIRECT}${GAP}*${WORD})*"' \
+  'SKIP="(${GAP}+${WORD}|${GAP}*${REDIRECT})*"' HOOK redirection_rows \
+  'redirection output spaced safe target'
+skill_load_control redirection-boundary "$HOOK" "ENDERS='&;|'" \
+  "ENDERS='' #" HOOK redirection_rows 'redirection semicolon boundary' \
+  'redirection and boundary' 'redirection or boundary' 'redirection pipe boundary'
+skill_load_control redirection-newline "$HOOK" 'GAP="[${BLANK}]"' \
+  'GAP="[${SPACE_ANY}]"' HOOK redirection_rows \
+  'redirection newline boundary'
+first_table 'unset and empty roots match no literal|payload|0|-|{"command":"rm -rf /home/method/dev/.scratch/agents /shared/tmp /shared/te(mp).+ /shared/agent /shared/home"}'
+PAYLOAD_HOME=/
+first_table 'filesystem root direct glob|payload|2|block-unsafe-rm: refused=shared-root|{"command":"rm -rf /tmp.*"}
+filesystem root named child|payload|0|-|{"command":"rm -rf /tmp.AbC123"}'
+unset PAYLOAD_HOME
+run_hook 'rm -rf -- "${TMPDIR:?}"'
+assert_contains "$ERR_FILE" 'd=$(mktemp -d)' 'shared-root remedy keeps the private directory'
+assert_contains "$ERR_FILE" '"${d:?}" in the same shell call' 'shared-root remedy keeps cleanup in the creating call'
+if grep -Fq -- '${NAME:?}' "$ERR_FILE"; then advice=unsafe; else advice=private; fi
+assert_eq "$advice" private 'shared-root remedy does not suggest guarding the shared name'
 
 echo "=== block-unsafe-rm: a variable-rooted operand is refused ==="
 run_hook 'rm -rf $CACHE/$KEY';        assert_eq "$rc" 2 'a bare $NAME root is refused'
