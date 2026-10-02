@@ -1,0 +1,1 @@
+- Branch checks no longer treat documentation or changelog files as an extra source subsystem. Their added lines still count toward the small size limit.
