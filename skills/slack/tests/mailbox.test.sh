@@ -7,6 +7,59 @@ set -uo pipefail
 sk_fake_start --page 2
 echo "=== slack mailbox events ==="
 
+# A hung lane-mail producer must fail its poll, not hold it indefinitely.
+for variant in normal no-timeout; do
+  HUNG="$(sk_new_root "timeout-$variant")"
+  sk_bind "$HUNG"
+  sk_poll "$HUNG"
+  rm -- "${HUNG:?}/.agents/skills/orch/scripts"
+  mkdir -p "$HUNG/.agents/skills/orch/scripts"
+  printf '#!/usr/bin/env python3\nimport time\ntime.sleep(31)\n' > "$HUNG/.agents/skills/orch/scripts/lane-mail"
+  chmod +x "$HUNG/.agents/skills/orch/scripts/lane-mail"
+  if [ "$variant" = no-timeout ]; then
+    sk_mutant mail-timeout mailbox.py 'timeout=LANE_MAIL_TIMEOUT_SECONDS\)' 'timeout=None)'
+  fi
+  sk_poll "$HUNG" # Real wait: crosses the production subprocess timeout.
+  if [ "$variant" = normal ]; then
+    assert_eq "$RC=$ERR1" "1=slack: lane-mail-failed=timeout=30 command=events root=$HUNG" 'hung lane-mail fails the poll with its named timeout'
+  else
+    sk_assert_red "$RC=$ERR1" "1=slack: lane-mail-failed=timeout=30 command=events root=$HUNG" 'control: removing timeout keeps the hung poll green'
+  fi
+  sk_bin_reset
+done
+
+# A real send stalls in jq under orch's directory mutex. Only the existing
+# lock owner's TERM/EXIT handlers may release it before the next delivery.
+for variant in normal hard-kill; do
+  LOCKED="$(sk_new_root "mutex-timeout-$variant")"
+  sk_bind "$LOCKED"
+  sk_poll "$LOCKED"
+  LOCKED_CH="$(sk_channel "$LOCKED")"
+  LOCKED_TS="$(sk_inject "$LOCKED_CH" U001 'After the stalled scan.')"
+  sk_stall_delivery "$LOCKED"
+  if [ "$variant" = hard-kill ]; then
+    sk_mutant mail-hard-kill mailbox.py '\(signal.SIGTERM, signal.SIGKILL\)' '(signal.SIGKILL,)'
+  fi
+  sk_poll "$LOCKED" # Real wait: timeout after the shipped send holds its mutex.
+  assert_eq "$RC=$ERR1" "1=slack: lane-mail-failed=timeout=30 command=send root=$LOCKED" "$variant: stalled send keeps its named timeout"
+  assert_eq "$(cat "$LOCKED/tmp/scan-locked")" "locked" "$variant: the guard reached the real directory mutex without flock"
+  MUTEX="$(sk_box "$LOCKED")/to-lane.jsonl.d"
+  RELEASED=no
+  [ -d "$MUTEX" ] || RELEASED=yes
+  sk_poll "$LOCKED"
+  DELIVERIES="$(jq -s --arg key "$LOCKED_CH:$LOCKED_TS" '[.[] | select(.delivery_id == $key)] | length' "$(sk_box "$LOCKED")/to-lane.jsonl")"
+  printf 'mailbox: mutex-recovery=%s=%s=%s variant=%s\n' "$RELEASED" "$RC" "$DELIVERIES" "$variant"
+  if [ "$RC" -ne 0 ]; then
+    printf 'mailbox: recovery-poll-failed=%s variant=%s\n%s\n' "$RC" "$variant" "$ERR" >&2
+  fi
+  if [ "$variant" = normal ]; then
+    assert_eq "$RELEASED=$RC=$DELIVERIES" "yes=0=1" 'timeout releases the mutex and the next poll acquires it to deliver once'
+  else
+    sk_assert_red "$RELEASED=$RC=$DELIVERIES" "yes=0=1" 'control: immediate hard kill fails the same mutex recovery assertion'
+  fi
+  sk_bin_reset
+done
+
 # A failed jq closure scan must stop a real owner answer, not turn it into
 # a directive. The wrapper leaves the ask read and all envelope writes real.
 SCAN="$(sk_new_root closure-scan)"
@@ -177,7 +230,7 @@ sk_poll "$SK_TMP/field-unknown-kind"
 assert_eq "$ERR" "" "control: unknown field choices no longer get a keyed diagnostic"
 sk_bin_reset
 
-sk_mutant root-isolation relay.py 'except Exception as err:' 'except Refusal as err:'
+sk_mutant root-isolation relay.py '(root.record_status\(True, "", self.connection, self.since, self.connection_error\)\n            )except Exception as err:' '\1except Refusal as err:'
 sk_lm "$HEALTHY" notice --item overseer --to owner --file "$(sk_text root-control 'Root control.')" >/dev/null
 sk_run -- listen --once --root "$BROKEN" --root "$HEALTHY"
 assert_eq "$RC=$(asks "$(sk_channel "$HEALTHY")" 'Root control.')" "1=0" "control: the root error escapes and prevents the healthy root from posting"
