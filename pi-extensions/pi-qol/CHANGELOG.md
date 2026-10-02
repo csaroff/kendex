@@ -2,6 +2,10 @@
 
 ## Consumer-impacting changes
 
+### 2.3.4
+
+- The package test suite now runs a copy of the extension code against the installed Pi packages, with no stand-in modules. It fails when a Pi package is missing or loads from outside this package, when the Pi packages differ in version, or when their version is below the declared minimum Pi version. Run the suite after installing all Pi packages at one version at or above that minimum. With `PI_QOL_PEER_VERSION` set, the suite requires every Pi package at that version.
+
 ### 2.3.3
 
 - Session search prepares prompts and project paths asynchronously, cancels obsolete searches, and waits for a pause in typing before searching. Regex searches stop with a deadline error instead of freezing Pi. Submitted image paths load asynchronously and refuse a combined image size above 20 MiB before reading or encoding the files.
