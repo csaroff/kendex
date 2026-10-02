@@ -9,7 +9,7 @@
 //! member nobody can reach refuses whole rather than installing the part
 //! of itself that still resolves.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use specta::Type;
@@ -18,7 +18,7 @@ use crate::apply::{Op, Plan, PlannedOp, Pre};
 use crate::engine::ops::{self as engine_ops, AddRequest};
 use crate::env::Env;
 use crate::error::{CoreError, Result};
-use crate::manifest::{ItemDecl, LOCAL_SOURCE_NAME, Manifest, Method};
+use crate::manifest::{self, ItemDecl, LOCAL_SOURCE_NAME, Manifest, Method};
 use crate::model::{HarnessId, ItemKind, Scope};
 use crate::source::local_slot;
 
@@ -751,6 +751,29 @@ pub fn install(
             });
         }
     }
+    // Packages saved by Add to template can span repositories. Judge their
+    // combined destination intent before the per-group writes, including
+    // declarations saved disabled.
+    let destination_manifest = engine_ops::manifest_for_reading(env, destination)?;
+    let styles: BTreeSet<&str> = destination_manifest
+        .output_styles
+        .keys()
+        .map(String::as_str)
+        .chain(
+            resolution
+                .groups
+                .iter()
+                .flat_map(|group| &group.items)
+                .filter(|item| item.kind == ItemKind::OutputStyle)
+                .map(|item| item.name.as_str()),
+        )
+        .collect();
+    if let Some(finding) = manifest::output_style_count(styles.len()) {
+        return Err(CoreError::ManifestInvalid {
+            path: manifest::manifest_path(env, destination),
+            findings: vec![finding],
+        });
+    }
     let mut landed = Landing::default();
     for group in &resolution.groups {
         let group_landed = install_group(env, destination, group, &harnesses, method, &mut landed);
@@ -801,6 +824,7 @@ fn install_group(
                 "a plugin declares in [bundles.<name>]: MemberKind::namespace routes it to the group's sets, never its items"
             ),
             ItemKind::PiExtension => request.pi_extensions.push(item.name.clone()),
+            ItemKind::OutputStyle => request.output_styles.push(item.name.clone()),
         }
     }
     // A whole set carries its own members; expanding agents' skills on

@@ -16,7 +16,7 @@ use text::codex_enable_hooks;
 pub(crate) fn codex_env_vars(env: &Value) -> Result<Vec<String>, String> {
     codex_mcp::env_vars(env)
 }
-pub use text::{remove_marker_block, upsert_marker_block};
+pub use text::{marker_block, remove_marker_block, style_blocks, upsert_marker_block};
 
 /// A deterministic, idempotent structured edit. Applied to the file's
 /// current text at execute time; a file is in sync exactly when
@@ -24,6 +24,14 @@ pub use text::{remove_marker_block, upsert_marker_block};
 /// config-entry kinds. Unrelated keys always survive (invariant 2).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ConfigEdit {
+    /// Claude Code's response style selection. Set only when absent.
+    ClaudeOutputStyle {
+        name: String,
+    },
+    /// Remove a selection only while it still names our style.
+    RemoveClaudeOutputStyle {
+        name: String,
+    },
     /// claude settings.json / codex hooks.json: upsert our handler under
     /// `hooks.<event>` for `matcher`, replacing entries that run `command`.
     UpsertHook {
@@ -166,6 +174,14 @@ pub enum ConfigEdit {
 }
 
 impl ConfigEdit {
+    /// Response styles never follow a link placed at their shared file.
+    pub(crate) fn requires_regular_file(&self) -> bool {
+        matches!(
+            self,
+            Self::ClaudeOutputStyle { .. } | Self::RemoveClaudeOutputStyle { .. }
+        ) || matches!(self, Self::UpsertMarkerBlock { name, .. } | Self::RemoveMarkerBlock { name } if name.starts_with("output-style-"))
+    }
+
     /// Composed OpenCode cleanup may retire a document containing only our schema.
     pub(crate) fn removes_empty_document(edits: &[Self], current: &str) -> Result<bool, String> {
         let prunes = |edit: &Self| matches!(edit, Self::OpencodePruneInstructions { .. });
@@ -207,7 +223,15 @@ impl ConfigEdit {
                 } else {
                     serde_json::from_str(current).map_err(|e| e.to_string())?
                 };
+                let selection = root.get("outputStyle").cloned();
                 json_edit.apply_json(&mut root)?;
+                if matches!(
+                    json_edit,
+                    Self::ClaudeOutputStyle { .. } | Self::RemoveClaudeOutputStyle { .. }
+                ) && root.get("outputStyle").cloned() == selection
+                {
+                    return Ok(current.to_owned());
+                }
                 let mut text = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
                 text.push('\n');
                 Ok(text)
@@ -223,6 +247,18 @@ impl ConfigEdit {
             return applied;
         }
         match self {
+            ConfigEdit::ClaudeOutputStyle { name } => {
+                object
+                    .entry("outputStyle")
+                    .or_insert_with(|| Value::String(name.clone()));
+                Ok(())
+            }
+            ConfigEdit::RemoveClaudeOutputStyle { name } => {
+                if object.get("outputStyle").and_then(Value::as_str) == Some(name) {
+                    object.shift_remove("outputStyle");
+                }
+                Ok(())
+            }
             ConfigEdit::UpsertMcpServer { name, value } => {
                 let servers = ensure_object(object, "mcpServers")?;
                 servers.insert(name.clone(), value.clone());
@@ -293,22 +329,7 @@ impl ConfigEdit {
                 Ok(())
             }
             ConfigEdit::OpencodePruneInstructions { prefix, keep } => {
-                if let Some(list) = object.get_mut("instructions").and_then(Value::as_array_mut) {
-                    list.retain(|v| {
-                        v.as_str()
-                            .is_none_or(|row| !row.starts_with(prefix) || keep.contains_key(row))
-                    });
-                    if list.is_empty() {
-                        object.shift_remove("instructions");
-                    }
-                }
-                if !keep.values().any(|bash| *bash)
-                    && object.get("permission").and_then(|v| v.get("bash"))
-                        == Some(&json!({"*": "ask"}))
-                {
-                    remove_from_map(object, "permission", "bash");
-                }
-                Ok(())
+                opencode_prune_instructions(object, prefix, keep)
             }
             _ => Ok(()),
         }
@@ -405,6 +426,28 @@ fn opencode_add_instruction(
         permission
             .entry("bash")
             .or_insert_with(|| json!({"*": "ask"}));
+    }
+    Ok(())
+}
+
+fn opencode_prune_instructions(
+    object: &mut Map<String, Value>,
+    prefix: &str,
+    keep: &std::collections::BTreeMap<String, bool>,
+) -> Result<(), String> {
+    if let Some(list) = object.get_mut("instructions").and_then(Value::as_array_mut) {
+        list.retain(|v| {
+            v.as_str()
+                .is_none_or(|row| !row.starts_with(prefix) || keep.contains_key(row))
+        });
+        if list.is_empty() {
+            object.shift_remove("instructions");
+        }
+    }
+    if !keep.values().any(|bash| *bash)
+        && object.get("permission").and_then(|v| v.get("bash")) == Some(&json!({"*": "ask"}))
+    {
+        remove_from_map(object, "permission", "bash");
     }
     Ok(())
 }

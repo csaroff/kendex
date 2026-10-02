@@ -31,6 +31,7 @@ mod file_plan;
 pub mod fork;
 mod gemini;
 pub mod generated_paths;
+pub(crate) mod output_style;
 pub use generated_paths::GeneratedPaths;
 mod holds;
 mod installed;
@@ -170,6 +171,12 @@ pub fn plan_scope(
 ) -> Result<EngineReport> {
     // Identity first: derived paths and the scope lock key off canonical.
     let scope = &scope.canonical();
+    if let Some(finding) = manifest::output_style_count(declared.output_styles.len()) {
+        return Err(crate::error::CoreError::ManifestInvalid {
+            path: manifest::manifest_path(env, scope),
+            findings: vec![finding],
+        });
+    }
     // `declared` is what the person declared, as this build reads it: the
     // manifest any write this plan carries is built from. A single-package
     // update reads from a copy with every other follower pinned at its
@@ -238,7 +245,7 @@ pub fn plan_scope(
         Some(&mut ops),
     )?);
     stale::stale_instruction_rows(env, scope, lock, &new_lock, &state.items, &mut config_edits)?;
-    plan_config_edits(config_edits, &mut ops)?;
+    plan_config_edits(config_edits, &mut new_lock, &mut ops)?;
     let set_changes = set_changes(lock, &new_lock);
     let kept = kept_members(lock, &new_lock, &options.uninstalled_bundles);
     let repo_effects_leaving = repo_effects::leaving(env, scope, lock, &new_lock)?;
