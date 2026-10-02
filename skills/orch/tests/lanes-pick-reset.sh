@@ -26,7 +26,7 @@ chmod +x "$TMP_ROOT/bin/date"
 
 # Controls remove one behavior without deleting the matching code. Use the
 # same expectations as the fixed chooser and require that each turns red.
-FALLBACK="$LANES"; SCORE="$LANES"; BOUND="$LANES"; LOCAL="$LANES"; UNKNOWN="$LANES"; RESTORE="$LANES"; COLLECT="$LANES"
+FALLBACK="$LANES"; SCORE="$LANES"; BOUND="$LANES"; LOCAL="$LANES"; NOMATCH="$LANES"; UNKNOWN="$LANES"; RESTORE="$LANES"; COLLECT="$LANES"
 # measure_lane is the helper dependency. This private copy makes its command
 # fail, rather than returning the unreachable record the usage endpoint emits.
 CTRL="$(mutant_scripts failed-local-reader lib/lane-model.sh)"
@@ -43,8 +43,13 @@ if [[ -z "${LANES_UNDER_TEST:-}" ]]; then
   mutate_file "$CTRL/lib/lane-model.sh" 'else 1 + 1 / (1 + $hours) end' 'else 1 + 1000 / (1 + $hours) end'
   BOUND="$CTRL/lanes"
   CTRL="$(mutant_scripts mutant-local-scope lib/lane-model.sh)"
-  mutate_file "$CTRL/lib/lane-model.sh" 'elif $h == "claude" and $model != "" and (model_bindings($model) | length) == 0 then empty' 'elif false and $h == "claude" and $model != "" and (model_bindings($model) | length) == 0 then empty'
+  mutate_file "$CTRL/lib/lane-model.sh" 'elif $h == "claude" and $model != "" and ((.model_buckets // []) | length) == 0 then empty' 'elif false and $h == "claude" and $model != "" and ((.model_buckets // []) | length) == 0 then empty'
   LOCAL="$CTRL/lanes"
+  # Restores the refusal of a reading whose buckets name no window for the
+  # model, so the shared-window rows must turn red.
+  CTRL="$(mutant_scripts mutant-no-match lib/lane-model.sh)"
+  mutate_file "$CTRL/lib/lane-model.sh" '((.model_buckets // []) | length) == 0 then empty' '(model_bindings($model) | length) == 0 then empty'
+  NOMATCH="$CTRL/lanes"
   CTRL="$(mutant_scripts mutant-unknown-bonus lib/lane-model.sh)"
   mutate_file "$CTRL/lib/lane-model.sh" 'if $hours == null then 1 else' 'if $hours == null then 1.1 else'
   UNKNOWN="$CTRL/lanes"
@@ -58,15 +63,25 @@ if [[ -z "${LANES_UNDER_TEST:-}" ]]; then
   COLLECT="$CTRL/lanes"
 fi
 
+pick_run() { # SCRIPT FETCHER ARGS... — one pick in H's world, its stderr in H/err
+  local script="$1" fetcher="$2"
+  shift 2
+  (cd "$TMP_ROOT/repo" && env -i PATH="$TMP_ROOT/bin:$PATH" HOME="$H" REAL_DATE="$REAL_DATE" \
+    LANES_HOME="$H" FIXTURE_DIR="$FIXTURE_DIR" ORCH_LANES_FETCH_CMD="$fetcher" \
+    ORCH_LANE_HOST="$TEST_DIR/fixtures/lane-host" LANE_HOST_STUB_ACCOUNTS="$H/accounts" LANE_HOST_STUB_LOG="$H/host.log" \
+    OVERSEE_WATCH_STATE_DIR="$H/store" ORCH_STATE_DIR="$H/state" ORCH_LANE_DIRS="$H/.8claude:$H/.10claude" \
+    "$script" "$@" 2>"$H/err")
+}
+
 # name|harness|host A room|A reset hours|B room|B reset hours|local A model use|A label|winner|score|script|local scope|fetch|host status
 # Local shared room without Opus comes from normal usage endpoint windows.
 for row in \
   "fresh-8claude|claude|null|75|11|67|0|Opus|8|unknown|$LANES" \
   "named-fresh-8claude|claude|null|75|11|67|0|Opus|8|named|$LANES" \
-  "neither-measures-opus|claude|100|75|11|67|0|Sonnet|10|reject|$LANES|Sonnet" \
-  "named-neither-measures-opus|claude|100|75|11|67|0|Sonnet|8|refuse|$LANES|Sonnet" \
-  "unreachable-wrong-model|claude|100|75|11|67|0|Sonnet|10|dropped|$LANES|Sonnet|ok|unreachable" \
-  "named-unreachable-wrong-model|claude|100|75|11|67|0|Sonnet|8|host-refused|$LANES|Sonnet|ok|unreachable" \
+  "neither-measures-opus|claude|100|75|11|67|0|Sonnet|8|unknown|$LANES|Sonnet" \
+  "named-neither-measures-opus|claude|100|75|11|67|0|Sonnet|8|named|$LANES|Sonnet" \
+  "unreachable-wrong-model|claude|100|75|11|67|0|Sonnet|8|unknown|$LANES|Sonnet|ok|unreachable" \
+  "named-unreachable-wrong-model|claude|100|75|11|67|0|Sonnet|8|named|$LANES|Sonnet|ok|unreachable" \
   "unreachable-matching-model|claude|100|75|11|67|0|Sonnet|8|unknown|$LANES|Opus|ok|unreachable" \
   "named-unreachable-matching-model|claude|100|75|11|67|0|Sonnet|8|named|$LANES|Opus|ok|unreachable" \
   "local-http-failed|claude|100|75|11|67|0|Sonnet|10|reject|$LANES|Opus|503" \
@@ -89,10 +104,10 @@ for row in \
   "control-fallback|claude|null|75|11|67|0|Opus|8|unknown|$FALLBACK" \
   "control-reset|claude|80|9|80|1|null|Opus|10|120|$SCORE" \
   "control-bound|claude|11|0|100|10000|null|Opus|10|unknown|$BOUND" \
-  "control-local-scope|claude|100|75|11|67|0|Sonnet|10|reject|$LOCAL|Sonnet" \
-  "control-named-local-scope|claude|100|75|11|67|0|Sonnet|8|refuse|$LOCAL|Sonnet" \
-  "control-unreachable-local-scope|claude|100|75|11|67|0|Sonnet|10|dropped|$LOCAL|Sonnet|ok|unreachable" \
-  "control-named-unreachable-local-scope|claude|100|75|11|67|0|Sonnet|8|host-refused|$LOCAL|Sonnet|ok|unreachable" \
+  "control-local-scope|claude|100|75|11|67|0|Sonnet|8|unknown|$NOMATCH|Sonnet" \
+  "control-named-local-scope|claude|100|75|11|67|0|Sonnet|8|named|$NOMATCH|Sonnet" \
+  "control-unreachable-local-scope|claude|100|75|11|67|0|Sonnet|8|unknown|$NOMATCH|Sonnet|ok|unreachable" \
+  "control-named-unreachable-local-scope|claude|100|75|11|67|0|Sonnet|8|named|$NOMATCH|Sonnet|ok|unreachable" \
   "control-unknown-reset|claude|80|null|40|1|null|Opus|8|80|$UNKNOWN" \
   "control-local-http|claude|100|75|11|67|0|Sonnet|10|reject|$RESTORE|Opus|503" \
   "control-named-local-http|claude|100|75|11|67|0|Sonnet|8|refuse|$RESTORE|Opus|503" \
@@ -136,11 +151,7 @@ for row in \
     failed) args+=(--lane "$H/.8claude" --projected); want_rc=1 ;;
   esac
   rc=0
-  out="$(cd "$TMP_ROOT/repo" && env -i PATH="$TMP_ROOT/bin:$PATH" HOME="$H" REAL_DATE="$REAL_DATE" \
-    LANES_HOME="$H" FIXTURE_DIR="$FIXTURE_DIR" ORCH_LANES_FETCH_CMD="$fetcher" \
-    ORCH_LANE_HOST="$TEST_DIR/fixtures/lane-host" LANE_HOST_STUB_ACCOUNTS="$H/accounts" LANE_HOST_STUB_LOG="$H/host.log" \
-    OVERSEE_WATCH_STATE_DIR="$H/store" ORCH_STATE_DIR="$H/state" ORCH_LANE_DIRS="$H/.8claude:$H/.10claude" \
-    "$script" "${args[@]}" 2>"$H/err")" || rc=$?
+  out="$(pick_run "$script" "$fetcher" "${args[@]}")" || rc=$?
   printf 'case=%s rc=%s json=%s\n' "$name" "$rc" "$out"
   got="$(jq -r '.config_dir // "none"' <<<"$out")"
   got="${got:-none}"
@@ -165,6 +176,43 @@ for row in \
     [[ ( "$rc" == 0 || "$rc" == 5 ) && "rc=$rc $got" != "rc=$want_rc $want" ]] && pass "$name turns its assertion red" || fail "$name did not reach the behavior"
   else
     assert_eq "rc=$rc $got" "rc=$want_rc $want" "$name" "$H/err"
+  fi
+done
+
+# A plan whose one scoped window is Fable's, at 5H 0 and WEEK 66. The host row's
+# model label is Fable for an Opus launch and Sonnet for a Fable launch, so it
+# names no window for the launched model and every row consults the local
+# reading. An Opus launch is judged on the shared windows and a Fable launch on
+# the local Fable window; a reading with no model window stays unmeasured.
+# `through` is the credential the record names and `line` the keyed stderr line
+# that consultation printed. `named` is the call the open-terminal launch gate
+# makes.
+# name|local scoped window|host label|model|form|script|expected
+NO_MODEL="detail=no fresh local model window for claude-opus-5-5 line=pick-local-model-unmeasured"
+for row in \
+  "shared-binds-opus|Fable|Fable|claude-opus-5-5|pick|$LANES|rc=0 lane=8claude through=local status=ok bucket=weekly room=34 detail=null line=pick-local-model-reading" \
+  "named-shared-binds-opus|Fable|Fable|claude-opus-5-5|named|$LANES|rc=0 lane=8claude through=local status=ok bucket=weekly room=34 detail=null line=pick-local-model-reading" \
+  "fable-window-binds-fable|Fable|Sonnet|fable|named|$LANES|rc=3 lane=8claude through=local status=ok bucket=model room=0 detail=null line=pick-local-model-reading" \
+  "no-model-window-unmeasured|none|Fable|claude-opus-5-5|named|$LANES|rc=5 lane=8claude through=local status=no_usage_data bucket=null room=null $NO_MODEL" \
+  "control-shared-binds-opus|Fable|Fable|claude-opus-5-5|named|$NOMATCH|rc=0 lane=8claude through=local status=ok bucket=weekly room=34 detail=null line=pick-local-model-reading" \
+  "control-no-model-window|none|Fable|claude-opus-5-5|named|$LOCAL|rc=5 lane=8claude through=local status=no_usage_data bucket=null room=null $NO_MODEL"; do
+  IFS='|' read -r name scope host_label model form script want <<<"$row"
+  new_home "$name"
+  make_lane "$H" 8claude
+  jq -n --arg scope "$scope" '{five_hour: {utilization: 0}, seven_day: {utilization: 66},
+    limits: (if $scope == "none" then [] else [{kind: "weekly_scoped", percent: 100, scope: {model: {display_name: $scope}}}] end)}' \
+    > "$FIXTURE_DIR/.8claude.json"
+  printf 'account=%s\tharness=claude\tstatus=ok\tsession-5h-pct=0\tweekly-pct=66\tmodel-pct=100\tmodel-label=%s\n' "$H/.8claude" "$host_label" > "$H/accounts"
+  args=(pick --harness claude --model "$model" --json)
+  [[ "$form" == pick ]] || args+=(--lane "$H/.8claude" --projected)
+  rc=0
+  out="$(pick_run "$script" "$FETCHER" "${args[@]}")" || rc=$?
+  line="$(sed -nE 's/^lanes: (pick-local-model-(reading|unmeasured)) .*/\1/p' "$H/err")"
+  got="rc=$rc $(jq -r '"lane=\(.config_dir // "none" | sub(".*/\\."; "")) through=\(.measured_through) status=\(.status) bucket=\(.binding_bucket) room=\(.projected_headroom_pct) detail=\(.detail)"' <<<"$out") line=${line:-none}"
+  if [[ "$name" == control-* && -z "${LANES_UNDER_TEST:-}" ]]; then
+    [[ ( "$rc" == 0 || "$rc" == 5 ) && "$got" != "$want" ]] && pass "$name turns its assertion red" || fail "$name did not reach the behavior"
+  else
+    assert_eq "$got" "$want" "$name" "$H/err"
   fi
 done
 printf 'pass: %d   fail: %d\n' "$PASS" "$FAIL"
