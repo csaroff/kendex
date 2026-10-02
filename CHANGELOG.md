@@ -8,6 +8,17 @@ change came from an outside contributor.
 
 ## [Unreleased]
 
+## [1.5.1] - 2026-10-02
+
+### Fixed
+
+- Slack acknowledges messages during API and mailbox waits, resumes reconnect history from saved positions, and logs deliveries and refused eyes reactions.
+- Since 1.5.0, verify names `kendex source refresh` when a source mirror lacks a recorded commit, including stale render rows; the 1.5.0 notes missed it.
+- The built-in second-opinion Codex command now disables Codex hooks, so project Stop hooks no longer block the nested review. A custom `SECOND_OPINION_CODEX_CMD` needs `--disable hooks` added.
+- second-opinion keeps a review or audit answer a CLI printed on stdout with a zero exit, even when its stderr echoes quota or rate-limit text, instead of falling through.
+- github: `pr-merge` merges past the merge queue only when it is empty, so queued entries keep their CI; an occupied or unreadable queue takes the queue route (`queue-occupied`, `queue-unreadable`).
+- commit-guards: the byte ceiling exempts `.kendex-lock.json`, the install record kendex generates, as it exempts package-manager lockfiles.
+
 ## [1.5.0] - 2026-10-02
 
 ### Upgrading
@@ -1320,7 +1331,8 @@ change came from an outside contributor.
 
 Releases before 1.0.0 (the vstack-era numbering up to 5.0.1) are not listed here; their history is in git.
 
-[Unreleased]: https://github.com/vanillagreencom/kendex/compare/v1.5.0...HEAD
+[Unreleased]: https://github.com/vanillagreencom/kendex/compare/v1.5.1...HEAD
+[1.5.1]: https://github.com/vanillagreencom/kendex/releases/tag/v1.5.1
 [1.5.0]: https://github.com/vanillagreencom/kendex/releases/tag/v1.5.0
 [1.4.0]: https://github.com/vanillagreencom/kendex/releases/tag/v1.4.0
 [1.3.0]: https://github.com/vanillagreencom/kendex/releases/tag/v1.3.0
