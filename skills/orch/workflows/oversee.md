@@ -166,6 +166,8 @@ Write owner summaries with [communication-modes.md § Owner messages](../referen
 - Judgement rules for every event: [oversee-events.md § Judgement rules](../references/oversee-events.md#judgement-rules).
 - Handling per event kind: [oversee-events.md § Event kinds](../references/oversee-events.md#event-kinds).
 
+- Direct push: `oversee-cycle record --commit SHA ITEM` has no PR-opened, gate-green, CI-green or armed stamp. Record it before lane close per [oversee-events.md § Direct-push cycle records](../references/oversee-events.md#direct-push-cycle-records).
+
 ### Outside contributions
 
 The overseer owns each contribution the watch reports as `outside-contribution`, until it is merged or closed. `ORCH_EXTERNAL_TRIAGE`, default `on`, has each long pass of the watch list the open pull requests of every repository and the open issues of the first, and report each one whose author is outside the fleet once, and a pull request again on each new head; `off` lists nothing and changes nothing else. `oversee-watch --help` states who counts as the fleet and the event's fields. The fleet is every author GitHub marks type `Bot` or whose `author_association` is `OWNER`, `MEMBER` or `COLLABORATOR`, because no setting names the lanes app or the owner login and the association rule covers them without one.
