@@ -32,21 +32,6 @@ set -uo pipefail
 sk_fake_start --page 2
 echo "=== slack listen: Socket Mode ==="
 
-# landed ROOT DELIVERY_ID [TRIES] — the text of the envelope keyed DELIVERY_ID,
-# awaited TRIES tenths of a second, 200 unless given. Empty when none landed.
-landed() {
-  local tries=0 file text
-  file="$(sk_box "$1")/to-lane.jsonl"
-  while [ "$tries" -lt "${3:-200}" ]; do
-    if [ -f "$file" ]; then
-      text="$(jq -r --arg d "$2" 'select(.delivery_id == $d) | .text' "$file")"
-      if [ -n "$text" ]; then printf '%s' "$text"; return 0; fi
-    fi
-    tries=$((tries + 1))
-    sleep 0.1
-  done
-  return 0
-}
 # lines ROOT KIND — the `at`-less shape of each journal line of KIND, one per line
 lines() { jq -r --arg k "$2" 'select(.t == $k) | [.t, (.reason // "")] | join(" ")' "$(sk_journal "$1")"; }
 # awaited CMD... — CMD's output once it is non-empty, twenty seconds at most
@@ -68,7 +53,6 @@ envelope() {
     '[.sent[] | select(.channel == $c and .ts == $t) | .envelope_id] as $ids
      | "sent=\($ids | length) unacked=\($ids - .acks | length)"'
 }
-field() { printf '%s\n' "$1" | tr ' ' '\n' | sed -n "s/^$2=//p"; } # LINE KEY
 connection() { sk_run -- listen --status --root "$1"; field "$OUT" connection; } # ROOT
 state_link() { sk_run -- listen --status --root "$1"; printf '%s %s' "$(field "$OUT" state)" "$(field "$OUT" connection)"; } # ROOT
 texts() { jq -r .text "$(sk_box "$1")/to-lane.jsonl" | tr '\n' ' '; } # ROOT — every text in its to-lane box

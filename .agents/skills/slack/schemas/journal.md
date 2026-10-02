@@ -46,7 +46,7 @@ Every line carries `t`, its kind. The relay replays the file at start; a line of
 | `thread` | `ts`, `seen` | The thread under `ts` is read past the reply stamp `seen`; only a history read writes it |
 | `mark` | `ts`, `name` | The owner message at `ts` carries the reaction `name`: `eyes` once an answer or directive lands, `white_check_mark` once the overseer's `to-lane.cursor` passes a directive. Each delivery and each poll marks `eyes` an `in` line for an answer or directive with no `mark` line. An `eyes` line with no later `white_check_mark` line is checked every poll; `compact` drops a mark line once `ts` is past `SLACK_THREAD_DAYS` and the directive is read, and keeps the `in` and `mark` lines of a directive with no `white_check_mark` line whatever their age |
 | `connect` | `at` | The relay's first Socket Mode connection since it started is open: Slack's `hello` arrived at the UTC second `at`. The next poll reads the channel's history |
-| `disconnect` | `at`, `reason` | The connection closed at `at`. `reason` is `slack-<reason>` for Slack's own `disconnect` envelope, such as `slack-refresh_requested`, or the client's cause, such as `connection ended` or `no frame in 60s` |
+| `disconnect` | `at`, `reason` | The connection closed at `at`. `reason` is `slack-<reason>` for Slack's own `disconnect` envelope, such as `slack-refresh_requested`, the client's cause, such as `connection ended` or `no frame in 60s`, or `reload` when the relay closed it to re-execute onto updated code |
 | `reconnect` | `at` | A later connection is open; the next poll reads the channel's history, which delivers what was sent while the relay was disconnected |
 
 Stamps (`ts`, `thread`, `seen`) are Slack message stamps, seconds with six decimals; `at` is the UTC second `lane-mail` writes, or the relay's clock on a connection line. `compact` drops a connection line once its `at` is older than `SLACK_THREAD_DAYS`; the connection lines of one relay are written to the journal of every root it serves, and replay reads nothing from them. Every inbound delivery hands `lane-mail` the key `channel:ts`. Every `out` line carries its envelope's `at`. An envelope whose `at` is older than `SLACK_THREAD_DAYS` is never posted, and `compact` judges an `out` line by that same `at`, never by its `thread`, so a line it drops is one whose envelope can never post again.
@@ -75,7 +75,8 @@ A root `out` line carries `parent` for a relay-posted ask or notice. A `bound` l
 
 | Field | Value |
 |-------|-------|
-| `pid` | The relay's process id |
+| `pid` | The relay's process id, which a re-execution onto updated code keeps |
+| `code` | The fingerprint of the code the relay runs: 12 hex characters of one sha256 over `scripts/slack` and every `scripts/lib/*.py`, files in sorted order |
 | `channel` | The bound channel id |
 | `poll_seconds` | The `SLACK_POLL_SECONDS` the relay runs with |
 | `compacted_day` | The UTC day the journal was last compacted, or first seen |
@@ -89,4 +90,4 @@ A root `out` line carries `parent` for a relay-posted ask or notice. A `bound` l
 | `held_by` | `master` while a hold stands, empty otherwise |
 
 
-`listen --status` prints per root: `state` (`ok` inside two poll intervals plus five seconds of a successful poll, `failing` inside that of a refused one, or of one with a `connection_error` after 120 seconds `reconnecting`, `stale` past it, `never` with no record), `channel`, `last_poll_age`, `connection` and `connection_since` (for a `stale` record `disconnected` since its `last_poll`, since its relay is gone), `last_delivered_ts`, `open_asks`, `oldest_unknown`, `refused`, `calls_last_minute`, `held-by=master` while a hold stands, and `fix=` when the state is not `ok`: `last_error` for a refused poll, else `connection_error` for `failing`, a restart for `stale`, the start command for `never`. A `never` line carries `fix=` alone, with no other field.
+`listen --status` prints per root: `state` (`ok` inside two poll intervals plus five seconds of a successful poll, `failing` inside that of a refused one, or of one with a `connection_error` after 120 seconds `reconnecting`, `stale` past it, `never` with no record), `channel`, `code` (`-` for a record without one), `last_poll_age`, `connection` and `connection_since` (for a `stale` record `disconnected` since its `last_poll`, since its relay is gone), `last_delivered_ts`, `open_asks`, `oldest_unknown`, `refused`, `calls_last_minute`, `held-by=master` while a hold stands, and `fix=` when the state is not `ok`: `last_error` for a refused poll, else `connection_error` for `failing`, a restart for `stale`, the start command for `never`. A `never` line carries `fix=` alone, with no other field.
