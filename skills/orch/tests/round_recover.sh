@@ -375,6 +375,48 @@ new_round none KEN-91 7-7 0
 run --worktree "$WT" --issue KEN-91 --round-id 7-7
 assert_eq "rc=$RC ${OUT##* }" "rc=3 reason=no-transcript" "no transcript re-delegates" "$TMP_ROOT/stderr"
 
+echo "=== the Apple gate's refusal re-delegates ==="
+# apple_case NAME ISSUE EXIT PATH VALIDATE — a round whose main holds the
+# mac-run workflow, whose branch also adds PATH unless it is "-", with a run
+# whose sentinel reads EXIT, recovered from a report of VALIDATE. Leaves RC and
+# OUT.
+apple_case() {
+  new_round "$1" "$2" 9-9 none
+  git -C "$WT" switch -q main
+  mkdir -p "$WT/.github/workflows"
+  printf 'name: mac-run\n' > "$WT/.github/workflows/mac-run.yml"
+  git -C "$WT" add .github
+  git -C "$WT" commit -q -m workflow
+  git -C "$WT" switch -q "$2"
+  if [[ "$4" != - ]]; then
+    mkdir -p "$WT/$(dirname "$4")"
+    printf 'app\n' > "$WT/$4"
+    git -C "$WT" add -- "$4"
+    git -C "$WT" commit -q -m app
+    HEAD_SHA="$(git -C "$WT" rev-parse HEAD)"
+  fi
+  add_run "$WT" 1 10 "$3" "$DEAD_PID"
+  transcript "$TMP_ROOT/$1.jsonl" claude-send 9-9 "$(implement_report "$HEAD_SHA" "$5" none)"
+  run --worktree "$WT" --issue "$2" --round-id 9-9 --transcript "$TMP_ROOT/$1.jsonl"
+}
+APPLE_CASES=(
+  "a pass for an Apple path|apple-path|KEN-60|0|ios/App.swift|pass"
+  "a no-verdict for an Apple path|apple-cut|KEN-61|no-verdict|ios/App.swift|no-verdict: dev_validate_run.sh"
+  "a pass with no Apple path|apple-armed|KEN-62|0|-|pass"
+)
+for case in "${APPLE_CASES[@]}"; do
+  IFS='|' read -r label name key exit path validate <<<"$case"
+  apple_case "$name" "$key" "$exit" "$path" "$validate"
+  assert_eq "rc=$RC ${OUT##* }" "rc=3 reason=mac-run-unproven" "$label" "$TMP_ROOT/stderr"
+done
+# Control: without the re-delegation, the gate's refusal is a write failure.
+SHIPPED_RECOVER="$RECOVER"
+RECOVER="$(mutant_scripts recover-re-delegation-mutant round-recover)/round-recover" || exit 1
+mutate_file "$RECOVER" "no_report mac-run-unproven ;;" ": ;;"
+apple_case control-re-delegation KEN-60 0 ios/App.swift pass
+assert_eq "rc=$RC ${OUT##* }" "rc=2 " "control: without the re-delegation, a pass for an Apple path flips" "$TMP_ROOT/stderr"
+RECOVER="$SHIPPED_RECOVER"
+
 echo "=== dev-validate-run decides whether the round's run is still going ==="
 # Two runs since the delegation: the one started last is the round's run,
 # whatever its directory name sorts as.
