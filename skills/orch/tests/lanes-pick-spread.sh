@@ -29,6 +29,9 @@ source "$TEST_DIR/lib/assertions.sh"
 source "$TEST_DIR/lib/lanes-fixture.sh"
 # shellcheck source=lib/growth-state.sh
 source "$TEST_DIR/lib/growth-state.sh"
+source "$TEST_DIR/lib/virtual-clock.sh"
+source "$TEST_DIR/lib/open-terminal-stubs.sh"
+source "$TEST_DIR/lib/question-off.sh"
 
 FETCHER="$TMP_ROOT/fetch"
 make_fetcher "$FETCHER"
@@ -43,12 +46,15 @@ git -C "$NOSETTINGS" config maintenance.auto false
 # The tmux stub answers `list-panes` with the panes file, so a claim naming
 # this process and a listed pane is live.
 BIN="$TMP_ROOT/bin"; mkdir -p "$BIN"
+virtual_clock_install "$BIN" "$TMP_ROOT/clock"
 cat > "$BIN/tmux" <<'STUBEOF'
 #!/usr/bin/env bash
 [[ "${1:-}" == "list-panes" ]] || exit 0
 cat "$TMUX_PANES_FILE"
 STUBEOF
 chmod +x "$BIN/tmux"
+OT_BIN="$TMP_ROOT/ot-bin"
+ot_stub_bin "$OT_BIN"
 
 # Three claude accounts: a at 20 percent used, b at 30, c at 60, each binding
 # on its 5-hour window, and w binding on its weekly window at 86.
@@ -59,6 +65,11 @@ for lane in a:20 b:30 c:60; do
 done
 make_lane "$H" wclaude 3600
 claude_usage 10 86 5 Opus > "$FIXTURE_DIR/.wclaude.json"
+make_lane "$H" mclaude 3600
+claude_usage 10 20 84 Opus > "$FIXTURE_DIR/.mclaude.json"
+make_codex_token_lane "$H/.1codex" 3600
+jq -n '{rate_limit: {primary_window: {used_percent: 22, reset_at: 1900000000,
+  limit_window_seconds: 18000}}}' > "$FIXTURE_DIR/.1codex.json"
 ALL_DIRS="ORCH_LANE_DIRS=$H/.aclaude:$H/.bclaude:$H/.cclaude"
 
 # stage SPEC — the claim store and fleet state for one run. SPEC items,
@@ -105,29 +116,37 @@ stage() {
   done
 }
 
-# stage_rate LANE CURRENT PRIOR — LANE's cached figure at CURRENT percent on
-# its 5-hour window, with a prior sample ten minutes earlier at PRIOR, so the
-# run serves the figure and measures a rate of (CURRENT - PRIOR) / 10 percent a
-# minute. The record is written by a listing first, so its name is the one
-# `lanes` keys it on.
+# stage_rate LANE CURRENT PRIOR [CLAIMS] [ELAPSED] [AGE] [BUCKET]: LANE's cached figure at CURRENT
+# percent on BUCKET (session by default), with a prior sample ELAPSED seconds earlier at
+# PRIOR. ELAPSED defaults to 600 seconds. The record is written by a listing
+# first, so its name is the one
+# `lanes` keys it on. CLAIMS is the count at sample time, one by default;
+# `missing` stages a record from before counts were stored. AGE defaults to zero;
+# an age beyond the usage TTL makes the next command fetch a new sample.
 stage_rate() {
   local lane="$1" f now staged=no
   (cd "$NOSETTINGS" && env GIT_CEILING_DIRECTORIES="$TMP_ROOT" LANES_HOME="$H" ORCH_LANES_FETCH_CMD="$FETCHER" \
-    ORCH_LANE_DIRS="$H/.${lane}claude" OVERSEE_WATCH_STATE_DIR="$STORE" TMUX_PANES_FILE="$RUN/panes" \
+    ORCH_LANE_DIRS="$H/.${lane}${ACCOUNT_HARNESS:-claude}" OVERSEE_WATCH_STATE_DIR="$STORE" TMUX_PANES_FILE="$RUN/panes" \
+    STUB_CLOCK="$STUB_CLOCK" STUB_REAL_DATE="$STUB_REAL_DATE" STUB_REAL_SLEEP="$STUB_REAL_SLEEP" \
     PATH="$BIN:$PATH" "$LANES" list --json >/dev/null 2>&1)
-  now="$(date +%s)"
+  now="$("$BIN/date" +%s)" || exit 1
   for f in "$STORE"/usage/*.json; do
-    [[ -f "$f" && "$(jq -r '.config_dir' "$f")" == "$H/.${lane}claude" ]] || continue
-    jq --argjson now "$now" --argjson current "$(claude_usage "$2" 10 5 Opus)" \
-      --argjson prior "$(claude_usage "$3" 10 5 Opus)" \
-      '.fetched_at = $now | .usage = $current | .prior = {fetched_at: ($now - 600), usage: $prior}' \
+    [[ -f "$f" && "$(jq -r '.config_dir' "$f")" == "$H/.${lane}${ACCOUNT_HARNESS:-claude}" ]] || continue
+    jq --argjson now "$now" --argjson current "$2" --argjson prior "$3" --arg claims "${4:-1}" \
+      --argjson elapsed "${5:-600}" --argjson age "${6:-0}" --arg bucket "${7:-session}" '
+      def pct($p): if .rate_limit then .rate_limit.primary_window.used_percent = $p
+                   elif $bucket == "model" then .limits[0].percent = $p
+                   else .five_hour.utilization = $p end;
+      .fetched_at = ($now - $age) | .prior = {fetched_at: ($now - $age - $elapsed), usage: (.usage | pct($prior))}
+      | .usage |= pct($current)
+      | if $claims == "missing" then del(.sample_claims) else .sample_claims = ($claims | tonumber) end' \
       "$f" > "$f.tmp" && mv "$f.tmp" "$f" && staged=yes
   done
   [[ "$staged" == yes ]] || { echo "stage_rate: no cached record for $lane" >&2; exit 1; }
 }
 
-# table ROW... — `label|env|stage|rate|args|expect`: env is `;`-separated
-# `env` arguments, stage a stage SPEC, rate `LANE:CURRENT:PRIOR` or empty.
+# table ROW...: `label|env|stage|rate|args|expect`: env is `;`-separated
+# `env` arguments, stage a stage SPEC, rate `LANE:CURRENT:PRIOR[:CLAIMS[:ELAPSED[:AGE[:BUCKET]]]]` or empty.
 # expect is `name=value` tokens: rc, seatrefusal (`named` where the first keyed
 # line is the pick-overseer-seats refusal naming the seat step and this run's
 # own fleet state, else that line), keyed.KEY (the first keyed stderr line
@@ -135,23 +154,32 @@ stage_rate() {
 # `key,field=value,...`), out (stdout whole), or a field of the JSON record.
 RUN_SEQ=0
 table() {
-  local row label env stage_spec rate args expect env_args got token name value rate_lane rate_now rate_prior
+  local row label env stage_spec rate args expect env_args command got token name value rate_lane rate_now rate_prior rate_claims rate_elapsed rate_age rate_bucket
   for row in "$@"; do
     IFS='|' read -r label env stage_spec rate args expect <<<"$row"
     [[ -n "$expect" ]] || { printf 'table: a row with no expect asserts nothing: %s\n' "$row" >&2; exit 1; }
     RUN="$TMP_ROOT/runs/$((++RUN_SEQ))"; mkdir -p "$RUN"
     stage "$stage_spec"
     if [[ -n "$rate" ]]; then
-      IFS=':' read -r rate_lane rate_now rate_prior <<<"$rate"
-      stage_rate "$rate_lane" "$rate_now" "$rate_prior"
+      IFS=':' read -r rate_lane rate_now rate_prior rate_claims rate_elapsed rate_age rate_bucket <<<"$rate"
+      stage_rate "$rate_lane" "$rate_now" "$rate_prior" "${rate_claims:-1}" "${rate_elapsed:-600}" "${rate_age:-0}" "${rate_bucket:-session}"
     fi
     env_args=()
     [[ -z "$env" ]] || IFS=';' read -ra env_args <<<"$env"
-    # shellcheck disable=SC2086
-    OUT=$(cd "$NOSETTINGS" && env GIT_CEILING_DIRECTORIES="$TMP_ROOT" LANES_HOME="$H" \
-      ORCH_LANES_FETCH_CMD="$FETCHER" OVERSEE_WATCH_STATE_DIR="$STORE" ORCH_STATE_DIR="$FLEET" \
-      TMUX_PANES_FILE="$RUN/panes" PATH="$BIN:$PATH" ${env_args[@]+"${env_args[@]}"} \
-      "${LANES_UNDER_TEST:-$LANES}" $args 2>"$RUN/err")
+    # shellcheck disable=SC2206 # args contains suite-authored command words.
+    command=("${LANES_UNDER_TEST:-$LANES}" $args)
+    if [[ "$args" == launch ]]; then
+      command=("${command[0]%/*}/open-terminal" --ghostty --harness codex --lane "$H/.1codex" --cmd "true -m gpt-6.1-sol -c model_reasoning_effort=high $QUESTION_OFF_ALL $COMPACTION_OFF_ALL" SPREAD-1)
+    fi
+    # The launcher reads settings from its source checkout. An empty team
+    # keeps this projection test independent of tracker authentication.
+    OUT=$(cd "$NOSETTINGS" && env GIT_CEILING_DIRECTORIES="$TMP_ROOT" LANES_HOME="$H" LINEAR_TEAM= GH_ISSUE_PATTERN='[A-Z]+-[0-9]+' LANES_CLI="${LANES_UNDER_TEST:-$LANES}" \
+      ORCH_LANES_FETCH_CMD="$FETCHER" FETCH_LOG="$RUN/fetch.log" OVERSEE_WATCH_STATE_DIR="$STORE" ORCH_STATE_DIR="$FLEET" \
+      STUB_CLOCK="$STUB_CLOCK" STUB_REAL_DATE="$STUB_REAL_DATE" STUB_REAL_SLEEP="$STUB_REAL_SLEEP" \
+      TMUX_PANES_FILE="$RUN/panes" PATH="$BIN:$OT_BIN:$PATH" OT_WT_LOG="$RUN/worktree.log" \
+      OT_CAPTURE="$RUN/ghostty" WORKTREE_CLI="$OT_BIN/worktree" TERMINAL=ghostty TMUX= ORCH_LANE_HOST=local ORCH_LANE_PREFERENCE= \
+      ORCH_LANE_DIRS= ORCH_LANE_ALIASES= ORCH_LANE_EXCLUDE= ORCH_LANE_RETIRE= ORCH_LANE_COPILOT_POOL= ORCH_LANE_BURN_PCT_PER_HOUR= ORCH_LANE_MAX_PCT= \
+      ${env_args[@]+"${env_args[@]}"} "${command[@]}" 2>"$RUN/err")
     RC=$?
     got=""
     for token in $expect; do
@@ -159,6 +187,10 @@ table() {
       case "$name" in
         rc) value="$RC" ;;
         out) value="$OUT" ;;
+        launched) value="$(awk '$1 == "open-terminal:" && $2 == "terminal-opened" { print "yes" }' <<<"$OUT")"; value="${value:-no}" ;;
+        sample_claims) value="$(jq -r --arg dir "$H/.1codex" 'select(.config_dir == $dir) | .sample_claims' "$STORE"/usage/*.json)" || exit 1 ;;
+        fetched) value="$(cat "$RUN/fetch.log")" || exit 1 ;;
+        headroom_hundredths) value="$(jq -r '.projected_headroom_pct * 100 | round' <<<"$OUT")" ;;
         seatrefusal)
           value="$(awk '$1 == "lanes:" { $1 = ""; sub(/^ +/, ""); gsub(/ +/, ","); print; exit }' "$RUN/err")"
           [[ "$value" != "pick-overseer-seats,step=seat,state=$FLEET/workflow-state-oversee.json" ]] || value=named
@@ -196,7 +228,7 @@ table \
   "--projected is refused without --lane, the chooser judging the projection always|$ALL_DIRS|||$PICK --projected|rc=1 key=unknown-option,arg1=--projected" \
   "a weekly-bound account is charged the default by its window's length and stays a candidate|ORCH_LANE_DIRS=$H/.wclaude|claim:w:2||$PICK|rc=0 config_dir=$H/.wclaude binding_bucket=weekly" \
   "a burn of 0 charges a claim nothing|ORCH_LANE_DIRS=$H/.aclaude;ORCH_LANE_BURN_PCT_PER_HOUR=0|claim:a:3||pick --lane $H/.aclaude --harness claude --projected --json|rc=0 projected_headroom_pct=80" \
-  "each claim inherits the measured account rate|ORCH_LANE_DIRS=$H/.aclaude|claim:a:2|a:20:15|pick --lane $H/.aclaude --harness claude --json|rc=0 usage_rate_state=measured burn_pct_per_lane_hour=30 projected_headroom_pct=20" \
+  "claims added after a one-claim sample each inherit its measured burn|ORCH_LANE_DIRS=$H/.aclaude|claim:a:2|a:20:15|pick --lane $H/.aclaude --harness claude --json|rc=0 usage_rate_state=measured burn_pct_per_lane_hour=30 projected_headroom_pct=20" \
   "a measured rate with nothing claimed charges nothing and names the default burn|ORCH_LANE_DIRS=$H/.aclaude||a:20:15|pick --lane $H/.aclaude --harness claude --json|rc=0 burn_pct_per_lane_hour=5 projected_headroom_pct=80" \
   "the listing carries the projection beside the verdict of the reading, whose wall lifts at its reset|ORCH_LANE_DIRS=$H/.aclaude;ORCH_LANE_BURN_PCT_PER_HOUR=30|claim:a:3||list --harness claude --json|rc=0 [0].verdict=room [0].projected_headroom_pct=-10"
 
@@ -209,8 +241,49 @@ table \
   "the named projection charges the added measured claim too|ORCH_LANE_DIRS=$H/.aclaude|claim:a:2|a:20:19|pick --lane $H/.aclaude --harness claude --projected --json|rc=0 claims=2 burn_pct_per_lane_hour=6 projected_headroom_pct=68" \
   "enough claims wall the named measured projection|ORCH_LANE_DIRS=$H/.aclaude|claim:a:13|a:20:19|pick --lane $H/.aclaude --harness claude --projected --json|rc=3 projected_headroom_pct=2"
 
+ACCOUNT_HARNESS=codex table \
+  "twelve sampled claims share the account burn in the chooser|ORCH_LANE_DIRS=$H/.1codex|claim:1:12|1:22:20:12:628|pick --harness codex --model gpt-6.1-sol --json|rc=0 config_dir=$H/.1codex claims=12 headroom_hundredths=6654" \
+  "the named projection shares the same twelve-claim burn|ORCH_LANE_DIRS=$H/.1codex|claim:1:12|1:22:20:12:628|pick --lane $H/.1codex --harness codex --model gpt-6.1-sol --projected --json|rc=0 claims=12 headroom_hundredths=6654" \
+  "open-terminal launches on the sampled twelve-claim account|ORCH_LANE_DIRS=$H/.1codex|claim:1:12|1:22:20:12:628|launch|rc=0 launched=yes" \
+  "a fresh sample records its live claim count|ORCH_LANE_DIRS=$H/.1codex|claim:1:12||list --harness codex --json|rc=0 sample_claims=12"
+# The usage endpoint returns 22 after an expired sample of 20. The fixed clock
+# keeps the 628-second interval exact, including on a loaded runner.
+ACCOUNT_HARNESS=codex table \
+  "the first projection after a fetch shares the newly sampled account burn|ORCH_LANE_DIRS=$H/.1codex|claim:1:12|1:20:19:12:628:628|pick --harness codex --model gpt-6.1-sol --json|rc=0 claims=12 usage_rate_state=measured usage_age_s=0 headroom_hundredths=6654 sample_claims=12 fetched=.1codex"
+table \
+  "one sampled claim keeps its measured charge|ORCH_LANE_DIRS=$H/.aclaude|claim:a:1|a:20:19:1|$PICK|rc=0 burn_pct_per_lane_hour=6 projected_headroom_pct=74" \
+  "an older cache record keeps the one-claim charge|ORCH_LANE_DIRS=$H/.aclaude|claim:a:2|a:20:19:missing|$PICK|rc=0 burn_pct_per_lane_hour=6 projected_headroom_pct=68" \
+  "a zero-claim sample uses one as its divisor|ORCH_LANE_DIRS=$H/.aclaude|claim:a:2|a:20:19:0|$PICK|rc=0 burn_pct_per_lane_hour=6 projected_headroom_pct=68"
+
+# Claims from open-terminal omit models. A cached Opus rate cannot share its
+# six-point hourly charge across the two sampled account claims. Three live
+# claims spend 18 points, with 16 left; shared windows remain below Opus.
+table \
+  "a model rate refuses the chooser despite unrelated sampled claims|ORCH_LANE_DIRS=$H/.mclaude|claim:m:3|m:84:78:2:3600:0:model|pick --harness claude --model opus --json|rc=3 walled=1 unmeasured=0" \
+  "a model rate refuses the named projection on the same cached samples|ORCH_LANE_DIRS=$H/.mclaude|claim:m:3|m:84:78:2:3600:0:model|pick --lane $H/.mclaude --harness claude --model opus --projected --json|rc=3 binding_bucket=model usage_rate_state=measured burn_pct_per_lane_hour=6 projected_headroom_pct=-2"
+
+CTRL="$(mutant_scripts mutant-model-rate-shared lib/lane-model.sh)" || exit 1
+mutate_file "$CTRL/lib/lane-model.sh" '(if .binding_bucket == "model" then 1 else ([._rate_sample_claims // 1, 1] | max) end)' '([._rate_sample_claims // 1, 1] | max)'
+LANES_UNDER_TEST="$CTRL/lanes" table \
+  "control: sharing the model rate admits the chooser with spent room|ORCH_LANE_DIRS=$H/.mclaude|claim:m:3|m:84:78:2:3600:0:model|pick --harness claude --model opus --json|rc=0 binding_bucket=model burn_pct_per_lane_hour=3 projected_headroom_pct=7" \
+  "control: sharing the model rate admits the named projected pick too|ORCH_LANE_DIRS=$H/.mclaude|claim:m:3|m:84:78:2:3600:0:model|pick --lane $H/.mclaude --harness claude --model opus --projected --json|rc=0 binding_bucket=model burn_pct_per_lane_hour=3 projected_headroom_pct=7"
+
+CTRL="$(mutant_scripts mutant-rate-whole lib/lane-model.sh)" || exit 1
+mutate_file "$CTRL/lib/lane-model.sh" 'then (.usage_rate_pct_per_min * 60) / (if .binding_bucket == "model" then 1 else ([._rate_sample_claims // 1, 1] | max) end)' 'then .usage_rate_pct_per_min * 60'
+LANES_UNDER_TEST="$CTRL/lanes" ACCOUNT_HARNESS=codex table \
+  "control: charging the whole account rate walls the twelve-claim account|ORCH_LANE_DIRS=$H/.1codex|claim:1:12|1:22:20:12:628|pick --harness codex --model gpt-6.1-sol --json|rc=3 walled=1"
+CTRL="$(mutant_scripts mutant-sample-count lanes)" || exit 1
+mutate_file "$CTRL/lanes" 'sample_claims="$(lane_claims_count "$LANE_CLAIMS_LIVE" "$2")"' 'sample_claims=1'
+LANES_UNDER_TEST="$CTRL/lanes" ACCOUNT_HARNESS=codex table \
+  "control: omitting the sampled count records one instead of twelve|ORCH_LANE_DIRS=$H/.1codex|claim:1:12||list --harness codex --json|rc=0 sample_claims=1"
+
+CTRL="$(mutant_scripts mutant-fresh-sample-count lanes)" || exit 1
+mutate_file "$CTRL/lanes" 'sample_claims="${USAGE_SAMPLE_CLAIMS:-1}"' 'sample_claims=1'
+LANES_UNDER_TEST="$CTRL/lanes" ACCOUNT_HARNESS=codex table \
+  "control: losing the fresh count walls the account before a cache read|ORCH_LANE_DIRS=$H/.1codex|claim:1:12|1:20:19:12:628:628|pick --harness codex --model gpt-6.1-sol --json|rc=3 walled=1 sample_claims=12 fetched=.1codex"
+
 CTRL="$(mutant_scripts mutant-rate-divided lib/lane-model.sh)" || exit 1
-mutate_file "$CTRL/lib/lane-model.sh" 'then .usage_rate_pct_per_min * 60' 'then (.usage_rate_pct_per_min * 60) / .claims'
+mutate_file "$CTRL/lib/lane-model.sh" 'then (.usage_rate_pct_per_min * 60) / (if .binding_bucket == "model" then 1 else ([._rate_sample_claims // 1, 1] | max) end)' 'then (.usage_rate_pct_per_min * 60) / .claims'
 LANES_UNDER_TEST="$CTRL/lanes" table \
   "control: dividing by current claims keeps stacking launches on cached measured room|ORCH_LANE_DIRS=$H/.aclaude:$H/.bclaude|claim:a:2|a:20:19|$PICK|rc=0 config_dir=$H/.aclaude projected_headroom_pct=74" \
   "control: the divided rate also admits a named launch whose claims spend its room|ORCH_LANE_DIRS=$H/.aclaude|claim:a:13|a:20:19|pick --lane $H/.aclaude --harness claude --projected --json|rc=0 projected_headroom_pct=74"
