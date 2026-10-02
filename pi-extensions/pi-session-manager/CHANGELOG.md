@@ -2,6 +2,14 @@
 
 ## Consumer-impacting changes
 
+### 2.0.3
+
+- Search runs after a 120 ms typing pause and in slices that yield to the keyboard; a new keystroke cancels the search in progress. A match preview is built only for the selected row.
+- Resume, rename, delete and delete-all wait for the search to match the search box; pressed earlier, they show "Search still running" and do nothing.
+- A `re:` search stops with an error when the pattern runs past 250 ms on the prompts of one session.
+- Delete runs `trash` without blocking the browser. After 5 seconds it stops `trash` and any helper `trash` started. If the session file is still in place, the delete fails and keeps it; it never falls back to a permanent unlink.
+- The prompt text the search reads is released when the browser closes. A delete still running at close reports its outcome as a Pi notification, and a delete-all run stops after the session in progress.
+
 ### 2.0.2
 
 - Settings reads come from memory. A read is answered for one second without touching disk, then the settings files are read again. A change made in the extension manager, or a new session, applies at once; a hand edit to `settings.json` applies within one second. Before, every read went to disk.

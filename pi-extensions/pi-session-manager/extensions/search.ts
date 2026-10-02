@@ -1,6 +1,35 @@
+import { Script, createContext } from "node:vm";
 import { ansiRed, oneLine } from "./text.js";
 import { sessionTitleSearchText, userMessagesForSession } from "./session-data.js";
-import type { MatchResult, ParsedQuery, SearchToken, SessionInfo } from "./types.js";
+import type { MatchResult, ParsedQuery, SearchToken, SessionInfo, SessionUserMessage } from "./types.js";
+
+/** How long one `re:` evaluation may run: over a batch of sessions, then over each session alone when the batch runs past it, or over one snippet. */
+const REGEX_DEADLINE_MS = 250;
+
+export class RegexTimeoutError extends Error {
+	constructor() {
+		super(`Regex ran past ${REGEX_DEADLINE_MS} ms; simplify the pattern`);
+		this.name = "RegexTimeoutError";
+	}
+}
+
+// A running RegExp cannot be interrupted from JavaScript. A vm timeout terminates
+// whatever runs inside the script, backtracking included. Each timed run starts a
+// watchdog, so callers batch their regex work into one run.
+const regexContext = createContext({ run: undefined as (() => unknown) | undefined });
+const regexScript = new Script("run()");
+
+function withinRegexDeadline<T>(run: () => T): T {
+	regexContext.run = run;
+	try {
+		return regexScript.runInContext(regexContext, { timeout: REGEX_DEADLINE_MS }) as T;
+	} catch (error) {
+		if ((error as { code?: unknown } | null)?.code === "ERR_SCRIPT_EXECUTION_TIMEOUT") throw new RegexTimeoutError();
+		throw error;
+	} finally {
+		regexContext.run = undefined;
+	}
+}
 
 function normalizeSearchText(text: string): string {
 	return oneLine(text).toLowerCase();
@@ -102,10 +131,10 @@ function matchTextSearch(text: string, parsed: ParsedQuery): MatchResult {
 	return { matches: true, score };
 }
 
-export function matchSession(session: SessionInfo, parsed: ParsedQuery): MatchResult {
+function matchSession(session: SessionInfo, messages: SessionUserMessage[], parsed: ParsedQuery): MatchResult {
 	if (parsed.mode === "tokens" && parsed.tokens.length === 0) return { matches: true, score: 0 };
 	let best: number | undefined;
-	for (const message of userMessagesForSession(session)) {
+	for (const message of messages) {
 		const match = matchTextSearch(message.text, parsed);
 		if (!match.matches) continue;
 		best = best === undefined ? match.score : Math.min(best, match.score);
@@ -113,6 +142,24 @@ export function matchSession(session: SessionInfo, parsed: ParsedQuery): MatchRe
 	if (best !== undefined) return { matches: true, score: best };
 	const titleMatch = matchTextSearch(sessionTitleSearchText(session), parsed);
 	return titleMatch.matches ? titleMatch : { matches: false, score: 0 };
+}
+
+/**
+ * Match a batch of sessions, one result per session in order. Transcripts are read
+ * before any deadline starts. A regex query runs the whole batch under one
+ * deadline; past it, each session reruns under its own, and `RegexTimeoutError`
+ * is thrown only when one session alone runs past the deadline.
+ */
+export function matchSessions(sessions: SessionInfo[], parsed: ParsedQuery): MatchResult[] {
+	const messages = sessions.map((session) => userMessagesForSession(session));
+	const matchAt = (index: number) => matchSession(sessions[index]!, messages[index]!, parsed);
+	if (parsed.mode !== "regex") return sessions.map((_, index) => matchAt(index));
+	try {
+		return withinRegexDeadline(() => sessions.map((_, index) => matchAt(index)));
+	} catch (error) {
+		if (!(error instanceof RegexTimeoutError) || sessions.length === 1) throw error;
+		return sessions.map((_, index) => withinRegexDeadline(() => matchAt(index)));
+	}
 }
 
 function snippetAround(text: string, start: number, length: number, width: number): string {
@@ -123,8 +170,13 @@ function snippetAround(text: string, start: number, length: number, width: numbe
 	return `${prefix}${text.slice(safeStart, safeEnd)}${suffix}`;
 }
 
+/** The preview of a session's first matching prompt; a regex query throws `RegexTimeoutError` past its deadline. */
 export function buildSnippet(session: SessionInfo, parsed: ParsedQuery): string | undefined {
 	const messages = userMessagesForSession(session);
+	return parsed.mode === "regex" ? withinRegexDeadline(() => snippetFromMessages(messages, parsed)) : snippetFromMessages(messages, parsed);
+}
+
+function snippetFromMessages(messages: SessionUserMessage[], parsed: ParsedQuery): string | undefined {
 	if (parsed.mode === "tokens" && parsed.tokens.length === 0) return messages[messages.length - 1]?.text.slice(0, 180);
 	for (const message of messages) {
 		const source = message.text;

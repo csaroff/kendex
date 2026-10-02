@@ -1,18 +1,18 @@
-import { canonicalPath } from "./paths.js";
 import type { FlatSessionNode, SessionInfo, SessionTreeNode } from "./types.js";
 
-export function buildSessionTree(sessions: SessionInfo[]): SessionTreeNode[] {
+/** Link sessions to their parents; `key` maps a session path to the identity two paths share. */
+export function buildSessionTree(sessions: SessionInfo[], key: (path: string) => string): SessionTreeNode[] {
 	const byPath = new Map<string, SessionTreeNode>();
-	for (const session of sessions) {
-		const key = canonicalPath(session.path) ?? session.path;
-		byPath.set(key, { session, children: [] });
-	}
+	const nodes = sessions.map((session) => {
+		const node: SessionTreeNode = { session, children: [] };
+		byPath.set(key(session.path), node);
+		return node;
+	});
 
 	const roots: SessionTreeNode[] = [];
-	for (const session of sessions) {
-		const key = canonicalPath(session.path) ?? session.path;
-		const node = byPath.get(key)!;
-		const parent = canonicalPath(session.parentSessionPath);
+	for (const node of nodes) {
+		const { parentSessionPath } = node.session;
+		const parent = parentSessionPath ? key(parentSessionPath) : undefined;
 		if (parent && byPath.has(parent)) byPath.get(parent)!.children.push(node);
 		else roots.push(node);
 	}

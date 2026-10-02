@@ -28,9 +28,20 @@ for (const row of [
 		children: true,
 		expected: ["/older-child.jsonl", "/newer-child.jsonl"],
 	},
+	{
+		name: "a child nests under its parent when the session and parent paths spell it differently",
+		sessions: [
+			session("/alias/root.jsonl", "2026-01-01T00:00:00Z"),
+			session("/alias/child.jsonl", "2026-02-01T00:00:00Z", "/real/root.jsonl"),
+		],
+		// Neither spelling is the key's form, so skipping the key at the session or the parent path splits them.
+		key: (path: string) => path.replace(/^\/(alias|real)\//, "/canonical/"),
+		children: true,
+		expected: ["/alias/child.jsonl"],
+	},
 ]) {
 	test(row.name, () => {
-		const roots = buildSessionTree(row.sessions);
+		const roots = buildSessionTree(row.sessions, row.key ?? ((path) => path));
 		const nodes = row.children ? roots[0]?.children : roots;
 		expect(nodes?.map((node) => node.session.path)).toEqual(row.expected);
 	});
