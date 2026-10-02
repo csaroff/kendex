@@ -363,6 +363,23 @@ assert_eq "a base whose settings the loader rejects reads queue-only" \
   "queue_only=true cause=queue-settings-unreadable" \
   "$(settings_queue "$CHANGE_CLASS" "$rejected_base")"
 
+# The undeclared list's one warning, counted by its key line: once where the
+# key is unset, and never where the base declares a list, empty or naming
+# none of the diff.
+unset_warnings_of() { # STDERR
+  grep -c '^setting-unset: setting=HARNESS_CI_QUEUE_PATHS$' <<<"$1" || true
+}
+ROW_BASE=""
+assert_eq "an undeclared list warns once" 1 \
+  "$(unset_warnings_of "$(run_row "$CHANGE_CLASS" runtime/product.ts=2)")"
+ROW_BASE="$empty_base"
+assert_eq "an empty declared list warns never" 0 \
+  "$(unset_warnings_of "$(run_row "$CHANGE_CLASS" runtime/product.ts=2)")"
+ROW_BASE="$declared_base"
+assert_eq "a declared list naming none of the diff warns never" 0 \
+  "$(unset_warnings_of "$(run_row "$CHANGE_CLASS" runtime/product.ts=2)")"
+ROW_BASE=""
+
 # Every `queue` entry of the shipped list has a row above, read off the list
 # itself. The floor and the one required entry say the reader found the
 # group; a reader that found nothing has broken, not found an empty list.
@@ -444,10 +461,11 @@ assert_eq "an orch with no list reads queue-only" \
 # one that reads a missing list as not queue-only answers so on the listless
 # orch; one that judges the class after harness-only's refusals, as it once
 # did, answers paths-unread on a refusal raised after the paths were read.
-# One that reads an undeclared repository list as not queue-only, one that
-# never matches the repository's list, one that never reads the base's
+# One that reads an undeclared repository list by the shipped list alone, one
+# that never matches the repository's list, one that never reads the base's
 # settings and one that reads unreadable settings as not queue-only each let
-# through the row that rule holds. The shipped-list controls run where the
+# through the row that rule holds; one that drops the undeclared list's
+# warning reads it silently. The shipped-list controls run where the
 # repository declares an empty list, so only the rule under control answers.
 CONTROL_READ=queue_of
 ROW_BASE="$empty_base"
@@ -487,6 +505,11 @@ control "a classifier that reads an undeclared list as not queue-only lets an un
   queue-undeclared change-class \
   '    QUEUE_CAUSE="cause=queue-list-undeclared"' \
   '    QUEUE_ONLY=false QUEUE_CAUSE="cause=queue-list-undeclared"'
+silent_mutant="$(mutant queue-undeclared-silent change-class \
+  "    printf 'setting-unset: setting=HARNESS_CI_QUEUE_PATHS\\n' >&2" \
+  "    printf 'setting-unset: setting=HARNESS_CI_QUEUE_PATHS\\n' >/dev/null")"
+assert_eq "a classifier that drops the undeclared list's warning reads it silently" 0 \
+  "$(unset_warnings_of "$(run_row "$silent_mutant" runtime/product.ts=2)")"
 ROW_BASE="$declared_base"
 control "a classifier that never matches the repository's list lets its path through" \
   "queue_only=false cause=no-queue-path" scripts/ci/run.sh=2 \
