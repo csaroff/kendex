@@ -1,0 +1,1 @@
+- `lane-close` and the SSH lane host's `stop` end a lane's harness by its recorded launch identity, so a lane whose worktree was removed still stops, and a close also ends a woken turn.

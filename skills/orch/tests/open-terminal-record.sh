@@ -54,6 +54,8 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/assertions.sh"
 # where set, for every name. list-panes lists the one pane new-window makes,
 # and fails with tmux's own line where STUB_LIST_PANES_FAIL is set. A
 # paste-buffer marks STUB_PASTED, which run_ot clears before each launch.
+# The pane's process is STUB_PANE_PID where a row sets it, the stub's own
+# otherwise.
 BIN="$TMP_ROOT/bin"
 mkdir -p "$BIN"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$BIN/ghostty"
@@ -64,7 +66,9 @@ cat > "$BIN/gh" <<'EOF'
 printf '%s\n' "$STUB_GH_REPO"
 EOF
 printf '#!/usr/bin/env bash\ncase "${1:-}" in check) exit 0 ;; list) echo "[]" ;; esac\nexit 0\n' > "$BIN/lanes"
-printf '#!/usr/bin/env bash\nexit 0\n' > "$BIN/claude"
+# claude holds while the file STUB_CLAUDE_HOLD names exists, a woken turn
+# still running, and exits at once where no row sets it.
+printf '#!/usr/bin/env bash\nwhile [[ -n "${STUB_CLAUDE_HOLD:-}" && -e "$STUB_CLAUDE_HOLD" ]]; do sleep 0.1; done\nexit 0\n' > "$BIN/claude"
 # kendex hooks-off, which a Copilot fleet launch asks whether Copilot's settings
 # switch its hooks off: nothing does here.
 cat > "$BIN/kendex" <<'EOF'
@@ -94,7 +98,7 @@ case "${1:-}" in
     if [[ "$*" == *pane_current_command* ]]; then
       running=bash
       [[ ! -e "${STUB_PASTED:-}" ]] || running="${STUB_PANE_CMD:-claude}"
-      printf '%%1\t%s\t%s\n' "$$" "$running"
+      printf '%%1\t%s\t%s\n' "${STUB_PANE_PID:-$$}" "$running"
     else echo %1; fi ;;
   load-buffer) cat -- "${@: -1}" > "$STUB_PANE_BUFFER" || exit 1
     [[ -z "${STUB_BUFFER_LOG:-}" ]] || cat -- "$STUB_PANE_BUFFER" >> "$STUB_BUFFER_LOG" ;;
@@ -179,7 +183,7 @@ run_ot() {
   OUT="$(cd "$cwd" && PATH="$BIN:$PROC_BIN:$PATH" OVERSEE_WATCH_STATE_DIR="$TMP_ROOT/claims" STUB_PASTED="$TMP_ROOT/pasted" STUB_PANE_BUFFER="$TMP_ROOT/pane-buffer" \
     WORKTREE_CLI="$STUB" LANES_CLI="$BIN/lanes" LANES_HOME="$SESSION_HOME" EXISTS_DIR="$EXISTS_DIR" \
     GH_ISSUE_PATTERN='[A-Z]+-[0-9]+' TMUX="${RUN_TMUX:-}" ORCH_TMUX_SESSION="${RUN_SESSION-stub}" TMUX_PANE="${RUN_PANE:-}" \
-    STUB_SESSION_NAME="${STUB_SESSION_NAME:-}" STUB_TMUX_LOG="${STUB_TMUX_LOG:-}" STUB_DEAD_SESSIONS="${STUB_DEAD_SESSIONS:-}" STUB_PANE_GONE="${STUB_PANE_GONE:-}" STUB_HAS_SESSION_ERR="${STUB_HAS_SESSION_ERR:-}" GH_REPO="" STUB_GH_REPO="${STUB_GH_REPO:-}" \
+    STUB_SESSION_NAME="${STUB_SESSION_NAME:-}" STUB_TMUX_LOG="${STUB_TMUX_LOG:-}" STUB_DEAD_SESSIONS="${STUB_DEAD_SESSIONS:-}" STUB_PANE_GONE="${STUB_PANE_GONE:-}" STUB_HAS_SESSION_ERR="${STUB_HAS_SESSION_ERR:-}" STUB_PANE_PID="${STUB_PANE_PID:-}" STUB_CLAUDE_HOLD="${STUB_CLAUDE_HOLD:-}" GH_REPO="" STUB_GH_REPO="${STUB_GH_REPO:-}" \
     "$script" ${state_args[@]+"${state_args[@]}"} "$@" 2>"$TMP_ROOT/err")"
   RC=$?
   set -e
@@ -189,10 +193,12 @@ run_ot() {
 # record ITEM — the item's record as `field=value` words, null spelled null.
 # running_at and session_since are left out: each is a clock read at the
 # launch, which running_at ITEM and session_since ITEM read on their own rows
-# below.
+# below. launch is left out too: launch_of ITEM reads it on its own rows. So
+# is wake, whose start a wake reads while a turn that exits at once may be gone.
 record() {
-  "$WS" --state-dir "$STATE" get oversee '.lanes[] | select(.item == "'"$1"'") | to_entries | map(select(.key != "running_at" and .key != "session_since" and .key != "tier" and .key != "tier_inputs")) | map("\(.key)=\(.value // "null")") | join(" ")'
+  "$WS" --state-dir "$STATE" get oversee '.lanes[] | select(.item == "'"$1"'") | to_entries | map(select(.key != "running_at" and .key != "session_since" and .key != "tier" and .key != "tier_inputs" and .key != "launch" and .key != "wake")) | map("\(.key)=\(.value // "null")") | join(" ")'
 }
+launch_of() { "$WS" --state-dir "$STATE" get oversee '.lanes[] | select(.item == "'"$1"'") | .launch | if . == null then null else [.pane, (.server | type), .pid, .start] end' | jq -c .; }
 running_at() { "$WS" --state-dir "$STATE" get oversee '.lanes[] | select(.item == "'"$1"'") | .running_at // "null"' | tr -d '"'; }
 session_since() { "$WS" --state-dir "$STATE" get oversee '.lanes[] | select(.item == "'"$1"'") | .session_since // "null"' | tr -d '"'; }
 records() { "$WS" --state-dir "$STATE" get oversee '[.lanes[] | select(.item == "'"$1"'")] | length'; }
@@ -246,6 +252,31 @@ RUN_TMUX=stub,1,0 run_ot --tmux --harness claude --lane "$LANE_DIR" --cmd "true 
 assert_eq "rc=$RC $(sed "s/ launched_at=[^ ]*//" <<<"$(record CC-2)")" \
   "rc=0 item=CC-2 tracker=linear repo=null harness=claude window=stub:CC-2 account=$LANE_DIR host=null mail_root=$TMP_ROOT/wt/CC-2 surface=tmux model=opus effort=high session_id=null status=running over_cap=null allow_all=null" \
   "a tmux launch under a lane records its window, its account dir, the tmux surface and the model its own command names"
+assert_eq "launch=$(launch_of CC-2) unread=$(grep -c '^open-terminal: launch-identity-unread item=CC-2 pane=%1 step=harness$' <<<"$ERR" || true)" \
+  'launch=["%1","number",null,null] unread=1' \
+  "a tmux launch whose pane runs no harness records its pane and server, no harness, and says so"
+gui_launch="$(launch_of CC-1)"
+assert_eq "launch=$gui_launch" 'launch=null' "a GUI launch records no launch identity"
+
+# The launch identity lane-close stops the harness by: the pane and its tmux
+# server from the window's creation and, once the launch stands, the harness
+# process under the pane's own with its start time. This shell stands in for
+# that harness, the pane's process itself.
+launch_identity_row() { # ITEM [SCRIPT]
+  proc_table_write "$PROC_TABLE" "$$ 1 claude"
+  STUB_PANE_PID=$$ RUN_TMUX=stub,1,0 run_ot ${2:+SCRIPT="$2"} --tmux --harness claude --lane "$LANE_DIR" --cmd "true --model opus --effort high $QUESTION_OFF_ALL $COMPACTION_OFF_ALL" "$1"
+  proc_table_write "$PROC_TABLE"
+}
+SHELL_START="$(bash -c '. "$1" && lane_process_start "$2"' _ "$SCRIPTS_DIR/lib/lane-state.sh" "$$")"
+[[ -n "$SHELL_START" ]] || { echo "open-terminal-record: shell-start-unread pid=$$" >&2; exit 1; }
+launch_identity_row CC-3
+assert_eq "rc=$RC launch=$(launch_of CC-3)" "rc=0 launch=$(jq -cn --argjson pid $$ --arg start "$SHELL_START" '["%1", "number", $pid, $start]')" \
+  "a confirmed local launch records its pane, server, harness pid and the harness's start"
+IDENTITY_OT="$(mutant_scripts identity-mutant open-terminal)/open-terminal" || exit 1
+mutate_file "$IDENTITY_OT" '[[ "$launch_rc" -ne 0 || -n "$target" ]] || launch_identity_read "$pane" "$title"' '[[ "$launch_rc" -ne 0 || -n "$target" ]] || true'
+launch_identity_row CC-4 "$IDENTITY_OT"
+assert_eq "rc=$RC launch=$(launch_of CC-4)" 'rc=0 launch=["%1","number",null,null]' \
+  "control: without the read at confirmation the record names no harness"
 STUB_GH_REPO=o/r RUN_TMUX=stub,1,0 run_ot --tmux --tracker github --repo o/r "${FLEET_CMD[@]}" 2709
 assert_eq "rc=$RC $(record issue-2709 | sed -E 's/ (account|host|mail_root|surface|model|effort|session_id|launched_at|over_cap|allow_all)=[^ ]*//g')" \
   "rc=0 item=issue-2709 tracker=github repo=o/r harness=claude window=stub:gh-2709 status=running" \
@@ -486,6 +517,29 @@ assert_eq "$("$WS" --state-dir "$STATE" get oversee '.lanes[] | select(.item == 
   'true' "a wake retains the first file-backed launch tier and inputs"
 assert_eq "running_at=$(running_at CC-1)" "running_at=$RELAUNCH_RUNNING_AT" "a wake keeps running_at: the lane it rouses already started"
 assert_eq "session_since=$(session_since CC-1)" "session_since=$LAUNCHED_AT" "a wake keeps session_since: it resumes the session the last launch started"
+
+echo "=== a wake records the identity of the turn it started ==="
+# The turn runs detached, outside the pane's process tree, so lane-close stops
+# it by this identity: the detached shell's pid and its start, read while the
+# resumed harness below it still holds.
+wake_identity_row() { # [SCRIPT]
+  : >"$TMP_ROOT/wake-hold"
+  STUB_CLAUDE_HOLD="$TMP_ROOT/wake-hold" run_ot ${1:+SCRIPT="$1"} --wake --harness claude CC-1
+  WAKE_PID="$("$WS" --state-dir "$STATE" get oversee '.lanes[] | select(.item == "CC-1") | .wake.pid // empty')"
+  WAKE_WANT=null
+  if [[ -n "$WAKE_PID" ]]; then
+    WAKE_WANT="$(jq -cn --argjson pid "$WAKE_PID" --arg start "$(bash -c '. "$1" && lane_process_start "$2"' _ "$SCRIPTS_DIR/lib/lane-state.sh" "$WAKE_PID")" '{pid: $pid, start: $start}')"
+  fi
+  WAKE_GOT="$("$WS" --state-dir "$STATE" get oversee '.lanes[] | select(.item == "CC-1") | .wake' | jq -c .)"
+  rm -f -- "${TMP_ROOT:?}/wake-hold"
+}
+wake_identity_row
+assert_eq "rc=$RC recorded=$([[ -n "$WAKE_PID" ]] && echo yes || echo no) wake=$WAKE_GOT" "rc=0 recorded=yes wake=$WAKE_WANT" \
+  "a wake records the pid and start of the detached turn it started"
+WAKE_OT="$(mutant_scripts wake-mutant open-terminal)/open-terminal" || exit 1
+mutate_file "$WAKE_OT" '  if start="$(lane_process_start "$pid")"; then' '  if start=""; then'
+wake_identity_row "$WAKE_OT"
+assert_eq "rc=$RC wake=$WAKE_GOT" 'rc=0 wake=null' "control: without the start read a wake records no turn to stop"
 
 echo "=== a wake is not judged on the fleet cap ==="
 # The fleet already runs more lanes than a cap of 1 allows; a wake rouses one of
