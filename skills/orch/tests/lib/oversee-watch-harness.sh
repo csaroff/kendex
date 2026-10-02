@@ -578,9 +578,11 @@ EOF
 # `exists <item>` and `get <item> <expr>` read state-<item>.json, a missing file
 # exiting 1 the way the real CLI does; `handoff-standing` is handed over for the
 # same reason the oversee calls are. Every call's argv is appended to
-# workflow-state.args.
-cat > "$TMP_ROOT/bin/workflow-state-stub.sh" <<'EOF'
-#!/usr/bin/env bash
+# workflow-state.args. Its lock library is this tree's, written into the stub:
+# a case points REAL_WORKFLOW_STATE at a reader fixture with no library beside it.
+{
+printf '#!/usr/bin/env bash\nFILE_LOCK_LIB=%q\n' "$REPO_ROOT/skills/orch/scripts/lib/file-lock.sh"
+cat <<'EOF'
 set -uo pipefail
 printf '%s\n' "$*" >> "$STUB_DIR/workflow-state.args"
 [[ -f "$STUB_DIR/workflow-state.err" ]] && cat "$STUB_DIR/workflow-state.err" >&2
@@ -593,11 +595,18 @@ while [[ $# -gt 0 && "$1" == --* ]]; do
 done
 cmd="${1:-}"; id="${2:-}"; expr="${3:-}"
 if [[ "$id" == oversee ]]; then
+  # One call at a time from copy-in to copy-back: the real CLI's own lock
+  # covers only its run, and a long pass reads the fleet state while a mail
+  # pass runs, so an unguarded copy hands one of them a half-written file.
+  # shellcheck source=../../scripts/lib/file-lock.sh
+  source "$FILE_LOCK_LIB" || exit 2
+  exec 9>"$STUB_DIR/oversee-state.lock" || exit 2
+  orch_take_lock 9 "$STUB_DIR/oversee-state.lock" 30 || exit 2
   ws="$STUB_DIR/ws"
   mkdir -p "$ws" || exit 2
   cp -- "$STUB_DIR/oversee-state.json" "$ws/workflow-state-oversee.json" || exit 2
   rc=0
-  "$REAL_WORKFLOW_STATE" --state-dir "$ws" "$@" || rc=$?
+  "$REAL_WORKFLOW_STATE" --state-dir "$ws" "$@" 9>&- || rc=$?
   cp -- "$ws/workflow-state-oversee.json" "$STUB_DIR/oversee-state.json" || exit 2
   exit "$rc"
 fi
@@ -611,6 +620,7 @@ case "$cmd" in
   *) echo "workflow-state stub: unexpected call: $*" >&2; exit 2 ;;
 esac
 EOF
+} > "$TMP_ROOT/bin/workflow-state-stub.sh"
 
 # Close-out stub. lane-close has its own suite; watch tests keep their provider
 # fixtures and assert only the event translation around this one verb.
