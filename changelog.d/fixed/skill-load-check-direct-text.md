@@ -1,0 +1,1 @@
+- Codex skill reads through functions.exec now count when the command succeeds. Codex unloaded-skill refusals report the failed check step.
