@@ -12,6 +12,9 @@
 # `cycles` decides nothing here. It is the general fix-round tally
 # `dev-fix.md` keeps, bumped by QA fix rounds and by review/submit fix rounds
 # that run before the loop starts; those must leave the loop budget untouched.
+# At a cap of 0 that budget is review-pr § 4's one fix round, which `cap
+# --issue` reads from `review_fix_round`: § 4 Fix Delegation sets it on every
+# round whatever its items' outcomes, and no other round touches it.
 # The failing direction runs first so a green pass is evidence.
 
 set -euo pipefail
@@ -155,6 +158,19 @@ grep -q -F "$FIRST_WRITE" <<<"$(section_2 "$REVIEW_PR_WF")" \
   && pass "§ 2 records its panel on first_panel" \
   || fail "§ 2 records no first_panel"
 
+# The zero cap's one writer: the walk sets review_fix_round itself, so only
+# these pins hold § 4 Fix Delegation to the write `cap --issue` reads, and
+# every other workflow to leaving it alone.
+section_4() { awk '$0 == "## 4. Handle Review Items" { on = 1; next } on && /^## 5[.]/ { on = 0 } on' "$1"; }
+FIX_WRITE='workflow-state set [ISSUE_ID] review_fix_round true'
+grep -q -F "$FIX_WRITE" <<<"$(section_4 "$REVIEW_PR_WF")" \
+  && pass "§ 4 records its fix round on review_fix_round" \
+  || fail "§ 4 records no review_fix_round"
+writers="$(grep -r -n -F 'set [ISSUE_ID] review_fix_round' "$REPO_ROOT/skills/orch/workflows")" || true
+[[ "$(wc -l <<<"$writers")" -eq 1 && "$writers" == "$REVIEW_PR_WF:"* ]] \
+  && pass "no other workflow writes review_fix_round" \
+  || fail "review_fix_round is not written by review-pr.md alone" "$writers"
+
 # --- § 7 states which counter governs it --------------------------
 # The doc side of the same separation. § 7 must name its own key and must not
 # read or raise the § 4 budget.
@@ -194,6 +210,78 @@ err="$(cd "$NO_SETTINGS" && REVIEW_MAX_CYCLES=2 "$WS" --state-dir "$sd" set KEN-
   && pass "REVIEW_MAX_CYCLES=2 allows two entries and refuses the third" \
   || fail "REVIEW_MAX_CYCLES=2 allows two entries and refuses the third" "rc=$rc err=$err"
 
+# --- the review walk per setting, tier history, prior round and outcome ----
+# review-pr § 4 reads `cap --issue` before Fix Delegation, which sets
+# review_fix_round before it delegates, at every cap; that round's
+# dev-fix then records each item as fixed or escalated and raises `cycles`,
+# and the At The Cap write may later drop a fixed entry whose fix did not
+# hold. Bounded Re-Review reads the bare cap, where `0` routes to § 5, and
+# otherwise writes rereview_panel; § 4 then reads the cap again. At 0 the
+# first read is below and every read after the fix round is at-cap, whatever
+# the round's items came to, so there is exactly one fix round and no
+# re-review. A `local-review` prior is submit-pr § 1.2's fix round before the
+# first § 4 read: it raises `cycles` and records a fixed item, and must leave
+# the § 4 fix round to run. That § 5 route and the verification pass it skips
+# are workflow sentences no script holds; the script holds the reads either
+# side of them and the refused write.
+# `small standard` is a small item relaunched at standard by ../workflows/small.md § Escape.
+# walk [SCRIPT] SETTING TIERS PRIOR OUTCOME — each step's output, joined with |.
+walk() {
+  local bin="$WS" sdw issue=KEN-W err rc tier
+  [[ "$1" != /* ]] || { bin="$1"; shift; }
+  local setting="$1" tiers="$2" prior="$3" outcome="$4"
+  sdw="$(mktemp -d "$TMP_ROOT/state-walk.XXXXXX")" || return 1
+  wsw() { (cd "$NO_SETTINGS" && REVIEW_MAX_CYCLES="$setting" "$bin" --state-dir "$sdw" "$@"); }
+  # record BUCKET SOURCE — the dev-fix outcome write for one item.
+  record() {
+    wsw update "$issue" --arg src "$2" ".$1 += [{description: (\"d-\" + \$src), location: \"l\", commit: \"c\", source: \$src}]" >/dev/null
+  }
+  wsw init "$issue" --worktree "$REPO_ROOT" --branch ken-w >/dev/null
+  for tier in $tiers; do wsw set "$issue" tier "$tier"; done
+  [[ "$prior" == none ]] || { record fixed_items "$prior"; wsw increment "$issue" cycles >/dev/null; }
+  printf '%s|' "$(wsw cap REVIEW_MAX_CYCLES --issue "$issue")"
+  wsw set "$issue" review_fix_round true
+  case "$outcome" in
+    fixed) record fixed_items pr-review ;;
+    escalated) record escalated_items pr-review ;;
+    dropped)
+      record fixed_items pr-review
+      wsw update "$issue" '.fixed_items |= map(select(.source != "pr-review"))' >/dev/null
+      record escalated_items pr-review ;;
+  esac
+  wsw increment "$issue" cycles >/dev/null
+  printf '%s|%s|' "$(wsw cap REVIEW_MAX_CYCLES --issue "$issue")" "$(wsw cap REVIEW_MAX_CYCLES)"
+  err="$(wsw set "$issue" rereview_panel '{"agents": ["rev-a"], "reason": "test", "external": false}' 2>&1 >/dev/null)" && rc=0 || rc=$?
+  printf '%s rc=%s|%s' "$(sed -n '1s/^workflow-state: \([a-z-]*\).*/\1/p' <<<"$err")" "$rc" "$(wsw cap REVIEW_MAX_CYCLES --issue "$issue")"
+}
+# setting|tiers|prior|outcome|first pass|after the fix round|bare cap|rereview_panel|next pass
+WALK_ROWS=(
+  "0|standard|none|fixed|below 0/0|at-cap 0/0|0|cycle-cap rc=1|at-cap 0/0"
+  "0|standard|local-review|fixed|below 0/0|at-cap 0/0|0|cycle-cap rc=1|at-cap 0/0"
+  "0|standard|none|escalated|below 0/0|at-cap 0/0|0|cycle-cap rc=1|at-cap 0/0"
+  "0|standard|none|dropped|below 0/0|at-cap 0/0|0|cycle-cap rc=1|at-cap 0/0"
+  "0|small standard|none|fixed|below 0/0|at-cap 0/0|0|cycle-cap rc=1|at-cap 0/0"
+  "0|small|none|fixed|below 0/0|at-cap 0/0|0|cycle-cap rc=1|at-cap 0/0"
+  "1|standard|none|fixed|below 0/1|below 0/1|1| rc=0|at-cap 1/1"
+)
+for row in "${WALK_ROWS[@]}"; do
+  IFS='|' read -r setting tiers prior outcome want <<<"$row"
+  assert_eq "$(walk "$setting" "$tiers" "$prior" "$outcome")" "$want" "REVIEW_MAX_CYCLES=$setting, tiers $tiers, prior $prior, item $outcome: one fix round, then the re-reviews the setting allows"
+done
+
+# The exception is REVIEW_MAX_CYCLES's alone: another cap at 0 on a fresh
+# item has no fix round to allow, so it reads at-cap from the first read.
+# other_zero [SCRIPT] — REVIEW_MAX_EXTERNAL_ROUNDS=0 read with --issue on a fresh item.
+other_zero() {
+  local bin="$WS" sdo
+  [[ "${1:-}" != /* ]] || bin="$1"
+  sdo="$(mktemp -d "$TMP_ROOT/state-other.XXXXXX")" || return 1
+  (cd "$NO_SETTINGS" && export REVIEW_MAX_EXTERNAL_ROUNDS=0 \
+    && "$bin" --state-dir "$sdo" init KEN-X --worktree "$REPO_ROOT" --branch ken-x >/dev/null \
+    && "$bin" --state-dir "$sdo" cap REVIEW_MAX_EXTERNAL_ROUNDS --issue KEN-X)
+}
+assert_eq "$(other_zero)" "at-cap 0/0" "REVIEW_MAX_EXTERNAL_ROUNDS=0 on a fresh item is at-cap: the zero-cap exception is REVIEW_MAX_CYCLES's alone"
+
 # --- planted controls: one per instrument, proving each can fail ----------
 echo
 echo "--- planted controls ---"
@@ -211,6 +299,46 @@ for control in "$OFF_WS|a guard comparing >" "$DEFAULT_WS|a table defaulting to 
     && pass "the boundary assertion flags ${control#*|} admitting a second re-entry" \
     || fail "the boundary assertion MISSED ${control#*|} admitting a second re-entry" "got=$got"
 done
+
+# The zero cap's four directions, each in a copy of the script: the
+# exception gone, so the first pass at 0 is at-cap and no fix round runs; the
+# exception blind to the record, so a second fix round is admitted; the
+# exception keyed on a pr-review `fixed_items` entry, so a round whose item
+# was escalated or whose fixed entry was dropped reads as never taken; and
+# the exception keyed on `cycles`, so a prior local-review round spends the
+# § 4 fix round. Each turns its rows at 0 red.
+NOZERO_WS="$(mutant_scripts no-zero workflow-state)/workflow-state" || exit 1
+mutate_file "$NOZERO_WS" '&& (( limit == 0 )); then' '&& (( limit == -1 )); then'
+FIX_KEY="fix_round=\$(jq -r '.review_fix_round // false | tostring'"
+BLIND_WS="$(mutant_scripts zero-blind workflow-state)/workflow-state" || exit 1
+mutate_file "$BLIND_WS" "$FIX_KEY" "fix_round=\$(jq -r 'false | tostring'"
+FIXED_WS="$(mutant_scripts zero-fixed-items workflow-state)/workflow-state" || exit 1
+mutate_file "$FIXED_WS" "$FIX_KEY" "fix_round=\$(jq -r 'any((.fixed_items // [])[]; .source == \"pr-review\") | tostring'"
+CYCLES_WS="$(mutant_scripts zero-cycles workflow-state)/workflow-state" || exit 1
+mutate_file "$CYCLES_WS" "$FIX_KEY" "fix_round=\$(jq -r '(.cycles // 0) > 0 | tostring'"
+# script|label|row|the copy's walk
+for control in \
+  "$NOZERO_WS|a zero cap that runs no fix round|0|at-cap 0/0|at-cap 0/0|0|cycle-cap rc=1|at-cap 0/0" \
+  "$BLIND_WS|a zero cap that admits a second fix round|0|below 0/0|below 0/0|0|cycle-cap rc=1|below 0/0" \
+  "$FIXED_WS|a zero cap that an escalated item leaves untaken|2|below 0/0|below 0/0|0|cycle-cap rc=1|below 0/0" \
+  "$FIXED_WS|a zero cap that a dropped fixed entry gives back|3|below 0/0|below 0/0|0|cycle-cap rc=1|below 0/0" \
+  "$CYCLES_WS|a zero cap that a local-review round spends|1|at-cap 0/0|at-cap 0/0|0|cycle-cap rc=1|at-cap 0/0"; do
+  IFS='|' read -r bin label n mutant <<<"$control"
+  IFS='|' read -r setting tiers prior outcome want <<<"${WALK_ROWS[$n]}"
+  got="$(walk "$bin" "$setting" "$tiers" "$prior" "$outcome")"
+  [[ "$got" != "$want" && "$got" == "$mutant" ]] \
+    && pass "the walk at 0, prior $prior, item $outcome, flags $label" \
+    || fail "the walk at 0, prior $prior, item $outcome, MISSED $label" "got=$got"
+done
+
+# The exception widened past its setting: a copy whose branch matches any cap
+# reads the external cap at 0 as below, which the row above must turn red.
+SCOPE_WS="$(mutant_scripts zero-any-cap workflow-state)/workflow-state" || exit 1
+mutate_file "$SCOPE_WS" '[[ "$setting" == REVIEW_MAX_CYCLES ]] && (( limit == 0 ))' '[[ -n "$setting" ]] && (( limit == 0 ))'
+got="$(other_zero "$SCOPE_WS")"
+[[ "$got" == "below 0/0" ]] \
+  && pass "the external-cap row flags a zero-cap exception that matches any cap" \
+  || fail "the external-cap row MISSED a zero-cap exception that matches any cap" "got=$got"
 
 # § 7 changed to the shared key: the assertion must catch the counter
 # coming back into the section that must not spend it.
@@ -233,6 +361,17 @@ elif grep -q -F "$FIRST_WRITE" <<<"$(section_2 "$CTRL_WF")"; then
   fail "the assertion MISSED § 2 recording no first_panel"
 else
   pass "the assertion flags § 2 recording no first_panel"
+fi
+
+# § 4 without its review_fix_round write: every later § 4 read at 0 is below.
+CTRL_WF="$TMP_ROOT/review-pr-nofix.md"
+grep -v -F "$FIX_WRITE" "$REVIEW_PR_WF" > "$CTRL_WF" || true
+if cmp -s "$CTRL_WF" "$REVIEW_PR_WF"; then
+  fail "§ 4 review_fix_round control planted nothing — its filter matched no text"
+elif grep -q -F "$FIX_WRITE" <<<"$(section_4 "$CTRL_WF")"; then
+  fail "the assertion MISSED § 4 recording no review_fix_round"
+else
+  pass "the assertion flags § 4 recording no review_fix_round"
 fi
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
