@@ -498,18 +498,71 @@ exec git "$@"
             self.assertIsNone(holder.poll(), "the lock holder exited without taking the lock")
             self.assertLess(time.monotonic(), deadline, f"the lock holder never wrote {taken}")
             time.sleep(0.05)
-        append = subprocess.Popen(
-            [str(self.script), "append", "--item", "TEST-1", "--", str(target)],
-            cwd=self.root, env=self.env, stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        append.stdin.write(b'{"id":"held"}\n')
-        append.stdin.close()
+        appends = []
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        for identity in ("first", "second"):
+            append = subprocess.Popen(
+                [str(self.script), "append", "--item", "TEST-1", "--", str(target)],
+                cwd=self.root, env=self.env, stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            append.stdin.write((json.dumps(dict(id=identity, kind="directive", at=stamp,
+                                               **{"from": "owner"}, text="one report")) + "\n").encode())
+            append.stdin.close()
+            appends.append(append)
+        # Both transfers wait behind the holder before either can append.
         time.sleep(2)
         during = len(target.read_bytes().splitlines())
         release.write_bytes(b"")
-        append.wait()
+        reports = [append.stderr.read() for append in appends]
+        codes = sorted(append.wait() for append in appends)
         holder.wait()
-        self.assertEqual((during, len(target.read_bytes().splitlines())), (0, 1))
+        rows = [json.loads(line) for line in target.read_bytes().splitlines()]
+        self.assertEqual((during, len(rows), codes), (0, 1, [0, 4]))
+        self.assertIn(f"duplicate id={rows[0]['id']}\n".encode(), b"".join(reports))
+        self.assertEqual(list(target.parent.glob("to-lane.jsonl.kendex-append.*")), [])
+        # The provider must pass its staged envelope to the shared guard.
+        original = self.script.read_text()
+        rule = 'mailbox_append_locked "$1" 30 "" "$staged"'
+        self.assertEqual(original.count(rule), 1)
+        self.addCleanup(self.script.write_text, original)
+        self.script.write_text(original.replace(rule, rule.replace('"$staged"', '""')))
+        identity = "second" if rows[0]["id"] == "first" else "first"
+        repeated = (json.dumps(dict(id=identity, kind="directive", at=stamp,
+                                   **{"from": "owner"}, text="one report")) + "\n").encode()
+        result = self.call("append", "--item", "TEST-1", "--", str(target), data=repeated)
+        self.assertEqual((result.returncode, len(target.read_bytes().splitlines())), (0, 2))
+
+    def test_append_compares_sender_stamps_on_a_lagging_host(self):
+        """Sequential UTC envelopes repeat even when the provider clock lags."""
+        self.assertEqual(self.create().returncode, 0)
+        library = Path(self.row["clone"]) / ".agents/skills/orch/scripts/lib/mailbox-append.sh"
+        original = library.read_text()
+        self.addCleanup(library.write_text, original)
+        rule = '| ($candidate.at | at_epoch) as $now'
+        self.assertEqual(original.count(rule), 1)
+        # The control restores the provider's clock without removing the judge.
+        mutant = original.replace(rule, '| 1699999999 as $now # ' + rule)
+        self.assertNotEqual(mutant, original)
+        target = self.root / "lane/tmp/lane-mail/TEST-1/to-lane.jsonl"
+        target.parent.mkdir(parents=True)
+        envelope = dict(id="first", kind="directive", at="2023-11-14T22:13:20Z",
+                        **{"from": "owner"}, text="one report")
+        for clock, source, expected in ((1700000000, original, (4, 1)),
+                                        (1699999999, original, (4, 1)),
+                                        (1699999999, mutant, (0, 2))):
+            with self.subTest(clock=clock, control=source == mutant):
+                self.executable(self.bin / "date", f"#!/bin/sh\nprintf '%s\\n' {clock}\n")
+                library.write_text(source)
+                target.write_bytes(b"")
+                first = self.call("append", "--item", "TEST-1", "--", str(target),
+                                  data=(json.dumps(envelope) + "\n").encode())
+                self.assertEqual(first.returncode, 0, first.stderr)
+                second = self.call("append", "--item", "TEST-1", "--", str(target),
+                                   data=(json.dumps(dict(envelope, id="second")) + "\n").encode())
+                self.assertEqual((second.returncode, len(target.read_bytes().splitlines())), expected,
+                                 second.stderr)
+                if expected == (4, 1):
+                    self.assertIn(b"duplicate id=first\n", second.stderr)
 
     def test_append_names_its_failure_in_a_word(self):
         """The library's number is decoded where it is printed, not passed on."""
@@ -600,6 +653,34 @@ exec "$REAL_CAT" "$@"
         self.assertIn(b"predates the append verb", refused.stderr)
         self.assertFalse(target.exists())
         self.assertEqual(list(target.parent.glob("*.kendex-append.*")), [])
+
+    def test_append_refuses_an_old_but_present_library(self):
+        """An existing host clone can retain append without the repeat guard."""
+        self.assertEqual(self.create().returncode, 0)
+        library = Path(self.row["clone"]) / ".agents/skills/orch/scripts/lib/mailbox-append.sh"
+        old = library.read_text()
+        # Model the old library: it accepts surplus arguments without judging them.
+        for rule, replacement in (("mailbox_duplicate_id()", "legacy_duplicate_id()"),
+                                  ('if [ -n "${4:-}" ]; then', 'if false; then')):
+            self.assertEqual(old.count(rule), 1)
+            changed = old.replace(rule, replacement)
+            self.assertNotEqual(changed, old)
+            old = changed
+        library.write_text(old)
+        target = self.root / "lane/tmp/lane-mail/TEST-1/to-lane.jsonl"
+        refused = self.call("append", "--item", "TEST-1", "--", str(target), data=b'{"id":"nowhere"}\n')
+        self.assertEqual(refused.returncode, 1, refused.stderr)
+        self.assertIn(f"lane-host-ssh: append-library-outdated path={library}\n".encode(), refused.stderr)
+        self.assertFalse(target.parent.exists())
+        # Without the loader's capability requirement the old append accepts the bytes.
+        original = self.script.read_text()
+        rule = 'if ! declare -F mailbox_duplicate_id >/dev/null; then'
+        self.assertEqual(original.count(rule), 1)
+        changed = original.replace(rule, 'if false; then # ' + rule)
+        self.assertNotEqual(changed, original)
+        self.script.write_text(changed)
+        result = self.call("append", "--item", "TEST-1", "--", str(target), data=b'{"id":"nowhere"}\n')
+        self.assertEqual((result.returncode, target.read_bytes()), (0, b'{"id":"nowhere"}\n'))
 
     def test_cat_tells_an_absent_path_from_one_it_cannot_read(self):
         """Exit 2 is "not there"; every other read failure keeps its own status."""

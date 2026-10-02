@@ -99,7 +99,8 @@ assert_eq "$(jq -r '.id' < "$BOX/to-overseer.jsonl")" "$ID" "the printed id is t
 assert_eq "$(jq -r '.at | test("^[0-9-]{10}T[0-9:]{8}Z$")' < "$BOX/to-overseer.jsonl")" "true" "the envelope stamps a UTC time"
 
 lm notice --item KEN-1 --file "$(text n 'Rebased onto main.')"
-assert_eq "$RC=$OUT" "0=" "notice exits 0 and prints nothing"
+assert_eq "$RC=$OUT" "0=lane-mail: sent item=KEN-1 id=$(jq -r 'select(.kind == "notice") | .id' "$BOX/to-overseer.jsonl") bytes=18 to= ref=" \
+  "notice prints its appended id and text bytes"
 assert_eq "$(jq -rs '.[1] | .kind + " " + (has("options") | tostring)' < "$BOX/to-overseer.jsonl")" \
   "notice false" "a notice carries no options"
 lm notice --item KEN-1 --file "$(text n 'x')" --options a,b
@@ -451,9 +452,9 @@ for row in "${CURSOR_ROWS[@]}"; do
 done
 
 new_lane concurrent
-printf 'parallel\n' > "$TMP_ROOT/p.txt"
 for i in 1 2 3 4 5 6 7 8; do
-  (cd "$LANE" && "$LANE_MAIL" notice --item KEN-1 --file "$TMP_ROOT/p.txt") &
+  printf 'parallel %s\n' "$i" > "$TMP_ROOT/p-$i.txt"
+  (cd "$LANE" && "$LANE_MAIL" notice --item KEN-1 --file "$TMP_ROOT/p-$i.txt") &
 done
 wait
 BOX="$LANE/tmp/lane-mail/KEN-1"
@@ -622,6 +623,11 @@ assert_eq "$RC=$(jq -rs 'map(select(.text == "Both of us.")) | map(.from) | join
 lm peer send --repo peer_b --file "$(text d 'Both of us.')"
 assert_eq "$RC=$ERR" "2=lane-mail: duplicate id=$PEER_C_SENT" \
   "a peer send repeating its own envelope inside a minute is refused"
+lm peer ask --repo peer_b --file "$(text q 'Retry the question?')"
+PEER_ASK_ID="${OUT#id=}"
+lm peer ask --repo peer_b --file "$(text q 'Retry the question?')"
+assert_eq "$RC=$ERR" "2=lane-mail: duplicate id=$PEER_ASK_ID" \
+  "a peer ask repeats against the mailbox it joins before recording itself"
 assert_eq "$(jq -rs 'map(select(.text == "Both of us.")) | length' \
   < "$PEER_B/tmp/lane-mail/overseer/to-lane.jsonl")" "2" \
   "and the peer's mailbox still holds only the two that landed"
@@ -891,35 +897,6 @@ raced_texts() {
   jq -rs 'map(.text) | sort | join(",")' < "$RACED" 2>/dev/null || printf 'lost'
 }
 
-# A background writer holding one file's lock, through the same orch_take_lock
-# every mailbox append calls. It signals NAME.taken once it holds the lock and
-# lets go when NAME.release appears, or after a minute, so a case that aborts
-# before releasing it leaves no process spinning behind the suite.
-hold_lock() { # FILE NAME
-  local waited=0
-  . "$REPO_ROOT/skills/orch/scripts/lib/file-lock.sh"
-  exec 9>>"$1"
-  orch_take_lock 9 "$1" 30 || return 1
-  : > "$TMP_ROOT/$2.taken"
-  while [ ! -e "$TMP_ROOT/$2.release" ]; do
-    waited=$((waited + 1))
-    [ "$waited" -lt 1200 ] || return 1
-    sleep 0.05
-  done
-}
-
-# Wait for a holder's marker, bounded at five seconds. A holder that failed
-# before writing it would otherwise spin the suite to the CI job's own timeout,
-# with nothing on screen saying which assertion was in flight.
-await_marker() { # PATH
-  local tries=0
-  while [ ! -e "$1" ]; do
-    tries=$((tries + 1))
-    [ "$tries" -lt 100 ] || return 1
-    sleep 0.05
-  done
-}
-
 # The lock the provider takes, observed without a race, because a race only
 # ever samples one interleaving. The holder takes the mailbox's own lock
 # through the same orch_take_lock the library calls, so a hosted send cannot
@@ -966,12 +943,11 @@ assert_eq "$(tail -n +2 <<<"$OUT")" "" "a hosted drain skips the ask its hosted 
 assert_eq "$(grep -c -- "append --item KEN-1" "$STUB_LOG")" "1" "the hosted send crosses lane-host append once"
 assert_eq "$(grep -c -- "put --item KEN-1" "$STUB_LOG")" "0" "and never put, which would replace the whole mailbox"
 
-# The repeat is judged on the remote file, read through the transport the
-# append writes, so a hosted send judges the mailbox its own line would join.
+# The provider judges the repeat under the lock on the remote file.
 host_lm send --item KEN-1 --root "$REMOTE_ROOT" --host --re remote-ask --file "$(text a 'Hosted answer.')"
 assert_eq "$RC=$ERR" "2=lane-mail: duplicate id=$HOSTED_ID" \
   "a hosted repeat is refused against the mailbox its own transport reads"
-assert_eq "$(grep -c -- "append --item KEN-1" "$STUB_LOG")" "1" "and crosses no second append"
+assert_eq "$(grep -c -- "append --item KEN-1" "$STUB_LOG")" "2" "the second append call judges the repeat without adding a row"
 
 # A fresh watch record on the lane's host is a monitor polling there. The
 # sender's own disk holds none, so a receipt judged there reads no monitor.
@@ -1003,7 +979,7 @@ assert_eq "$RC=$ERR=$OUT" "2=lane-mail: mail-read-failed=KEN-1=" \
 assert_eq "$(jq -rs 'map(select(.text == "Unjudged.")) | length' \
   < "$REMOTE_DISK$REMOTE_ROOT/tmp/lane-mail/KEN-1/to-lane.jsonl")" "0" \
   "and nothing of it reached the remote mailbox"
-assert_eq "$(grep -c -- "append --item KEN-1" "$STUB_LOG")" "1" "and it crossed no second append"
+assert_eq "$(grep -c -- "append --item KEN-1" "$STUB_LOG")" "2" "and the failed monitor read crossed no further append"
 
 # A provider predating the verb fails it. The send refuses and names the verb;
 # reading the mailbox and putting it back is what loses a line, so no write
@@ -1307,6 +1283,34 @@ RECORD_FIRST_OUT="$RC=$OUT"
 chmod 644 "$PEER_A/tmp/lane-mail/overseer/to-overseer.jsonl"
 assert_eq "$RECORD_FIRST_OUT" "2=" \
   "control: with the id behind the record a delivered ask leaves the caller nothing to wait on"
+LANE_MAIL_BIN=""
+
+# One overseer can ask two repositories the same question. Its own records
+# track delivered ids, not whether the second recipient repeats the first.
+mutant guarded-bookkeeping 'lm_append_local "$TO_OVERSEER" "$LINE" :' 'lm_append_local "$TO_OVERSEER" "$LINE"'
+CROSS_PEER_MUTANT="$LANE_MAIL_BIN"
+for row in original control; do
+  new_lane "${row}_cross_peer"
+  LANE_MAIL_BIN="$LANE_MAIL"
+  [ "$row" != control ] || LANE_MAIL_BIN="$CROSS_PEER_MUTANT"
+  IDS=""; CODES=""
+  for peer in "$PEER_B" "$PEER_C"; do
+    lm peer ask --repo "$peer" --file "$(text q 'Who owns this work?')"
+    IDS="${IDS:+$IDS }${OUT#id=}"
+    CODES="${CODES:+$CODES }$RC"
+    assert_eq "${OUT#id=}" "$(jq -rs 'last.id' < "$peer/tmp/lane-mail/overseer/to-lane.jsonl")" \
+      "$row: each peer receives its ask under the printed id"
+  done
+  lm pending --item overseer --to peer
+  PENDING_IDS="$(jq -rs 'map(.id) | join(" ")' <<<"$OUT")"
+  if [ "$row" = original ]; then
+    assert_eq "$CODES" "0 0" "identical asks to two peers both return success"
+    assert_eq "$RC=$PENDING_IDS" "0=$IDS" "both delivered peer asks remain pending"
+  else
+    assert_eq "$CODES" "0 2" "control: judging bookkeeping refuses the second delivered ask"
+    assert_eq "$RC=$PENDING_IDS" "0=${IDS%% *}" "control: the second delivered ask is absent from pending"
+  fi
+done
 LANE_MAIL_BIN=""
 
 mutant_lib unlocked 'if ! orch_take_lock 9 "$1" "$2"; then' 'if false; then'

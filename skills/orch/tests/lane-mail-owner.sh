@@ -99,6 +99,183 @@ new_repo wait_default
 owner_ask 'Settle it?' yes,no yes
 assert_eq "$RC=$(field "$BOX/to-overseer.jsonl" '.wait')" "0=120" "with no setting the wait is 120 minutes"
 
+# The overseer retries a silent notice or ask. Keep the clock fixed so the
+# minute guard does not depend on how long the runner spends on these rows.
+source "$REPO_ROOT/skills/orch/tests/lib/virtual-clock.sh"
+mkdir -p "$TMP_ROOT/clock-bin"
+virtual_clock_install "$TMP_ROOT/clock-bin" "$TMP_ROOT/clock"
+SAVED_PATH="$PATH"; PATH="$TMP_ROOT/clock-bin:$PATH"
+new_repo notice_receipt
+for delivery in first second; do
+  lm send --item overseer --directive --delivery-id "$delivery" --file "$(text d 'Reply owed.')"
+done
+REF_ROWS="$(jq -rs 'map(.id) | join(" ")' < "$BOX/to-lane.jsonl")" || exit 1
+read -r -a REFS <<<"$REF_ROWS"
+FIRST_ID=""
+while IFS='|' read -r audience ref words want; do
+  lm notice --item overseer --to "$audience" --ref "${REFS[$ref]}" --file "$(text n "$words")"
+  if [[ "$want" == duplicate ]]; then
+    assert_eq "$RC=$ERR=$OUT=$(field "$BOX/to-overseer.jsonl" '.id')" \
+      "2=lane-mail: duplicate id=$FIRST_ID==$FIRST_ID" "notice repeat refuses before appending"
+  else
+    ID="$(jq -rs 'last.id' < "$BOX/to-overseer.jsonl")" || exit 1
+    assert_eq "$RC=$OUT" "0=lane-mail: sent item=overseer id=$ID bytes=6 to=$audience ref=${REFS[$ref]}" \
+      "notice $want prints its appended receipt"
+    [[ -n "$FIRST_ID" ]] || FIRST_ID="$ID"
+  fi
+done <<'ROWS'
+owner|0|Reply.|first
+owner|0|Reply.|duplicate
+owner|1|Reply.|changed-ref
+owner|0|Other.|changed-text
+ROWS
+owner_ask 'Retry?' yes,no yes
+FIRST_ASK="$ASK"
+sleep 5
+owner_ask 'Retry?' yes,no yes
+ASK_REPEAT_WANT="2=lane-mail: duplicate id=$FIRST_ASK=$FIRST_ASK"
+ASK_REPEAT_ASSERTION="an owner ask retry after the clock advances refuses without appending"
+assert_eq "$RC=$ERR=$(field "$BOX/to-overseer.jsonl" 'select(.kind == "ask") | .id')" \
+  "$ASK_REPEAT_WANT" "$ASK_REPEAT_ASSERTION"
+# Caller changes remain distinct even while the generated deadline moves.
+while IFS='|' read -r name words options recommend wait advance; do
+  new_repo "ask_$name"
+  owner_ask 'Retry?' yes,no yes
+  sleep "$advance"
+  owner_ask "$words" "$options" "$recommend" "$wait"
+  assert_eq "$RC=$(wc -l < "$BOX/to-overseer.jsonl" | tr -d ' ')" "0=2" "ask $name lands a new row"
+done <<'ROWS'
+wait|Retry?|yes,no|yes|121|5
+recommend|Retry?|yes,no|no||5
+options|Retry?|yes,no,later|yes||5
+text|Other?|yes,no|yes||5
+expired|Retry?|yes,no|yes||61
+ROWS
+new_repo control_ask_retry
+owner_ask 'Retry?' yes,no yes
+FIRST_ASK="$ASK"
+ASK_REPEAT_WANT="2=lane-mail: duplicate id=$FIRST_ASK=$FIRST_ASK"
+mutant_dir="$(mutant_scripts mutants/ask-retry lib/mailbox-append.sh)" || exit 1
+mutate_file "$mutant_dir/lib/mailbox-append.sh" '.deadline = ($deadline - $stamp)' '. # .deadline = ($deadline - $stamp)'
+sleep 5
+LANE_MAIL_BIN="$mutant_dir/lane-mail" owner_ask 'Retry?' yes,no yes
+CONTROL_RC=0
+CONTROL_OUT="$(
+  FAIL=0
+  assert_eq "$RC=$ERR=$(field "$BOX/to-overseer.jsonl" 'select(.kind == "ask") | .id')" \
+    "$ASK_REPEAT_WANT" "$ASK_REPEAT_ASSERTION"
+  [[ "$FAIL" -eq 0 ]]
+)" || CONTROL_RC=$?
+assert_eq "$RC=$CONTROL_RC=$(wc -l < "$BOX/to-overseer.jsonl" | tr -d ' ')" "0=1=2" \
+  "control: the advancing-clock retry assertion fails without deadline normalization"
+# Chat answers use send --re without a delivery key while the ask stays open.
+# Both controls keep the semantic guard and remove one append-owner rule.
+while IFS='~' read -r name old replacement want; do
+  new_repo "answer_repeat_$name"
+  owner_ask 'Which?' a,b a
+  lm send --item overseer --re "$ASK" --file "$(text a b)"
+  FIRST="$(field "$BOX/to-lane.jsonl" '.id')"
+  bin="$LANE_MAIL"
+  if [[ -n "$old" ]]; then
+    dir="$(mutant_scripts "mutants/answer-repeat-$name" lane-mail)" || exit 1
+    mutate_file "$dir/lane-mail" "$old" "$replacement"; bin="$dir/lane-mail"
+  fi
+  LANE_MAIL_BIN="$bin" lm send --item overseer --re "$ASK" --file "$(text a b)"
+  control_rc=0
+  (FAIL=0; assert_eq "$RC=$ERR=$(field "$BOX/to-lane.jsonl" '.id')" \
+    "2=lane-mail: duplicate id=$FIRST=$FIRST" "unkeyed owner answer retry refuses without appending"; [[ "$FAIL" -eq 0 ]]) \
+    >"$TMP_ROOT/answer-repeat-assertion" || control_rc=$?
+  assert_eq "$control_rc" "$want" "$name: the owner answer retry assertion detects either missing rule" "$TMP_ROOT/answer-repeat-assertion"
+  if [[ "$name" == live ]]; then
+    lm resolve --item overseer --id "$ASK"
+    CLOSE="$(field "$BOX/to-lane.jsonl" 'select(.kind == "resolution") | .id')"
+    lm send --item overseer --re "$ASK" --file "$(text a c)"
+    assert_eq "$RC=$ERR" "2=lane-mail: resolved-already=$ASK id=$CLOSE" "unkeyed new answer after close retains its semantic refusal"
+  fi
+done <<'ROWS'
+live~~~0
+eligibility~[ "$VERB" != resolve ] && [ -z "$DELIVERY_ID" ] && [ "${3:-}" != : ]~false && [ "$VERB" != resolve ] && [ -z "$DELIVERY_ID" ] && [ "${3:-}" != : ]~1
+refusal~[ "${report#duplicate id=}" != "$report" ] || return 4~[ "${report#duplicate id=}" != "$report" ] && return 4~1
+ROWS
+PATH="$SAVED_PATH"
+
+FIXTURE_HOST="$REPO_ROOT/skills/orch/tests/fixtures/lane-host"
+REMOTE_DISK="$TMP_ROOT/repeat-remote"
+STUB_LOG="$TMP_ROOT/repeat-host.log"
+# Both senders reach the append while a third process holds its lock. The
+# markers instrument a disposable library, not the sender or the repeat rule.
+# A fixed clock gives both envelopes the same second, as Copilot reports do.
+race_repeats() { # NAME MODE ACTION LIB
+  local name="$1" mode="$2" action="$3" lib="$4" sender receiver box n holder first codes
+  local pids=() args=()
+  new_repo "repeat-$name-sender"; sender="$LANE"
+  new_repo "repeat-$name-receiver"; receiver="$LANE"
+  case "$action" in
+    ask) args=(ask --item overseer --to owner --options keep,stop --recommend keep); box="$sender/tmp/lane-mail/overseer/to-overseer.jsonl" ;;
+    notice) args=(notice --item overseer --to owner); box="$sender/tmp/lane-mail/overseer/to-overseer.jsonl" ;;
+    send) args=(send --item overseer --directive --root "$sender"); box="$sender/tmp/lane-mail/overseer/to-lane.jsonl" ;;
+    send-peer | ask-peer) args=(peer "${action%-peer}" --repo "$receiver"); box="$receiver/tmp/lane-mail/overseer/to-lane.jsonl" ;;
+    *) echo "lane-mail suite: action=$action" >&2; exit 1 ;;
+  esac
+  if [ "$mode" = hosted ]; then args+=(--host); box="$REMOTE_DISK$box"; fi
+  mkdir -p -- "${box%/*}" "$TMP_ROOT/repeat-home"
+  : > "$box"
+  printf 'one progress report\n' > "$TMP_ROOT/repeat.txt"
+  hold_lock "$box" "$name" & holder=$!
+  await_marker "$TMP_ROOT/$name.taken" || exit 1
+  for n in 1 2; do
+    (cd -- "$sender" && rc=0
+      env -i PATH="$TMP_ROOT/clock-bin:$PATH" HOME="$TMP_ROOT/repeat-home" LC_ALL=C \
+        STUB_CLOCK="$STUB_CLOCK" STUB_REAL_DATE="$STUB_REAL_DATE" STUB_REAL_SLEEP="$STUB_REAL_SLEEP" \
+        RACE_MARKER="$TMP_ROOT/$name-$n.waiting" ORCH_LANE_HOST="$FIXTURE_HOST" \
+        LANE_HOST_STUB_LOG="$STUB_LOG" LANE_HOST_STUB_DIR="$REMOTE_DISK" LANE_HOST_STUB_LIB="$lib" \
+        "$lib/../lane-mail" "${args[@]}" --file "$TMP_ROOT/repeat.txt" \
+        >"$TMP_ROOT/$name-$n.out" 2>"$TMP_ROOT/$name-$n.err" || rc=$?
+      printf '%s\n' "$rc" >"$TMP_ROOT/$name-$n.rc") &
+    pids+=("$!")
+  done
+  for n in 1 2; do await_marker "$TMP_ROOT/$name-$n.waiting" || exit 1; done
+  : > "$TMP_ROOT/$name.release"
+  wait "$holder" "${pids[@]}"
+  first="$(jq -r '.id' "$box" | sed -n '1p')" || exit 1
+  codes="$(sort -n "$TMP_ROOT/$name-1.rc" "$TMP_ROOT/$name-2.rc" | tr '\n' ',')" || exit 1
+  RACE_RESULT="$codes|$(wc -l < "$box" | tr -d ' ')|$(sed -n '/^lane-mail: duplicate /p' "$TMP_ROOT/$name-1.err" "$TMP_ROOT/$name-2.err")"
+  RACE_WANT="0,2,|1|lane-mail: duplicate id=$first"
+}
+RACE_DIR="$(mutant_scripts fixtures/repeat-lock lib/mailbox-append.sh)" || exit 1
+mutate_file "$RACE_DIR/lib/mailbox-append.sh" '  if ! orch_take_lock 9 "$1" "$2"; then' \
+  '  : > "$RACE_MARKER"
+  if ! orch_take_lock 9 "$1" "$2"; then'
+EARLY_DIR="$(mutant_scripts mutants/repeat-before-lock lib/mailbox-append.sh)" || exit 1
+mutate_file "$EARLY_DIR/lib/mailbox-append.sh" '  local duplicate=""' \
+  '  local duplicate=""
+  [ -z "${4:-}" ] || duplicate="$(mailbox_duplicate_id "$1" "$4")" || return 2'
+mutate_file "$EARLY_DIR/lib/mailbox-append.sh" '    if ! duplicate="$(mailbox_duplicate_id "$1" "$4")"; then' \
+  '    if false; then # if ! duplicate="$(mailbox_duplicate_id "$1" "$4")"; then'
+mutate_file "$EARLY_DIR/lib/mailbox-append.sh" '  if ! orch_take_lock 9 "$1" "$2"; then' \
+  '  : > "$RACE_MARKER"
+  if ! orch_take_lock 9 "$1" "$2"; then'
+for implementation in live early; do
+  lib="$RACE_DIR/lib"; [ "$implementation" != early ] || lib="$EARLY_DIR/lib"
+  while IFS='|' read -r name mode action; do
+    race_repeats "$implementation-$name" "$mode" "$action" "$lib"
+    control_rc=0
+    (FAIL=0; assert_eq "$RACE_RESULT" "$RACE_WANT" "identical $mode $action writers refuse under the append lock"; [[ "$FAIL" -eq 0 ]]) \
+      >"$TMP_ROOT/repeat-assertion" || control_rc=$?
+    want=0; [ "$implementation" != early ] || want=1
+    assert_eq "$control_rc" "$want" "$implementation $name: the locked repeat assertion turns red with an early read" "$TMP_ROOT/repeat-assertion"
+  done <<'ROWS'
+ask|local|ask
+notice|local|notice
+send|local|send
+peer-send|local|send-peer
+peer-ask|local|ask-peer
+host-send|hosted|send
+host-peer-send|hosted|send-peer
+host-peer-ask|hosted|ask-peer
+ROWS
+done
+
 # --- refusals, one row per rule -----------------------------------------------
 new_repo refusals
 lm notice --item overseer --to owner --file "$(text n 'A note.')"
@@ -207,14 +384,16 @@ ln -s "$REPORTS" "$LANE/reports-link"
 # PATH|WANT
 while IFS='|' read -r path want; do
   lm notice --item overseer --to owner --file "$(text n 'Report.')" --attach "$path"
+  [[ "$want" != duplicate ]] || want="2=lane-mail: duplicate id=$ATTACH_ID"
   assert_eq "$RC=$ERR" "$want" "attach $path"
+  [[ "$RC" != 0 ]] || ATTACH_ID="$(field "$BOX/to-overseer.jsonl" '.id')"
 done <<ROWS
 $REPORTS/09-26-01-00.md|0=
-tmp/progress-reports/09-26-01-00.md|0=
+tmp/progress-reports/09-26-01-00.md|duplicate
 $REPORTS/deeper/09-26-01-01.md|2=lane-mail: attach-outside=$REPORTS/deeper/09-26-01-01.md
 $LANE/elsewhere/09-26-01-02.md|2=lane-mail: attach-outside=$LANE/elsewhere/09-26-01-02.md
 $REPORTS/09-26-01-03.md|2=lane-mail: attach-outside=$REPORTS/09-26-01-03.md
-$LANE/reports-link/09-26-01-00.md|0=
+$LANE/reports-link/09-26-01-00.md|duplicate
 $REPORTS|2=lane-mail: attach-outside=$REPORTS
 ROWS
 assert_eq "$(field "$BOX/to-overseer.jsonl" '.attach' | sort -u)" "$(cd "$REPORTS" && pwd -P)/09-26-01-00.md" \
@@ -458,7 +637,7 @@ LANE_MAIL_BIN="$LANE_MAIL"
 new_repo control_resolve
 LANE_MAIL_BIN="$LANE_MAIL" owner_ask 'Cut?' cut,keep cut 0
 LANE_MAIL_BIN="$LANE_MAIL" lm resolve --item overseer --id "$ASK" --default
-mutant resolve-twice 'lm_append_local "$TO_LANE" "$LINE" lm_guard_close' 'lm_append_local "$TO_LANE" "$LINE"'
+mutant resolve-twice 'select(overseer_mail_class == "close" and .re == $re)' 'select(false and overseer_mail_class == "close" and .re == $re)'
 lm resolve --item overseer --id "$ASK" --default
 assert_eq "$RC=$(wc -l < "$BOX/to-lane.jsonl" | tr -d ' ')" "0=3" \
   "control: without the resolve guard a second resolution lands"
@@ -501,7 +680,7 @@ assert_eq "$CONTROL_RC" "1" "control: collapsing guard errors loses the operatio
 
 new_repo control_delivery
 LANE_MAIL_BIN="$LANE_MAIL" lm send --item overseer --directive --file "$(text d 'Once.')" --delivery-id k1
-mutant delivery-twice 'lm_append_local "$TO_LANE" "$LINE" lm_guard_delivery' 'lm_append_local "$TO_LANE" "$LINE"'
+mutant delivery-twice 'select(.delivery_id == $key)' 'select(false and .delivery_id == $key)'
 lm send --item overseer --directive --file "$(text d 'Once.')" --delivery-id k1
 assert_eq "$RC=$(wc -l < "$BOX/to-lane.jsonl" | tr -d ' ')" "0=2" \
   "control: without the delivery guard the retry lands a second time"

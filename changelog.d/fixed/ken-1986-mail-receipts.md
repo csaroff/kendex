@@ -1,0 +1,1 @@
+- Owner notices print receipts. Mail refuses unkeyed repeats under its lock, including owner answers. Peer asks keep both pending records. Hosts require the repeat guard. Reports name their notice.
