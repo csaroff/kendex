@@ -206,6 +206,10 @@ SUPP_MISMATCH_PROSE="$(supp_body '### Suppressed comments (1)' 'src/model/naming
 SUPP_THIRD='src/ui/lanes.tsx:12'
 SUPP_UNDER="$(printf '### Suppressed comments (2)\n\n**%s**\n* Blocking: a generated name can collide.\nsrc/model/lanes.ts line 9: a finding with no token.\n' "$SUPP_FIRST")"
 SUPP_OVER="$(printf '### Previously missed (1)\n\n**%s**\n* Blocking: selected can exceed the list length.\n**%s**\n* Blocking: a lane can exit twice.\n' "$SUPP_SECOND" "$SUPP_THIRD")"
+# The live Copilot shape whose only finding sits in the body: COMMENTED,
+# `Findings: None` and no thread, the entry only under `Previously missed
+# (1)`, its summary carrying a severity image.
+COPILOT_ENTRY='skills/orch/references/merge-attempt.md:25'
 body_of() {
   case "$1" in
     heading) supp_body '### Suppressed comments (2)' "$SUPP_ENTRIES" ;;
@@ -222,6 +226,8 @@ body_of() {
     v2) supp_v2_body 'Previously missed (2)' ;;
     v2-no-count) supp_v2_body 'Previously missed' ;;
     v2-other-title) supp_v2_body 'Reviewer notes (2)' ;;
+    copilot) printf '<!-- ccr-overview-v2 -->\n\n## Copilot review overview\n\n### Needs a closer look\n\nThe recording workflow assumes a lane status file.\n\n**Findings:** None\n\n<details>\n<summary><strong>Previously missed (1)</strong></summary>\n\nIn code that has not changed since last review\n\n<details>\n<summary><picture><img alt="Medium severity"></picture> Unconditional lane-status write breaks standalone merge-pr runs</summary>\n\n`%s`\n\n**Blocking:** This status write is unconditional.\n</details>\n</details>\n' \
+      "$(supp_zwsp "$COPILOT_ENTRY")" ;;
     crlf) supp_body '### Suppressed comments (2)' "$SUPP_ENTRIES" | awk '{ printf "%s\r\n", $0 }' ;;
     *) echo "UNKNOWN-BODY: $1" >&2; exit 2 ;;
   esac
@@ -246,6 +252,7 @@ a markdown heading carrying the newer name is the same block|renamed|$BOTH_STAND
 a summary-titled section counts entries past a nested </details>, display spaces stripped|v2|$BOTH_STANDING
 a summary-titled section with no count fails as unparsed|v2-no-count|$FAILED | suppressed-findings state=unparsed
 the same section under another title passes|v2-other-title|$PASSED
+a body whose overview reads Findings: None still fails on its one entry|copilot|$FAILED | suppressed-findings count=1 | suppressed-entry $COPILOT_ENTRY
 a body written with CRLF line ends reads as the same block|crlf|$BOTH_STANDING
 ROWS
 
@@ -626,6 +633,9 @@ mutant_row "with the page-shape test cut, a non-array reviews page reads as no r
   "  pages=\$(jq -s 'if (length > 0) and all(type == \"array\") then add else error(\"pages are not arrays\") end' <<<\"\$raw\" 2>/dev/null) ||" \
   "  pages=\$(jq -s '[.[] | arrays] | add // []' <<<\"\$raw\" 2>/dev/null) ||" \
   "at_head \"\$(body_of heading)\"; gh_stub_answer \"\$REVIEWS_PATH\" '{\"message\":\"Server Error\"}'" "$PASSED"
+mutant_row "with the body scan cut, only thread state is read and a body-only finding passes" body-scan \
+  '      | (.body // "") | suppressed_scan' '      | "" | suppressed_scan' \
+  'at_head "$(body_of copilot)"' "$PASSED"
 
 echo
 echo "$PASS passed, $FAIL failed"
