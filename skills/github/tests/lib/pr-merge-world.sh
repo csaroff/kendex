@@ -13,6 +13,10 @@
 #     merge-commit:<oid>, merge-fail:<already-queued|policy|transport|queue-required>
 #     graphql:fail (the queue query fails, the REST fallback answers),
 #     post-view-fail (that REST fallback fails too)
+#     replies:<unreasoned|two|fail> the review threads check-review-replies
+#     reads: one thread whose author declined with a label alone, that
+#     thread beside one whose author claims tracking and names no issue, or
+#     a read that fails
 #     review:<decision|none> GitHub's reviewDecision, none being empty, with
 #     no latest review; review-latest:<state> one latest review in that state
 #     require-token (the stub refuses a mutation without the bot token)
@@ -91,6 +95,8 @@ GITHUB="$REPO_ROOT/skills/github/scripts/github.sh"
 
 # shellcheck source=lib/check-stub.sh
 source "$TEST_DIR/lib/check-stub.sh"
+# shellcheck source=lib/mutant-copy.sh
+source "$TEST_DIR/lib/mutant-copy.sh"
 # A child that resolves symlinks prints the sandbox's physical path, under
 # /private on macOS, so err_lines maps that spelling to <tmp> as well.
 TMPDIR_PHYSICAL="$(cd "$TMPDIR" && pwd -P)"
@@ -199,6 +205,9 @@ word() {
     merge-fail:*) W_ENV+=("STUB_MERGE_EXIT=1" "STUB_MERGE_STDERR=$(merge_stderr_of "$v")") ;;
     graphql:fail) W_ENV+=("STUB_POST_GRAPHQL_FAIL=true") ;;
     post-view-fail) W_ENV+=("STUB_POST_VIEW_FAIL=true") ;;
+    replies:unreasoned) W_ENV+=('STUB_THREADS=[{"comments":{"totalCount":1,"nodes":[{"author":{"login":"pr-author","__typename":"User","databaseId":1001},"body":"Declined: frozen"}]}}]') ;;
+    replies:two) W_ENV+=('STUB_THREADS=[{"comments":{"totalCount":1,"nodes":[{"author":{"login":"pr-author","__typename":"User","databaseId":1001},"body":"Out of scope, tracked."}]}},{"comments":{"totalCount":1,"nodes":[{"author":{"login":"pr-author","__typename":"User","databaseId":1001},"body":"Declined: frozen"}]}}]') ;;
+    replies:fail) W_ENV+=("STUB_THREADS_FAIL=true") ;;
     review:none) W_ENV+=("STUB_REVIEW_DECISION=" "STUB_REVIEW_LATEST=[]") ;;
     review:*) W_ENV+=("STUB_REVIEW_DECISION=$v" "STUB_REVIEW_LATEST=[]") ;;
     review-latest:*) W_ENV+=("STUB_REVIEW_LATEST=[{\"state\":\"$v\"}]") ;;
@@ -327,7 +336,7 @@ calls() {
       "api graphql"*mergeQueueEntry*) out="$out,graphql:queue" ;;
       "api user"*) out="$out,user" ;;
       "api -X DELETE repos/{owner}/{repo}/git/refs/heads/"*) out="$out,delete:${line##*/heads/}" ;;
-      "auth status"*|"repo view"*|"api repos/"*|"pr view 123 --json baseRefName"*) ;;
+      "auth status"*|"repo view"*|"api repos/"*|"api graphql"*reviewThreads*|"api graphql"*viewer*|"pr view 123 --json baseRefName"*) ;;
       *) out="$out,?($line)" ;;
     esac
   done < <(awk '/^(pr|api|auth|repo) / { if (call != "") print call; call = $0; next }
@@ -374,27 +383,13 @@ run() {
   printf 'rc=%s out=%s err=%s calls=%s auth=%s' "$rc" "$(stdout_text "$1")" "$(err_lines)" "$(calls)" "$(auth)"
 }
 
-# A must-fail control's subject: a copy of the scripts tree under
-# $TMPDIR/NAME with one whole line of FILE (a path under scripts/, default
-# commands/pr-merge.sh) replaced by TO, the rest kept. Prints the copy's
-# pr-merge.sh.
+# A must-fail control's subject: lib/mutant-copy.sh's copy under
+# $TMPDIR/NAME, one whole line of FILE (a path under scripts/, default
+# commands/pr-merge.sh) replaced by TO. Prints the copy's pr-merge.sh, the
+# command every control runs whichever file it edits.
 mutant_copy() { # NAME FROM TO [FILE]
-  local dest="$TMPDIR/$1" script
-  mkdir -p "$dest/skills/github"
-  cp -R "$REPO_ROOT/skills/github/scripts" "$dest/skills/github/scripts"
-  script="$dest/skills/github/scripts/${4:-commands/pr-merge.sh}"
-  [[ "$(grep -cxF -- "$2" "$script")" == 1 ]] || {
-    echo "FIXTURE: the $1 line was not unique in $script" >&2
-    exit 2
-  }
-  F="$2" T="$3" awk 'BEGIN { f = ENVIRON["F"]; t = ENVIRON["T"] } $0 == f { $0 = t } { print }' "$script" >"$script.edit"
-  cat -- "$script.edit" >"$script"
-  rm -f -- "${script:?}.edit"
-  ! grep -qxF -- "$2" "$script" || {
-    echo "FIXTURE: the $1 edit matched nothing in $script" >&2
-    exit 2
-  }
-  printf '%s\n' "$dest/skills/github/scripts/commands/pr-merge.sh"
+  mutant_copy_edit "$TMPDIR/$1" "$2" "$3" "${4:-commands/pr-merge.sh}" >/dev/null
+  printf '%s\n' "$TMPDIR/$1/skills/github/scripts/commands/pr-merge.sh"
 }
 
 # --- the err macros ---------------------------------------------------------------
@@ -479,7 +474,9 @@ run_table() {
 }
 
 # The calls a --check makes on an open PR, and a merge's calls before the
-# mutation: no review-thread read among them.
+# mutation. Each also makes the reply check's viewer and review-thread
+# reads, which calls() filters out of the pin: the review_replies rows and
+# the no-replies mutant prove those reads.
 CHECK="view:state,view:mergeable,checks,view:reviews"
 PRE="view:state,view:mergeable,checks,view:reviews,view:head"
 OPEN="state=OPEN mergeable=MERGEABLE at=-"
