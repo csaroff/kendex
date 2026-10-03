@@ -774,6 +774,32 @@ out="$(run_watch -- --item KEN-1 2>"$err")" && rc=0 || rc=$?
 assert_eq "rc=$rc first=$(head -1 <<<"$out")" "rc=0 first=$HEARTBEAT" "the same record is reported once" "$err"
 assert_not_contains "$out" "EVENT handoff" "a re-run carries no second handoff line" "$err"
 
+# A lane root a --root entry names: its record stands only in that root's own
+# tmp, read with the root passed as the worktree; a torn file there is reported
+# by the path the verdict names. CONTENT is that file's content.
+handoff_root() { # NAME CONTENT [WATCH]
+  new_case "$1"
+  mkdir -p "$STUB_DIR/wt-KEN-1" "$CASE_REPO_ROOT/tmp" "$STUB_DIR/root-KEN-1/tmp"
+  printf '{"cycles":0}\n' > "$CASE_REPO_ROOT/tmp/workflow-state-KEN-1.json"
+  printf '%s\n' "$2" > "$STUB_DIR/root-KEN-1/tmp/workflow-state-KEN-1.json"
+  err="$TMP_ROOT/e-$1"
+  out="$(WATCH_BIN="${3:-}" run_watch -- --item KEN-1 --root "KEN-1=$STUB_DIR/root-KEN-1" 2>"$err")" && rc=0 || rc=$?
+  ROOT_READ="first=$(head -1 <<<"$out") worktree=$(grep -cF -- "handoff-standing KEN-1 --worktree $STUB_DIR/root-KEN-1" "$STUB_DIR/workflow-state.args" || :)"
+}
+handoff_root handoff_root_record '{"handoff":{"written_at":"t"}}'
+assert_eq "rc=$rc $ROOT_READ" "rc=0 first=EVENT handoff KEN-1 worktree=1" \
+  "a record only in the --root lane's tmp is the event, read with that root as the worktree" "$err"
+handoff_root handoff_root_torn '{"handoff":'
+assert_eq "rc=$rc failed=$(grep -c "^oversee-watch: handoff-read-failed item=KEN-1 path=$STUB_DIR/root-KEN-1/tmp/workflow-state-KEN-1.json\$" "$err")" \
+  "rc=2 failed=1" "a torn state file in the lane root's tmp is reported by that file's path" "$err"
+ROOT_MUTANT_DIR="$TMP_ROOT/root-mutant"
+ROOT_MUTANT="$(mutant_scripts root-mutant/orch oversee-watch)/oversee-watch" || exit 1
+ln -s "$REPO_ROOT/skills/github" "$ROOT_MUTANT_DIR/github"
+mutate_file "$ROOT_MUTANT" '    ITEM_WORKTREE="$LOCAL_ROOT"' '    ITEM_WORKTREE=""'
+handoff_root handoff_root_control '{"handoff":{"written_at":"t"}}' "$ROOT_MUTANT"
+assert_eq "rc=$rc $ROOT_READ" "rc=0 first=$HEARTBEAT worktree=0" \
+  "control: a watch passing no --root worktree misses the record in that root's tmp" "$err"
+
 new_case handoff_no_worktree
 handoff_record KEN-1
 rm -rf "$STUB_DIR/wt-KEN-1"
@@ -1101,7 +1127,7 @@ fleet_case() { # NAME
   out="$(run_watch OVERSEE_WATCH_WORKFLOW_STATE="$STUB_DIR/swap-state.sh" ORCH_LANE_HOST="$FIXTURE_HOST" \
     LANE_HOST_STUB_LOG="$STUB_DIR/host.log" LANE_HOST_STUB_DIR="$STUB_DIR/remote" -- --max-loops 1 \
     --repeat 0 --state "$STUB_DIR/state.json" 2>"$err" </dev/null)" && rc=0 || rc=$?
-  REPEAT_ITEMS="$(awk '$(NF-1) == "handoff-standing" { printf "%s%s", sep, $NF; sep = " " }' "$STUB_DIR/workflow-state.args")"
+  REPEAT_ITEMS="$(awk '{ for (i = 1; i < NF; i++) if ($i == "handoff-standing") { printf "%s%s", sep, $(i + 1); sep = " " } }' "$STUB_DIR/workflow-state.args")"
   REPEAT_EVENTS="$(awk '/^EVENT / { printf "%s%s", sep, $2; sep = " " }' <<<"$out")"
 }
 fleet_case repeat_state_fleet
@@ -1517,7 +1543,7 @@ mid_pass_case() { # NAME joins|departs
     LANE_HOST_STUB_LOG="$STUB_DIR/host.log" LANE_HOST_STUB_DIR="$STUB_DIR/remote" PATH="$STUB_DIR/bin:$TMP_ROOT/bin:$PATH" \
     -- --max-loops 3 --repeat 0 --state "$STUB_DIR/state.json" 2>"$err" </dev/null)" && rc=0 || rc=$?
   MID_EVENTS="$(awk '/^EVENT / { printf "%s%s", sep, $2; sep = " " }' <<<"$out")"
-  MID_ITEMS="$(awk '$(NF-1) == "handoff-standing" { printf "%s%s", sep, $NF; sep = " " }' "$STUB_DIR/workflow-state.args")"
+  MID_ITEMS="$(awk '{ for (i = 1; i < NF; i++) if ($i == "handoff-standing") { printf "%s%s", sep, $(i + 1); sep = " " } }' "$STUB_DIR/workflow-state.args")"
   MID_MAIL_READS="$(grep -c -- "/tmp/lane-mail/KEN-10/to-overseer.jsonl" "$STUB_DIR/host.log" || true)"
 }
 mid_pass_case repeat_state_joins_mid_pass joins
