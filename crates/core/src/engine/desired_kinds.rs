@@ -137,12 +137,37 @@ pub(super) fn not_written(
         Ok(header) => header,
         Err(problem) => return Some(NotWritten::UnreadableHeader(problem.to_owned())),
     };
-    if declared
-        .and_then(|decl| decl.harnesses.as_ref())
-        .is_some_and(|list| !list.contains(&harness))
-    {
+    let pin = declared.and_then(|decl| decl.harnesses.as_ref());
+    if pin.is_some_and(|list| !list.contains(&harness)) {
         return Some(NotWritten::OtherTools);
     }
+    past_pin(
+        env,
+        scope,
+        state,
+        kind,
+        name,
+        header,
+        pin.is_some(),
+        harness,
+    )
+}
+
+/// [`not_written`] once the declaration's pin names the tool, or there is
+/// none: what decides it other than the person's list. `pinned` is whether
+/// a pin names it. Asked on its own of a tool a pin leaves out, where
+/// `None` means the pin alone keeps the hook off it.
+#[allow(clippy::too_many_arguments)]
+fn past_pin(
+    env: &Env,
+    scope: &Scope,
+    state: &DesiredState,
+    kind: ItemKind,
+    name: &str,
+    header: Option<&HookSpec>,
+    pinned: bool,
+    harness: HarnessId,
+) -> Option<NotWritten> {
     if state
         .withheld
         .contains_key(&(kind, name.to_owned(), harness))
@@ -151,11 +176,7 @@ pub(super) fn not_written(
     }
     if let Some(own) = header {
         if !own.applies_to(harness) {
-            // A declaration listing harnesses that left this tool out
-            // returned above, so a list here names it.
-            return Some(NotWritten::OwnHarnessesLine {
-                declared: declared.is_some_and(|decl| decl.harnesses.is_some()),
-            });
+            return Some(NotWritten::OwnHarnessesLine { declared: pinned });
         }
         if let crate::hook::Delivery::NotInstallable(reason) =
             crate::hook::delivery(env, scope, harness, own)
@@ -239,12 +260,7 @@ pub(super) fn desired_hook(ctx: &ItemCtx, state: &mut DesiredState) -> Result<()
                 // decides the skip, so a remedy only naming the manifest
                 // would change nothing.
                 match declared {
-                    true => state.notes.push(format!(
-                        "kendex-hook-excluded: hook={record_arg0} harness={record_arg1} source=catalog field=harnesses\nkendex.toml lists {arg2} in this hook's harnesses, and the hook's own harnesses line in the catalog leaves it out; add {arg2} to the catalog line, or take it off the hook's harnesses in kendex.toml",
-                        arg2 = harness.name(),
-                        record_arg0 = crate::names::shown(ctx.name),
-                        record_arg1 = crate::names::shown(harness.name()),
-                    )),
+                    true => pin_names_excluded(ctx.name, harness, state),
                     false => state.excluded_hooks.push(super::ExcludedHook {
                         name: ctx.name.to_owned(),
                         harness,
@@ -282,6 +298,7 @@ pub(super) fn desired_hook(ctx: &ItemCtx, state: &mut DesiredState) -> Result<()
         let item = declared(ctx, ItemKind::Hook, harness, artifact)?;
         state.items.push(item);
     }
+    pins_left_out(ctx, state, &hook);
     // Unsupported events already refused their copies above. Other delivery
     // limits warn when a copy lands; no artifact means an incomplete hook.
     // Count artifacts so a failed restatement cannot count as delivery.
@@ -309,6 +326,65 @@ pub(super) fn desired_hook(ctx: &ItemCtx, state: &mut DesiredState) -> Result<()
         }
     }
     Ok(())
+}
+
+/// A pin naming a tool the hook's own harnesses line leaves out, said in
+/// the plan's notes and recorded for `verify`.
+fn pin_names_excluded(name: &str, harness: HarnessId, state: &mut DesiredState) {
+    state.pinned_hooks.push(super::PinnedHook {
+        name: name.to_owned(),
+        harness,
+        pin: super::Pin::NamesExcluded,
+    });
+    state.notes.push(format!(
+        "kendex-hook-excluded: hook={record_arg0} harness={record_arg1} source=catalog field=harnesses\nkendex.toml lists {arg2} in this hook's harnesses, and the hook's own harnesses line in the catalog leaves it out; add {arg2} to the catalog line, or take it off the hook's harnesses in kendex.toml",
+        arg2 = harness.name(),
+        record_arg0 = crate::names::shown(name),
+        record_arg1 = crate::names::shown(harness.name()),
+    ));
+}
+
+/// Records each tool the person's pin alone keeps the hook off: one the
+/// declaration aims at or the scope installs on, that the pin leaves out
+/// and the plan would write the hook on past the pin.
+fn pins_left_out(ctx: &ItemCtx, state: &mut DesiredState, hook: &HookSpec) {
+    let defaults = super::desired::harnesses_for(None, ctx.manifest, ItemKind::Hook, ctx.scope);
+    let mut asked = Vec::new();
+    for harness in ctx.harnesses.iter().copied().chain(defaults) {
+        if asked.contains(&harness) {
+            continue;
+        }
+        asked.push(harness);
+        let left_out = not_written(
+            ctx.env,
+            ctx.scope,
+            ctx.manifest,
+            state,
+            ItemKind::Hook,
+            ctx.name,
+            Ok(Some(hook)),
+            harness,
+        ) == Some(NotWritten::OtherTools);
+        let written_past_pin = left_out
+            && past_pin(
+                ctx.env,
+                ctx.scope,
+                state,
+                ItemKind::Hook,
+                ctx.name,
+                Some(hook),
+                false,
+                harness,
+            )
+            .is_none();
+        if written_past_pin {
+            state.pinned_hooks.push(super::PinnedHook {
+                name: ctx.name.to_owned(),
+                harness,
+                pin: super::Pin::LeavesOut,
+            });
+        }
+    }
 }
 
 /// The hook restated in one harness's own words, then placed: event renamed
