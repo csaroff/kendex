@@ -1,43 +1,18 @@
 {
-  "authentication": {
-    "browser_session": true,
-    "device_bearer": {
-      "rule": "A live device token can read its own identity.",
-      "required_capabilities": []
-    }
-  },
-  "success": {
+  "with_github": {
     "status": 200,
-    "body": {
-      "name": "Ada Lovelace",
-      "github_login": "1234567"
-    }
+    "body": { "name": "Robin Example", "github_login": "robin-example" }
   },
-  "unlinked_github": {
+  "without_github": {
     "status": 200,
-    "body": {
-      "name": "Ada Lovelace",
-      "github_login": null
-    }
+    "body": { "name": "Robin Example", "github_login": null }
   },
-  "errors": {
-    "unauthenticated": {
-      "status": 401,
-      "body": {
-        "error": "sign in first"
-      }
-    },
-    "database_unavailable": {
-      "status": 503,
-      "body": {
-        "error": "no database configured"
-      }
-    },
-    "missing_user": {
-      "status": 500,
-      "body": {
-        "error": "account identity is incomplete"
-      }
-    }
+  "token_rejected": {
+    "status": 401,
+    "body": { "error": "token_rejected" }
+  },
+  "store_down": {
+    "status": 503,
+    "body": { "error": "store_down" }
   }
 }
