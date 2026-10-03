@@ -412,6 +412,28 @@ linear_require_option_value() {
     return 0
 }
 
+# A --team read filter must name a team. A workflow interpolating an unresolved
+# $LINEAR_TEAM writes `--team ""`, which would send no team filter and read
+# every team as if it were the one named, or, unquoted, `--team --max`, which
+# would bind the next flag as the team and swallow it. No Linear team key or
+# name begins with a dash, so a dash-led value is a missing one.
+# Usage: linear_require_team_value "$@", with $1 the --team flag.
+linear_require_team_value() {
+    linear_require_option_value "$@" || return 1
+    case "$2" in
+    -*)
+        linear_require_option_value "$1"
+        return 1
+        ;;
+    "")
+        jq -cn --arg flag "$1" \
+            '{error: ($flag + " requires a non-empty team key or name: an empty value would read every team, not the one named")}' >&2
+        return 1
+        ;;
+    esac
+    return 0
+}
+
 # Days-before-now as an ISO timestamp, for the --updated-since/--created-since
 # "7d" spelling. GNU and BSD date disagree on the flag, so both are tried; a
 # non-numeric count is rejected here rather than reaching either.
@@ -433,6 +455,7 @@ linear_iso_days_ago() {
 # holding a quote or backslash must not be able to reshape the filter object.
 parse_filter() {
     local filter_parts=()
+    local team=""
     local first=75
     local include_archived="false"
 
@@ -465,8 +488,8 @@ parse_filter() {
             shift 2
             ;;
         --team)
-            linear_require_option_value "$@" || return 1
-            filter_parts+=("$(jq -cn --arg v "$2" '{team: {name: {eq: $v}}}')")
+            linear_require_team_value "$@" || return 1
+            team="$2"
             shift 2
             ;;
         --assignee)
@@ -517,6 +540,13 @@ parse_filter() {
             ;;
         esac
     done
+
+    # Resolved after the loop, so a malformed option refuses before any API call.
+    if [ -n "$team" ]; then
+        local team_id
+        team_id=$(resolve_team_id "$team") || return 1
+        filter_parts+=("$(jq -cn --arg v "$team_id" '{team: {id: {eq: $v}}}')")
+    fi
 
     if [ ${#filter_parts[@]} -gt 0 ]; then
         FILTER_JSON=$(printf '%s\n' "${filter_parts[@]}" | jq -cs 'add')
