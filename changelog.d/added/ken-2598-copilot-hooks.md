@@ -1,0 +1,1 @@
+- On Copilot, the doc-drift-check, reviewer-stop-check, session-start-row and session-end-row hooks now install and run.

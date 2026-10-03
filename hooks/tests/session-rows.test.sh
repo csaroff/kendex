@@ -61,6 +61,7 @@ CHECKOUT=""
 ROWS=""
 HOOK_HOME=.claude/hooks
 new_checkout() { # NAME [HOOK_HOME]
+  local wrapper
   HOOK_HOME="${2:-.claude/hooks}"
   CHECKOUT="$TMP_ROOT/$1"
   mkdir -p "$CHECKOUT"
@@ -196,6 +197,25 @@ run session-start-row "$START"
 assert_eq "RC=$RC harness=$(last_row .harness)" "RC=0 harness=codex" \
   "a hook installed under .codex/hooks writes a codex row"
 
+# Copilot, from .github/hooks, with payloads in the camelCase shape Copilot
+# CLI 1.0.91 sent tools/harness-smoke's event rows: no hook_event_name, the
+# session as sessionId, sessionStart and sessionEnd for the lead alone.
+COP_HOME_DIR="$TMP_ROOT/cop-home"
+mkdir -p "$COP_HOME_DIR"
+COP_BASE='"sessionId":"l1","timestamp":1790975267602,"cwd":"/work"'
+COP_START="{$COP_BASE,\"source\":\"new\",\"initialPrompt\":\"Reply with ok.\"}"
+COP_END="{$COP_BASE,\"reason\":\"error\"}"
+COP_ENV=("HOME=$COP_HOME_DIR" COPILOT_HOME=/accounts/cop)
+while IFS='|' read -r label wrapper payload want; do
+  new_checkout "$label" .github/hooks
+  run "$wrapper" "$payload" "${COP_ENV[@]}"
+  got="$(last_row '[.event, .harness, .session_id, .cwd, .account, (.source // .reason // "-")] | join(",")')"
+  assert_eq "RC=$RC first=$(first_line) row=$got" "RC=0 first=- row=$want" "$label"
+done <<ROWSTABLE
+copilot start|session-start-row|$COP_START|SessionStart,copilot,l1,/work,/accounts/cop,new
+copilot end|session-end-row|$COP_END|SessionEnd,copilot,l1,/work,/accounts/cop,error
+ROWSTABLE
+
 # What is reported and passed: an install whose orch scripts lack the row
 # library, a key tmux cannot answer, and a wrapper with no judge beside it.
 new_checkout no_library
@@ -262,6 +282,23 @@ sed -i.bak 's/!= StopFailure \]; then/= Never ]; then/' "$LIB"
 assert_eq "$(grep -c -F -- "$STOP_RULE" "$LIB")" "0" "control removed it"
 run session-start-row "$STOP"
 assert_eq "path=$(last_row .transcript_path)" "path=/t/5f0c.jsonl" "control: without the compact Stop rule a turn's Stop lands whole"
+# Each camelCase read removed from a copy of the orch scripts: a Copilot
+# session end's row then lacks what that read carries.
+n=0
+while IFS='@' read -r old new field label; do
+  n=$((n + 1))
+  new_checkout "camel_control_$n" .github/hooks
+  rm -f -- "${CHECKOUT:?}/.agents/skills/orch/scripts"
+  cp -R "$REPO_ROOT/skills/orch/scripts" "$CHECKOUT/.agents/skills/orch/scripts"
+  CAMEL_LIB="$CHECKOUT/.agents/skills/orch/scripts/lib/session-rows.sh"
+  assert_eq "$(grep -c -F -- "$old" "$CAMEL_LIB")" "1" "control finds: $old"
+  OLD="$old" NEW="$new" perl -i -pe 's/\Q$ENV{OLD}\E/$ENV{NEW}/' "$CAMEL_LIB"
+  assert_eq "$(grep -c -F -- "$old" "$CAMEL_LIB")" "0" "control removed: $old"
+  run session-end-row "$COP_END" "${COP_ENV[@]}"
+  assert_eq "RC=$RC $field=$(last_row ".$field // \"-\"")" "RC=0 $field=-" "control: $label"
+done <<'CAMEL'
+({session_id: (.session_id // .sessionId), transcript_path@({session_id, transcript_path@session_id@without the sessionId read a Copilot session end's row names no session
+CAMEL
 # The event list removed from the reader: a start seventy Stops back is lost.
 READ_RULE='    lines="$(grep -F -- "\"event\":\"$2\"" "$1")" || rc=$?'
 assert_eq "$(grep -c -F -- "$READ_RULE" "$LIB")" "1" "control finds the event list"
@@ -296,6 +333,17 @@ if [ -z "${HOOK_UNDER_TEST:-}" ]; then
   assert_eq "$(grep -c '^  FAIL  a hook installed under .codex/hooks writes a codex row$' <<<"$CONTROL_OUT")" "1" \
     "control: a row harness fixed at claude fails the codex install row"
 fi
+# The event the wrapper names removed from the checkout's copy of
+# session-start-row: a Copilot payload, which spells none, writes no row.
+new_checkout event_control .github/hooks
+WRAPPER="$CHECKOUT/.github/hooks/session-start-row.sh"
+EVENT_RULE='exec "$BASH" "$JUDGE" row SessionStart'
+assert_eq "$(grep -c -x -F -- "$EVENT_RULE" "$WRAPPER")" "1" "control finds the wrapper's event"
+EVENT_RULE="$EVENT_RULE" perl -i -pe 's/^\Q$ENV{EVENT_RULE}\E$/exec "\$BASH" "\$JUDGE" row/' "$WRAPPER"
+assert_eq "$(grep -c -x -F -- "$EVENT_RULE" "$WRAPPER")" "0" "control removed it"
+run session-start-row "$COP_START" "${COP_ENV[@]}"
+assert_eq "RC=$RC first=$(first_line) rows=$(row_count)" "RC=0 first=lane-mail-check: rows-unwritten=$CHECKOUT rows=0" \
+  "control: without the wrapper's event a Copilot start writes no row"
 
 printf 'pass: %d   fail: %d\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

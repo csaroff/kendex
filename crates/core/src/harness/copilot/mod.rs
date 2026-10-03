@@ -314,5 +314,8 @@ mod tests {
         assert_eq!(event("PreToolUse"), Some("preToolUse"));
         assert_eq!(event("Stop"), Some("agentStop"));
         assert_eq!(event("TaskCompleted"), None);
+        // errorOccurred fires once per retried model call, not once per
+        // failed turn (Copilot CLI 1.0.91), so it is no StopFailure.
+        assert_eq!(event("StopFailure"), None);
     }
 }
