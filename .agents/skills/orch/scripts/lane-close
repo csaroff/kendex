@@ -16,6 +16,7 @@ source "$SCRIPT_DIR/lib/lane-state.sh"
 source "$SCRIPT_DIR/lib/lane-host-slots.sh"
 source "$SCRIPT_DIR/lib/date-ladder.sh"
 source "$SCRIPT_DIR/lib/usage-reset.sh"
+source "$SCRIPT_DIR/lib/lane-capabilities.sh"
 
 message() { # REASON FIELD=VALUE...
   local reason="$1" field
@@ -103,6 +104,9 @@ message() { # REASON FIELD=VALUE...
         'A stopped record is what --keep-sandbox leaves: a relaunch recovers it, and lane-close --park --pr N on it retries the stop from the record alone.' ;;
     parked) printf '%s\n' 'The lane window closed, its harness ended and its sandbox stopped with its disk kept. The record reads parked and names the pull request and head it was judged on; the watch keeps its merged check, which hands that merge to the overseer as parked-merged.' ;;
     stopped) printf '%s\n' 'The lane window closed and its sandbox was kept.' ;;
+    host-kept) printf '%s\n' 'The host kind has no stop: the session runs on until the operator archives it from the claude.ai sidebar. The record reads done and the local worktree is removed.' ;;
+    host-capabilities-unread) printf '%s\n' 'lane-host could not declare the capability line of the host the record names, or declared a stop this close has no arm for; lane-host'"'"'s own words are above this line. Nothing was stopped and the record is unchanged.' ;;
+    worktree-remove-failed) printf '%s\n' "The item's worktree on this machine could not be removed; worktree remove names the cause above this line. The record is unchanged, and a second close retries the removal." ;;
     closed) printf '%s\n' 'The lane, sandbox and fleet record closed.' ;;
   esac
 }
@@ -115,8 +119,10 @@ Usage: lane-close [--state-dir PATH] [--keep-sandbox | --park --pr N]
 
 Close one lane recorded in the oversee workflow state. The command refuses a
 live lane. It accepts an exited lane, an idle lane whose tracker item is
-terminal, or, in a full close, a hosted record whose window no pane carries
-on a terminal item. A limit banner below the lane's last turn is passed over only where
+terminal, in a full close a hosted record whose window no pane carries on a
+terminal item, or a record whose host kind declares stop=none, in any state,
+which the close ends on this machine alone (the stop=none paragraph below).
+A limit banner below the lane's last turn is passed over only where
 `lanes pick --lane`, run under the record's host, so a hosted lane is read
 through the provider's copy, reads the account the record names as room, for
 the model the record names or over the whole account where it names none, and
@@ -159,7 +165,13 @@ process holds is a turn already over.
 A record already marked stopped can close its kept sandbox without a pane.
 A full close of a hosted record whose window no pane carries, on an item its
 tracker answers terminal, closes with no lane state read and no exit wait:
-the harness is stopped through lane-host stop and the host closed. A
+the harness is stopped through lane-host stop and the host closed.
+A record whose host kind declares stop=none (lane-host capabilities), a Claude
+cloud session, has no harness, pane or sandbox this machine can stop: the
+close removes the item's files as below, removes its worktree on this machine,
+the record's mail_root, through worktree remove, records it done and prints
+host-kept kind=KIND session=ID, the session the operator archives from the
+claude.ai sidebar. --park refuses on its stop-sandbox --check read. A
 preparing record, a hosted launch whose background job has written no
 outcome, closes without a harness exit: the job the record names is stopped
 and its window closed. --keep-sandbox ends the harness, closes its window and
@@ -750,6 +762,28 @@ finish_close() {
   else message closed "${fields[@]}" "status=done"; fi
   exit 0
 }
+
+# The record's host kind declares whether this machine can stop its lane. A
+# stop=none kind, a Claude cloud session, has no harness, pane or sandbox to
+# reach and no mailbox to ask: the close removes the item's files and its
+# worktree on this machine and closes the record, and the session stays the
+# operator's to archive. A park keeps its stop-sandbox --check read, which the
+# kind refuses.
+lane_capabilities_read "$LANE_HOST" "${host:-local}" || { message host-capabilities-unread "item=$ITEM" "host=${host:-local}" >&2; exit 1; }
+lane_capability host_stop stop
+case "$host_stop" in
+  window | verb) ;;
+  none)
+    [[ "$PARK" != true ]] || park_judge
+    remove_item_files
+    [[ -x "$WORKTREE" ]] || { message helper-missing "item=$ITEM" "path=$WORKTREE" >&2; exit 1; }
+    "$WORKTREE" remove "$mail_root" >&2 || { message worktree-remove-failed "item=$ITEM" "path=$mail_root" >&2; exit 1; }
+    update_status done || { message state-write-failed "item=$ITEM" "status=done" >&2; exit 1; }
+    lane_capability host_kind kind
+    message host-kept "kind=$host_kind" "session=$(record_field session_id)"
+    exit 0 ;;
+  *) message host-capabilities-unread "item=$ITEM" "host=${host:-local}" "stop=$host_stop" >&2; exit 1 ;;
+esac
 
 # A stopped record means an earlier --keep-sandbox call already exited the
 # harness and removed its window. Only the kept sandbox and the record remain.

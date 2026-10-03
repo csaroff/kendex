@@ -1121,10 +1121,10 @@ fleet_case() { # NAME
   printf 'ssh\n' > "$STUB_DIR/cmd-KEN-10.txt"
   remote_disk "$STUB_DIR/remote"
   write_state "$STUB_DIR/state.json" "$(lane_record issue-1 gh-1 '' /w/issue-1 running)" \
-    "$(lane_record KEN-10 KEN-10 /srv/provider "$REMOTE_ROOT" running)" "$(lane_record issue-3 gh-3 '' /w/issue-3 done)"
+    "$(lane_record KEN-10 KEN-10 "$FIXTURE_HOST" "$REMOTE_ROOT" running)" "$(lane_record issue-3 gh-3 '' /w/issue-3 done)"
   swap_state '2) unlink "$STUB_DIR/state.json" ;;'
   err="$TMP_ROOT/e-$1"
-  out="$(run_watch OVERSEE_WATCH_WORKFLOW_STATE="$STUB_DIR/swap-state.sh" ORCH_LANE_HOST="$FIXTURE_HOST" \
+  out="$(run_watch OVERSEE_WATCH_WORKFLOW_STATE="$STUB_DIR/swap-state.sh" \
     LANE_HOST_STUB_LOG="$STUB_DIR/host.log" LANE_HOST_STUB_DIR="$STUB_DIR/remote" -- --max-loops 1 \
     --repeat 0 --state "$STUB_DIR/state.json" 2>"$err" </dev/null)" && rc=0 || rc=$?
   REPEAT_ITEMS="$(awk '{ for (i = 1; i < NF; i++) if ($i == "handoff-standing") { printf "%s%s", sep, $(i + 1); sep = " " } }' "$STUB_DIR/workflow-state.args")"
@@ -1336,7 +1336,7 @@ custom_close_case() { # NAME
   printf '{"handoff":{"written_at":"t"}}\n' > "$STUB_DIR/remote/srv/clone/tmp/workflow-state-issue-2.json"
   printf '[{"number":2,"headRefName":"issue-2","mergedAt":"2026-09-20T00:00:00Z"}]\n' > "$STUB_DIR/merged.json"
   write_state "$custom/workflow-state-oversee.json" \
-    "$(lane_record issue-2 gh-2 /srv/provider /srv/lane/issue-2 running)"
+    "$(lane_record issue-2 gh-2 "$FIXTURE_HOST" /srv/lane/issue-2 running)"
   printf 'running\n' > "$STUB_DIR/harness-state"
   repeat_sleep_stub \
     'n=0; [[ ! -f "$STUB_DIR/repeat.calls" ]] || n="$(cat "$STUB_DIR/repeat.calls")"' \
@@ -1457,10 +1457,10 @@ printf 'gh-1\ngh-2\nKEN-10\n' > "$STUB_DIR/windows.txt"
 printf '⏺ working on it\n' > "$STUB_DIR/pane-KEN-10.txt"
 printf 'ssh\n' > "$STUB_DIR/cmd-KEN-10.txt"
 remote_disk "$STUB_DIR/remote"
-write_state "$STUB_DIR/state.json" "$(lane_record KEN-10 KEN-10 /srv/provider "$REMOTE_ROOT" running)"
+write_state "$STUB_DIR/state.json" "$(lane_record KEN-10 KEN-10 "$FIXTURE_HOST" "$REMOTE_ROOT" running)"
 repeat_sleep_stub 'unlink "$STUB_DIR/state.json"'
 err="$TMP_ROOT/e-repeat_state_hosted_merge"
-out="$(run_watch ORCH_LANE_HOST="$FIXTURE_HOST" LANE_HOST_STUB_LOG="$STUB_DIR/host.log" LANE_HOST_STUB_DIR="$STUB_DIR/remote" \
+out="$(run_watch LANE_HOST_STUB_LOG="$STUB_DIR/host.log" LANE_HOST_STUB_DIR="$STUB_DIR/remote" \
   PATH="$STUB_DIR/bin:$TMP_ROOT/bin:$PATH" -- --max-loops 1 --repeat 0 --state "$STUB_DIR/state.json" --hosted KEN-10=/srv/other 2>"$err" </dev/null)" && rc=0 || rc=$?
 assert_eq "rc=$rc dup=$(grep -c 'hosted-duplicate' "$err") carried=$(grep -o '^oversee-watch: fleet-read items=[0-9]* windows=[0-9]* hosted=[0-9]*' "$err" | head -1) events=$(awk '/^EVENT / { printf "%s%s", sep, $2; sep = " " }' <<<"$out")" \
   "rc=2 dup=0 carried=oversee-watch: fleet-read items=1 windows=1 hosted=1 events=lane-question" \
@@ -1496,11 +1496,11 @@ joins_case() { # NAME
   printf 'ssh\n' > "$STUB_DIR/cmd-KEN-10.txt"
   remote_disk "$STUB_DIR/remote"
   write_state "$STUB_DIR/state.json" "$(lane_record issue-1 gh-1 '' /w/issue-1 running)"
-  lane_record KEN-10 KEN-10 /srv/provider "$REMOTE_ROOT" running > "$STUB_DIR/hosted.json"
+  lane_record KEN-10 KEN-10 "$FIXTURE_HOST" "$REMOTE_ROOT" running > "$STUB_DIR/hosted.json"
   swap_state "'' | 0) jq --slurpfile h \"\$STUB_DIR/hosted.json\" '.lanes += \$h' \"\$STUB_DIR/state.json\" > \"\$STUB_DIR/state.next\" && mv \"\$STUB_DIR/state.next\" \"\$STUB_DIR/state.json\" ;;" \
     '3) unlink "$STUB_DIR/state.json" ;;'
   err="$TMP_ROOT/e-$1"
-  out="$(run_watch OVERSEE_WATCH_WORKFLOW_STATE="$STUB_DIR/swap-state.sh" ORCH_LANE_HOST="$FIXTURE_HOST" \
+  out="$(run_watch OVERSEE_WATCH_WORKFLOW_STATE="$STUB_DIR/swap-state.sh" \
     LANE_HOST_STUB_LOG="$STUB_DIR/host.log" LANE_HOST_STUB_DIR="$STUB_DIR/remote" PATH="$STUB_DIR/bin:$TMP_ROOT/bin:$PATH" -- --max-loops 1 \
     --repeat 0 --state "$STUB_DIR/state.json" 2>"$err" </dev/null)" && rc=0 || rc=$?
   REPEAT_EVENTS="$(awk '/^EVENT / { printf "%s%s", sep, $2; sep = " " }' <<<"$out")"
@@ -1529,17 +1529,17 @@ mid_pass_case() { # NAME joins|departs
   remote_disk "$STUB_DIR/remote"
   if [[ "$2" == joins ]]; then
     write_state "$STUB_DIR/state.json" "$(lane_record issue-1 gh-1 '' /w/issue-1 running)"
-    lane_record KEN-10 KEN-10 /srv/provider "$REMOTE_ROOT" running > "$STUB_DIR/hosted.json"
+    lane_record KEN-10 KEN-10 "$FIXTURE_HOST" "$REMOTE_ROOT" running > "$STUB_DIR/hosted.json"
     swap_state "'' | 0) jq --slurpfile h \"\$STUB_DIR/hosted.json\" '.lanes += \$h' \"\$STUB_DIR/state.json\" > \"\$STUB_DIR/state.next\" && mv \"\$STUB_DIR/state.next\" \"\$STUB_DIR/state.json\" ;;"
   else
     write_state "$STUB_DIR/state.json" "$(lane_record issue-1 gh-1 '' /w/issue-1 running)" \
-      "$(lane_record KEN-10 KEN-10 /srv/provider "$REMOTE_ROOT" running)"
+      "$(lane_record KEN-10 KEN-10 "$FIXTURE_HOST" "$REMOTE_ROOT" running)"
     unlink "$STUB_DIR/remote$REMOTE_ROOT/tmp/lane-mail/KEN-10/to-overseer.jsonl"
     swap_state "'' | 0) jq '(.lanes[] | select(.item == \"KEN-10\") | .status) = \"done\"' \"\$STUB_DIR/state.json\" > \"\$STUB_DIR/state.next\" && mv \"\$STUB_DIR/state.next\" \"\$STUB_DIR/state.json\" ;;"
   fi
   repeat_sleep_stub 'unlink "$STUB_DIR/state.json"'
   err="$TMP_ROOT/e-$1"
-  out="$(run_watch OVERSEE_WATCH_WORKFLOW_STATE="$STUB_DIR/swap-state.sh" ORCH_LANE_HOST="$FIXTURE_HOST" \
+  out="$(run_watch OVERSEE_WATCH_WORKFLOW_STATE="$STUB_DIR/swap-state.sh" \
     LANE_HOST_STUB_LOG="$STUB_DIR/host.log" LANE_HOST_STUB_DIR="$STUB_DIR/remote" PATH="$STUB_DIR/bin:$TMP_ROOT/bin:$PATH" \
     -- --max-loops 3 --repeat 0 --state "$STUB_DIR/state.json" 2>"$err" </dev/null)" && rc=0 || rc=$?
   MID_EVENTS="$(awk '/^EVENT / { printf "%s%s", sep, $2; sep = " " }' <<<"$out")"

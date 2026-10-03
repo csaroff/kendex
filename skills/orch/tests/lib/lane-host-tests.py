@@ -26,6 +26,7 @@ class LaneHostTests(unittest.TestCase):
         self.script = self.root / "scripts/lane-host"
         self.script.parent.mkdir()
         shutil.copy2(PACKAGE / "scripts/lane-host", self.script)
+        shutil.copy2(PACKAGE / "scripts/lane-host-ssh", self.script.parent / "lane-host-ssh")
         (self.script.parent / "lib").symlink_to(PACKAGE / "scripts/lib")
         self.stub = self.root / "provider with space"
         shutil.copy2(PACKAGE / "tests/fixtures/lane-host", self.stub)
@@ -60,6 +61,17 @@ class LaneHostTests(unittest.TestCase):
         self.assertEqual((refused.returncode, refused.stderr.splitlines()[:1]),
                          (69, [b"lane-host: lane-host-busy count=2 cap=2 verb=touch item=TEST-3"]))
         self.assertNotIn("touch --item TEST-3", (self.root / "calls").read_text())
+        # The kind's line takes no slot, so a full cap still answers it; a
+        # dispatcher that took one first is busy.
+        declared = self.run_host("capabilities", **env, ORCH_LANE_HOST_BUSY_WAIT_SECS="0")
+        self.assertEqual((declared.returncode, declared.stdout.startswith(b"kind=ssh\t")), (0, True), declared.stderr)
+        original = self.script.read_text()
+        rule = "slot cap never stands between a caller and the kind's line.\n"
+        self.assertEqual(original.count(rule), 1)
+        self.script.write_text(original.replace(rule, rule + 'lane_host_slot_take "$@" || exit $?\n'))
+        busy = self.run_host("capabilities", **env, ORCH_LANE_HOST_BUSY_WAIT_SECS="0")
+        self.assertEqual(busy.returncode, 69, busy.stderr)
+        self.script.write_text(original)
         waiting = self.start_host("touch", "--item", "TEST-4", **env, ORCH_LANE_HOST_BUSY_WAIT_SECS="20")
         time.sleep(0.5)
         self.assertIsNone(waiting.poll())
@@ -183,12 +195,99 @@ class LaneHostTests(unittest.TestCase):
         result = self.run_host("status", "--item", "TEST-1", ORCH_LANE_HOST=str(missing))
         with self.assertRaises(AssertionError):
             self.assertEqual(result.returncode, 1)
+    LOCAL = b"kind=local\tlaunch=window\tchannel=mailbox\tfiles=local\tstatus=pane\tstop=window\trelaunch=resume\tpark=none\taccounts=none\tpool=plan\tland=lane\n"
+    CLOUD = b"kind=claude-cloud\tlaunch=cloud-session\tchannel=session\tfiles=none\tstatus=none\tstop=none\trelaunch=fresh\tpark=none\taccounts=none\tpool=cloud-credit\tland=handoff\n"
+    SSH = b"kind=ssh\tlaunch=ssh\tchannel=mailbox\tfiles=verb\tstatus=verb\tstop=verb\trelaunch=resume\tpark=none\taccounts=none\tpool=plan\tland=lane\n"
+
+    def capabilities_rows(self):
+        """(name, env, exit, stdout, stderr) per declared line and refusal.
+        A provider's absent-verb answer, exit 2 or Daytona's 64 with its
+        verb-unsupported line, gets the static ssh line, pinned as SSH;
+        a 64 without that line is the provider's own failure."""
+        stub = {"ORCH_LANE_HOST": str(self.stub)}
+        daytona = "lane-host-daytona: verb-unsupported verb=capabilities provider=daytona"
+        declared = self.SSH.decode().strip().replace("pool=plan", "pool=cloud-credit")
+        return [("local", {}, 0, self.LOCAL, b""),
+                ("claude-cloud", {"ORCH_LANE_HOST": "claude-cloud"}, 0, self.CLOUD, b""),
+                ("provider-declared", {**stub, "LANE_HOST_STUB_CAPABILITIES": declared}, 0, (declared + "\n").encode(), b""),
+                ("provider-absent", {**stub, "LANE_HOST_STUB_NO_CAPABILITIES": "2"}, 0, self.SSH, b""),
+                ("provider-absent-64", {**stub, "LANE_HOST_STUB_NO_CAPABILITIES": "64", "LANE_HOST_STUB_CAPABILITIES_WORDS": daytona}, 0, self.SSH, b""),
+                ("provider-failed-64", {**stub, "LANE_HOST_STUB_NO_CAPABILITIES": "64", "LANE_HOST_STUB_CAPABILITIES_WORDS": "usage-invalid"},
+                 64, b"", b"usage-invalid\n"),
+                ("value-unknown", {**stub, "LANE_HOST_STUB_CAPABILITIES": declared.replace("status=verb", "status=probe")},
+                 1, b"", b"lane-host: capability-invalid key=status value=probe\n"),
+                ("value-spaced", {**stub, "LANE_HOST_STUB_CAPABILITIES": declared.replace("launch=ssh", "launch=window ssh")},
+                 1, b"", b"lane-host: capability-invalid key=launch value=window ssh\n"),
+                ("key-unknown", {**stub, "LANE_HOST_STUB_CAPABILITIES": declared + "\tcolour=red"},
+                 1, b"", b"lane-host: capability-invalid key=colour value=red\n"),
+                ("key-missing", {**stub, "LANE_HOST_STUB_CAPABILITIES": declared.replace("\tland=lane", "")},
+                 1, b"", b"lane-host: capability-invalid key=land value=\n")]
+
+    def test_capabilities(self):
+        for name, env, code, out, err in self.capabilities_rows():
+            with self.subTest(row=name):
+                result = self.run_host("capabilities", **env)
+                self.assertEqual((result.returncode, result.stdout, result.stderr), (code, out, err))
+        refused = self.run_host("cat", "--item", "TEST-1", ORCH_LANE_HOST="claude-cloud")
+        self.assertEqual((refused.returncode, refused.stderr), (2, b"lane-host: host-kind-verb kind=claude-cloud verb=cat\n"))
+        # A refused verb reaches no provider, so nothing is logged.
+        self.assertFalse((self.root / "calls").exists())
+
+    def test_capabilities_outside_a_checkout(self):
+        outside = Path(tempfile.mkdtemp(dir=self.root.parent))
+        self.addCleanup(shutil.rmtree, outside)
+        env = {**self.env, "GIT_CEILING_DIRECTORIES": str(outside.parent)}
+        ask = lambda: subprocess.run([str(self.script), "capabilities"], cwd=outside, env=env, capture_output=True)
+        self.assertEqual((ask().returncode, ask().stdout), (0, self.LOCAL))
+        original = self.script.read_text()
+        rule = '2>/dev/null)" || PROJECT_ROOT=""'
+        self.assertEqual(original.count(rule), 1)
+        self.script.write_text(original.replace(rule, ')"'))
+        self.assertNotEqual(ask().returncode, 0)
+        self.script.write_text(original)
+
+    def test_capabilities_controls(self):
+        # One mutant per rule: each keeps the matched text and removes the
+        # behaviour, and the row that rule owns turns red.
+        original = self.script.read_text()
+        rows = dict((name, (env, code, out, err)) for name, env, code, out, err in self.capabilities_rows())
+        controls = [("claude-cloud", "channel=session\\tfiles=none", "channel=mailbox\\tfiles=none"),
+                    ("provider-absent", 'line="$("$SCRIPT_DIR/lane-host-ssh" capabilities)"', 'line=""'),
+                    ("provider-absent", '"$status" -eq 2 || ', '"$status" -eq 99 || '),
+                    ("provider-absent-64", '( "$status" -eq 64 && ', '( 1 -eq 0 && '),
+                    ("provider-failed-64", ' && "$words" == *"verb-unsupported verb=capabilities"* )', ' )'),
+                    ("value-unknown", '|| ! capability_allowed "$key" "$value"; then', '|| false; then'),
+                    ("value-spaced", '[[ "$2" == "$allowed" ]]', '[[ " $values " == *" $2 "* ]]')]
+        for row, rule, removed in controls:
+            with self.subTest(control=row):
+                self.assertEqual(original.count(rule), 1)
+                self.script.write_text(original.replace(rule, removed))
+                env, code, out, err = rows[row]
+                result = self.run_host("capabilities", **env)
+                self.assertNotEqual((result.returncode, result.stdout, result.stderr), (code, out, err))
+        self.script.write_text(original)
+        # lane-host-ssh's own verb: printing no line fails the absent rows.
+        ssh = self.script.parent / "lane-host-ssh"
+        ssh_text = ssh.read_text()
+        self.assertEqual(ssh_text.count("        print(CAPABILITIES)\n"), 1)
+        ssh.write_text(ssh_text.replace("        print(CAPABILITIES)\n", "        pass\n"))
+        env, code, out, err = rows["provider-absent"]
+        self.assertNotEqual(self.run_host("capabilities", **env).stdout, out)
+        ssh.write_text(ssh_text)
+        rule = "  claude-cloud:*)\n"
+        self.assertEqual(original.count(rule), 1)
+        self.script.write_text(original.replace(rule, "  claude-cloud:never)\n"))
+        refused = self.run_host("cat", "--item", "TEST-1", ORCH_LANE_HOST="claude-cloud")
+        self.assertNotEqual((refused.returncode, refused.stderr),
+                            (2, b"lane-host: host-kind-verb kind=claude-cloud verb=cat\n"))
+        self.script.write_text(original)
+
     def test_inert_help(self):
         (self.root / ".env.local").write_text("exit 91\n")
         self.assertEqual(self.run_host("--help").returncode, 0)
     def test_dispatch_protocol(self):
         original = self.script.read_text()
-        rule = "  create|wait|cat|put|append|touch|status|stop|stop-sandbox|start|close|list|accounts)"
+        rule = "  capabilities|create|wait|cat|put|append|touch|status|stop|stop-sandbox|start|close|list|accounts)"
         self.assertEqual(original.count(rule), 1)
         protocol = [(("stop", "--item", "TEST-1", "--harness", "claude"), (0, True)),
                     (("status", "--item", "TEST-1", "--harness", "claude"), (0, True)),
@@ -212,7 +311,7 @@ class LaneHostCallersTests(unittest.TestCase):
     provider verb is a call outside the bound."""
     # A provider verb, or the caller's own argv forwarded whole, which is how
     # open-terminal's host_transport hands its verbs on.
-    VERB = re.compile(r"(?:create|wait|cat|put|append|touch|status|stop|stop-sandbox|start|close|list|accounts|\$@)")
+    VERB = re.compile(r"(?:capabilities|create|wait|cat|put|append|touch|status|stop|stop-sandbox|start|close|list|accounts|\$@)")
     # Keywords, `!`, environment assignments and optional argv prefixes, then
     # the command word and the word after it. A prefix is an array expanded
     # whole, `${X[@]+"${X[@]}"}` or `"${X[@]}"`, such as the github skill's
