@@ -4,6 +4,7 @@ import { appendFileSync, existsSync } from "node:fs";
 import { rm, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { liveOwner, type SessionOwner } from "./live-sessions.js";
 import { piUserDir } from "./package-config.js";
 import { canonicalPath } from "./paths.js";
 import { forEachSessionJsonlLine } from "./session-lines.js";
@@ -110,18 +111,45 @@ export function renameSession(path: string, name: string): void {
 	}
 }
 
-export async function deleteSessionFile(
-	sessionPath: string,
-	cwd: string,
-	sessionId?: string,
-): Promise<{ ok: boolean; method: "trash" | "unlink"; error?: string }> {
+type DeleteMethod = "trash" | "unlink";
+
+/** A failed delete keeps the session file. `live` is a session another running
+ * Pi owns; `owner-check` is a failure to read who owns it. */
+export type DeleteResult =
+	| { ok: true; method: DeleteMethod }
+	| { ok: false; method: DeleteMethod; error: string }
+	| { ok: false; method: "live"; owner: SessionOwner; error: string }
+	| { ok: false; method: "owner-check"; error: string };
+
+/** The refusal for a session another running Pi owns, or for an owner check
+ * that failed; undefined when no running Pi owns it. */
+async function ownerRefusal(sessionPath: string, sessionId: string): Promise<DeleteResult | undefined> {
+	let owner: SessionOwner | undefined;
+	try {
+		owner = await liveOwner(sessionPath, sessionId);
+	} catch (error) {
+		return { ok: false, method: "owner-check", error: `could not check whether a running Pi owns the session: ${error instanceof Error ? error.message : String(error)}` };
+	}
+	if (owner) return { ok: false, method: "live", owner, error: `open in the running Pi at ${owner.cwd} (pid ${owner.pid}); the session file was kept` };
+	return undefined;
+}
+
+export async function deleteSessionFile(sessionPath: string, cwd: string, sessionId?: string): Promise<DeleteResult> {
 	const id = sessionId && sessionId.trim() ? sessionId.trim() : sessionIdFromPath(sessionPath);
 
-	let primary: { ok: boolean; method: "trash" | "unlink"; error?: string } | undefined;
+	const claimed = await ownerRefusal(sessionPath, id);
+	if (claimed) return claimed;
+
+	let primary: DeleteResult | undefined;
 	if (settingBoolean("deleteUsesTrash", true, cwd)) {
 		const outcome = await runTrash(sessionPath);
 		if (outcome === "trashed" || !existsSync(sessionPath)) primary = { ok: true, method: "trash" };
 		else if (outcome === "timed-out") return { ok: false, method: "trash", error: `trash did not finish within ${TRASH_TIMEOUT_MS / 1000} s; the session file was kept` };
+		else {
+			// Another Pi may have resumed the session while `trash` ran.
+			const claimedDuringTrash = await ownerRefusal(sessionPath, id);
+			if (claimedDuringTrash) return claimedDuringTrash;
+		}
 	}
 
 	if (!primary) {
