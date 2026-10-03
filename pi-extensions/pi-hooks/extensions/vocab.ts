@@ -103,6 +103,30 @@ export function claudeSessionSource(reason: string): string {
 	return CLAUDE_SESSION_SOURCES.get(reason.trim().toLowerCase()) ?? reason.trim();
 }
 
+/**
+ * Pi's `session_shutdown` reasons said the way Claude Code's `SessionEnd`
+ * payload says them, for the matcher and the `reason` a hook body reads.
+ * Claude Code sends `clear|resume|logout|prompt_input_exit|other`.
+ *
+ * `new` and `fork` end a session for another inside the same process, Claude
+ * Code's `clear`; `resume` and `reload` end it for a resumed one, its
+ * `resume`; and `quit` is the person leaving Pi, its `prompt_input_exit`.
+ * Pi has no `logout` ending.
+ */
+const CLAUDE_SESSION_END_REASONS = new Map<string, string>([
+	["new", "clear"],
+	["fork", "clear"],
+	["resume", "resume"],
+	["reload", "resume"],
+	["quit", "prompt_input_exit"],
+]);
+
+/** The session's end reason as a `SessionEnd` hook spells it. A reason Pi adds
+ * and this table has not learned keeps its own word, as a start reason does. */
+export function claudeSessionEndReason(reason: string): string {
+	return CLAUDE_SESSION_END_REASONS.get(reason.trim().toLowerCase()) ?? reason.trim();
+}
+
 /** Public session-start vocabulary for extension consumers. */
 export const PI_SESSION_REASONS = ["startup", "reload", "new", "resume", "fork"];
 
