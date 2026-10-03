@@ -689,7 +689,7 @@ resolve_team_id() {
     local team_ref="$1"
 
     # Check if it's already a UUID
-    if [[ "$team_ref" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+    if [[ "$team_ref" =~ $LINEAR_UUID_PATTERN ]]; then
         echo "$team_ref"
         return 0
     fi
@@ -759,23 +759,40 @@ resolve_state_id() {
 }
 
 # Resolve label name to UUID
-# Usage: resolve_label_id "backend" ["issue-team-name"]
-# With an issue team, only that team's labels and workspace labels can match.
-# Exit 1 = the workspace has no such label (a caller handling several labels may
-# skip it). Exit 2 = the lookup itself failed, so whether the label exists is
+# Usage: resolve_label_id "backend" team-id|team-name "issue-team"
+# Only that team's labels and workspace labels can match. Two teams can each
+# own a label of one name, and an unscoped lookup returns whichever the API
+# lists first, which Linear refuses as another team's label. The caller says
+# which form its team is in: resolve_team_id alone decides whether a reference
+# is an id or a name, so this function never guesses.
+# Exit 1 = no label of that name in scope, with nothing printed: the caller
+# names the miss, because whether it is a warning (a create skips the label) or
+# a refusal (an update replaces the whole set) is the caller's decision.
+# Exit 2 = the lookup itself failed, so whether the label exists is
 # unknown — a caller rebuilding a label set must abort rather than drop it,
 # because "not found" and "could not ask" produce the same empty result.
 resolve_label_id() {
-    local label_name="$1"
-    local team_name="${2:-}"
+    local label_name="$1" scope="$2" team="$3"
 
-    local query='query GetLabel($name: String!) { issueLabels(filter: {name: {eq: $name}}) { nodes { id } } }'
-    local vars result
-    if [ -n "$team_name" ]; then
+    local query team_var
+    case "$scope" in
+    team-id)
+        team_var=teamId
+        query='query GetLabel($name: String!, $teamId: ID!) { issueLabels(filter: {name: {eq: $name}, or: [{team: {id: {eq: $teamId}}}, {team: {null: true}}]}) { nodes { id } } }'
+        ;;
+    team-name)
+        team_var=teamName
         query='query GetLabel($name: String!, $teamName: String!) { issueLabels(filter: {name: {eq: $name}, or: [{team: {name: {eq: $teamName}}}, {team: {null: true}}]}) { nodes { id } } }'
-    fi
-    vars=$(jq -cn --arg name "$label_name" --arg teamName "$team_name" \
-        '{name: $name} + (if $teamName == "" then {} else {teamName: $teamName} end)') || return 2
+        ;;
+    *)
+        jq -cn --arg scope "$scope" \
+            '{error: ("resolve_label_id: unknown team scope " + ($scope | tojson) + "; callers pass team-id or team-name")}' >&2
+        return 2
+        ;;
+    esac
+    local vars result
+    vars=$(jq -cn --arg name "$label_name" --arg key "$team_var" --arg team "$team" \
+        '{name: $name, ($key): $team}') || return 2
     if ! result=$(graphql_query "$query" "$vars"); then
         jq -cn --arg name "$label_name" \
             '{error: ("Label lookup failed for " + ($name | tojson) + ": Linear API request failed (see previous error)")}' >&2
@@ -784,15 +801,7 @@ resolve_label_id() {
     local label_id
     label_id=$(echo "$result" | jq -r '.issueLabels.nodes[0].id // empty') || return 2
 
-    if [ -z "$label_id" ]; then
-        if [ -n "$team_name" ]; then
-            jq -cn --arg team "$team_name" --arg label "$label_name" \
-                '{error: ("Label not found for team " + ($team | tojson) + ": " + ($label | tojson))}' >&2
-        else
-            echo "Warning: Label not found: '$label_name'" >&2
-        fi
-        return 1
-    fi
+    [ -n "$label_id" ] || return 1
 
     echo "$label_id"
 }
