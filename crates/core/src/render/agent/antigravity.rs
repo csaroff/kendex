@@ -1,14 +1,14 @@
 use super::{EffectiveAgent, GENERATED_BANNER, RenderedAgent, hooks_prose, skills_prose};
-use crate::harness::models::resolve_model;
+use crate::harness::models::render_model;
 use crate::model::HarnessId;
 use crate::render::permission::PermissionIntent;
 use crate::render::vocab::{antigravity_tool_name, rewrite_prose};
 use crate::render::{RenderWarning, yaml_quoted, yaml_scalar};
 
 /// Antigravity custom agent: YAML frontmatter + markdown body, saved as
-/// `<name>.md`. `name` and `description` are required; `model` is a tier
-/// of the loader's own (`inherit`, `flash`, `pro`) and is written only
-/// when a tier was asked for; `subagent: true` lets the primary agent
+/// `<name>.md`. `name` and `description` are required; explicit native
+/// `flash` and `pro` selectors write `model`, while classes and inherit
+/// omit it; `subagent: true` lets the primary agent
 /// delegate to it; `tools` is an allowlist of Antigravity's own tool names,
 /// and a name it has no word for is left out rather than written, since
 /// the loader documents that an unknown name there can hang the subagent
@@ -25,8 +25,8 @@ pub fn generate(agent: &EffectiveAgent) -> RenderedAgent {
 
     push(format!("name: {}", yaml_scalar(&source.name)));
     push(format!("description: {}", yaml_quoted(&source.description)));
-    let model = agent.overrides.model.as_deref().unwrap_or(&source.model);
-    let resolved = resolve_model(HarnessId::Antigravity, model);
+    let model = agent.model_request();
+    let resolved = render_model(HarnessId::Antigravity, model, &agent.model_classes);
     warnings.extend(resolved.warning.map(RenderWarning::new));
     if let Some(id) = &resolved.id {
         push(format!("model: {}", yaml_scalar(id)));
@@ -115,6 +115,7 @@ mod tests {
 
     fn effective<'a>(source: &'a SourceAgent, scope: &'a Scope) -> EffectiveAgent<'a> {
         EffectiveAgent {
+            model_classes: Default::default(),
             source,
             harness: HarnessId::Antigravity,
             scope,
@@ -132,18 +133,18 @@ mod tests {
     }
 
     #[test]
-    fn a_tier_is_the_loaders_own_and_inherit_leaves_the_key_out() {
+    fn classes_and_inherit_leave_the_native_model_key_out() {
         let scope = Scope::Project {
             root: "/tmp/proj".into(),
         };
         let pro = generate(&effective(&source("opus"), &scope)).text;
-        assert!(pro.starts_with("---\nname: rust\ndescription: \"Rust \\\"systems\\\" engineer\"\nmodel: pro\nsubagent: true\n---\n"), "{pro}");
+        assert!(pro.starts_with("---\nname: rust\ndescription: \"Rust \\\"systems\\\" engineer\"\nsubagent: true\n---\n"), "{pro}");
         assert!(!pro.contains("effort"), "{pro}");
         assert!(pro.contains("- dev: .agents/skills/dev/SKILL.md"));
         let inherited = generate(&effective(&source("inherit"), &scope)).text;
         assert!(!inherited.contains("model:"), "{inherited}");
         let flash = generate(&effective(&source("haiku"), &scope)).text;
-        assert!(flash.contains("model: flash\n"), "{flash}");
+        assert!(!flash.contains("model:"), "{flash}");
     }
 
     /// The allowlist arrives in Claude's names and leaves in Antigravity's;

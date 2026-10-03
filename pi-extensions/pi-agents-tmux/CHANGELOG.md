@@ -2,6 +2,11 @@
 
 ## Consumer-impacting changes
 
+### 3.4.0
+
+- Both child launch forms resolve model classes through kendex with the active Pi model registry. Unknown model facts preserve the native parent or default model.
+- Agents with no model and parent-model settings retain inheritance. The start and send commands use the active registry. OpenRouter model IDs retain their vendor path. Exact pins keep their provider.
+
 ### 3.3.3
 
 - A parallel sub-agent that fails with a long error returns its error within `resultMaxBytes` and `resultMaxLines`, as single and chain calls already do. The full error stays in the saved full-output file.
