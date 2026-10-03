@@ -409,7 +409,7 @@ for row in "${RESOLVE_ROWS[@]}"; do
 done
 # Control: a resolution that never reads the range command names full for the
 # project that sets one.
-mutant mutant-resolve-full 'validate_mode=range' 'validate_mode=full'
+mutant mutant-resolve-full $'  else\n    validate_mode=range' $'  else\n    validate_mode=full'
 run_script "$MUTANT" --resolve-mode --worktree "$TMP_ROOT/proj-resolve-1"
 assert_eq "$OUT" "validate-mode=full" \
   "control: with the range command unread the project that sets one resolves to full" "$ERR"
@@ -644,6 +644,9 @@ case "$STUB_ANSWER" in
   exit-2) echo "wiring-error: cause=stub" >&2; exit 2 ;;
   *) printf '%s\n' "$STUB_ANSWER" ;;
 esac
+# The classifier's own measured marker, where the row names one.
+[[ -z "${STUB_MEASURED:-}" ]] \
+  || printf 'class: class=%s measured=%s cause=stub\n' "${STUB_ANSWER#change_class=}" "$STUB_MEASURED" >&2
 SH
 cat > "$LAYOUT/harness-ci/scripts/harness-only" <<'SH'
 #!/usr/bin/env bash
@@ -746,6 +749,127 @@ assert_eq "$(output_of "$OUT" 2>/dev/null) $(sed -n 's/^state=started .* cap-sec
   "no classifier runs the whole battery, naming the absence" "$ERR"
 mv "$LAYOUT/harness-ci.off" "$LAYOUT/harness-ci"
 
+# --- A ci request runs nothing where the class says CI covers the change -------
+# Projects whose range command prints that it ran, one with a workflow at
+# HEAD and one with none. Each row's run is a ci request; the classifier stub
+# answers the class, the docs verdict and the measured marker.
+ci_proj() { # NAME WORKFLOW(yes|no)
+  local dir
+  dir="$(make_mode_proj "$1" 'echo range')"
+  printf 'tmp/\n' > "$dir/.gitignore"
+  # Both projects hold a .github file outside workflows/, so a read of all of
+  # .github finds a workflow in each.
+  mkdir -p "$dir/.github"
+  printf 'notes\n' > "$dir/.github/copilot-instructions.md"
+  if [[ "$2" == yes ]]; then
+    mkdir -p "$dir/.github/workflows"
+    printf 'on: pull_request\n' > "$dir/.github/workflows/ci.yml"
+  fi
+  git -C "$dir" add -A
+  git -C "$dir" -c user.name=t -c user.email=t@example.com commit -q -m ignore
+  git -C "$dir" update-ref refs/remotes/origin/main HEAD
+  printf '%s\n' "$dir"
+}
+proj_ci="$(ci_proj proj-ci yes)"
+proj_ci_none="$(ci_proj proj-ci-none no)"
+ci_head="$(git -C "$proj_ci" rev-parse HEAD)"
+# label|workflow at HEAD|classifier answer|docs answer|measured|verdict and what the command printed|recorded mode
+CI_ROWS=(
+  "a measured micro diff is left to CI|yes|change_class=micro|false|true|state=done guard-exit=0 validate=pass |ci"
+  "a measured small diff is left to CI|yes|change_class=small|false|true|state=done guard-exit=0 validate=pass |ci"
+  "a measured standard diff is left to CI|yes|change_class=standard|false|true|state=done guard-exit=0 validate=pass |ci"
+  "a project with no workflow runs the range command|no|change_class=standard|false|true|state=done guard-exit=0 validate=pass range|range"
+  "a render diff, whose checks CI stands down, runs the range command|yes|change_class=render|false|true|state=done guard-exit=0 validate=pass range|range"
+  "a trivial diff outside the docs set runs the range command|yes|change_class=trivial|false|true|state=done guard-exit=0 validate=pass range|range"
+  "a standard diff of docs alone runs the range command|yes|change_class=standard|true|true|state=done guard-exit=0 validate=pass range|range"
+  "a standard class the classifier fell back to runs the range command|yes|change_class=standard|false|false|state=done guard-exit=0 validate=pass range|range"
+  "a class with no measured marker runs the range command|yes|change_class=micro|false||state=done guard-exit=0 validate=pass range|range"
+  "a docs verdict that did not read runs the range command|yes|change_class=micro|exit-2|true|state=done guard-exit=0 validate=pass range|range"
+)
+# ci_rows SCRIPT — one line per row: its label, its stderr file, then the
+# verdict, what the command printed and the recorded mode, tab-separated.
+ci_rows() {
+  local row label workflow answer docs measured proj ci_dir
+  for row in "${CI_ROWS[@]}"; do
+    IFS='|' read -r label workflow answer docs measured _ _ <<<"$row"
+    proj="$proj_ci"
+    [[ "$workflow" == yes ]] || proj="$proj_ci_none"
+    STUB_ANSWER="$answer" STUB_DOCS="$docs" STUB_MEASURED="$measured" \
+      run_script "$1" --worktree "$proj" --poll 1 --validate-mode ci --base HEAD
+    ci_dir="$(run_dir_of "$OUT")"
+    printf '%s\t%s\t%s %s|%s\n' "$label" "$ERR" "$(verdict_of "$OUT")" "$(output_of "$OUT" 2>/dev/null)" \
+      "$(start_line "$ci_dir" validate-mode 2>/dev/null)"
+  done
+}
+CI_SCRIPT="$LAYOUT/orch/scripts/dev-validate-run"
+CI_GOT="$(ci_rows "$CI_SCRIPT")"
+for row in "${CI_ROWS[@]}"; do
+  IFS='|' read -r label _ _ _ _ want_out want_mode <<<"$row"
+  got_line="$(awk -F'\t' -v want="$label" '$1 == want' <<<"$CI_GOT")"
+  IFS=$'\t' read -r _ err got <<<"$got_line"
+  assert_eq "$got" "$want_out|$want_mode" "$label" "$err"
+done
+# The ci run's record, its wait and its exit: no command ran, so no time passed.
+STUB_ANSWER=change_class=micro STUB_DOCS=false STUB_MEASURED=true \
+  run_script "$CI_SCRIPT" --worktree "$proj_ci" --poll 1 --validate-mode ci --base HEAD
+ci_dir="$(run_dir_of "$OUT")"
+assert_eq "$RC $(sed -n 2p <<<"$OUT" | sed 's/ at=[^ ]* / at=T /')" \
+  "0 state=done guard-exit=0 at=T validate=pass run-dir=$ci_dir log=$ci_dir/log" \
+  "a ci run passes, and its done line names the run directory and the log" "$ERR"
+run_script "$CI_SCRIPT" --record --run-dir "$ci_dir"
+assert_eq "$(sed -E 's/started-at=[^ ]+ ended-at=[^ ]+$/started-at=T ended-at=T/' <<<"$OUT")" \
+  "validate-mode=ci selection=unreported verdict=pass head=$ci_head start=$(start_of "$ci_dir") seconds=0 started-at=T ended-at=T" \
+  "its record names the ci mode, a pass, the HEAD it started at and no wall time" "$ERR"
+# Under --attached a ci run still prints its started line first, then the done
+# line, since no child runs to print it before.
+STUB_ANSWER=change_class=micro STUB_DOCS=false STUB_MEASURED=true \
+  run_script "$CI_SCRIPT" --worktree "$proj_ci" --poll 1 --validate-mode ci --base HEAD --attached
+assert_eq "$RC $(sed -n 1p <<<"$OUT" | cut -d' ' -f1) $(verdict_of "$OUT")" \
+  "0 state=started state=done guard-exit=0 validate=pass" \
+  "an attached ci run prints its started line, then its done line" "$ERR"
+cp -p -- "$CI_SCRIPT" "$CI_SCRIPT.mutant"
+mutate_file "$CI_SCRIPT.mutant" '[[ "$attached" == true && "$validate_mode" != ci ]]' '[[ "$attached" == true ]]'
+STUB_ANSWER=change_class=micro STUB_DOCS=false STUB_MEASURED=true \
+  run_script "$CI_SCRIPT.mutant" --worktree "$proj_ci" --poll 1 --validate-mode ci --base HEAD --attached
+assert_eq "$(sed -n 1p <<<"$OUT" | cut -d' ' -f1)" "state=done" \
+  "control: an attached ci run that skips its started line opens on the done line" "$ERR"
+# One control per rule the ci route holds: each mutant copy sits beside the
+# stubbed classifier and leaves to CI the one row that rule keeps local.
+ci_control() { # LABEL ANCHOR REPLACEMENT ROW
+  local got_line got
+  cp -p -- "$CI_SCRIPT" "$CI_SCRIPT.mutant"
+  mutate_file "$CI_SCRIPT.mutant" "$2" "$3"
+  got_line="$(ci_rows "$CI_SCRIPT.mutant" | awk -F'\t' -v want="$4" '$1 == want')"
+  IFS=$'\t' read -r _ _ got <<<"$got_line"
+  assert_eq "$got" "state=done guard-exit=0 validate=pass |ci" "control: with $1, '$4' fails"
+}
+ci_control 'the workflow read dropped' '-n "$workflows" && ' '' \
+  'a project with no workflow runs the range command'
+ci_control 'render among the covered classes' \
+  'micro|small|standard) validate_mode=ci' 'micro|small|standard|render) validate_mode=ci' \
+  'a render diff, whose checks CI stands down, runs the range command'
+ci_control 'the docs verdict unread' ' && "$docs_only" == false ]]' ' ]]' \
+  'a standard diff of docs alone runs the range command'
+ci_control 'the measured marker unread' ' && "$CHANGE_CLASS_MEASURED" == true' '' \
+  'a standard class the classifier fell back to runs the range command'
+ci_control 'the class fallback unread' '-z "$class_fallback" && ' '' \
+  'a docs verdict that did not read runs the range command'
+# A ci run left to CI reads neither command, so a project that sets neither
+# passes it. Control: resolving the range mode first, as a range run does,
+# reads the empty DEV_VALIDATE_CMD and refuses.
+printf '[env]\nDEV_VALIDATE_TIMEOUT_SECS = "20"\n' > "$proj_ci/kendex.settings.toml"
+cp -p -- "$CI_SCRIPT" "$CI_SCRIPT.mutant"
+mutate_file "$CI_SCRIPT.mutant" '[[ "$validate_mode" == ci ]] || resolve_range_mode' 'resolve_range_mode'
+STUB_ANSWER=change_class=micro STUB_DOCS=false STUB_MEASURED=true \
+  run_script "$CI_SCRIPT" --worktree "$proj_ci" --poll 1 --validate-mode ci --base HEAD
+assert_eq "$RC $(verdict_of "$OUT")" "0 state=done guard-exit=0 validate=pass" \
+  "a ci run left to CI in a project that sets no command passes" "$ERR"
+STUB_ANSWER=change_class=micro STUB_DOCS=false STUB_MEASURED=true \
+  run_script "$CI_SCRIPT.mutant" --worktree "$proj_ci" --poll 1 --validate-mode ci --base HEAD
+assert_eq "$RC $(sed -n 1p <"$ERR")" "2 dev-validate-run: empty-validate-cmd setting=DEV_VALIDATE_CMD" \
+  "control: a ci run that resolves the range mode first is refused" "$ERR"
+rm -f -- "${CI_SCRIPT:?}.mutant"
+
 # --- The real classifier weighs uncommitted render edits -----------------------
 # dev-implement validates before it commits, so the runner hands the
 # classifier a snapshot commit of the worktree as the range's head, and
@@ -790,8 +914,9 @@ printf 'started-at=2026-01-01T00:00:00Z\nended-at=2026-01-01T00:55:00Z\nseconds=
 printf 'started-at=2026-01-01 00:00:00\nended-at=2026-01-01T00:55:00Z\nseconds=3300\n' > "$TMP_ROOT/badstart/timing"
 printf 'started-at=2026-01-01T00:00:00Z\nended-at=soon\nseconds=3300\n' > "$TMP_ROOT/badend/timing"
 MODE_REFUSALS=(
-  "a validation mode outside the two is refused, naming it|--worktree $proj_refuse --validate-mode fast|dev-validate-run: invalid-mode option=--validate-mode value=fast"
+  "a validation mode outside the three is refused, naming it|--worktree $proj_refuse --validate-mode fast|dev-validate-run: invalid-mode option=--validate-mode value=fast"
   "a range run with no base is refused|--worktree $proj_refuse --validate-mode range|dev-validate-run: required option=--base validate-mode=range"
+  "a ci run with no base is refused|--worktree $proj_refuse --validate-mode ci|dev-validate-run: required option=--base validate-mode=ci"
   "a base handed to a full run is refused, never silently dropped|--worktree $proj_refuse --base HEAD|dev-validate-run: option-unused option=--base validate-mode=full"
   "a base that names no commit is refused, naming it|--worktree $proj_refuse --validate-mode range --base no-such-ref|dev-validate-run: invalid-base base=no-such-ref"
   "a validation mode handed to the waiter is refused|--wait --run-dir $stale --validate-mode range|dev-validate-run: option-unused option=--validate-mode mode=wait"
