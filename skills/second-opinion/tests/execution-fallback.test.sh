@@ -17,6 +17,9 @@ Claude usage-limit banner with empty stdout falls through|refusal:codex=claude-b
 incomplete answer on stdout does not outrank a quota code on stderr|refusal:codex=insufficient_quota codex:partial|review|rc=0 [{\"name\":\"codex\",\"cause\":\"quota\",\"timed\":true},{\"name\":\"claude\",\"cause\":\"answered\",\"timed\":true}] order=codex,claude calls=1,1,0
 usable answer on stdout outranks a quota code on stderr|refusal:codex=insufficient_quota|review|rc=0 [{\"name\":\"codex\",\"cause\":\"answered\",\"timed\":true}] order=codex calls=1,0,0
 execution failure during the existing format retry falls through|codex:junk retry-exit:codex=7 inline:claude=1|review|rc=0 [{\"name\":\"codex\",\"cause\":\"answered\",\"timed\":true},{\"name\":\"codex\",\"cause\":\"exit-7\",\"timed\":true},{\"name\":\"claude\",\"cause\":\"answered\",\"timed\":true}] order=codex,codex,claude calls=2,1,0|review-fallback
+a fall-through answer passes the first-response gate|codex:junk retry-exit:codex=7 claude:flagged-envelope|review|rc=5 [{\"name\":\"codex\",\"cause\":\"answered\",\"timed\":true},{\"name\":\"codex\",\"cause\":\"exit-7\",\"timed\":true},{\"name\":\"claude\",\"cause\":\"result-success\",\"timed\":true}] order=codex,codex,claude calls=2,1,0|envelope-cause
+a fall-through exit passes the first-response gate|models:codex+claude codex:junk retry-exit:codex=7 exit:claude=8|review|rc=5 [{\"name\":\"codex\",\"cause\":\"answered\",\"timed\":true},{\"name\":\"codex\",\"cause\":\"exit-7\",\"timed\":true},{\"name\":\"claude\",\"cause\":\"exit-8\",\"timed\":true}] order=codex,codex,claude calls=2,1,0
+a fall-through empty answer passes the first-response gate|models:codex+claude codex:junk retry-exit:codex=7 claude:empty|review|rc=5 [{\"name\":\"codex\",\"cause\":\"answered\",\"timed\":true},{\"name\":\"codex\",\"cause\":\"exit-7\",\"timed\":true},{\"name\":\"claude\",\"cause\":\"answered\",\"timed\":true}] order=codex,codex,claude calls=2,1,0
 replacement review receives its own format retry|codex:junk retry-exit:codex=7 claude:junk retry:claude=clean inline:claude=1|review|rc=0 [{\"name\":\"codex\",\"cause\":\"answered\",\"timed\":true},{\"name\":\"codex\",\"cause\":\"exit-7\",\"timed\":true},{\"name\":\"claude\",\"cause\":\"answered\",\"timed\":true},{\"name\":\"claude\",\"cause\":\"answered\",\"timed\":true}] order=codex,codex,claude,claude calls=2,2,0|review-fallback
 replacement audit receives its own format retry|codex:junk retry-exit:codex=7 claude:junk retry:claude=clean|audit|rc=0 [{\"name\":\"codex\",\"cause\":\"answered\",\"timed\":true},{\"name\":\"codex\",\"cause\":\"exit-7\",\"timed\":true},{\"name\":\"claude\",\"cause\":\"answered\",\"timed\":true},{\"name\":\"claude\",\"cause\":\"answered\",\"timed\":true}] order=codex,codex,claude,claude calls=2,2,0|audit-fallback
 union keeps the format retry invocation|count:2 codex:junk retry:codex=clean|review|rc=0 [{\"name\":\"codex\",\"cause\":\"answered\",\"timed\":true},{\"name\":\"codex\",\"cause\":\"answered\",\"timed\":true},{\"name\":\"claude\",\"cause\":\"answered\",\"timed\":true}] order=codex,codex,claude calls=2,1,0
@@ -40,6 +43,7 @@ while IFS='|' read -r label world command expected prompt; do
   case "$prompt" in
     review-fallback) assert_eq "$(request_state claude 1)" '{"inline_diff":true,"repair":false,"audit_original":false}' "$label: replacement receives its own diff and original request" ;;
     audit-fallback) assert_eq "$(request_state claude 1)" '{"inline_diff":false,"repair":false,"audit_original":true}' "$label: replacement receives the original audit request" ;;
+    envelope-cause) assert_eq "$(jq -r .cause_source < "$ROW/out/out.json.failed.json")" 'claude result' "$label: the replacement's result envelope is the cause" ;;
   esac
   if [[ "$world" == exit:codex=7* && "$prompt" == review-fallback ]]; then
     assert_eq "$(jq '.qa_metadata.selected_count' < "$ROW/out/out.json")" 2 "$label: attempted eligible targets counted"
@@ -82,21 +86,27 @@ child invocation history|count:2 codex:junk retry:codex=clean|history|3
 attempted target count|exit:codex=7|selected|2
 stdout failure cause|exit:codex=7 failure-stdout:codex=login-required|cause|login-required
 stdout answer outranks stderr|refusal:codex=insufficient_quota|answer|rc=0 [{"name":"codex","cause":"answered","timed":true}] order=codex calls=1,0,0
+fall-through first-response gate|codex:junk retry-exit:codex=7 claude:flagged-envelope|gate|rc=5 [{"name":"codex","cause":"answered","timed":true},{"name":"codex","cause":"exit-7","timed":true},{"name":"claude","cause":"result-success","timed":true}] order=codex,codex,claude calls=2,1,0
+fall-through exit first-response gate|models:codex+claude codex:junk retry-exit:codex=7 exit:claude=8|gate|rc=5 [{"name":"codex","cause":"answered","timed":true},{"name":"codex","cause":"exit-7","timed":true},{"name":"claude","cause":"exit-8","timed":true}] order=codex,codex,claude calls=2,1,0
+fall-through empty-answer first-response gate|models:codex+claude codex:junk retry-exit:codex=7 claude:empty|gate|rc=5 [{"name":"codex","cause":"answered","timed":true},{"name":"codex","cause":"exit-7","timed":true},{"name":"claude","cause":"answered","timed":true}] order=codex,codex,claude calls=2,1,0
 '
+n=0
 while IFS='|' read -r label world rule correct; do
   [[ -n "$label" ]] || continue
+  n=$((n + 1))
   # shellcheck disable=SC2086 # fixture words are a list
-  build "control-$rule" $DEFAULTS $world
+  build "control-$n-$rule" $DEFAULTS $world
   case "$rule" in
     rebuild) mutate_script "$SO" '      PROMPT=$(build_review_prompt)' '      : '\''PROMPT=$(build_review_prompt)'\'' ' ;;
     reset) mutate_script "$SO" '    invocation_prompt="$PROMPT_TMP"' '    : '\''invocation_prompt="$PROMPT_TMP"'\'' ' ;;
-    recovery) mutate_script "$SO" '      if [[ "$TARGET_CLI" != "$RECOVERY_TARGET" && $EXIT_CODE -eq 0 ]]; then' '      if false; then # "$TARGET_CLI" != "$RECOVERY_TARGET" && $EXIT_CODE -eq 0' ;;
+    recovery) mutate_script "$SO" '      if [[ "$TARGET_CLI" != "$RECOVERY_TARGET" ]]; then' '      if false; then # "$TARGET_CLI" != "$RECOVERY_TARGET"' ;;
     history) mutate_script "$SO" '      lane_attempts=$(jq -ce '\''.qa_metadata.attempts | select(type == "array")'\'' <<<"$lane_raw" 2>/dev/null) || lane_attempts=""' '      lane_attempts="" # lane_attempts=$(jq -ce .qa_metadata.attempts <<<"$lane_raw")' ;;
     selected) mutate_script "$SO" '  SELECTED_COUNT=${#REVIEW_LANES[@]}
   if STAMPED=' '  SELECTED_COUNT=1 # SELECTED_COUNT=${#REVIEW_LANES[@]}
   if STAMPED=' ;;
     cause) mutate_script "$SO" '    CLI_FAILURE_CAUSE=$(printf '\''%s\n'\'' "$partial" | tail -20)' '    : '\''CLI_FAILURE_CAUSE=$(printf "%s\n" "$partial" | tail -20)'\'' ' ;;
-    answer) mutate_script "$SO" '    elif $REVIEW_LIKE && answer_json=$(extract_json "$RESULT") && ! response_incomplete_schema "$answer_json"; then' '    elif false; then # $REVIEW_LIKE && answer_json=$(extract_json "$RESULT") && ! response_incomplete_schema "$answer_json"' ;;
+    answer) mutate_script "$SO" '    elif [[ -z "$RESULT_ENVELOPE_CAUSE" ]] && $REVIEW_LIKE && answer_json=' '    elif false && [[ -z "$RESULT_ENVELOPE_CAUSE" ]] && $REVIEW_LIKE && answer_json=' ;;
+    gate) mutate_script "$SO" '  [[ $invocation_prompt != "$PROMPT_TMP" ]] || gate_first_response' '  [[ $invocation_prompt != "$PROMPT_TMP" ]] || : gate_first_response' ;;
   esac
   got=$(run_fallback review)
   case "$rule" in
@@ -105,7 +115,7 @@ while IFS='|' read -r label world rule correct; do
     history) actual=$(jq '.qa_metadata.attempts | length' < "$ROW/out/out.json") ;;
     selected) actual=$(jq '.qa_metadata.selected_count' < "$ROW/out/out.json") ;;
     cause) actual=$(grep -Fx -- login-required "$ROW/stderr" || true) ;;
-    answer) actual="$got" ;;
+    answer|gate) actual="$got" ;;
   esac
   assert_eq "$([[ "$actual" != "$correct" ]] && printf red || printf green)" red "control: $label turns its assertion red"
 done <<<"$CONTROLS"
