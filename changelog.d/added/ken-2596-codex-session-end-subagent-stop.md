@@ -1,0 +1,1 @@
+- On Codex, kendex now registers `SubagentStop` and `SessionEnd` hooks for every agent in `hooks.json`; before, a custom hook on these events was advisory prose and a package hook installed nothing.
