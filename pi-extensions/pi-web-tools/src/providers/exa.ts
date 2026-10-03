@@ -1,4 +1,5 @@
 import { requireApiKey } from "../utils/auth.js";
+import { requestWithin } from "../utils/deadline.js";
 
 export type ExaDeepType = "deep-reasoning" | "deep-lite" | "deep";
 
@@ -31,6 +32,8 @@ export interface ExaClientOptions {
 	apiKey?: string;
 	baseUrl?: string;
 	fetchImpl?: typeof fetch;
+	/** Deadline of each request, through its body; DEFAULT_DEADLINE_MS when absent. `deepResearch` takes its own. */
+	timeoutMs?: number;
 }
 
 export interface NormalizedExaResult {
@@ -97,25 +100,21 @@ export class ExaClient {
 	private readonly apiKey: string;
 	private readonly baseUrl: string;
 	private readonly fetchImpl: typeof fetch;
+	private readonly timeoutMs: number | undefined;
 
 	constructor(options: ExaClientOptions) {
 		this.apiKey = requireApiKey(options.apiKey, "Exa", "Set EXA_API_KEY or PI_WEB_TOOLS_CONFIG_FILE with exaApiKey.");
 		this.baseUrl = options.baseUrl ?? "https://api.exa.ai";
 		this.fetchImpl = options.fetchImpl ?? fetch;
+		this.timeoutMs = options.timeoutMs;
 	}
 
-	private async post(path: string, body: Record<string, unknown>, signal?: AbortSignal): Promise<any> {
-		const response = await this.fetchImpl(`${this.baseUrl}${path}`, {
+	private post(path: string, body: Record<string, unknown>, signal?: AbortSignal, timeoutMs = this.timeoutMs): Promise<any> {
+		return requestWithin(`Exa ${path}`, `${this.baseUrl}${path}`, {
 			method: "POST",
 			headers: { "content-type": "application/json", "x-api-key": this.apiKey },
 			body: JSON.stringify(body),
-			signal,
-		});
-		if (!response.ok) {
-			const text = await response.text().catch(() => "");
-			throw new Error(`Exa request failed (${response.status}): ${text || response.statusText}`);
-		}
-		return response.json();
+		}, { fetchImpl: this.fetchImpl, signal, timeoutMs });
 	}
 
 	buildSearchBody(params: ExaSearchParams): Record<string, unknown> {
@@ -144,8 +143,8 @@ export class ExaClient {
 		return body;
 	}
 
-	async search(params: ExaSearchParams, signal?: AbortSignal): Promise<NormalizedExaResponse> {
-		const raw = await this.post("/search", this.buildSearchBody(params), signal);
+	async search(params: ExaSearchParams, signal?: AbortSignal, timeoutMs?: number): Promise<NormalizedExaResponse> {
+		const raw = await this.post("/search", this.buildSearchBody(params), signal, timeoutMs);
 		return { answer: synthesized(raw), results: normalizeResults(raw), raw, metadata: { request: this.buildSearchBody(params) } };
 	}
 
@@ -168,8 +167,9 @@ export class ExaClient {
 		return { answer: synthesized(raw), results: normalizeResults(raw), raw, metadata: { url } };
 	}
 
-	async deepResearch(params: ExaSearchParams & { type: ExaDeepType }, signal?: AbortSignal): Promise<NormalizedExaResponse> {
-		return this.search(params, signal);
+	/** A deep search under `timeoutMs`, the research mode's deadline, in place of the client's request deadline. */
+	async deepResearch(params: ExaSearchParams & { type: ExaDeepType }, signal?: AbortSignal, timeoutMs?: number): Promise<NormalizedExaResponse> {
+		return this.search(params, signal, timeoutMs);
 	}
 
 	async codeContext(query: string, tokensNum: number | "dynamic" = "dynamic", signal?: AbortSignal): Promise<{ raw: any; text: string; resultsCount?: number; outputTokens?: number }> {

@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
-import { writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import test, { beforeEach, afterEach } from "node:test";
 import { CALL_BYTE_BUDGET, IN_FLIGHT_BYTE_BUDGET, PDF_READ_BYTE_LIMIT, TEXT_READ_BYTE_LIMIT } from "../src/extract/byte-budget.js";
 import { createWebFetchToolDefinition } from "../src/tools/web-fetch.js";
 import { endWebContentSession, getWebContent } from "../src/storage.js";
-import { tempDir, textOf } from "./fixtures.js";
+import { isolateEnvironment, piExec, sleepingHelper, tempDir, textOf } from "./fixtures.js";
 
 beforeEach(endWebContentSession);
 afterEach(endWebContentSession);
@@ -287,12 +287,31 @@ for (const row of [
 		const observed: unknown[] = [];
 		const tool = createWebFetchToolDefinition({ appendEntry() {} } as any, () => webFetchSettings(), "web_fetch", {
 			extractYouTubeUrl: async (url, options) => {
-				observed.push({ mode: options?.mode, prompt: options?.prompt, language: options?.transcriptLanguage, signal: options?.signal === controller.signal, timeout: options?.timeoutMs });
+				observed.push({ mode: options?.mode, prompt: options?.prompt, language: options?.transcriptLanguage, signal: options?.signal === controller.signal });
 				return { videoId: "abc123XYZ_-", url, title: "Transcript", content: "[00:00:00] Hallo", source: "youtube-captions", metadata: { provider: "youtube-captions" } };
 			},
 		});
 		await tool.execute("test", { url: "https://youtu.be/abc123XYZ_-", videoMode: row.mode, prompt: row.prompt, transcriptLanguage: row.language }, controller.signal, undefined, { cwd: process.cwd() } as any);
-		assert.deepEqual(observed, [{ mode: row.mode, prompt: row.prompt, language: row.language, signal: true, timeout: 120000 }]);
+		assert.deepEqual(observed, [{ mode: row.mode, prompt: row.prompt, language: row.language, signal: true }]);
+	});
+}
+
+for (const { browserCookieAccess, expected } of [
+	{ browserCookieAccess: false, expected: undefined },
+	{ browserCookieAccess: true, expected: { samePi: true, preferredBrowser: "firefox", profile: "work" } },
+]) {
+	test(`web_fetch YouTube understanding reads browser cookies only with browserCookieAccess: ${browserCookieAccess}`, async () => {
+		const pi = { appendEntry() {} } as any;
+		let cookies: unknown = "never called";
+		const tool = createWebFetchToolDefinition(pi, () => ({ ...webFetchSettings(), browserCookieAccess, browserCookies: { preferredBrowser: "firefox", profile: "work" } }), "web_fetch", {
+			extractYouTubeUrl: async (url, options) => {
+				const read = options?.browserCookies;
+				cookies = read && { samePi: read.pi === pi, preferredBrowser: read.preferredBrowser, profile: read.profile };
+				return { videoId: "abc123XYZ_-", url, title: "Video", content: "summary", source: "gemini-api", metadata: { provider: "gemini-api" } };
+			},
+		});
+		await tool.execute("test", { url: "https://youtu.be/abc123XYZ_-", videoMode: "understand" }, undefined, undefined, { cwd: process.cwd() } as any);
+		assert.deepEqual(cookies, expected);
 	});
 }
 
@@ -343,6 +362,35 @@ test("web_fetch preserves AbortError identity", async () => {
 	const tool = createWebFetchToolDefinition({ appendEntry() {} } as any, () => webFetchSettings(), "web_fetch", { extractYouTubeUrl: async () => { throw abort; } });
 	await assert.rejects(() => tool.execute("test", { url: "https://youtu.be/abc123XYZ_-", videoMode: "transcript" }, undefined, undefined, { cwd: process.cwd() } as any), (error) => error === abort);
 });
+
+for (const row of [
+	{ name: "pdftotext", ocr: false },
+	{ name: "pdftoppm", ocr: true },
+]) {
+	test(`web_fetch on a local PDF cancelled while ${row.name} runs rejects with the cancellation and stores nothing`, { timeout: 10_000 }, async (t) => {
+		const path = process.env.PATH;
+		isolateEnvironment(t, ["PATH"]);
+		const cwd = tempDir(t);
+		const bin = join(cwd, "bin");
+		mkdirSync(bin);
+		// A PDF with no text layer: pdftotext and the basic parser find nothing, so the OCR run starts when it is enabled.
+		writeFileSync(join(cwd, "scan.pdf"), "%PDF-1.4\n");
+		writeFileSync(join(bin, "pdfinfo"), "#!/bin/sh\nprintf 'Pages: 1\\n'\n");
+		writeFileSync(join(bin, "pdftotext"), "#!/bin/sh\nexit 1\n");
+		chmodSync(join(bin, "pdfinfo"), 0o755);
+		chmodSync(join(bin, "pdftotext"), 0o755);
+		const helper = sleepingHelper(bin, row.name, 30);
+		process.env.PATH = `${bin}:${path}`;
+		let stored = 0;
+		const tool = createWebFetchToolDefinition({ appendEntry() { stored++; }, exec: piExec.exec } as any, () => ({ ...webFetchSettings(), pdfOcr: { enabled: row.ocr, maxPages: 1, dpi: 150 } }), "web_fetch");
+		const controller = new AbortController();
+		const abort = new DOMException("cancelled", "AbortError");
+		const pending = tool.execute("test", { filePath: "scan.pdf" }, controller.signal, undefined, { cwd } as any).then(() => undefined, (error: unknown) => error);
+		while (!existsSync(`${helper.path}.args`)) await new Promise((resolve) => setTimeout(resolve, 10)); // the helper has started
+		controller.abort(abort);
+		assert.deepEqual({ sameError: await pending === abort, stored }, { sameError: true, stored: 0 });
+	});
+}
 
 test("web_fetch all-failed batch retains every fixture failure", async () => {
 	const tool = createWebFetchToolDefinition({ appendEntry() {} } as any, () => webFetchSettings(), "web_fetch", { extractYouTubeUrl: async (url) => { throw new Error(`failed ${url.slice(-11)}`); } });

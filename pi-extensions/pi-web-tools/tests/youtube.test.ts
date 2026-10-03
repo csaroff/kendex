@@ -56,18 +56,17 @@ for (const row of [
 	{ name: "language variant", prompt: undefined, mode: "transcript" as const, language: "EN", returned: "en-US", title: "English Track", text: "Hello", offset: 0, expectedLanguages: ["EN", "en-US"], expectedContent: "[00:00:00] Hello" },
 ]) {
 	test(`YouTube captions: ${row.name}`, async () => {
-		const controller = new AbortController();
 		const requests: unknown[] = [];
 		const result = await extractYouTubeUrl("https://www.youtube.com/watch?v=abc123XYZ_-&t=42s", {
-			prompt: row.prompt, mode: row.mode, transcriptLanguage: row.language, signal: controller.signal,
+			prompt: row.prompt, mode: row.mode, transcriptLanguage: row.language,
 			transcriptFetcher: async (videoId, config) => {
-				requests.push({ videoId, lang: config.lang, hasLanguage: Object.hasOwn(config, "lang"), videoDetails: config.videoDetails, sameSignal: config.signal === controller.signal });
+				requests.push({ videoId, lang: config.lang, hasLanguage: Object.hasOwn(config, "lang"), videoDetails: config.videoDetails });
 				if (config.lang === "EN") throw Object.assign(new Error("language"), { name: "YoutubeTranscriptNotAvailableLanguageError", availableLangs: ["fr", "en-US"] });
 				return captions(videoId, row.title, row.text, row.returned, row.offset);
 			},
 		});
 		assert.deepEqual({ requests, source: result?.source, title: result?.title, content: result?.content, kind: result?.metadata.contentKind, language: result?.metadata.language }, {
-			requests: row.expectedLanguages.map((lang) => ({ videoId: "abc123XYZ_-", lang, hasLanguage: lang !== undefined, videoDetails: true, sameSignal: true })),
+			requests: row.expectedLanguages.map((lang) => ({ videoId: "abc123XYZ_-", lang, hasLanguage: lang !== undefined, videoDetails: true })),
 			source: "youtube-captions", title: row.title, content: row.expectedContent, kind: "full-transcript", language: row.returned,
 		});
 	});

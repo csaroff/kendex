@@ -1,5 +1,6 @@
 import { readFile, stat } from "node:fs/promises";
 import { basename, extname } from "node:path";
+import { requestWithin } from "../utils/deadline.js";
 
 const VIDEO_EXTENSIONS = new Set([".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v", ".mpg", ".mpeg", ".wmv", ".flv"]);
 const VIDEO_MIME: Record<string, string> = {
@@ -30,6 +31,9 @@ export interface LocalVideoExtractOptions {
 	signal?: AbortSignal;
 	maxSizeMB?: number;
 	fetchImpl?: typeof fetch;
+	/** Deadline of each Gemini request, the upload start, the upload and the analysis, through its body; DEFAULT_DEADLINE_MS
+	 * when absent. */
+	timeoutMs?: number;
 }
 
 export interface LocalVideoExtractResult {
@@ -51,11 +55,11 @@ function enhancePrompt(input: string | undefined): string {
 	return base;
 }
 
-async function uploadVideoToGemini(filePath: string, apiKey: string, fetchImpl: typeof fetch, signal?: AbortSignal): Promise<{ uri: string; mimeType: string }> {
+async function uploadVideoToGemini(filePath: string, apiKey: string, options: LocalVideoExtractOptions): Promise<{ uri: string; mimeType: string }> {
 	const data = await readFile(filePath);
 	const mimeType = videoMimeForPath(filePath);
 	const initUrl = `https://generativelanguage.googleapis.com/upload/v1beta/files?key=${encodeURIComponent(apiKey)}`;
-	const startResponse = await fetchImpl(initUrl, {
+	const uploadUrl = await requestWithin("Gemini Files API upload start", initUrl, {
 		method: "POST",
 		headers: {
 			"x-goog-upload-protocol": "resumable",
@@ -65,29 +69,21 @@ async function uploadVideoToGemini(filePath: string, apiKey: string, fetchImpl: 
 			"content-type": "application/json",
 		},
 		body: JSON.stringify({ file: { display_name: basename(filePath) } }),
-		signal,
+	}, options, async (response) => {
+		const uploadUrl = response.headers.get("x-goog-upload-url");
+		if (!uploadUrl) throw new Error("Gemini Files API did not return upload URL.");
+		return uploadUrl;
 	});
-	if (!startResponse.ok) {
-		const text = await startResponse.text().catch(() => "");
-		throw new Error(`Gemini Files API start failed (${startResponse.status}): ${text || startResponse.statusText}`);
-	}
-	const uploadUrl = startResponse.headers.get("x-goog-upload-url");
-	if (!uploadUrl) throw new Error("Gemini Files API did not return upload URL.");
-	const finishResponse = await fetchImpl(uploadUrl, {
+	// fetch sets content-length from the body. Node 22's fetch appends its value to one given here ("5, 5"), which the npm
+	// undici 8 dispatcher Pi loads rejects as an invalid content-length header.
+	const payload = await requestWithin<any>("Gemini Files API upload", uploadUrl, {
 		method: "POST",
 		headers: {
-			"content-length": String(data.byteLength),
 			"x-goog-upload-offset": "0",
 			"x-goog-upload-command": "upload, finalize",
 		},
 		body: data as unknown as BodyInit,
-		signal,
-	});
-	if (!finishResponse.ok) {
-		const text = await finishResponse.text().catch(() => "");
-		throw new Error(`Gemini Files API finalize failed (${finishResponse.status}): ${text || finishResponse.statusText}`);
-	}
-	const payload = await finishResponse.json() as any;
+	}, options);
 	const uri = payload?.file?.uri;
 	if (!uri) throw new Error("Gemini Files API did not return a file URI.");
 	return { uri, mimeType };
@@ -98,17 +94,11 @@ export async function extractLocalVideo(filePath: string, options: LocalVideoExt
 	const info = await stat(filePath);
 	const limit = (options.maxSizeMB ?? 50) * 1024 * 1024;
 	if (info.size > limit) throw new Error(`Video too large (${Math.round(info.size / (1024 * 1024))}MB > ${options.maxSizeMB ?? 50}MB).`);
-	const fetchImpl = options.fetchImpl ?? fetch;
-	const { uri, mimeType } = await uploadVideoToGemini(filePath, options.geminiApiKey, fetchImpl, options.signal);
+	const { uri, mimeType } = await uploadVideoToGemini(filePath, options.geminiApiKey, options);
 	const model = options.geminiModel ?? "gemini-2.5-flash";
 	const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(options.geminiApiKey)}`;
 	const body = { contents: [{ role: "user", parts: [{ fileData: { fileUri: uri, mimeType } }, { text: enhancePrompt(options.prompt) }] }] };
-	const response = await fetchImpl(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal: options.signal });
-	if (!response.ok) {
-		const text = await response.text().catch(() => "");
-		throw new Error(`Gemini API video analysis failed (${response.status}): ${text || response.statusText}`);
-	}
-	const raw = await response.json() as any;
+	const raw = await requestWithin<any>(`Gemini API ${model} local video analysis`, url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }, options);
 	const content = raw?.candidates?.[0]?.content?.parts?.map((p: any) => p?.text).filter(Boolean).join("\n").trim();
 	if (!content) throw new Error("Gemini API returned empty response for local video.");
 	return {

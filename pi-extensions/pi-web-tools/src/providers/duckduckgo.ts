@@ -1,3 +1,4 @@
+import { requestWithin } from "../utils/deadline.js";
 import type { NormalizedExaResponse, NormalizedExaResult } from "./exa.js";
 
 const DUCKDUCKGO_HTML_URL = "https://html.duckduckgo.com/html/";
@@ -12,6 +13,8 @@ export interface DuckDuckGoSearchParams {
 
 export interface DuckDuckGoClientOptions {
 	fetchImpl?: typeof fetch;
+	/** Deadline of each request, through its body; DEFAULT_DEADLINE_MS when absent. */
+	timeoutMs?: number;
 }
 
 function decodeHtml(value: string): string {
@@ -81,21 +84,20 @@ export function parseDuckDuckGoHtml(html: string, limit = 10): NormalizedExaResu
 
 export class DuckDuckGoClient {
 	private readonly fetchImpl: typeof fetch;
+	private readonly timeoutMs: number | undefined;
 
 	constructor(options: DuckDuckGoClientOptions = {}) {
 		this.fetchImpl = options.fetchImpl ?? fetch;
+		this.timeoutMs = options.timeoutMs;
 	}
 
 	async search(params: DuckDuckGoSearchParams, signal?: AbortSignal): Promise<NormalizedExaResponse> {
 		const query = addDomainHints(params.query, params.includeDomains, params.excludeDomains);
 		const url = new URL(DUCKDUCKGO_HTML_URL);
 		url.searchParams.set("q", query);
-		const response = await this.fetchImpl(url.toString(), {
+		const html = await requestWithin("DuckDuckGo search", url.toString(), {
 			headers: { "user-agent": USER_AGENT, accept: "text/html,application/xhtml+xml" },
-			signal,
-		});
-		if (!response.ok) throw new Error(`DuckDuckGo request failed (${response.status}): ${await response.text().catch(() => response.statusText)}`);
-		const html = await response.text();
+		}, { fetchImpl: this.fetchImpl, signal, timeoutMs: this.timeoutMs }, (response) => response.text());
 		if (looksBlocked(html)) throw new Error("DuckDuckGo search appears blocked or rate limited.");
 		const results = parseDuckDuckGoHtml(html, params.numResults ?? 10);
 		return { results, raw: html, metadata: { provider: "duckduckgo", query, requestUrl: url.toString() } };
