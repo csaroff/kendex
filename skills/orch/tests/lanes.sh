@@ -315,6 +315,82 @@ table \
   "excluding the caller leaves the one other qualifying account|ORCH_LANE_DIRS=$H/.claude:$H/.eclaude:$H/.nclaude|pick --harness claude --exclude-lane $H/.claude --json|alias=eclaude qualifying_count=1" \
   "pick exits 3 when no lane is under the threshold||pick --harness claude --max-pct 15|rc=3"
 
+echo "=== a weekly wall the harness banner stated reads walled until its reset ==="
+# A usage reading can show room on an account its harness has walled: the
+# endpoint's figures parse and still name no wall. oversee-watch records the
+# weekly wall a claimed lane's harness reported, on each pass that finds the
+# lane walled (lib/account-wall.sh; the oversee_watch suites hold the writer).
+# While the stated reset is ahead the account's weekly window reads 100 in
+# `list` and both pick forms; past it, its measured value. A record nobody can
+# read leaves the account unmeasured. nclaude reads 0 everywhere, so without
+# its wall it would be the pick.
+new_home walled
+make_lane "$H" claude 3600
+make_lane "$H" nclaude 3600
+claude_usage 10 20 5 Opus > "$FIXTURE_DIR/.claude.json"
+claude_usage 0  0  0 Opus > "$FIXTURE_DIR/.nclaude.json"
+# stage_wall STATE RESET SEEN — nclaude's wall under STATE, through the writer
+# oversee-watch calls, so the record is the one it writes.
+stage_wall() {
+  (source "$SCRIPTS_DIR/lib/lane-claims.sh" && source "$SCRIPTS_DIR/lib/account-wall.sh" \
+    && OVERSEE_WATCH_STATE_DIR="$1" account_wall_record "" "$H/.nclaude" "$2" "$3" $'  \xe2\x8e\xbf \xc2\xa0'"You've hit your weekly limit") \
+    && compgen -G "$1/walls/*.json" >/dev/null \
+    || { echo "stage_wall: no wall record under $1" >&2; exit 1; }
+}
+WALL_NOW="$(date +%s)"
+WALL_RESET="$(jq -rn --argjson e "$((WALL_NOW + 86400))" '$e | todate')" || { echo "walled: reset stamp" >&2; exit 1; }
+WALL_AHEAD="OVERSEE_WATCH_STATE_DIR=$TMP_ROOT/wall-ahead"
+WALL_PASSED="OVERSEE_WATCH_STATE_DIR=$TMP_ROOT/wall-passed"
+WALL_JUNK="OVERSEE_WATCH_STATE_DIR=$TMP_ROOT/wall-junk"
+stage_wall "$TMP_ROOT/wall-ahead" "$((WALL_NOW + 86400))" "$WALL_NOW"
+stage_wall "$TMP_ROOT/wall-passed" "$((WALL_NOW - 60))" "$((WALL_NOW - 3600))"
+stage_wall "$TMP_ROOT/wall-junk" "$((WALL_NOW + 86400))" "$WALL_NOW"
+for f in "$TMP_ROOT"/wall-junk/walls/*.json; do printf 'not json\n' > "$f"; done
+WALL_ROW_LIST="a 0% reading under a stated weekly wall lists walled, its weekly window at 100 until the stated reset|$WALL_AHEAD|$LIST|nclaude.weekly_pct=100 nclaude.binding_bucket=weekly nclaude.binding_resets_at=$WALL_RESET nclaude.verdict=walled claude.weekly_pct=20"
+WALL_ROW_PICK="pick passes over the walled account for the one with room|$WALL_AHEAD|pick --harness claude --json|rc=0 alias=claude qualifying_count=1"
+WALL_ROW_LANE="pick --lane refuses the walled account for any model|$WALL_AHEAD|pick --lane $H/.nclaude --harness claude --model opus --json|rc=3 wall=100"
+WALL_ROW_PASSED="past the stated reset the account reads its measured value|$WALL_PASSED|$LIST|nclaude.weekly_pct=0 nclaude.verdict=room"
+WALL_ROW_JUNK="a wall record nobody can read leaves the account unmeasured, never room|$WALL_JUNK|$LIST|nclaude.status=error nclaude.verdict=unmeasured claude.verdict=room"
+# The record names the account in lane_claims_canon's spelling, and discovery
+# keeps an ORCH_LANE_DIRS entry as written: a trailing slash or a symlink to
+# the account still reaches its wall.
+mkdir -p "$TMP_ROOT/spelled"
+ln -sfn "$H/.nclaude" "$TMP_ROOT/spelled/.nclaude"
+WALL_SLASH="$WALL_AHEAD;ORCH_LANE_DIRS=$H/.claude:$H/.nclaude/"
+WALL_LINK="$WALL_AHEAD;ORCH_LANE_DIRS=$H/.claude:$TMP_ROOT/spelled/.nclaude"
+WALL_ROW_SLASH="a wall reaches an account ORCH_LANE_DIRS spells with a trailing slash|$WALL_SLASH|$LIST|nclaude.weekly_pct=100 nclaude.verdict=walled"
+WALL_ROW_LINK="a wall reaches an account ORCH_LANE_DIRS names through a symlink|$WALL_LINK|$LIST|nclaude.weekly_pct=100 nclaude.verdict=walled"
+table "$WALL_ROW_LIST" "$WALL_ROW_PICK" "$WALL_ROW_LANE" "$WALL_ROW_PASSED" "$WALL_ROW_JUNK" "$WALL_ROW_SLASH" "$WALL_ROW_LINK"
+# Controls for the reading rules of lib/account-wall.sh these rows reach, each
+# row run against a copy of the scripts with that rule's line mutated and
+# expecting what the mutant reads: the overlay keeping the measured weekly
+# figure, which reads room in its list, pick and pick --lane rows; the reset
+# test dropped, which keeps a passed wall; an unreadable record passed over,
+# which reads room; and the dir taken as spelled, which misses the wall under
+# both other spellings. The home goes back to the standard one the sections
+# below read.
+wall_control() { # NAME OLD NEW ROW...
+  local scripts
+  scripts="$(mutant_scripts "$1" lib/account-wall.sh)" || exit 1
+  mutate_file "$scripts/lib/account-wall.sh" "$2" "$3"
+  shift 3
+  LANES="$scripts/lanes" table "$@"
+}
+wall_control mutant-wall-overlay 'weekly_pct: 100,' 'weekly_pct: .weekly_pct,' \
+  "control: the measured weekly figure kept lists the account at room|$WALL_AHEAD|$LIST|nclaude.weekly_pct=0 nclaude.verdict=room" \
+  "control: the measured weekly figure kept counts the walled account as a candidate|$WALL_AHEAD|pick --harness claude --json|rc=0 qualifying_count=2" \
+  "control: the measured weekly figure kept passes the walled account|$WALL_AHEAD|pick --lane $H/.nclaude --harness claude --model opus --json|rc=0"
+wall_control mutant-wall-expiry ' or $wall.resets_at <= now' '' \
+  "control: with no reset test a passed wall still walls|$WALL_PASSED|$LIST|nclaude.weekly_pct=100 nclaude.verdict=walled"
+wall_control mutant-wall-fail-open 'unmeasured" >&2
+  return 1' 'unmeasured" >&2
+  printf '"'"'%s\n'"'"' "$3"; return 0' \
+  "control: an unreadable record passed over reads room|$WALL_JUNK|$LIST|nclaude.status=ok nclaude.verdict=room"
+wall_control mutant-wall-spelling 'ACCOUNT_WALL_CANON="$(lane_claims_canon "$2")"' 'ACCOUNT_WALL_CANON="$2"' \
+  "control: a dir taken as spelled misses the wall behind a trailing slash|$WALL_SLASH|$LIST|nclaude.weekly_pct=0 nclaude.verdict=room" \
+  "control: a dir taken as spelled misses the wall behind a symlink|$WALL_LINK|$LIST|nclaude.weekly_pct=0 nclaude.verdict=room"
+standard_home home
+
 echo "=== pick: a Pi launch on a Copilot model is judged on the stated Copilot pool ==="
 # Such a launch spends Copilot credits and no Claude or Codex window, so with
 # no lane host the owner's ORCH_LANE_COPILOT_POOL reading is its whole

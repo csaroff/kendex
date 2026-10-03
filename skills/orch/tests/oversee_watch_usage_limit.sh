@@ -32,6 +32,7 @@ AT_0950='EVENT+usage-limit+gh-2+resets=2026-09-02T16:50:00Z'   # what that banne
 HEARTBEAT='EVENT+heartbeat+loops=1+interval=0s+since=none'
 
 BANNER="You've hit your usage limit \xc2\xb7 resets 9:50am (America/Los_Angeles)"
+DRAWN='  \xe2\x8e\xbf \xc2\xa0'   # what Claude Code opens its limit message's line with
 CODEX_BANNER='Usage limit reached. Increase your limits to continue.'
 COMPOSER='\xe2\x9d\xaf\xc2\xa0'          # Claude's composer: `❯` + U+00A0
 CODEX_COMPOSER='\xe2\x80\xba Ask Codex to do anything'
@@ -126,6 +127,16 @@ screen() {
           "⏺ Done: lane gh-9 stopped. Its screen said \"$BANNER\"."
         for n in 4 5 6 7 8 9 10 11 12 13 14 15 16; do printf '  report line %s\n' "$n"; done
       } > "$STUB_DIR/pane-gh-2.txt" ;;
+    # the weekly wall a hosted Claude Code lane drew, byte-exact with the
+    # lines around it: the drawn banner is the fourth line, under the lane's
+    # own. `weekly_wall_under_lane_limit` adds a lane line naming a limit above
+    # it, so the drawn line is not the banner's first either.
+    weekly_wall|weekly_wall_under_lane_limit)
+      [[ "$(grep -nF -- "$(printf '%b' "$DRAWN")You've hit your weekly limit" "$CODEX_PANES/claude-usage-limit-weekly.txt")" == 4:* ]] \
+        || { echo "screen: the weekly wall fixture no longer draws its banner on line 4 under the prefix, so its rows would pin nothing" >&2; exit 1; }
+      { head -n 3 "$CODEX_PANES/claude-usage-limit-weekly.txt"
+        [[ "$1" == weekly_wall ]] || printf '%s\n' "● gh-9 is parked: You've hit your session limit"
+        tail -n +4 "$CODEX_PANES/claude-usage-limit-weekly.txt"; } > "$STUB_DIR/pane-gh-2.txt" ;;
     # the byte-exact startup screen of a fresh Codex, carrying its reset OFFER
     codex_idle)
       grep -qF 'You have 1 usage limit reset available' "$CODEX_PANES/codex-composer-idle.txt" \
@@ -181,6 +192,8 @@ run() {
 #   first         the first stdout line, or `none`
 #   out~<text>    whether stdout carries <text>
 #   claims        how many claim files the state directory holds
+#   wall          every account wall the state directory holds, as
+#                 `<config dir>@<reset epoch>`, or `none`
 watch() {
   local got="" token name value needle
   set -f
@@ -192,6 +205,7 @@ watch() {
       first) value="$(head -n 1 <<<"$OUT")"; value="${value:-none}"; value="${value// /+}" ;;
       out~*) value="$(grep -qF -- "$needle" <<<"$OUT" && echo true || echo false)" ;;
       claims) value="$(find "$STATE_DIR/claims" -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d '[:space:]')" ;;
+      wall) value="$(find "$STATE_DIR/walls" -name '*.json' -exec cat {} + 2>/dev/null | jq -r '"\(.config_dir)@\(.resets_at)"' | paste -sd, - || true)"; value="${value:-none}" ;;
       *) echo "watch: unknown field $name" >&2; exit 1 ;;
     esac
     got="$got $name=$value"
@@ -288,7 +302,8 @@ usage_table \
   "a claim whose pane is gone names no account and is pruned|new|banner:You've hit your weekly limit|claim_dead|-|-|rc=0 first=EVENT+usage-limit+gh-2 claims=0"
 
 # The note is about the event line it qualifies: a re-run that suppresses the
-# standing wall prints neither. Red with the claim read above the suppression.
+# standing wall prints neither. Red with the claim-missing note printed on a
+# pass that sets quiet.
 new_case claim_note_only_with_event
 # one live claim on this server, on a pane other than the one captured
 printf '900 %%3\n900 %%9\n' > "$STUB_DIR/panes.txt"
@@ -305,6 +320,68 @@ run
 expect="rc=0 first=$HEARTBEAT out~EVENT+usage-limit=false"
 assert_eq "$(watch "$expect")" "$expect" "a re-run over the same wall reports nothing" "$ERR"
 assert_eq "$(grep -c 'oversee-watch: claim-missing lane=gh-2' "$ERR" || true)" "0" "and the note about an event it did not print stays silent"
+
+echo "=== a weekly wall the banner states is kept for its account ==="
+# A usage reading can show room on an account whose harness has walled it, so
+# the watch records the weekly wall a claimed lane's harness drew, under the
+# claimed account and until the reset the banner states (lib/account-wall.sh),
+# and `lanes` judges the account on it (tests/lanes.sh). Claude Code draws its
+# limit message under the prefix DRAWN spells; the same line quoted by the lane,
+# a session wall, and a weekly reset already behind the pass record nothing.
+# The record is kept on every walled pass: a wall a watch reported without a
+# record, an install from before it or a write that failed, is recorded on the
+# next pass, which prints no second event.
+WEEKLY_0950="${DRAWN}You've hit your weekly limit \\xc2\\xb7 resets 9:50am (America/Los_Angeles)"
+WALL_AT_0950='EVENT+usage-limit+gh-2+/home/me/.eclaude+resets=2026-09-02T16:50:00Z'
+WALL_AT_OCT4='EVENT+usage-limit+gh-2+/home/me/.eclaude+resets=2026-10-04T18:00:00Z'
+WALL_ROW_WEEKLY="a weekly banner the harness drew on a claimed lane records its account's wall until the stated reset|new|weekly_wall|claim_live|$RESET_NOW|UTC|rc=0 first=$WALL_AT_OCT4 wall=/home/me/.eclaude@1791136800"
+WALL_ROW_UNDER="a lane line naming a limit above the drawn weekly banner still records the wall|new|weekly_wall_under_lane_limit|claim_live|$RESET_NOW|UTC|rc=0 first=$WALL_AT_OCT4 wall=/home/me/.eclaude@1791136800"
+WALL_ROW_QUOTED="a claimed lane quoting another lane's weekly banner line leaves its account selectable|new|banner:\xe2\x8f\xba gh-9 is parked; its screen showed:\n  $WEEKLY_0950|claim_live|$RESET_NOW|UTC|rc=0 first=$WALL_AT_0950 wall=none"
+WALL_ROW_SESSION="a session banner records no wall|new|banner:${DRAWN}You've hit your session limit \\xc2\\xb7 resets 9:50am (America/Los_Angeles)|claim_live|$RESET_NOW|UTC|rc=0 first=$WALL_AT_0950 wall=none"
+WALL_ROW_PASSED="a weekly reset already behind the pass records no wall|new|banner:${DRAWN}You've hit your weekly limit \\xc2\\xb7 resets Aug 30, 4pm|claim_live|$RESET_NOW|UTC|rc=0 first=EVENT+usage-limit-passed+gh-2+/home/me/.eclaude+resets=2026-08-30T16:00:00Z wall=none"
+usage_table "$WALL_ROW_WEEKLY" "$WALL_ROW_UNDER" "$WALL_ROW_QUOTED" "$WALL_ROW_SESSION" "$WALL_ROW_PASSED"
+
+# wall_mutant NAME FILE OLD NEW: a copy of the scripts whose FILE, relative to
+# scripts/, has OLD replaced by NEW once; its oversee-watch is WALL_WATCH.
+wall_mutant() {
+  local scripts
+  scripts="$(mutant_scripts "$1/orch" "$2")" || exit 1
+  ln -s "$REPO_ROOT/skills/github" "$TMP_ROOT/$1/github"
+  mutate_file "$scripts/$2" "$3" "$4"
+  WALL_WATCH="$scripts/oversee-watch"
+}
+# wall_control NAME FILE OLD NEW ROW WALL: ROW, its label marked as a control
+# and its wall expectation WALL, run against wall_mutant's copy.
+wall_control() {
+  local row="control: ${5%%wall=*}wall=$6"
+  wall_mutant "$1" "$2" "$3" "$4"
+  WATCH_BIN="$WALL_WATCH" usage_table "$row"
+}
+wall_control wall-quoted lib/account-wall.sh '"$ACCOUNT_WALL_DRAWN"You*' '*You*' \
+  "$WALL_ROW_QUOTED" /home/me/.eclaude@1788367800
+wall_control wall-first-line lib/account-wall.sh '"ve hit your weekly limit"* ]] || own=1
+    fi' '"ve hit your weekly limit"* ]] || own=1; break
+    fi' \
+  "$WALL_ROW_UNDER" none
+wall_control wall-any-banner lib/account-wall.sh '"$ACCOUNT_WALL_DRAWN"You*"ve hit your weekly limit"*' '"$ACCOUNT_WALL_DRAWN"You*"ve hit your "*' \
+  "$WALL_ROW_SESSION" /home/me/.eclaude@1788367800
+wall_control wall-any-reset lib/account-wall.sh ' && "$3" -gt "$4"' '' \
+  "$WALL_ROW_PASSED" /home/me/.eclaude@1788105600
+
+# A watch whose call is disabled stands in for the install that reported the
+# wall before the record existed, and is also the control for the call: its
+# pass records nothing. The next pass of this watch records the wall. The
+# control for that keeps a reported wall's later passes skipped whole.
+wall_mutant wall-unwritten oversee-watch '    account_wall_record "$PROJECT_ROOT"' '    : account_wall_record "$PROJECT_ROOT"'
+UNRECORDED_WATCH="$WALL_WATCH"
+WALL_ROW_UNRECORDED="control: a watch that does not call the writer reports the wall and records none|${WALL_ROW_WEEKLY#*|}"
+WALL_ROW_UNRECORDED="${WALL_ROW_UNRECORDED%%wall=*}wall=none"
+WALL_ROW_LATER="a wall reported with no record is recorded on the next pass, which reports nothing|cont|weekly_wall|claim_live|-|UTC|rc=0 first=$HEARTBEAT wall=/home/me/.eclaude@1791136800"
+WATCH_BIN="$UNRECORDED_WATCH" usage_table "$WALL_ROW_UNRECORDED"
+usage_table "$WALL_ROW_LATER"
+wall_mutant wall-quiet-skipped oversee-watch '|| quiet=1' '|| continue'
+WATCH_BIN="$UNRECORDED_WATCH" usage_table "$WALL_ROW_UNRECORDED"
+WATCH_BIN="$WALL_WATCH" usage_table "control: ${WALL_ROW_LATER%%wall=*}wall=none"
 
 echo "=== the reset the banner states ==="
 # SURFACE 1: the reset parsed out of each banner form the grammar accepts,
