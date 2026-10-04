@@ -142,8 +142,8 @@ jobs:
 
 ### Never pushing to a branch the queue holds
 
-- `refresh-consumer.sh` already lists the open rolling pull request before it refreshes. When that list finds one, the run reads its lifecycle once with the read KEN-2557 lifts into one function: `state`, `isInMergeQueue` and `autoMergeRequest`. A queued pull request ends the run as `refresh-state=deferred reason=queued`, with exit 0, before any refresh, push, body update or `--disable-auto`. The pull request merges and the next run refreshes from the new default branch.
-- A pull request can enter the queue between that read and the push. GitHub then refuses the push with GH006, and the post-refusal read KEN-2457 added is meant to defer the run. KEN-2557 adds the same read after a refused `--disable-auto`.
+- `refresh-consumer.sh` already lists the open rolling pull request before it refreshes. When that list finds one, the run reads its lifecycle once with the read KEN-2557 lifts into one function: `state`, `isInMergeQueue` and `autoMergeRequest`. A queued pull request ends the run as `refresh-state=deferred reason=queued`, with exit 0, before any refresh, push, body update or auto-merge change. The pull request merges and the next run refreshes from the new default branch.
+- A pull request can enter the queue between that read and the push. GitHub then refuses the push with GH006, and the post-refusal read KEN-2457 added is meant to defer the run. A GH006 refusal defers as queued even when that read answers armed or active, and any other refusal of an armed pull request exits 1, as [merge-rail.md](../architecture/merge-rail.md) § Invariants states.
 - The vg run shows the post-refusal read once did not defer: vg's copy carries KEN-2457's deferral and still failed on GH006. The cause is unknown, because this credential cannot read vg's log. Build A takes that log from vg's overseer before it lands the read, and its must-fail control puts the pull request into the queue between the run-start read and the push.
 - This adds one GraphQL read on a run that finds an open rolling pull request. It answers owner direction item 4 and the two measured GH006 runs, vsys 36970384017 and vg's 20:38Z run. Whether either pull request was already queued at run start is unread. KEN-2557's no-pre-flight-read bar answered a different symptom, a defer after a refused call.
 
@@ -151,7 +151,7 @@ jobs:
 
 - The adopter writes the caller from `refresh/kendex-refresh.yml` in its release tree. It accepts the existing file when its bytes equal any template in kendex default-branch history at either template path. This is the KEN-2416 check, extended to the new path, so a hand edit is still refused and kept. Its environment check judges the names the shared workflow declares, because the caller declares no `environment:` (Migration order step 2). It accepts only the shipped template's form: a `secrets:` key on the line under `uses:` mapping exactly those names, in order, each to its same-named secret. It refuses every other form with `refresh-error=caller-secrets`. A caller that maps neither name has its job read the app secrets empty (runs 37187198901 and 37191124465).
 - The adopter removes the caller's `.kendex-generated.json` record, and `kendex verify` no longer compares it. The history check is its equality check.
-- A refresh pull request that changes the caller classifies `standard`, so the overseer or a maintainer merges it (KEN-2539). With no version in the file, that happens only when the triggers change.
+- A refresh pull request that changes the caller classifies `standard` (KEN-2539) and is armed like every other class (KEN-2759), so it merges once the required approval, thread resolution and checks pass. With no version in the file, that happens only when the triggers change.
 
 ### Compatibility contract
 
