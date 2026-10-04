@@ -1,5 +1,3 @@
-import { spawnSync } from "node:child_process";
-import { __setSpawnSyncForTests } from "../extensions/manager/process.ts";
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -10,14 +8,21 @@ import { applyUpdateMetadata, buildInventory } from "../extensions/manager/inven
 import { npmCachePath } from "../extensions/manager/paths.ts";
 import { gitPackageDirCandidates } from "../extensions/manager/versions.ts";
 import { packageExtensions } from "../extensions/manager/filters.ts";
+import { mutantManager, writeCommand } from "./fixtures/commands.ts";
 
 const rootTmp = join(process.cwd(), "tmp", "pi-extension-manager-inventory-tests");
 const originalEnv = {
 	HOME: process.env.HOME,
 	NPM_CONFIG_PREFIX: process.env.NPM_CONFIG_PREFIX,
 	npm_config_prefix: process.env.npm_config_prefix,
+	PATH: process.env.PATH,
 	PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR,
 };
+const nodePath = Bun.which("node");
+
+function live(): AbortSignal {
+	return new AbortController().signal;
+}
 
 function resetTmp(): void {
 	rmSync(rootTmp, { force: true, recursive: true });
@@ -63,11 +68,13 @@ beforeEach(() => {
 	process.env.npm_config_prefix = process.env.NPM_CONFIG_PREFIX;
 	process.env.PI_CODING_AGENT_DIR = join(rootTmp, "home", ".pi", "agent");
 	clearPackageConfigCache();
-	__setSpawnSyncForTests(((command: string, args: string[], options: object) => spawnSync(command, args, { ...options, env: { ...process.env, HOME: process.env.HOME, PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR } })) as never);
+	// Package scripts and npm-root lookups inherit the live environment.
+	if (!nodePath) throw new Error("inventory-test: node is not on PATH");
+	process.env.PATH = [dirname(nodePath), "/usr/bin", "/bin"].join(":");
 });
 
 afterEach(() => {
-	__setSpawnSyncForTests(undefined);
+	process.env.PATH = originalEnv.PATH;
 	if (originalEnv.HOME === undefined) delete process.env.HOME;
 	else process.env.HOME = originalEnv.HOME;
 	if (originalEnv.NPM_CONFIG_PREFIX === undefined) delete process.env.NPM_CONFIG_PREFIX;
@@ -111,6 +118,33 @@ test("reads settings schemas from user-scoped Pi npm packages", async () => {
 	expect(item?.settingsSchema?.map((schema) => schema.key)).toEqual(["enabled"]);
 	expect(item?.packageDir).toBe(npmPackageDir);
 	expect(inv.items.some((entry) => entry.kind === "extension module" && entry.sourcePath === join(npmPackageDir, "extensions", "index.ts"))).toBe(true);
+});
+
+type InventoryModule = typeof import("../extensions/manager/inventory.ts");
+
+/** The broken reason of a user npm package no cheap root holds, while `npm root -g` exits 3. */
+async function unrootedReason(module: InventoryModule): Promise<string | undefined> {
+	const project = join(rootTmp, "project");
+	const userPi = process.env.PI_CODING_AGENT_DIR!;
+	const bin = join(rootTmp, "bin");
+	writeCommand(join(bin, "npm"), "exit 3");
+	mkdirSync(join(project, ".pi"), { recursive: true });
+	writeJson(join(userPi, "settings.json"), { packages: ["npm:@scope/unrooted"] });
+	clearPackageConfigCache();
+	process.env.PATH = [bin, process.env.PATH].join(":");
+	// A fresh host object is a fresh session, so no earlier lookup is memoized.
+	const inv = await module.buildInventory({} as never, { cwd: project } as never);
+	return inv.packages.find((pkg) => pkg.packageName === "@scope/unrooted")?.stateReason;
+}
+
+test("a failed npm root lookup is named in the broken reason; control: dropping the lookup failures reads as not installed", async () => {
+	expect(await unrootedReason(await import("../extensions/manager/inventory.ts"))).toBe("package source not found: npm:@scope/unrooted; npm root -g: exit=3");
+	const mutant = mutantManager(join(rootTmp, "mutant-reason"), [{
+		file: "inventory.ts",
+		before: "[`package source not found: npm:${npmName}`, ...lookup.lookupFailures]",
+		after: "[`package source not found: npm:${npmName}`]",
+	}]);
+	expect(await unrootedReason(await import(join(mutant, "inventory.ts")))).toBe("package source not found: npm:@scope/unrooted");
 });
 
 test("reads settings schemas from legacy npm global prefix packages", async () => {
@@ -236,11 +270,11 @@ test("toggle runs the package's own append-system script", async () => {
 	const ctx = { cwd: project, ui: { notify() {} } } as never;
 
 	const disable = await inventoryWithTrust(project, true);
-	await toggleItem({} as never, ctx, disable, disable.packages.find((pkg) => pkg.packageName === "@scope/append-toggle")!);
+	await toggleItem({} as never, ctx, disable, disable.packages.find((pkg) => pkg.packageName === "@scope/append-toggle")!, live());
 	expect(existsSync(target) ? readFileSync(target, "utf8") : "").not.toContain("Toggle instructions");
 
 	const enable = await inventoryWithTrust(project, true);
-	await toggleItem({} as never, ctx, enable, enable.packages.find((pkg) => pkg.packageName === "@scope/append-toggle")!);
+	await toggleItem({} as never, ctx, enable, enable.packages.find((pkg) => pkg.packageName === "@scope/append-toggle")!, live());
 	expect(readFileSync(target, "utf8")).toContain("Toggle instructions");
 });
 
@@ -294,7 +328,7 @@ test.each([
 	for (const pkg of original.packages) expect(packageExtensions(original.items, pkg)).toHaveLength(1);
 	const selected = packageExtensions(original.items, original.packages[0]!)[0]!;
 	expect(original.packages.map((pkg) => pkg.packageDir)).toEqual(dirs);
-	await toggleItem({} as never, ctx, original, selected);
+	await toggleItem({} as never, ctx, original, selected, live());
 	const moved = join(rootTmp, "deeper", "relocated");
 	cpSync(project, moved, { recursive: true });
 	const movedCtx = { cwd: moved, isProjectTrusted: () => true, ui: { notify() {} } } as never;
@@ -303,13 +337,13 @@ test.each([
 	const module = relocated.items.find((item) => item.id === selected.id)!;
 	expect(module.state).toBe("disabled");
 	expect(packageExtensions(relocated.items, relocated.packages[0]!)[0]!.id).toBe(selected.id);
-	await toggleItem({} as never, movedCtx, relocated, module);
+	await toggleItem({} as never, movedCtx, relocated, module, live());
 	const settingsPath = join(moved, ".pi", "settings.json");
 	const saved = JSON.parse(readFileSync(settingsPath, "utf8"));
 	expect(saved.packages).toEqual(sources);
 	expect(saved.kendex.extensionManager.disabledItems).toEqual([]);
 	const enabled = await buildInventory({} as never, movedCtx);
-	await toggleItem({} as never, movedCtx, enabled, enabled.packages[0]!);
+	await toggleItem({} as never, movedCtx, enabled, enabled.packages[0]!, live());
 	expect(JSON.parse(readFileSync(settingsPath, "utf8")).packages).toEqual([{ source: sources[0], extensions: [] }, ...sources.slice(1)]);
 });
 
@@ -338,7 +372,7 @@ test("toggle writes stay in the selected scope through disable, other-scope togg
 	const steps = [projectPackage.id, userModule.id, projectPackage.id];
 	for (const [step, id] of steps.entries()) {
 		const inv = await buildInventory({} as never, ctx);
-		toggleItem({} as never, ctx, inv, inv.items.find((item) => item.id === id)!);
+		await toggleItem({} as never, ctx, inv, inv.items.find((item) => item.id === id)!, live());
 		for (const row of roots) {
 			const saved = JSON.parse(readFileSync(join(row.base, "settings.json"), "utf8"));
 			const selected = row.scope === "project" ? (step < 2 ? [projectPackage.id] : []) : (step > 0 ? [userModule.id] : []);
@@ -375,13 +409,13 @@ test("legacy toggle ids migrate to the owning installation with a warning", asyn
 			const current = await inventoryWithTrust(project, true);
 			const pkg = current.packages.find((pkg) => pkg.scope === row.scope)!;
 			const module = packageExtensions(current.items, pkg)[0]!;
-			toggleItem({} as never, { cwd: project, ui: { notify() {} } } as never, current, pkg);
+			await toggleItem({} as never, { cwd: project, ui: { notify() {} } } as never, current, pkg, live());
 			const saved = JSON.parse(readFileSync(join(row.base, "settings.json"), "utf8"));
 			expect(saved.kendex.extensionManager.disabledItems).toEqual([module.id, `unrelated:${row.scope}`].sort());
 			expect(saved.kendex.extensionManager.config).toEqual({ owned: { scope: row.scope } });
 			const enabled = await inventoryWithTrust(project, true);
 			expect(enabled.managerState.disabledItems).not.toContain(pkg.id);
-			toggleItem({} as never, { cwd: project, ui: { notify() {} } } as never, enabled, enabled.items.find((item) => item.id === module.id)!);
+			await toggleItem({} as never, { cwd: project, ui: { notify() {} } } as never, enabled, enabled.items.find((item) => item.id === module.id)!, live());
 			expect(JSON.parse(readFileSync(join(row.base, "settings.json"), "utf8")).kendex.extensionManager.disabledItems).toEqual([`unrelated:${row.scope}`]);
 		}
 	} finally { warning.mockRestore(); }
