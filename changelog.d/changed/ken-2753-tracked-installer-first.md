@@ -1,0 +1,1 @@
+- Commit-guards refusals in an unarmed clone name the tracked installer before `kendex guard install`. Re-arm each clone once: until then, hook checks report the helper outdated.
