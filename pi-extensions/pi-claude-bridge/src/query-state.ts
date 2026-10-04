@@ -11,13 +11,34 @@ import { isConnectorTool } from "./connectors.js";
 import type { McpResult } from "./extract-tool-results.js";
 import { currentRequestLaneId } from "./request-lane.js";
 
+/** Pi's assistant message for a turn that has produced nothing yet. */
+function emptyTurnOutput(model: Model<any>): AssistantMessage {
+	return {
+		role: "assistant", content: [],
+		api: model.api, provider: model.provider, model: model.id,
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+		stopReason: "stop", timestamp: Date.now(),
+	};
+}
+
+/** A failed turn's message, built apart from any QueryContext: for a stream
+ *  whose query no longer holds its context, which a successor query may
+ *  already own. */
+export function failedTurnOutput(model: Model<any>, stopReason: "error" | "aborted", errorMessage: string): AssistantMessage {
+	return { ...emptyTurnOutput(model), stopReason, errorMessage };
+}
+
 /** A mid-query user run captured for replay after the active query ends.
  *  `text` is the joined text form, the replay prompt when no image blocks
  *  were captured. `blocks` is present when the run carried
- *  images — the replay must send the blocks or the images are silently lost. */
+ *  images — the replay must send the blocks or the images are silently lost.
+ *  `messages` is the run as Pi holds it, which a history restart sends again
+ *  as live input after Pi's rewritten history. */
 export interface DeferredUserMessage {
 	text: string;
 	blocks?: ContentBlockParam[];
+	messages: Context["messages"];
 }
 
 /** Diag payload for a deferred-message drop: counts, sites, and lengths only.
@@ -279,6 +300,12 @@ export class QueryContext {
 	 *  own promise chain runs it, after teardown released the query state, and
 	 *  feeds the replacement query's events into that callback's stream. */
 	restartRequest: QueryRestartRequest | null = null;
+	/** Settles once an aborted query's teardown has released this context. Set
+	 *  at the abort, cleared by that teardown. A provider call arriving in
+	 *  between belongs to no turn of the aborted query, so it waits on this and
+	 *  then takes the fresh-query path instead of being queued on a dying
+	 *  query whose abort completion drops it. */
+	abortedQueryTeardown: Promise<void> | null = null;
 	latestCursor = 0;
 	pendingToolCalls = new Map<string, PendingToolCall>();
 	pendingResults = new Map<string, McpResult>();
@@ -444,13 +471,7 @@ export class QueryContext {
 	}
 
 	resetTurnState(model: Model<any>): void {
-		this.turnOutput = {
-			role: "assistant", content: [],
-			api: model.api, provider: model.provider, model: model.id,
-			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-			stopReason: "stop", timestamp: Date.now(),
-		};
+		this.turnOutput = emptyTurnOutput(model);
 		this.turnStarted = false;
 		this.turnSawStreamEvent = false;
 		this.turnSawToolCall = false;
