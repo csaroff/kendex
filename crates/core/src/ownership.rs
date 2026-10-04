@@ -48,7 +48,8 @@ pub fn read(env: &Env, scope: &Scope) -> Records {
 
 /// Compare source and disk bytes through the same engine in each reader,
 /// with the source read as `options` says. A scope with no record has
-/// nothing to hold, so `options` reaches the recorded path alone.
+/// nothing to hold, so `options` reaches the recorded path and only its
+/// `judge_pins` reaches the recordless one.
 pub fn audit(
     env: &Env,
     scope: &Scope,
@@ -58,7 +59,7 @@ pub fn audit(
     let empty = Manifest::default();
     let manifest = records.manifest.as_deref().unwrap_or(&empty);
     if records.fallback {
-        crate::engine::audit_without_record(env, scope, manifest)
+        crate::engine::audit_without_record(env, scope, manifest, options.judge_pins)
     } else {
         Ok(crate::engine::RecordlessAudit {
             report: crate::engine::plan_scope(env, scope, manifest, &records.lock, options)?,

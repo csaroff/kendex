@@ -41,6 +41,9 @@ pub(super) fn desired_custom_hooks(
         });
         let targets =
             super::desired::harnesses_for(listed.as_deref(), manifest, ItemKind::Hook, scope);
+        if listed.is_some() && state.judge_pins {
+            pins_left_out(env, scope, manifest, &spec, state);
+        }
         for harness in &targets {
             let harness = *harness;
             if !spec.applies_to(harness) {
@@ -126,6 +129,57 @@ pub(super) fn desired_custom_hooks(
             });
         }
     }
+}
+
+/// Records each tool the entry's `harnesses` list alone keeps it off: one
+/// it would be written on with no list ([`unlisted_tools`]). The rule a
+/// `[hooks.<n>]` pin is judged by (`desired_kinds::pin_records`),
+/// whatever the switch says; an entry has no header of its own, so its
+/// list never names a tool the hook excludes.
+fn pins_left_out(
+    env: &Env,
+    scope: &Scope,
+    manifest: &Manifest,
+    spec: &HookSpec,
+    state: &mut DesiredState,
+) {
+    for harness in unlisted_tools(env, scope, manifest, spec) {
+        if !spec.applies_to(harness) {
+            state.pinned_hooks.push(super::PinnedHook {
+                name: spec.name.clone(),
+                harness,
+                pin: super::Pin::LeavesOut,
+            });
+        }
+    }
+}
+
+/// The tools a `[[custom-hooks]]` entry is written on with no `harnesses`
+/// list: each the scope installs on where [`delivery()`] answers anything
+/// but `NotInstallable` for the entry without its list, registered, in an
+/// agent's file or as prose, as a `[hooks.<n>]` pin is judged
+/// (`desired_kinds::not_written`). The one answer for the leave-out
+/// records ([`pins_left_out`]) and for adoption, which writes a list only
+/// where the tools it found differ from these (`adopt::hooks`).
+pub(super) fn unlisted_tools(
+    env: &Env,
+    scope: &Scope,
+    manifest: &Manifest,
+    spec: &HookSpec,
+) -> Vec<HarnessId> {
+    let unlisted = HookSpec {
+        harnesses: None,
+        ..spec.clone()
+    };
+    super::desired::harnesses_for(None, manifest, ItemKind::Hook, scope)
+        .into_iter()
+        .filter(|harness| {
+            !matches!(
+                delivery(env, scope, *harness, &unlisted),
+                Delivery::NotInstallable(_)
+            )
+        })
+        .collect()
 }
 
 fn advisory_downgrade(harness: HarnessId, spec: &HookSpec) -> String {
