@@ -116,9 +116,9 @@ pub fn matching_lock_entry(
     }))
 }
 
-/// Where a planning pass collects what switching a declaration changes: the
-/// native switches' settings write, and each switched package's
-/// `APPEND_SYSTEM.md` edit with its label, which the plan composes with the
+/// Where a planning pass collects what a declaration's switch changes: the
+/// native switches' settings write, and each `APPEND_SYSTEM.md` edit a
+/// package's block needs with its label, which the plan composes with the
 /// file's other edits into one mutation.
 pub struct SwitchPlan<'a> {
     pub ops: &'a mut Vec<crate::apply::PlannedOp>,
@@ -126,10 +126,13 @@ pub struct SwitchPlan<'a> {
 }
 
 /// Compare each declared carrier package and preserve durable provenance.
-/// Missing or unreadable bytes produce drift rather than an omitted row.
-/// With `plan`, plan native switches and record their intended state.
-/// Without it, retain the observed switch for read-only recovery and
-/// installation.
+/// Missing or unreadable bytes produce drift rather than an omitted row,
+/// except an `APPEND_SYSTEM.md` a plan cannot compare, which fails it.
+/// A package's `APPEND_SYSTEM.md` block follows its declaration, not the
+/// native filter: a disable Pi already set needs no switch, yet the
+/// declaration still takes the block away. With `plan`, plan native
+/// switches and block edits and record their intended state. Without it,
+/// retain the observed switch for read-only recovery and installation.
 pub fn record_matching_manifest(
     env: &Env,
     scope: &crate::model::Scope,
@@ -177,7 +180,7 @@ fn record_matching<'a>(
     basis: RecordBasis,
     mut plan: Option<SwitchPlan<'_>>,
 ) -> Result<Vec<crate::engine::DriftRow>> {
-    use crate::engine::{DriftRow, DriftState};
+    use crate::engine::{DriftCause, DriftRow, DriftState};
     use crate::model::{HarnessId, ItemKind};
     let root = scope_root(env, scope)?;
     let mut drift = Vec::new();
@@ -187,26 +190,52 @@ fn record_matching<'a>(
         let result = resolve_declared(env, scope, manifest, name, decl).and_then(|package| {
             matching_lock_entry(&root, name, &package, lock.entries.get(&key), basis)
         });
-        let detail = match result {
+        let (detail, cause) = match result {
             Ok(Some(mut entry)) => {
                 let differs = entry.enabled != decl.enabled;
-                if differs && let Some(plan) = plan.as_mut() {
-                    switches.push((name.as_str(), decl.enabled));
-                    entry.enabled = decl.enabled;
-                    let (path, edit) = super::append_system_edit(env, &root, name, decl.enabled)?;
-                    plan.edits.push((path, format!("switch {name}"), edit));
+                // A plan fails on a block it cannot compare, as a toggle
+                // must before it saves the manifest: a switch never lands
+                // without its block. Only the read-only pass reports it.
+                let block = match block_edit(env, &root, name, decl.enabled) {
+                    Err(error) if plan.is_some() => return Err(error),
+                    block => block,
+                };
+                if let Some(plan) = plan.as_mut()
+                    && let Ok(edit) = &block
+                {
+                    if differs {
+                        switches.push((name.as_str(), decl.enabled));
+                        entry.enabled = decl.enabled;
+                    }
+                    if let Some((path, edit)) = edit {
+                        plan.edits
+                            .push((path.clone(), format!("{name} instructions"), edit.clone()));
+                    }
                 }
                 lock.entries.insert(key, entry);
-                if !differs {
-                    continue;
+                match block {
+                    Err(error) => (
+                        format!("APPEND_SYSTEM.md block could not be compared: {error}"),
+                        None,
+                    ),
+                    Ok(_) if differs => (
+                        "native extension filter does not match the enabled declaration".to_owned(),
+                        None,
+                    ),
+                    // The block alone is what a plan simply writes.
+                    Ok(Some(_)) => (
+                        "APPEND_SYSTEM.md block does not match the package's enabled state (declaration or kendex.extensionManager.config)".to_owned(),
+                        Some(DriftCause::UpstreamChanged),
+                    ),
+                    Ok(None) => continue,
                 }
-                "native extension filter does not match the enabled declaration".to_owned()
             }
-            Ok(None) => {
+            Ok(None) => (
                 "carrier package or completed install record does not match; update-pi must settle it"
-                    .to_owned()
-            }
-            Err(error) => format!("carrier package could not be compared: {error}"),
+                    .to_owned(),
+                None,
+            ),
+            Err(error) => (format!("carrier package could not be compared: {error}"), None),
         };
         drift.push(DriftRow {
             kind: ItemKind::PiExtension,
@@ -215,7 +244,7 @@ fn record_matching<'a>(
             scope: scope.clone(),
             state: DriftState::Stale,
             detail,
-            cause: None,
+            cause,
             compared: None,
             also_in_the_way: Vec::new(),
         });
@@ -236,6 +265,26 @@ fn record_matching<'a>(
         });
     }
     Ok(drift)
+}
+
+/// The edit that brings the package's `APPEND_SYSTEM.md` block in line with
+/// a declaration's `enabled`, or `None` where the file already holds what
+/// the declaration wants, wherever the block sits in it.
+fn block_edit(
+    env: &Env,
+    root: &Path,
+    name: &str,
+    enabled: bool,
+) -> Result<Option<(PathBuf, crate::configedit::ConfigEdit)>> {
+    let (path, edit) = super::append_system_edit(env, root, name, enabled)?;
+    let current = crate::fs::read_if_exists(&path)?.unwrap_or_default();
+    let in_sync = edit
+        .in_sync(&current)
+        .map_err(|message| CoreError::ConfigEdit {
+            path: path.clone(),
+            message,
+        })?;
+    Ok((!in_sync).then_some((path, edit)))
 }
 
 /// Refuse a toggle that the carrier comparison cannot plan. A manifest-only

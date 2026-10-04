@@ -295,6 +295,46 @@ fn retiring_pi_inventory_keeps_declared_packages_until_pi_remove() {
     }
 }
 
+const WIDGETS_INDEX: &[u8] = b"export default function widgets(pi) {}\n";
+
+/// A catalog shipping `pi-widgets`, a package whose `appendSystem` file
+/// tells the model to use its tool: the catalog and the package source.
+#[allow(clippy::unwrap_used)]
+fn widgets_catalog(w: &World) -> (PathBuf, PathBuf) {
+    let catalog = w.home.join("cat");
+    let source = catalog.join("pi-extensions/pi-widgets");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(catalog.join("kendex.toml"), "is_source_catalog = true\n").unwrap();
+    fs::write(
+        source.join("package.json"),
+        r#"{"name":"pi-widgets","pi":{"extensions":["index.js"],"appendSystem":"system.md"}}"#,
+    )
+    .unwrap();
+    fs::write(source.join("index.js"), WIDGETS_INDEX).unwrap();
+    fs::write(source.join("system.md"), "Use the widget tool.\n").unwrap();
+    (catalog, source)
+}
+
+/// Record the scope's installed Pi packages as they match their bytes, the
+/// record `update-pi` leaves behind, over whatever the record already holds.
+#[allow(clippy::unwrap_used)]
+fn record_installed_packages(w: &World, scope: &Scope) {
+    use kendex_core::{engine, lock, pi_ext};
+    let path = lock::lock_path(&w.env, scope);
+    let mut record = lock::load(&path).unwrap();
+    let declared = engine::ops::manifest_for_reading(&w.env, scope).unwrap();
+    pi_ext::record_matching_manifest(
+        &w.env,
+        scope,
+        &declared,
+        &mut record,
+        pi_ext::RecordBasis::MatchedBytes,
+        None,
+    )
+    .unwrap();
+    lock::save(&path, &record).unwrap();
+}
+
 #[test]
 #[allow(clippy::unwrap_used)]
 #[allow(
@@ -306,18 +346,7 @@ fn native_package_toggles_keep_files_settings_and_records_at_both_scopes() {
     use serde_json::json;
     let w = world();
     let name = "pi-widgets";
-    let catalog = w.home.join("cat");
-    let source = catalog.join("pi-extensions/pi-widgets");
-    fs::create_dir_all(&source).unwrap();
-    fs::write(catalog.join("kendex.toml"), "is_source_catalog = true\n").unwrap();
-    fs::write(
-        source.join("package.json"),
-        r#"{"name":"pi-widgets","pi":{"extensions":["index.js"],"appendSystem":"system.md"}}"#,
-    )
-    .unwrap();
-    let payload = b"export default function widgets(pi) {}\n";
-    fs::write(source.join("index.js"), payload).unwrap();
-    fs::write(source.join("system.md"), "Use the widget tool.\n").unwrap();
+    let (catalog, source) = widgets_catalog(&w);
     for scope in [Scope::Global, scope(&w)] {
         let path = manifest::manifest_path(&w.env, &scope);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -373,7 +402,7 @@ fn native_package_toggles_keep_files_settings_and_records_at_both_scopes() {
             // A switch carries the package's instructions with it.
             let append = fs::read_to_string(pi_ext::append_system_path(&root)).unwrap();
             assert_eq!(append.contains("Use the widget tool."), enabled);
-            assert_eq!(fs::read(dest.join("index.js")).unwrap(), payload);
+            assert_eq!(fs::read(dest.join("index.js")).unwrap(), WIDGETS_INDEX);
             let record = lock::load(&lock::lock_path(&w.env, &scope)).unwrap();
             let declared = engine::ops::manifest_for_reading(&w.env, &scope).unwrap();
             assert_eq!(
@@ -404,6 +433,171 @@ fn native_package_toggles_keep_files_settings_and_records_at_both_scopes() {
                 .drift
                 .iter()
                 .any(|row| row.kind == ItemKind::PiExtension && row.name == name)
+        );
+    }
+}
+
+/// A package's `APPEND_SYSTEM.md` block follows its declaration whatever
+/// Pi's native filter already says: a declaration switched to agree with
+/// the filter needs no native switch, and still takes the block away or
+/// puts it back. Each row: the declaration installed, whether Pi's filter
+/// loads the package, and the declaration the toggle sets.
+#[test]
+#[allow(clippy::unwrap_used)]
+fn a_declaration_switch_pi_already_made_moves_only_its_block() {
+    use kendex_core::{apply, engine, manifest, pi_ext};
+    use serde_json::json;
+    for (declared, native_on, toggled) in [(true, false, false), (false, true, true)] {
+        let row = format!("declared {declared}, toggled {toggled}");
+        let w = world();
+        let (catalog, source) = widgets_catalog(&w);
+        let scope = scope(&w);
+        fs::write(manifest::manifest_path(&w.env, &scope), format!(
+            "schema = 6\n[sources.cat]\n{}\n[install]\nharnesses = [\"pi\"]\n[pi-extensions.pi-widgets]\nsource = \"cat\"\nenabled = {declared}\n", source_path(&catalog)
+        )).unwrap();
+        let root = pi_ext::scope_root(&w.env, &scope).unwrap();
+        let dest = pi_ext::install(&w.env, &root, &source, declared)
+            .unwrap()
+            .dest;
+        let settings_path = pi_ext::settings_path(&root);
+        let mut entry = json!({"source": dest});
+        if !native_on {
+            entry["extensions"] = json!([]);
+        }
+        fs::write(&settings_path, json!({"packages": [entry]}).to_string()).unwrap();
+        record_installed_packages(&w, &scope);
+        let append_path = pi_ext::append_system_path(&root);
+        let settings = fs::read(&settings_path).unwrap();
+        let instructions = fs::read(&append_path).ok();
+        assert_eq!(
+            instructions
+                .as_deref()
+                .is_some_and(|text| String::from_utf8_lossy(text).contains("Use the widget tool.")),
+            declared,
+            "{row}"
+        );
+
+        let report = engine::ops::toggle(
+            &w.env,
+            &scope,
+            &["pi-widgets".to_owned()],
+            Some(ItemKind::PiExtension),
+            toggled,
+            None,
+        )
+        .unwrap();
+        apply::execute(&w.env, &report.plan).unwrap();
+
+        let append = fs::read_to_string(&append_path).unwrap_or_default();
+        assert_eq!(
+            append.contains("Use the widget tool."),
+            toggled,
+            "{row}: {append}"
+        );
+        assert_eq!(
+            fs::read(&settings_path).unwrap(),
+            settings,
+            "{row}: no native switch"
+        );
+        let drift = engine::audit(&w.env, &scope).unwrap().drift;
+        assert!(drift.is_empty(), "{row}: {} rows", drift.len());
+        // The block as it stood before the toggle is drift the plan writes.
+        match &instructions {
+            Some(bytes) => fs::write(&append_path, bytes).unwrap(),
+            None => fs::remove_file(&append_path).unwrap(),
+        }
+        let drift = engine::audit(&w.env, &scope).unwrap().drift;
+        assert!(
+            drift.iter().any(|row| row.kind == ItemKind::PiExtension
+                && row.name == "pi-widgets"
+                && row.state == engine::DriftState::Stale
+                && row.cause == Some(engine::DriftCause::UpstreamChanged)),
+            "{row}: {} rows",
+            drift.len()
+        );
+    }
+}
+
+/// A toggle plans before it saves the manifest, so an `APPEND_SYSTEM.md`
+/// that will not read fails it there: no declaration claims a switch whose
+/// block was never compared.
+#[test]
+#[allow(clippy::unwrap_used)]
+fn a_toggle_over_an_unreadable_append_system_refuses_and_writes_nothing() {
+    use kendex_core::{engine, lock, manifest, pi_ext};
+    let w = world();
+    let (catalog, source) = widgets_catalog(&w);
+    let scope = scope(&w);
+    let manifest_path = manifest::manifest_path(&w.env, &scope);
+    fs::write(&manifest_path, format!(
+        "schema = 6\n[sources.cat]\n{}\n[install]\nharnesses = [\"pi\"]\n[pi-extensions.pi-widgets]\nsource = \"cat\"\n", source_path(&catalog)
+    )).unwrap();
+    let root = pi_ext::scope_root(&w.env, &scope).unwrap();
+    pi_ext::install(&w.env, &root, &source, true).unwrap();
+    record_installed_packages(&w, &scope);
+    // Bytes that are not UTF-8, as an editor saving another encoding leaves.
+    fs::write(pi_ext::append_system_path(&root), b"Notes \xff\n").unwrap();
+    let lock_path = lock::lock_path(&w.env, &scope);
+    let settings_path = pi_ext::settings_path(&root);
+    let before = [&manifest_path, &settings_path, &lock_path].map(|path| fs::read(path).unwrap());
+
+    let toggled = engine::ops::toggle(
+        &w.env,
+        &scope,
+        &["pi-widgets".to_owned()],
+        Some(ItemKind::PiExtension),
+        false,
+        None,
+    );
+
+    assert!(toggled.is_err(), "the toggle planned over an unread block");
+    let after = [&manifest_path, &settings_path, &lock_path].map(|path| fs::read(path).unwrap());
+    assert_eq!(after, before);
+}
+
+/// A package installed after the scope's Pi output style puts its block
+/// after the style's. Keeping either block where it stands is no change,
+/// so every audit reads both in line and no apply rewrites the file.
+#[test]
+#[allow(clippy::unwrap_used)]
+fn a_style_and_a_package_block_audit_clean_across_repeated_applies() {
+    use kendex_core::{apply, engine, manifest, pi_ext};
+    let w = world();
+    let (catalog, source) = widgets_catalog(&w);
+    fs::create_dir_all(catalog.join("output-styles")).unwrap();
+    fs::write(
+        catalog.join("output-styles/STE.md"),
+        "---\nname: STE\ndescription: Short sentences\nkeep-coding-instructions: true\n---\nWrite short sentences.\n",
+    )
+    .unwrap();
+    let scope = scope(&w);
+    fs::write(manifest::manifest_path(&w.env, &scope), format!(
+        "schema = 6\n[sources.cat]\n{}\n[install]\nharnesses = [\"pi\"]\n[output-styles.STE]\nsource = \"cat\"\n[pi-extensions.pi-widgets]\nsource = \"cat\"\n", source_path(&catalog)
+    )).unwrap();
+    let style = engine::audit(&w.env, &scope).unwrap();
+    apply::execute(&w.env, &style.plan).unwrap();
+    let root = pi_ext::scope_root(&w.env, &scope).unwrap();
+    pi_ext::install(&w.env, &root, &source, true).unwrap();
+    record_installed_packages(&w, &scope);
+    let append_path = pi_ext::append_system_path(&root);
+    let installed = fs::read_to_string(&append_path).unwrap();
+    let style_at = installed.find("output-style-STE begin").unwrap();
+    let package_at = installed.find("pi-widgets begin").unwrap();
+    assert!(style_at < package_at, "{installed}");
+
+    for pass in 0..3 {
+        let report = engine::audit(&w.env, &scope).unwrap();
+        let drift: Vec<_> = report
+            .drift
+            .iter()
+            .map(|row| (row.name.clone(), row.detail.clone()))
+            .collect();
+        assert!(drift.is_empty(), "pass {pass}: {drift:?}");
+        apply::execute(&w.env, &report.plan).unwrap();
+        assert_eq!(
+            fs::read_to_string(&append_path).unwrap(),
+            installed,
+            "pass {pass}"
         );
     }
 }
