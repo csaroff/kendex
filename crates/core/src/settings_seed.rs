@@ -1,14 +1,12 @@
 //! `kendex.settings.toml` seeding — skills ship a
 //! `kendex.settings.toml.example`, and the `[env]` entries [`Seeding`]
 //! admits merge into the project's settings file, write-if-absent per key:
-//! comment blocks travel with their key. What it admits is a narrow set. A
-//! template applies once, when its skill arrives, and writes then only the
-//! keys it marks `# required`; a save writes the keys it names. Nothing
-//! else here reaches a consumer's file. Seeding on refresh leaves it
-//! byte-identical and keeps deleted keys absent; the compatibility pass in
-//! `crate::engine::settings_write` can still update legacy agent labels.
-//! A key nobody
-//! answers is named by [`notes`] rather than written.
+//! comment blocks travel with their key. What it admits is a narrow set,
+//! [`Seeding`] states it, and `docs/authoring/settings.md` states which
+//! operations reach a consumer's file and when. Seeding on refresh leaves
+//! it byte-identical and keeps deleted keys absent; the compatibility pass
+//! in `crate::engine::settings_write` can still update legacy agent
+//! labels. A key nobody answers is named by [`notes`] rather than written.
 //!
 //! The shell-side readers consume the `[env]` table only, but the presence
 //! check here stays file-wide, conservatively: seeding must never add a key
@@ -33,8 +31,8 @@
 //! hands the consumer a different string from the one it declared.
 //!
 //! Nothing here ever revisits a block it wrote. A comment a consumer
-//! carries is theirs from the moment it lands, whether an arrival or a
-//! save put it there, and a later template revision does not follow it in:
+//! carries is theirs from the moment it lands, and a later template
+//! revision does not follow it in:
 //! that would be a write into a tracked file on a pass nobody asked to
 //! write. Every write is byte-faithful — the inserted block is the only
 //! change — so CRLF files and missing-terminator state survive untouched.
@@ -99,10 +97,10 @@ pub struct EnvEntry {
     /// walk's answer, not a count off one end of a list of both.
     pub assignment: String,
     /// Whether the template marks this key as one the consumer has to
-    /// decide, which is the only reason an install writes a key into
-    /// their file. Every other key ships a value its own code already
-    /// reads, so writing it would put a line in a tracked file that
-    /// changes nothing.
+    /// decide, which is what an arrival writes. Every other key ships a
+    /// value its own code already reads, so an arrival writing it would
+    /// put a line in a tracked file that changes nothing. Every write to
+    /// that file is listed in `docs/authoring/settings.md`.
     pub required: bool,
 }
 
@@ -294,8 +292,9 @@ pub fn writable_all<'a>(
         .filter(move |seeded| seeded.entry.key == key && seeded.entry.complete())
 }
 
-/// Why this pass may put a key in the consumer's file, which is the whole
-/// of what an install writes there.
+/// Why this pass may put a key in the consumer's file. Two reasons, and
+/// the operations behind them are listed once, in
+/// `docs/authoring/settings.md`.
 ///
 /// A template applies ONCE, when its skill arrives. What it writes then is
 /// the keys it marks `# required` — the ones the consumer has to decide,
@@ -303,9 +302,9 @@ pub fn writable_all<'a>(
 /// over the same scope writes none of it, so a refresh leaves the file as
 /// it found it and a key the consumer deleted stays deleted.
 ///
-/// A save is the other reason. The app writes values for keys no seed ever
-/// wrote, and a value needs an assignment to land on, so the keys one save
-/// names are inserted by the same pass that then sets them.
+/// A key this pass sets a value on is the other reason. It may be one no
+/// seed ever wrote, and a value needs an assignment to land on, so the
+/// keys edited are inserted by the same pass that then sets them.
 #[derive(Debug, Default, Clone)]
 pub struct Seeding {
     /// Skills whose template this pass applies: the ones arriving now.
