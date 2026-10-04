@@ -127,7 +127,7 @@ for row in 'mint:1000:1:token-1' 'cache:1000:1:token-1' 'before-expiry:4540:2:to
 done
 config=$(cat "$LOG/config")
 assert_contains 'mint sends fixed scope and encoded client credentials' "$config" \
-    'grant_type=client_credentials&scope=read%2Cwrite&client_id=app%2Fid&client_secret=app%26secret'
+    'grant_type=client_credentials&scope=read%2Cwrite%2Cissues%3Acreate%2Ccomments%3Acreate%2CtimeSchedule%3Awrite%2Cinitiative%3Aread%2Cinitiative%3Awrite%2Ccustomer%3Aread%2Ccustomer%3Awrite&client_id=app%2Fid&client_secret=app%26secret'
 assert_not 'mint keeps client credentials out of jq arguments' \
     grep -F -e 'app&secret' -e 'app/id' "$LOG/jq-argv"
 cache_files=("$PROJECT/.cache/linear/oauth/"*.json)
@@ -390,5 +390,21 @@ for row in 'token-failure|token-http=400' 'token-transport|token=transport-faile
     assert_file_contains "mint-$mode: diagnostic" "$LOG/error" "$diagnostic"
     assert_eq "mint-$mode: no stdout" "$OUT" ''
 done
+
+# A token cached before a scope change, under the pair-only key, is never reused.
+if command -v sha256sum >/dev/null 2>&1; then
+    old_key=$(printf '%s' 'app/id:app&secret' | sha256sum | cut -c1-12) || { echo 'oauth-auth: digest=failed' >&2; exit 1; }
+else
+    old_key=$(printf '%s' 'app/id:app&secret' | shasum -a 256 | cut -c1-12) || { echo 'oauth-auth: digest=failed' >&2; exit 1; }
+fi
+printf 'LINEAR_CLIENT_ID="app/id"\nLINEAR_CLIENT_SECRET="app&secret"\n' >"$PROJECT/.env.local"
+mkdir -p -- "$PROJECT/.cache/linear/oauth"
+rm -f -- "${PROJECT:?}/.cache/linear/oauth/"*.json
+printf '{"access_token":"old-scope-token","expires_at":99999999}\n' >"$PROJECT/.cache/linear/oauth/$old_key.json"
+before=$(wc -l <"$LOG/mints")
+run_oauth_request request
+assert_eq 'old-scope cache: request succeeds' "$RC" 0
+after=$(wc -l <"$LOG/mints")
+assert_eq 'old-scope cache: scope change mints a new token' "$((after - before))" 1
 
 run_oauth_git_redirects "$SCRIPT_DIR/oauth-auth.test.sh" "$TMP_ROOT/git-callers"

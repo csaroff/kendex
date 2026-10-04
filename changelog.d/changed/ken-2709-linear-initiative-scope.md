@@ -1,0 +1,1 @@
+- The linear skill's app token requests every non-admin Linear data scope, initiatives and customers included. The first mint revokes every older app token; reissue the fleet token.
