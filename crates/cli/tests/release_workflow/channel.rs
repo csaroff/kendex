@@ -8,7 +8,7 @@
 #[cfg(unix)]
 use std::fs;
 
-use super::{concurrency_group, job, job_declaring, run_script, step, workflow};
+use super::{concurrency_value, job, job_declaring, run_script, step, workflow};
 use crate::test_util::rooted;
 
 #[path = "../../build.rs"]
@@ -483,7 +483,7 @@ fn burst(group: Option<&str>, tags: usize) -> Vec<bool> {
 fn overlapping_tags_each_publish_their_release() {
     let workflow = workflow();
     let publishing = job_declaring(&workflow, "uses: softprops/action-gh-release@v2");
-    let group = concurrency_group(&job(&workflow, publishing));
+    let group = concurrency_value(&job(&workflow, publishing), "group");
     assert!(
         group.is_some_and(|value| value.contains("github.run_id")),
         "tag publications do not get unique groups: {group:?}"
@@ -504,26 +504,55 @@ fn overlapping_tags_each_publish_their_release() {
     }
 }
 
-/// Main builds can be cancelled while they still produce private artifacts.
-/// Publication is immutable. The one channel pointer waits for an active
-/// replacement and cannot be interrupted by a later build.
+/// Later pushes leave running builds and publication to finish. GitHub keeps
+/// only the newest pending job per group. The channel pointer waits for an
+/// active replacement and cannot be interrupted by a later build.
 #[test]
-fn publication_never_cancels_an_asset_replacement_in_progress() {
+fn later_pushes_never_cancel_running_builds_or_publication() {
     let workflow = workflow();
-    let build = job(&workflow, "build");
-    assert!(
-        build
-            .iter()
-            .any(|line| line.trim() == "cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}")
-    );
-
+    let publishing = job_declaring(&workflow, "uses: softprops/action-gh-release@v2");
     let channel = job_declaring(&workflow, "name: Point the rolling channel at this build");
-    assert!(concurrency_group(&job(&workflow, channel)).is_some());
-    assert!(
-        job(&workflow, channel)
-            .iter()
-            .any(|line| line.trim() == "cancel-in-progress: false")
-    );
+    let check = |workflow: &str| {
+        for name in ["build", publishing, channel] {
+            let lines = job(workflow, name);
+            assert!(
+                concurrency_value(&lines, "group").is_some(),
+                "{name} has no group"
+            );
+            assert_eq!(
+                concurrency_value(&lines, "cancel-in-progress"),
+                Some("false"),
+                "{name} can cancel a running job"
+            );
+        }
+    };
+    check(&workflow);
+
+    // Keep the matched text in a shell no-op while restoring cancellation.
+    for name in ["build", publishing, channel] {
+        let original = job(&workflow, name).join("\n");
+        let setting = "      cancel-in-progress: false";
+        assert_eq!(original.matches(setting).count(), 1);
+        assert_eq!(original.matches("    steps:").count(), 1);
+        let cancelling = original
+            .replace(
+                setting,
+                "      cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}",
+            )
+            .replace(
+                "    steps:",
+                "    steps:\n      - name: Unused cancellation text\n        run: |\n          : <<'UNUSED'\n          cancel-in-progress: false\n          UNUSED",
+            );
+        assert_ne!(original, cancelling);
+        assert_eq!(cancelling.matches("cancel-in-progress: false").count(), 1);
+        assert_eq!(workflow.matches(&original).count(), 1);
+        let mutant = workflow.replacen(&original, &cancelling, 1);
+        assert_ne!(workflow, mutant);
+        assert!(
+            std::panic::catch_unwind(|| check(&mutant)).is_err(),
+            "{name}"
+        );
+    }
 }
 
 /// The rolling release uses a tag that cannot be confused with the main
