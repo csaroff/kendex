@@ -81,7 +81,7 @@ control_replace tests/must-fail-controls.sh 1 \
 #     satisfies every mutation that names the assertion it is red on.
 control_expect "a suite failing from its unmutated copy proves nothing under mutation"
 control_replace tests/must-fail-controls.sh 1 \
-	'	if ! timeout "$SUITE_TIMEOUT" bash "$root/tests/$suite" >/dev/null 2>&1; then' \
+	'	if ! out="$(timeout "$SUITE_TIMEOUT" bash "$root/tests/$suite" 2>&1)"; then' \
 	'	if false; then'
 
 # 13. The verdict on a control that counted no mutation.
@@ -96,3 +96,10 @@ control_expect "a mutation whose line the file lacks did not apply"
 control_replace tests/must-fail-controls.sh 1 \
 	'		if ! apply_control "$root" "$k"; then' \
 	'		if ! apply_control "$root" "$k" 2>/dev/null && false; then'
+
+# 15. What goes under the UNSTAGED verdict, discarded while the verdict stays,
+#     so only the row keeping those lines sees it.
+control_expect "the unstaged report shows the assertion the suite failed on"
+control_replace tests/must-fail-controls.sh 1 \
+	"		} | sed 's/^/         | /'" \
+	'		} >/dev/null'
