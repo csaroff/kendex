@@ -62,6 +62,22 @@ pub fn append_system_path(scope_root: &Path) -> PathBuf {
     scope_root.join("APPEND_SYSTEM.md")
 }
 
+/// Shared prompts reject final links and project directory links that leave
+/// the project. Global roots follow the user's layout, as planned writes do.
+pub(crate) fn append_system_target(env: &Env, root: &Path) -> Result<PathBuf> {
+    let path = append_system_path(root);
+    if let Some(message) = crate::engine::output_style::file_problem(&path) {
+        return Err(CoreError::ConfigEdit { path, message });
+    }
+    let project = (root != scope_root(env, &crate::model::Scope::Global)?)
+        .then(|| crate::paths::absolute(root.parent().unwrap_or(root)));
+    crate::apply::landing::landed_within(
+        project.as_deref(),
+        crate::apply::landing::Outside::Refused,
+        &path,
+    )
+}
+
 /// The `package.json` fields kendex acts on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PiPackage {
@@ -216,6 +232,7 @@ pub fn install(
     enabled: bool,
 ) -> Result<InstallOutcome> {
     let package = read(source_pkg_dir)?;
+    append_system_target(env, scope_root)?;
     let dest = package_path(scope_root, &package.name)?;
     if dest.symlink_metadata().is_ok() {
         crate::trash::move_to_trash(env, &dest)?;
@@ -237,6 +254,7 @@ pub fn install(
 /// Unregister a package and move its installed copy to the trash.
 pub fn remove(env: &Env, scope_root: &Path, name: &str) -> Result<()> {
     let dest = package_path(scope_root, name)?;
+    append_system_target(env, scope_root)?;
     settings::remove_package(&settings_path(scope_root), name)?;
     strip_append_system(&append_system_path(scope_root), name)?;
     unlink_bins(&bin_dir(scope_root), &dest)?;
@@ -458,7 +476,7 @@ pub(crate) fn append_system_edit(
         },
         None => ConfigEdit::RemoveMarkerBlock { name: package.name },
     };
-    Ok((append_system_path(scope_root), edit))
+    Ok((append_system_target(env, scope_root)?, edit))
 }
 
 /// Mirror the package's [`append_system_block`] into the scope's
@@ -470,16 +488,84 @@ fn write_append_system(
     dest: &Path,
     enabled: bool,
 ) -> Result<()> {
-    let path = append_system_path(scope_root);
-    let Some(block) = append_system_block(env, scope_root, package, dest, enabled)? else {
-        return strip_append_system(&path, &package.name);
-    };
+    let path = append_system_target(env, scope_root)?;
     let current = read_if_exists(&path)?.unwrap_or_default();
-    let next = upsert_marker_block(&current, &package.name, &block);
+    let mut next = match append_system_block(env, scope_root, package, dest, enabled)? {
+        Some(block) => upsert_marker_block(&current, &package.name, &block),
+        None => remove_marker_block(&current, &package.name),
+    };
+    if let Some(edit) = inherited_edit(env, scope_root, !next.trim().is_empty())? {
+        next = edit.apply(&next).map_err(|message| CoreError::ConfigEdit {
+            path: path.clone(),
+            message,
+        })?;
+    }
+    if !current.trim().is_empty() {
+        next = strip_inherited_only(&next);
+    }
     if next == current {
         return Ok(());
     }
+    if next.trim().is_empty() {
+        return std::fs::remove_file(&path).map_err(|e| CoreError::io(&path, e));
+    }
     atomic_write(&path, &next)
+}
+
+/// Pi reads only the trusted project's append file. Keep inherited content
+/// in one block so reapply can remove packages and styles that left globally.
+pub(crate) fn inherited_edit(
+    env: &Env,
+    root: &Path,
+    contributes: bool,
+) -> Result<Option<ConfigEdit>> {
+    let global = scope_root(env, &crate::model::Scope::Global)?;
+    if root == global || (!append_system_path(root).exists() && !contributes) {
+        return Ok(None);
+    }
+    match append_system_target(env, root) {
+        Err(CoreError::ConfigEdit { .. } | CoreError::ScopeEscape { .. }) => return Ok(None),
+        Err(error) => return Err(error),
+        Ok(_) => (),
+    }
+    let mut blocks = Vec::new();
+    for name in list_installed(&global)? {
+        let enabled = package_enabled(&settings_path(&global), &name)? == Some(true);
+        let dest = package_path(&global, &name)?;
+        if let Some(block) = append_system_block(env, root, &read(&dest)?, &dest, enabled)? {
+            blocks.push(block);
+        }
+    }
+    let global_text = read_if_exists(&append_system_path(&global))?.unwrap_or_default();
+    for name in crate::configedit::style_blocks(&global_text) {
+        if let Some(block) =
+            crate::configedit::marker_block(&global_text, &format!("output-style-{name}"))
+        {
+            let mut lines: Vec<_> = block.lines().skip(1).collect();
+            lines.pop();
+            blocks.push(lines.join("\n"));
+        }
+    }
+    let name = "inherited-global".to_owned();
+    Ok(Some(if blocks.is_empty() {
+        ConfigEdit::RemoveMarkerBlock { name }
+    } else {
+        ConfigEdit::UpsertMarkerBlock {
+            name,
+            block: blocks.join("\n\n"),
+        }
+    }))
+}
+
+/// Inheritance belongs to the project's instructions, not to an otherwise
+/// empty file that would prevent Pi from reading the user's global file.
+fn strip_inherited_only(text: &str) -> String {
+    let local = remove_marker_block(text, "inherited-global");
+    if local.trim().is_empty() {
+        local
+    } else {
+        text.to_owned()
+    }
 }
 
 /// Drop the package's block; a file with nothing left in it is deleted
@@ -488,7 +574,7 @@ fn strip_append_system(path: &Path, name: &str) -> Result<()> {
     let Some(current) = read_if_exists(path)? else {
         return Ok(());
     };
-    let next = remove_marker_block(&current, name);
+    let next = strip_inherited_only(&remove_marker_block(&current, name));
     if next == current {
         return Ok(());
     }

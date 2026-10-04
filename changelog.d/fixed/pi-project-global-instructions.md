@@ -1,0 +1,1 @@
+- Pi projects retain global instructions after combined apply. Blockless installs keep the global prompt. Prompt links, non-files, and Pi directory links outside the project block package changes.
