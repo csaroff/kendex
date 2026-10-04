@@ -3,13 +3,15 @@
 //!
 //! The collection is a value rather than a step inside the write, because
 //! two readers need it: the inventory this file writes, and the commit
-//! offer, which covers only the files kendex owns whole. One collection,
-//! so the two cannot disagree about what kendex wrote.
+//! offer, which tells the files kendex owns whole from the ones it writes
+//! into. One collection, so the two cannot disagree about what kendex
+//! wrote.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use crate::apply::{Op, PlannedOp, Pre};
+use crate::env::Env;
 use crate::error::Result;
 use crate::model::Scope;
 
@@ -31,13 +33,13 @@ pub(crate) use adopted::{committable_paths, inventory_paths};
 /// The manifest is deliberately not here. kendex writes keys in it and folds
 /// them into the document the person wrote — `crate::manifest::fold` keeps
 /// their comments, key order and every value it did not touch — so kendex
-/// does not own its bytes and may neither commit nor restore it whole. A
-/// source catalog moves the declaration to a sibling file besides
+/// does not own its bytes and never restores it whole. A commit carries it
+/// only where the action wrote it and it held no change before, and
+/// otherwise the offer names it to the person
+/// ([`crate::commit_offer::Pending::manifest_not_carried`]). A
+/// source catalog moves the declaration to a sibling file
 /// (`crate::manifest::project_manifest_path`), so a fixed name here would
-/// name the wrong file in this very repository. The declaration a render
-/// does need to survive a later apply is that manifest, and the offer names
-/// it to the person rather than committing it:
-/// [`crate::commit_offer::Pending::manifest_not_carried`].
+/// name the wrong file in this very repository.
 pub fn companions(root: &Path) -> [PathBuf; 2] {
     [root.join(INVENTORY), root.join(crate::lock::LOCK_FILE)]
 }
@@ -58,6 +60,22 @@ pub struct GeneratedPaths {
     /// `Registration` edit targets. `desired.rs` states why kendex edits
     /// rather than renders them: every unrelated key in them stays intact.
     pub shared: BTreeSet<PathBuf>,
+    /// Shared configuration files this pass edits keys in or, where its
+    /// edits leave nothing in one, takes away. A removal reverses a
+    /// registration in a file no item names after it, so
+    /// [`GeneratedPaths::shared`] does not hold every one. Adds nothing to
+    /// the inventory. Files kendex does not own whole: the person's own keys
+    /// may be in them, so neither the edit nor the deletion is kendex's
+    /// alone.
+    pub edited: BTreeSet<PathBuf>,
+    /// What the install record at `HEAD` says kendex writes keys in
+    /// ([`recorded`]). Adds nothing to the inventory. A removal left
+    /// uncommitted has taken its entry out of the record on disk and may
+    /// have taken an emptied file away with it, and the inventory at `HEAD`
+    /// still names that file: this is what keeps it a file kendex writes
+    /// into rather than one it owns, for a reading made after the action as
+    /// for the action's own.
+    pub recorded: Recorded,
     /// Sections a renderer owns inside files whose other bytes belong to
     /// the project. Commit and restore can only change the named section.
     pub regions: BTreeSet<crate::commit_offer::OwnedRegion>,
@@ -67,6 +85,38 @@ pub struct GeneratedPaths {
     /// Adoption copies checked against declared package templates. Refresh
     /// records their provenance but does not write or restore their YAML.
     pub adopted: BTreeMap<PathBuf, AdoptedWorkflow>,
+}
+
+/// What the install record at `HEAD` says about the shared configuration
+/// files kendex writes keys in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Recorded {
+    /// The record at `HEAD` read, or `HEAD` holds neither a record nor an
+    /// inventory listing paths: these files.
+    Known(BTreeSet<PathBuf>),
+    /// `HEAD` holds a record this build does not read, or none while its
+    /// inventory lists paths. That inventory cannot then tell a render from
+    /// a shared file whose last key went, so a deletion it names is
+    /// kendex's only where the record on disk names the path, or a tree
+    /// holding it, as a file it wrote whole: `rendered`.
+    Unknown { rendered: BTreeSet<PathBuf> },
+}
+
+impl Default for Recorded {
+    fn default() -> Self {
+        Recorded::Known(BTreeSet::new())
+    }
+}
+
+impl Recorded {
+    /// The files the record at `HEAD` names; none where it says nothing.
+    fn files(&self) -> &BTreeSet<PathBuf> {
+        static NONE: BTreeSet<PathBuf> = BTreeSet::new();
+        match self {
+            Recorded::Known(files) => files,
+            Recorded::Unknown { .. } => &NONE,
+        }
+    }
 }
 
 impl GeneratedPaths {
@@ -140,6 +190,42 @@ impl GeneratedPaths {
             .cloned()
             .chain(self.regions.iter().map(|region| region.path().to_owned()))
             .chain(companions(root))
+            .collect()
+    }
+
+    /// These paths, with `edited` as the shared configuration files the
+    /// pass edits or takes away ([`GeneratedPaths::edited`]) and `recorded`
+    /// as the ones the record at `HEAD` writes keys in
+    /// ([`GeneratedPaths::recorded`]).
+    pub(super) fn editing(self, edited: BTreeSet<PathBuf>, recorded: Recorded) -> Self {
+        Self {
+            edited,
+            recorded,
+            ..self
+        }
+    }
+
+    /// Every file an action can write into beside its renders without
+    /// owning it whole: the project's manifest, its settings file,
+    /// `.gitignore`, and the shared configuration files in
+    /// [`GeneratedPaths::shared`], [`GeneratedPaths::edited`] and
+    /// [`GeneratedPaths::recorded`]. What a
+    /// reading before an action records as the action's writes where the
+    /// caller holds no plan to name them
+    /// ([`crate::commit_offer::Before::read`]): the app reads before a write
+    /// it cannot see the plan of. A file among them the action left as it
+    /// found it is the person's.
+    pub fn beside(&self, root: &Path) -> BTreeSet<PathBuf> {
+        self.shared
+            .iter()
+            .chain(&self.edited)
+            .chain(self.recorded.files())
+            .cloned()
+            .chain([
+                crate::manifest::project_manifest_path(root),
+                crate::settings_seed::settings_file_path(root),
+                root.join(".gitignore"),
+            ])
             .collect()
     }
 
@@ -226,6 +312,71 @@ fn collect(
     generated
 }
 
+/// The shared configuration files the install record at `HEAD` has kendex
+/// writing keys in: the file each registration it records is reversed in
+/// ([`super::owned::installed`]), the one answer to what an installation
+/// wrote. Read at `HEAD` and not off the record on disk, which an
+/// uncommitted removal has already taken the entry out of.
+///
+/// A scope that is not a project, a project outside git, an unborn `HEAD`
+/// and one holding neither a record nor an inventory listing paths name
+/// none. A record at `HEAD` this build will not read, or none beside such
+/// an inventory, is [`Recorded::Unknown`] with what `lock`, the record on
+/// disk the plan reads, names whole: refusing here would fail every plan
+/// over a copy only the commit offer's deletion rule consults.
+pub(super) fn recorded(env: &Env, scope: &Scope, lock: &crate::lock::Lock) -> Result<Recorded> {
+    let Scope::Project { root } = scope else {
+        return Ok(Recorded::default());
+    };
+    if !root.join(".git").exists() {
+        return Ok(Recorded::default());
+    }
+    let committed = crate::commit_offer::committed(root, crate::lock::LOCK_FILE).map_err(
+        git_failed("read committed install record", "install record"),
+    )?;
+    let path = crate::lock::lock_path(env, scope);
+    let at_head = match committed {
+        Some(bytes) => crate::lock::parse_text(&path, &String::from_utf8_lossy(&bytes)).ok(),
+        None => {
+            let inventory = crate::commit_offer::committed_inventory(root).map_err(git_failed(
+                "read committed generated inventory",
+                "inventory",
+            ))?;
+            if inventory.is_empty() {
+                return Ok(Recorded::default());
+            }
+            None
+        }
+    };
+    let Some(at_head) = at_head else {
+        return Ok(Recorded::Unknown {
+            rendered: super::owned::paths(env, scope, lock),
+        });
+    };
+    let mut recorded = BTreeSet::new();
+    for entry in at_head.entries.values() {
+        let edits = super::owned::installed(env, scope, entry).edits?;
+        recorded.extend(edits.into_iter().map(|(path, _)| path));
+    }
+    Ok(Recorded::Known(recorded))
+}
+
+/// A read of the last commit that would not run, as the plan's error:
+/// `command` names the read and `what` the thing it reads.
+fn git_failed(
+    command: &'static str,
+    what: &'static str,
+) -> impl FnOnce(crate::commit_offer::Failed) -> crate::error::CoreError {
+    move |error| crate::error::CoreError::GitFailed {
+        command: command.to_owned(),
+        stderr: if error.timed_out() {
+            format!("{what} read timed out")
+        } else {
+            error.said().join("\n")
+        },
+    }
+}
+
 /// Collect what this pass renders and plan the inventory write for it.
 /// The collection is handed back so the report can carry it to the commit
 /// offer: one collection, so the inventory and the offer cannot disagree.
@@ -250,16 +401,10 @@ pub(super) fn plan(
     };
     generated.adopted = adopted;
     if !generated.held.is_empty() {
-        let committed = crate::commit_offer::committed_inventory(root).map_err(|error| {
-            crate::error::CoreError::GitFailed {
-                command: "read committed generated inventory".to_owned(),
-                stderr: if error.timed_out() {
-                    "inventory read timed out".to_owned()
-                } else {
-                    error.said().join("\n")
-                },
-            }
-        })?;
+        let committed = crate::commit_offer::committed_inventory(root).map_err(git_failed(
+            "read committed generated inventory",
+            "inventory",
+        ))?;
         generated.held.retain(|path| {
             path.strip_prefix(root)
                 .ok()

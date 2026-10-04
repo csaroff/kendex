@@ -19,6 +19,7 @@
 //! An effect inside `.git` is out of scope. A commit carries none of those
 //! files, and a hook that is not set up refuses nothing.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use crate::engine::GeneratedPaths;
@@ -63,8 +64,8 @@ pub enum Staleness {
     /// together.
     Split {
         /// The changed inputs the commit leaves out: the package's paths
-        /// under its tree or its declared writes, the manifest, which no
-        /// commit kendex makes carries, and the inventory. Empty where the
+        /// under its tree or its declared writes, the manifest where the
+        /// commit does not carry it, and the inventory. Empty where the
         /// input left out is a change kendex does not own.
         left: Vec<String>,
         /// What the staged checker said over the commit, escaped.
@@ -72,27 +73,8 @@ pub enum Staleness {
     },
 }
 
-/// Which of the scan's changed paths a commit carries.
-#[derive(Debug, Clone, Copy)]
-pub enum Carried<'a> {
-    /// Every changed path kendex owns: the terminal's commit, and the
-    /// window's commit of every pending change.
-    Everything,
-    /// Only these paths: the window's commit of one action's work.
-    Only(&'a std::collections::BTreeSet<String>),
-}
-
-impl Carried<'_> {
-    fn carries(self, path: &str) -> bool {
-        match self {
-            Carried::Everything => true,
-            Carried::Only(paths) => paths.contains(path),
-        }
-    }
-}
-
-/// Every installed package whose checkout files the commit carrying
-/// `carried` would hold out of date. Empty where that commit can be
+/// Every installed package whose checkout files the commit of `carried`,
+/// paths the scan names, would hold out of date. Empty where that commit can be
 /// offered. The one owner of the rule for both surfaces: each asks it of
 /// the commit it offers, with the `generated` set that commit is made
 /// from.
@@ -127,7 +109,7 @@ pub fn stale(
     scope: &Scope,
     scan: &Scan,
     generated: &GeneratedPaths,
-    carried: Carried,
+    carried: &BTreeSet<String>,
 ) -> crate::error::Result<Vec<Stale>> {
     let mut candidate: Option<Candidate> = None;
     let mut held = Vec::new();
@@ -144,7 +126,7 @@ pub fn stale(
             .iter()
             .map(|owned| owned.path.as_str())
             .filter(|path| belongs(&scan.root, &declared, path))
-            .partition(|path| carried.carries(path));
+            .partition(|path| carried.contains(*path));
         if taken.is_empty() || declared.effects.installer.is_none() {
             continue;
         }
@@ -160,7 +142,7 @@ pub fn stale(
                             None => candidate.insert(Candidate::build(
                                 &scan.root,
                                 generated,
-                                &carried_paths(scan, carried),
+                                &carried.iter().cloned().collect::<Vec<_>>(),
                             )?),
                         };
                         standing(candidate.status(scope, &declared), |said| {
@@ -208,30 +190,22 @@ fn standing(
     }
 }
 
-/// The scan's changed paths the commit carries.
-fn carried_paths(scan: &Scan, carried: Carried) -> Vec<String> {
-    scan.owned
-        .iter()
-        .map(|owned| owned.path.clone())
-        .filter(|path| carried.carries(path))
-        .collect()
-}
-
 /// A split package's changed inputs the commit leaves out: its own paths
-/// the commit does not carry, the manifest wherever it changed or was
-/// deleted, and the inventory where it changed and is not carried. The
-/// package renders from the whole manifest and from the inventory, so each
-/// is named where it is left behind; which of them the check read, only
-/// its own words say.
-fn left_out(scan: &Scan, carried: Carried, left: Vec<&str>) -> Vec<String> {
+/// the commit does not carry, the manifest where it changed, whatever the
+/// action did to it, and the commit does not carry it, and the inventory
+/// where it changed and is not carried. The package renders from the whole manifest and from the
+/// inventory, so each is named where it is left behind; which of them the
+/// check read, only its own words say.
+fn left_out(scan: &Scan, carried: &BTreeSet<String>, left: Vec<&str>) -> Vec<String> {
     let inventory = scan
         .owned
         .iter()
         .map(|owned| owned.path.as_str())
-        .filter(|path| *path == INVENTORY && !carried.carries(path));
+        .filter(|path| *path == INVENTORY);
     left.into_iter()
         .chain(scan.manifest.as_deref())
         .chain(inventory)
+        .filter(|path| !carried.contains(*path))
         .map(str::to_owned)
         .collect()
 }

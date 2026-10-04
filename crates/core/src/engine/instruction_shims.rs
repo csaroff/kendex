@@ -13,11 +13,13 @@
 //! content: exact bytes are kendex's to rewrite, anything else at the
 //! position is the person's and a conflict (invariant 6). The same plan that
 //! writes the root shim retires a `.claude/CLAUDE.md` link at the root
-//! `AGENTS.md`.
+//! `AGENTS.md`, and a project that stops installing to a harness has that
+//! harness's shims taken back (`retire`).
 
 use std::path::{Path, PathBuf};
 
 mod observe;
+mod retire;
 use observe::{agents_files, claude_standing, gemini_edit, gemini_standing, old_link};
 
 use super::file_plan::{TAKEN_OVER, set_aside};
@@ -185,8 +187,9 @@ pub fn observe(env: &Env, scope: &Scope, harnesses: &[HarnessId]) -> Result<Vec<
 }
 
 /// Plan every shim the scope owes: writes for the missing ones, the edit
-/// for Gemini's settings, the trash for the retired link, and a drift row
-/// for everything that is not in sync. Foreign content is a conflict
+/// for Gemini's settings, the trash for the retired link, the retirement of
+/// a shim whose harness the list no longer names, and a drift row for
+/// everything that is not in sync. Foreign content is a conflict
 /// unless the take-over names it, in which case it moves to the trash
 /// bound to the bytes read here and the shim lands after it (invariants 6
 /// and 7).
@@ -202,7 +205,7 @@ pub(super) fn plan_instruction_shims(
     config_edits: &mut super::config_edits::ConfigEditPlan,
 ) -> Result<(Vec<ShimStanding>, Vec<DriftRow>)> {
     let standings = observe(env, scope, harnesses)?;
-    let mut drift = Vec::new();
+    let mut drift = retire::retire(env, scope, harnesses, ops, config_edits)?;
     // The old link goes only once the root shim is planned or in sync: a
     // root position the plan cannot settle keeps its link, so Claude Code
     // keeps reading the root file one way or the other.

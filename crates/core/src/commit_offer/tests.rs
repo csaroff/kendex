@@ -521,6 +521,8 @@ impl Repo {
         GeneratedPaths {
             whole: whole.iter().map(|p| self.root.join(p)).collect(),
             shared: shared.iter().map(|p| self.root.join(p)).collect(),
+            edited: BTreeSet::new(),
+            recorded: crate::engine::Recorded::default(),
             regions: BTreeSet::new(),
             held: BTreeSet::new(),
             adopted: Default::default(),
@@ -573,7 +575,30 @@ impl Repo {
     }
 
     fn scan(&self, generated: &GeneratedPaths) -> Option<Scan> {
-        scan(&self.scope(), generated).unwrap()
+        self.scan_since(generated, &Before::Untaken)
+    }
+
+    /// What a reading before an action that writes `writes` beside its
+    /// renders finds.
+    fn before(&self, generated: &GeneratedPaths, writes: &[&str]) -> Before {
+        Before::read(
+            &self.scope(),
+            generated,
+            writes.iter().map(|path| self.root.join(path)),
+        )
+    }
+
+    /// The baseline a reading before the action took, which it must have.
+    fn baseline(&self, generated: &GeneratedPaths, writes: &[&str]) -> Baseline {
+        match self.before(generated, writes) {
+            Before::Read(baseline) => baseline,
+            other => panic!("the reading before did not run: {other:?}"),
+        }
+    }
+
+    /// The project read against what was read before the action.
+    fn scan_since(&self, generated: &GeneratedPaths, before: &Before) -> Option<Scan> {
+        scan(&self.scope(), generated, before).unwrap()
     }
 
     /// A hook in this repository: `body` under `/bin/sh`, ending at `exit`.
@@ -629,12 +654,15 @@ const OWNED: &[&str] = &[".claude/skills/dev/SKILL.md", ".claude/CLAUDE.md"];
 #[test]
 fn the_global_scope_and_a_folder_without_git_are_never_offered() {
     let generated = GeneratedPaths::default();
-    assert_eq!(scan(&Scope::Global, &generated).unwrap(), None);
+    assert_eq!(
+        scan(&Scope::Global, &generated, &Before::Untaken).unwrap(),
+        None
+    );
     let tmp = tempfile::tempdir().unwrap();
     let plain = Scope::Project {
         root: tmp.path().to_owned(),
     };
-    assert_eq!(scan(&plain, &generated).unwrap(), None);
+    assert_eq!(scan(&plain, &generated, &Before::Untaken).unwrap(), None);
 }
 
 #[test]
@@ -648,8 +676,10 @@ fn a_clean_checkout_and_an_ignored_render_are_nothing_to_offer() {
     assert_eq!(repo.scan(&generated), None);
 }
 
-/// Render-only dirty, mixed dirty, and a changed shared file: the three
-/// blocks of the offer come off the one status read.
+/// Render-only dirty, then mixed dirty with a changed shared file: the
+/// blocks of the offer come off the one status read. With no reading
+/// before an action, the shared file is not shown to be kendex's, so it is
+/// counted with the person's own.
 #[test]
 fn the_set_is_the_changed_owned_paths_and_the_rest_is_counted_or_named() {
     let repo = Repo::new(&[
@@ -676,7 +706,7 @@ fn the_set_is_the_changed_owned_paths_and_the_rest_is_counted_or_named() {
             },
         ]
     );
-    assert!(only.shared.is_empty());
+    assert!(only.beside.is_empty());
     assert_eq!(only.others, 0, "render-only dirty counted other files");
     assert_eq!(only.branch, Branch::On("main".to_owned()));
     assert_eq!(only.count(), 2);
@@ -685,10 +715,10 @@ fn the_set_is_the_changed_owned_paths_and_the_rest_is_counted_or_named() {
     repo.write(".claude/settings.json", "{\"permissions\":{}}\n");
     let mixed = repo.scan(&generated).unwrap();
     assert_eq!(mixed.owned.len(), 2, "the person's file joined the set");
-    assert_eq!(mixed.shared, [".claude/settings.json"]);
+    assert!(mixed.beside.is_empty(), "{:?}", mixed.beside);
     assert_eq!(
-        mixed.others, 1,
-        "the shared file or the render counted as other"
+        mixed.others, 2,
+        "the person's file and the shared file are not both counted as other"
     );
 }
 
@@ -964,6 +994,7 @@ fn the_commit_takes_the_set_and_leaves_the_persons_changes_alone() {
         &generated,
         "chore: kendex refresh",
         &Selection::All,
+        &Before::Untaken,
     )
     .unwrap();
     let Committed::Made {
@@ -998,7 +1029,14 @@ fn the_commit_takes_the_set_and_leaves_the_persons_changes_alone() {
     // Re-derived immediately before the commit runs: nothing left means
     // no commit, not an empty one.
     assert_eq!(
-        commit(&repo.root, &generated, "again", &Selection::All).unwrap(),
+        commit(
+            &repo.root,
+            &generated,
+            "again",
+            &Selection::All,
+            &Before::Untaken
+        )
+        .unwrap(),
         Committed::Nothing {
             // Nothing was named, so nothing can be reported as dropped.
             dropped: Vec::new()
@@ -1037,9 +1075,14 @@ fn a_path_with_metacharacters_commits_itself_and_nothing_it_would_match() {
         repo.write(ours, "ours\n");
         repo.write(theirs, "theirs\n");
     }
-    let Committed::Made { files, .. } =
-        commit(&repo.root, &generated, "m", &Selection::All).unwrap()
-    else {
+    let Committed::Made { files, .. } = commit(
+        &repo.root,
+        &generated,
+        "m",
+        &Selection::All,
+        &Before::Untaken,
+    )
+    .unwrap() else {
         panic!("nothing was committed");
     };
     assert_eq!(files, rows.len());
@@ -1093,9 +1136,14 @@ fn a_hook_reads_the_git_a_plain_commit_would_give_it() {
         0,
     );
 
-    let Committed::Made { files, .. } =
-        commit(&repo.root, &generated, "m", &Selection::All).unwrap()
-    else {
+    let Committed::Made { files, .. } = commit(
+        &repo.root,
+        &generated,
+        "m",
+        &Selection::All,
+        &Before::Untaken,
+    )
+    .unwrap() else {
         panic!("nothing was committed");
     };
     assert_eq!(files, 2);
@@ -1131,7 +1179,14 @@ fn a_refused_commit_carries_the_hooks_words_and_puts_the_index_back() {
         "",
     );
     let before = git::head_short(&repo.root).unwrap();
-    let refused = commit(&repo.root, &generated, "m", &Selection::All).unwrap_err();
+    let refused = commit(
+        &repo.root,
+        &generated,
+        "m",
+        &Selection::All,
+        &Before::Untaken,
+    )
+    .unwrap_err();
     assert_eq!(refused.failed.step, Step::Commit);
     assert_eq!(
         refused.failed.said(),
@@ -1165,7 +1220,14 @@ fn a_cleanup_that_cannot_unstage_says_how_many_paths_are_still_staged() {
     let generated = repo.generated(OWNED, &[]);
     repo.write(OWNED[1], "@AGENTS.md\n");
     repo.refusing_hook("pre-commit", &["no"], "chmod 555 .git");
-    let refused = commit(&repo.root, &generated, "m", &Selection::All).unwrap_err();
+    let refused = commit(
+        &repo.root,
+        &generated,
+        "m",
+        &Selection::All,
+        &Before::Untaken,
+    )
+    .unwrap_err();
     fs::set_permissions(repo.root.join(".git"), fs::Permissions::from_mode(0o755)).unwrap();
     let _ = fs::remove_file(repo.root.join(".git/index.lock"));
     assert_eq!(
@@ -1811,8 +1873,10 @@ fn a_glob_shaped_path_reads_its_own_mode_and_not_a_neighbours() {
 
 /// What the action did to each covered path, as a sorted list the rows
 /// below read.
-fn attributed(scan: &Scan, since: &Baseline) -> Vec<(String, Attribution)> {
-    pending(scan, since)
+fn attributed(scan: &Scan) -> Vec<(String, Attribution)> {
+    scan.carry
+        .pending()
+        .expect("the scan was read against a reading before")
         .files
         .iter()
         .map(|file| (file.path.clone(), file.attribution))
@@ -1836,14 +1900,15 @@ fn what_the_action_did_is_read_from_the_content_and_not_from_the_names() {
     // clean.
     repo.write(OWNED[0], "one, edited by hand\n");
     repo.write("docs/left.md", "left, edited by hand\n");
-    let before = baseline(&repo.scope(), &generated).unwrap();
-    // The two paths that were already pending, and the manifest, whose
-    // reading is taken whether it is pending or not. The owned file that
-    // was clean has no row: a path with no reading was clean before.
+    let baseline = repo.baseline(&generated, &[]);
+    // The two paths that were already pending. The owned file that was
+    // clean has no row, and neither has the manifest, which is clean too:
+    // a path with no row was clean before.
     assert_eq!(
-        before.held.keys().map(String::as_str).collect::<Vec<_>>(),
-        [OWNED[0], "docs/left.md", "kendex.toml"]
+        baseline.held.keys().map(String::as_str).collect::<Vec<_>>(),
+        [OWNED[0], "docs/left.md"]
     );
+    let before = Before::Read(baseline);
 
     // The action rewrites one clean file, rewrites one already-pending file
     // again, and leaves the third alone.
@@ -1851,9 +1916,9 @@ fn what_the_action_did_is_read_from_the_content_and_not_from_the_names() {
     repo.write(OWNED[0], "one, written by kendex over the edit\n");
 
     // The scan sorts by path, so the rows read in that order.
-    let scan = repo.scan(&generated).unwrap();
+    let scan = repo.scan_since(&generated, &before).unwrap();
     assert_eq!(
-        attributed(&scan, &before),
+        attributed(&scan),
         [
             (OWNED[1].to_owned(), Attribution::Action),
             (OWNED[0].to_owned(), Attribution::Both),
@@ -1861,7 +1926,7 @@ fn what_the_action_did_is_read_from_the_content_and_not_from_the_names() {
         ]
     );
 
-    let pending = pending(&scan, &before);
+    let pending = scan.carry.pending().unwrap();
     assert!(pending.acted(), "an action that wrote read as having not");
     assert!(!pending.same(), "the two choices read as one commit");
     // The file the action changed over an earlier edit is named, and the
@@ -1884,11 +1949,33 @@ fn an_action_that_wrote_nothing_here_has_nothing_to_offer_about_it() {
     let repo = Repo::new(&[(OWNED[0], "one\n")]);
     let generated = repo.generated(&[OWNED[0]], &[]);
     repo.write(OWNED[0], "left as a diff\n");
-    let before = baseline(&repo.scope(), &generated).unwrap();
+    let before = repo.before(&generated, &[]);
 
-    let scan = repo.scan(&generated).unwrap();
-    let pending = pending(&scan, &before);
+    let scan = repo.scan_since(&generated, &before).unwrap();
+    let pending = scan.carry.pending().unwrap();
     assert!(!pending.acted());
+    assert_eq!(pending.action_set(), BTreeSet::new());
+}
+
+/// A write whose only change is to a file it leaves out has nothing of its
+/// own to commit. Offering about it would hand the reader only the earlier
+/// renders, under a label that says they are the write's work.
+#[test]
+fn an_action_that_changed_only_a_file_it_leaves_out_has_nothing_to_offer() {
+    let repo = Repo::new(&[(OWNED[0], "one\n"), ("kendex.toml", "schema = 6\n")]);
+    let generated = repo.generated(&[OWNED[0]], &[]);
+    repo.write(OWNED[0], "an earlier render\n");
+    repo.write("kendex.toml", "# an earlier save\n");
+    let before = repo.before(&generated, &["kendex.toml"]);
+    repo.write("kendex.toml", "# a second save\n");
+
+    let scan = repo.scan_since(&generated, &before).unwrap();
+    let pending = scan.carry.pending().unwrap();
+    assert_eq!(pending.left_out(), ["kendex.toml"]);
+    assert!(
+        !pending.acted(),
+        "a left-out file read as the action's work"
+    );
     assert_eq!(pending.action_set(), BTreeSet::new());
 }
 
@@ -1900,12 +1987,14 @@ fn a_reading_that_could_not_be_taken_never_compares_as_unchanged() {
     let repo = Repo::new(&[(OWNED[0], "one\n")]);
     let generated = repo.generated(&[OWNED[0]], &[]);
     repo.write(OWNED[0], "edited by hand\n");
-    let mut before = baseline(&repo.scope(), &generated).unwrap();
-    before.held.insert(OWNED[0].to_owned(), Held::Unreadable);
+    let mut baseline = repo.baseline(&generated, &[]);
+    baseline.held.insert(OWNED[0].to_owned(), Held::Unreadable);
 
-    let scan = repo.scan(&generated).unwrap();
+    let scan = repo
+        .scan_since(&generated, &Before::Read(baseline))
+        .unwrap();
     assert_eq!(
-        attributed(&scan, &before),
+        attributed(&scan),
         [(OWNED[0].to_owned(), Attribution::Both)]
     );
 }
@@ -1925,13 +2014,13 @@ fn a_render_staged_by_hand_is_still_one_the_commit_adds() {
     let generated = repo.generated(&[OWNED[0], OWNED[1]], &[]);
     // Left as a diff before the action ran.
     repo.write(INVENTORY, "[\"changed by hand\"]");
-    let before = baseline(&repo.scope(), &generated).unwrap();
+    let before = repo.before(&generated, &[]);
 
     // The action adds a render; the person stages it before answering.
     repo.write(OWNED[1], "added\n");
     repo.git(&["add", "--", OWNED[1]]);
 
-    let scan = repo.scan(&generated).unwrap();
+    let scan = repo.scan_since(&generated, &before).unwrap();
     let staged = scan
         .owned
         .iter()
@@ -1942,7 +2031,7 @@ fn a_render_staged_by_hand_is_still_one_the_commit_adds() {
 
     // The commit of only this action's work carries the inventory, and says
     // so before it does: the file's own pending change is not the action's.
-    let pending = pending(&scan, &before);
+    let pending = scan.carry.pending().unwrap();
     assert!(pending.action_set().contains(INVENTORY));
     assert_eq!(
         pending
@@ -1972,12 +2061,12 @@ fn a_render_the_action_adds_takes_its_declarations_with_it() {
     let generated = repo.generated(&[OWNED[0], OWNED[1]], &[]);
     // Earlier work in the inventory alone, left as a diff.
     repo.write(INVENTORY, "[\"changed by hand\"]");
-    let before = baseline(&repo.scope(), &generated).unwrap();
+    let before = repo.before(&generated, &[]);
 
     // The action adds a render.
     repo.write(OWNED[1], "@AGENTS.md\n");
-    let scan = repo.scan(&generated).unwrap();
-    let pending = pending(&scan, &before);
+    let scan = repo.scan_since(&generated, &before).unwrap();
+    let pending = scan.carry.pending().unwrap();
 
     assert!(
         pending.action_set().contains(INVENTORY),
@@ -2000,11 +2089,11 @@ fn a_render_the_action_only_rewrites_leaves_the_declarations_alone() {
     let repo = Repo::new(&[(OWNED[0], "one\n")]);
     let generated = repo.generated(&[OWNED[0]], &[]);
     repo.write(INVENTORY, "[\"changed by hand\"]");
-    let before = baseline(&repo.scope(), &generated).unwrap();
+    let before = repo.before(&generated, &[]);
 
     repo.write(OWNED[0], "one, written by kendex\n");
-    let scan = repo.scan(&generated).unwrap();
-    let pending = pending(&scan, &before);
+    let scan = repo.scan_since(&generated, &before).unwrap();
+    let pending = scan.carry.pending().unwrap();
 
     assert_eq!(
         pending.action_set(),
@@ -2016,52 +2105,15 @@ fn a_render_the_action_only_rewrites_leaves_the_declarations_alone() {
 /// The manifest is not a file kendex owns whole. `manifest::fold` edits the
 /// keys kendex holds and leaves the rest of the document — comments, key
 /// order, a note inside a declaration — exactly as the person wrote it, so
-/// neither a commit nor the restore that writes over this set may take it.
+/// it is never among the files kendex owns whole and no restore takes it:
+/// it is a file the action writes into, and a published catalogue in a
+/// source catalog is neither.
 ///
 /// Both spellings are checked. A source catalog moves the declaration that
 /// drives renders to a sibling file, so a fixed name here would claim the
 /// maintainer's published catalogue and miss the file that actually matters.
 #[test]
-fn the_manifest_is_never_one_of_the_files_the_offer_covers() {
-    for (name, catalog) in [("an ordinary project", false), ("a source catalog", true)] {
-        let repo = Repo::new(&[
-            (OWNED[0], "one\n"),
-            ("kendex.toml", "# a note the person wrote\n"),
-            ("kendex-local.toml", "schema = 6\n"),
-        ]);
-        let generated = repo.generated(&[OWNED[0]], &[]);
-        repo.write(
-            "kendex.toml",
-            match catalog {
-                true => "is_source_catalog = true\n# the person edited their note\n",
-                false => "# the person edited their note\n",
-            },
-        );
-        repo.write("kendex-local.toml", "schema = 6\n[skills]\ngh = \"kit\"\n");
-        repo.write(OWNED[0], "one, written by kendex\n");
-
-        let scan = repo.scan(&generated).unwrap();
-        let covered: Vec<&str> = scan.owned.iter().map(|one| one.path.as_str()).collect();
-        assert!(!covered.contains(&"kendex.toml"), "{name}: {covered:?}");
-        assert!(
-            !covered.contains(&"kendex-local.toml"),
-            "{name}: {covered:?}"
-        );
-        // Counted as the person's own changed files, which is what they are.
-        assert_eq!(scan.others, 2, "{name}");
-    }
-}
-
-/// kendex commits the renders an action wrote and cannot commit the file
-/// that declares them, so the offer says which file is left behind. The
-/// person commits it; kendex folds keys into that document and owns none
-/// of its bytes.
-///
-/// Both spellings, because a source catalog declares its installs in the
-/// sibling file: naming the published catalogue instead would send the
-/// person to commit a file this action never wrote.
-#[test]
-fn an_action_that_wrote_the_declaration_says_the_commit_does_not_carry_it() {
+fn the_manifest_is_a_file_kendex_writes_into_and_never_one_it_owns() {
     for (name, catalog) in [("an ordinary project", false), ("a source catalog", true)] {
         let declared = match catalog {
             true => "kendex-local.toml",
@@ -2072,62 +2124,311 @@ fn an_action_that_wrote_the_declaration_says_the_commit_does_not_carry_it() {
             (
                 "kendex.toml",
                 match catalog {
+                    true => "is_source_catalog = true\n# a note the person wrote\n",
+                    false => "# a note the person wrote\n",
+                },
+            ),
+            ("kendex-local.toml", "schema = 6\n"),
+        ]);
+        let generated = repo.generated(&[OWNED[0]], &[]);
+        let before = repo.before(&generated, &[declared]);
+        repo.write(
+            "kendex.toml",
+            match catalog {
+                true => "is_source_catalog = true\n# the person edited their note\n",
+                false => "# the person edited their note\n",
+            },
+        );
+        repo.write("kendex-local.toml", "schema = 6\n[skills]\ngh = \"kit\"\n");
+        repo.write(OWNED[0], "one, written by kendex\n");
+
+        let scan = repo.scan_since(&generated, &before).unwrap();
+        let covered: Vec<&str> = scan.owned.iter().map(|one| one.path.as_str()).collect();
+        assert_eq!(covered, [OWNED[0]], "{name}");
+        let beside: Vec<&str> = scan.beside.iter().map(|one| one.path.as_str()).collect();
+        assert_eq!(beside, [declared], "{name}");
+        // The other one is the person's own changed file.
+        assert_eq!(scan.others, 1, "{name}");
+    }
+}
+
+/// What a commit after the action does with one file it writes into and
+/// does not own whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fate {
+    /// The action wrote it from a clean state: listed, counted, shown and
+    /// committed.
+    Carried,
+    /// The action wrote over a change it held before: named, left pending.
+    LeftOut,
+    /// The action did not write it, or nothing says it did: counted among
+    /// the person's own files, never drawn as kendex's.
+    Persons,
+    /// git reports no change in it.
+    Clean,
+}
+
+/// What a commit carries beside the files kendex owns whole is one answer,
+/// [`Scan::carry`], read from the reading before the action and the one
+/// after it, and every reader takes it from there: the listed set and the
+/// count every head prints ([`Scan::carried`], [`Scan::count`]), the files
+/// named as left out, the person's own count, the file viewer, and the
+/// commit. A file the action wrote from a clean state rides; one it wrote
+/// over a change of the person's is named and stays; one it left alone is
+/// the person's. A file the reading had no cause to read, because the
+/// action first wrote into it, is never taken for clean; one the plan after
+/// the action no longer names, because a removal edited it, still rides;
+/// and a commit with nothing owned whole in it still carries the manifest.
+///
+/// Both manifest spellings, because a source catalog declares its installs
+/// in the sibling file.
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one table: each row a file the action writes into, read before and after and committed"
+)]
+fn what_a_commit_carries_beside_the_renders_is_one_answer_every_reader_takes() {
+    const SETTINGS: &str = ".claude/settings.json";
+    const CHANGED: &str = "{\"written\":\"by kendex\"}\n";
+    struct Row {
+        what: &'static str,
+        catalog: bool,
+        target: &'static str,
+        /// Written into the file and left uncommitted before the action.
+        earlier: Option<&'static str>,
+        /// The reading before the action was taken, naming the file among
+        /// the action's writes where `named` says so.
+        read: bool,
+        named: bool,
+        /// The plan after the action names the file as a shared edit
+        /// target.
+        shared_after: bool,
+        /// What the action writes into the file, or `None` where it leaves
+        /// it alone.
+        action: Option<&'static str>,
+        /// The action also adds a render, and the inventory with it.
+        renders: bool,
+        fate: Fate,
+    }
+    let row = |what, target, earlier, action, fate| Row {
+        what,
+        catalog: false,
+        target,
+        earlier,
+        read: true,
+        named: true,
+        shared_after: false,
+        action,
+        renders: true,
+        fate,
+    };
+    let rows = [
+        row(
+            "a clean manifest the action wrote",
+            "kendex.toml",
+            None,
+            Some(CHANGED),
+            Fate::Carried,
+        ),
+        Row {
+            catalog: true,
+            ..row(
+                "a clean catalog declaration the action wrote",
+                "kendex-local.toml",
+                None,
+                Some(CHANGED),
+                Fate::Carried,
+            )
+        },
+        row(
+            "a manifest holding a hand edit the action wrote over",
+            "kendex.toml",
+            Some("# a note\n"),
+            Some(CHANGED),
+            Fate::LeftOut,
+        ),
+        Row {
+            catalog: true,
+            ..row(
+                "a catalog declaration holding a hand edit the action wrote over",
+                "kendex-local.toml",
+                Some("# a note\n"),
+                Some(CHANGED),
+                Fate::LeftOut,
+            )
+        },
+        row(
+            "an ignore file the person edited and the action left alone",
+            ".gitignore",
+            Some("tmp/\nmine/\n"),
+            None,
+            Fate::Persons,
+        ),
+        row(
+            "a manifest the action wrote back to what the last commit holds",
+            "kendex.toml",
+            Some("# the key taken out by hand\n"),
+            Some("schema = 6\n"),
+            Fate::Clean,
+        ),
+        row(
+            "a settings file a removal edited, which the plan after it no longer names",
+            SETTINGS,
+            None,
+            Some(CHANGED),
+            Fate::Carried,
+        ),
+        Row {
+            named: false,
+            shared_after: true,
+            ..row(
+                "a clean settings file a new hook first registers in",
+                SETTINGS,
+                None,
+                Some(CHANGED),
+                Fate::Carried,
+            )
+        },
+        Row {
+            shared_after: true,
+            ..row(
+                "a settings file holding a hand edit the reading read",
+                SETTINGS,
+                Some("{\"mine\":1}\n"),
+                Some(CHANGED),
+                Fate::LeftOut,
+            )
+        },
+        Row {
+            named: false,
+            shared_after: true,
+            ..row(
+                "a settings file holding a hand edit a new hook first registers in",
+                SETTINGS,
+                Some("{\"mine\":1}\n"),
+                Some(CHANGED),
+                Fate::LeftOut,
+            )
+        },
+        Row {
+            renders: false,
+            ..row(
+                "a clean manifest the action wrote, and nothing owned whole",
+                "kendex.toml",
+                None,
+                Some(CHANGED),
+                Fate::Carried,
+            )
+        },
+        Row {
+            read: false,
+            ..row(
+                "a clean manifest the action wrote, with no reading before it",
+                "kendex.toml",
+                None,
+                Some(CHANGED),
+                Fate::Persons,
+            )
+        },
+    ];
+    for row in rows {
+        let what = row.what;
+        let repo = Repo::new(&[
+            (OWNED[0], "one\n"),
+            (
+                "kendex.toml",
+                match row.catalog {
                     true => "is_source_catalog = true\nschema = 6\n",
                     false => "schema = 6\n",
                 },
             ),
             ("kendex-local.toml", "schema = 6\n"),
+            (SETTINGS, "{}\n"),
+            (".gitignore", "tmp/\n"),
         ]);
-        let generated = repo.generated(&[OWNED[0], OWNED[1]], &[]);
-        let before = baseline(&repo.scope(), &generated).unwrap();
+        if let Some(earlier) = row.earlier {
+            repo.write(row.target, earlier);
+        }
+        let named: &[&str] = match row.named {
+            true => &[row.target],
+            false => &[],
+        };
+        // The plan the reading is taken for reports the settings file it
+        // edits, as the engine does.
+        let reported = GeneratedPaths {
+            edited: named
+                .iter()
+                .filter(|path| **path == SETTINGS)
+                .map(|path| repo.root.join(path))
+                .collect(),
+            ..repo.generated(&[OWNED[0], OWNED[1]], &[])
+        };
+        let before = match row.read {
+            true => repo.before(&reported, named),
+            false => Before::Untaken,
+        };
 
-        // The action declares a skill and renders it.
-        repo.write(declared, "schema = 6\n[skills]\ngh = \"kit\"\n");
-        repo.write(OWNED[1], "written by kendex\n");
-        repo.write(INVENTORY, "[\"a\",\"b\"]");
+        if let Some(written) = row.action {
+            repo.write(row.target, written);
+        }
+        if row.renders {
+            repo.write(OWNED[1], "written by kendex\n");
+            repo.write(INVENTORY, "[\"a\",\"b\"]");
+        }
+        let shared: &[&str] = match row.shared_after {
+            true => &[row.target],
+            false => &[],
+        };
+        let generated = repo.generated(&[OWNED[0], OWNED[1]], shared);
+        let scan = repo.scan_since(&generated, &before).expect(what);
 
-        let scan = repo.scan(&generated).unwrap();
-        let pending = pending(&scan, &before);
-        assert_eq!(pending.manifest_not_carried(), Some(declared), "{name}");
-        // What the notice asserts: neither commit on offer carries it.
-        assert!(!pending.action_set().contains(declared), "{name}");
-        assert!(!pending.every_path().contains(declared), "{name}");
+        let mut listed: BTreeSet<String> = match row.renders {
+            true => [OWNED[1], INVENTORY].map(str::to_owned).into(),
+            false => BTreeSet::new(),
+        };
+        if row.fate == Fate::Carried {
+            listed.insert(row.target.to_owned());
+        }
+        assert_eq!(scan.carried(), listed, "{what}: the listed files");
+        assert_eq!(scan.count(), listed.len(), "{what}: the count");
+        let left: &[&str] = match row.fate {
+            Fate::LeftOut => &[row.target],
+            Fate::Carried | Fate::Persons | Fate::Clean => &[],
+        };
+        assert_eq!(scan.left_out(), left, "{what}: the files left out");
+        assert_eq!(
+            scan.others,
+            usize::from(row.fate == Fate::Persons),
+            "{what}: the person's own count"
+        );
+        assert_eq!(
+            scan.carry.pending().and_then(Pending::manifest_not_carried),
+            (row.fate == Fate::LeftOut && row.target.ends_with(".toml")).then_some(row.target),
+            "{what}: the manifest named"
+        );
+        assert_eq!(
+            matches!(file_changes(&scan, row.target).unwrap(), Changes::Shown(_)),
+            row.fate == Fate::Carried,
+            "{what}: the file viewer"
+        );
+
+        let made = commit(
+            &repo.root,
+            &generated,
+            "chore: kendex add",
+            &Selection::All,
+            &before,
+        )
+        .unwrap();
+        assert!(matches!(made, Committed::Made { .. }), "{what}: {made:?}");
+        assert_eq!(repo.head_files(), listed, "{what}: the commit");
+        assert_eq!(
+            repo.status().contains(row.target),
+            matches!(row.fate, Fate::LeftOut | Fate::Persons),
+            "{what}: {}",
+            repo.status()
+        );
     }
-}
-
-/// The offer says nothing about a declaration this action did not write.
-/// Two ways that happens, and each has to be told apart from the case
-/// above by a reading rather than by the file's name: the change in it is
-/// somebody else's, or there is no change in it left to commit.
-#[test]
-fn a_declaration_this_action_did_not_write_is_not_named() {
-    // The person edited their manifest and left it; the action renders.
-    let repo = Repo::new(&[(OWNED[0], "one\n"), ("kendex.toml", "schema = 6\n")]);
-    let generated = repo.generated(&[OWNED[0]], &[]);
-    repo.write("kendex.toml", "schema = 6\n# a note the person left\n");
-    let before = baseline(&repo.scope(), &generated).unwrap();
-    repo.write(OWNED[0], "one, written by kendex\n");
-
-    let scan = repo.scan(&generated).unwrap();
-    assert_eq!(
-        scan.manifest.as_deref(),
-        Some("kendex.toml"),
-        "git reports the manifest changed, so the silence is the reading's"
-    );
-    assert_eq!(pending(&scan, &before).manifest_not_carried(), None);
-
-    // The action wrote the declaration back to what the last commit
-    // already holds, so there is nothing about it to commit.
-    let repo = Repo::new(&[(OWNED[0], "one\n"), ("kendex.toml", "schema = 6\n")]);
-    let generated = repo.generated(&[OWNED[0]], &[]);
-    repo.write("kendex.toml", "# the key taken out by hand\n");
-    let before = baseline(&repo.scope(), &generated).unwrap();
-    repo.write("kendex.toml", "schema = 6\n");
-    repo.write(OWNED[0], "one, written by kendex\n");
-
-    let scan = repo.scan(&generated).unwrap();
-    assert_eq!(scan.manifest, None, "git reports the manifest unchanged");
-    assert_eq!(pending(&scan, &before).manifest_not_carried(), None);
 }
 
 /// The restore writes `HEAD` over what it is given, so a hand-authored file
@@ -2196,18 +2497,25 @@ fn only_this_actions_work_is_committed_and_the_rest_stays_pending() {
     repo.write("staged.md", "staged\n");
     repo.write(SHARED, "{\"servers\":{}}\n");
     repo.git(&["add", "staged.md"]);
-    let before = baseline(&repo.scope(), &generated).unwrap();
+    let before = repo.before(&generated, &[]);
 
     // The action: one render rewritten, one added, one taken away.
     repo.write(OWNED[0], "one, written by kendex\n");
     repo.write(OWNED[1], "@AGENTS.md\n");
     fs::remove_file(repo.root.join(GONE)).unwrap();
 
-    let scan = repo.scan(&generated).unwrap();
-    let pending = pending(&scan, &before);
+    let scan = repo.scan_since(&generated, &before).unwrap();
+    let pending = scan.carry.pending().unwrap();
     let chosen = Selection::Only(pending.action_set());
 
-    let made = commit(&repo.root, &generated, "chore: kendex install", &chosen).unwrap();
+    let made = commit(
+        &repo.root,
+        &generated,
+        "chore: kendex install",
+        &chosen,
+        &before,
+    )
+    .unwrap();
     let Committed::Made { files, dropped, .. } = made else {
         panic!("nothing was committed");
     };
@@ -2255,11 +2563,11 @@ fn all_pending_changes_commits_the_earlier_work_too() {
     let generated = repo.generated(&[OWNED[0], "docs/earlier.md"], &[]);
     repo.write("docs/earlier.md", "earlier, left as a diff\n");
     repo.write("mine.md", "changed\n");
-    let before = baseline(&repo.scope(), &generated).unwrap();
+    let before = repo.before(&generated, &[]);
     repo.write(OWNED[0], "one, written by kendex\n");
 
-    let scan = repo.scan(&generated).unwrap();
-    let pending = pending(&scan, &before);
+    let scan = repo.scan_since(&generated, &before).unwrap();
+    let pending = scan.carry.pending().unwrap();
     // The two choices differ here, which is what makes the choice worth
     // putting to a reader at all.
     assert!(!pending.same());
@@ -2269,6 +2577,7 @@ fn all_pending_changes_commits_the_earlier_work_too() {
         &generated,
         "chore: kendex refresh",
         &Selection::All,
+        &Before::Untaken,
     )
     .unwrap();
     let (in_commit, left) = committed_and_left(&repo);
@@ -2291,11 +2600,11 @@ fn one_file_that_carries_both_changes_goes_in_whole() {
     let repo = Repo::new(&[(OWNED[0], "one\nkeep\n")]);
     let generated = repo.generated(&[OWNED[0]], &[]);
     repo.write(OWNED[0], "one\nedited by hand\n");
-    let before = baseline(&repo.scope(), &generated).unwrap();
+    let before = repo.before(&generated, &[]);
     repo.write(OWNED[0], "written by kendex\nedited by hand\n");
 
-    let scan = repo.scan(&generated).unwrap();
-    let pending = pending(&scan, &before);
+    let scan = repo.scan_since(&generated, &before).unwrap();
+    let pending = scan.carry.pending().unwrap();
     assert_eq!(
         pending
             .tangled()
@@ -2310,6 +2619,7 @@ fn one_file_that_carries_both_changes_goes_in_whole() {
         &generated,
         "chore: kendex refresh",
         &Selection::Only(pending.action_set()),
+        &Before::Untaken,
     )
     .unwrap();
     // The whole file is in the commit, the hand edit with it, and nothing
@@ -2341,6 +2651,7 @@ fn a_chosen_path_that_changed_back_is_dropped_and_named() {
         &generated,
         "chore: kendex refresh",
         &Selection::Only(chosen),
+        &Before::Untaken,
     )
     .unwrap();
     let Committed::Made { files, dropped, .. } = made else {
@@ -2371,6 +2682,7 @@ fn a_selection_the_project_no_longer_covers_commits_nothing() {
             &generated,
             "chore: kendex refresh",
             &Selection::Only([OWNED[0].to_owned()].into_iter().collect()),
+            &Before::Untaken,
         )
         .unwrap(),
         Committed::Nothing {
@@ -2703,7 +3015,14 @@ fn committing_a_region_preserves_surrounding_staged_and_working_bytes() {
         "# App\n\nworking text\n\n## Code Review Rules\n\nnew rules\n\n#\n\nworking note\n",
     );
 
-    let made = commit(&repo.root, &generated, "docs: rules", &Selection::All).unwrap();
+    let made = commit(
+        &repo.root,
+        &generated,
+        "docs: rules",
+        &Selection::All,
+        &Before::Untaken,
+    )
+    .unwrap();
     assert!(matches!(made, Committed::Made { files: 1, .. }));
     assert_eq!(
         repo.git(&["show", "HEAD:./AGENTS.md"]),
@@ -2815,7 +3134,14 @@ fn committing_a_trailing_region_preserves_surrounding_staged_and_working_bytes()
         "# App\n\nworking text\n\n## Code Review Rules\n\nnew rules\n",
     );
 
-    let made = commit(&repo.root, &generated, "docs: rules", &Selection::All).unwrap();
+    let made = commit(
+        &repo.root,
+        &generated,
+        "docs: rules",
+        &Selection::All,
+        &Before::Untaken,
+    )
+    .unwrap();
     assert!(matches!(made, Committed::Made { files: 1, .. }));
     assert_eq!(
         repo.git(&["show", "HEAD:./AGENTS.md"]),
@@ -2888,11 +3214,17 @@ fn a_region_the_package_cannot_locate_names_the_file_and_the_snapshot() {
     );
 
     for said in [
-        commit(&repo.root, &generated, "m", &Selection::All)
-            .unwrap_err()
-            .failed
-            .said()
-            .join("\n"),
+        commit(
+            &repo.root,
+            &generated,
+            "m",
+            &Selection::All,
+            &Before::Untaken,
+        )
+        .unwrap_err()
+        .failed
+        .said()
+        .join("\n"),
         restore(
             &env,
             &repo.scope(),
@@ -2923,11 +3255,17 @@ fn a_region_the_package_cannot_locate_names_the_file_and_the_snapshot() {
         PATH,
         "# App\n\n## Code Review Rules\n\nnew rules\n\n## Code Review Rules\n\nagain\n",
     );
-    let said = commit(&twice.root, &generated, "m", &Selection::All)
-        .unwrap_err()
-        .failed
-        .said()
-        .join("\n");
+    let said = commit(
+        &twice.root,
+        &generated,
+        "m",
+        &Selection::All,
+        &Before::Untaken,
+    )
+    .unwrap_err()
+    .failed
+    .said()
+    .join("\n");
     assert!(said.contains(PATH), "the file is not named: {said}");
     assert!(
         said.contains("in the working tree:"),
@@ -2964,11 +3302,17 @@ fn a_package_that_exits_non_zero_refuses_the_region() {
     let generated = repo.generated_region_in(PATH, "## Code Review Rules", package.path());
     repo.write(PATH, "# App\n\n## Code Review Rules\n\nnew rules\n");
 
-    let said = commit(&repo.root, &generated, "m", &Selection::All)
-        .unwrap_err()
-        .failed
-        .said()
-        .join("\n");
+    let said = commit(
+        &repo.root,
+        &generated,
+        "m",
+        &Selection::All,
+        &Before::Untaken,
+    )
+    .unwrap_err()
+    .failed
+    .said()
+    .join("\n");
     assert!(said.contains(PATH), "the file is not named: {said}");
     assert!(
         said.contains("in HEAD:"),
@@ -3006,11 +3350,17 @@ fn a_package_answer_outside_the_bounds_protocol_refuses_rather_than_slices() {
         let generated = repo.generated_region_in(PATH, "## Code Review Rules", package.path());
         repo.write(PATH, "# App\n\n## Code Review Rules\n\nnew rules\n");
 
-        let said = commit(&repo.root, &generated, "m", &Selection::All)
-            .unwrap_err()
-            .failed
-            .said()
-            .join("\n");
+        let said = commit(
+            &repo.root,
+            &generated,
+            "m",
+            &Selection::All,
+            &Before::Untaken,
+        )
+        .unwrap_err()
+        .failed
+        .said()
+        .join("\n");
         assert!(
             said.contains("invalid region bounds"),
             "{what}: not refused as invalid bounds: {said}"

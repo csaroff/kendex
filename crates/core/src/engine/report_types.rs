@@ -307,8 +307,8 @@ pub struct EngineReport {
     /// The paths this pass renders into the scope, split into the files
     /// kendex owns whole and the shared configuration files it writes one
     /// key in. The inventory is written from it, and the commit offer
-    /// covers the whole-file group — one collection, so the two cannot
-    /// name different files.
+    /// covers the whole-file group and reads the rest as files it writes
+    /// into — one collection, so the two cannot name different files.
     pub generated: super::GeneratedPaths,
     /// The settings edits each registration this pass plans is, by lock
     /// entry key, as the pass held them in place: a record write for an
@@ -352,8 +352,9 @@ pub struct HeldPin {
     pub commit: String,
 }
 
-/// What a held pin holds: an item's declaration or a set's.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One declaration in the manifest, an item's or a set's: what a held pin
+/// holds, and what a targeted update brings current.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Held {
     Item { kind: ItemKind, name: String },
     Set { name: String },
@@ -564,7 +565,11 @@ pub struct PlanOptions {
     /// reading is stated per declaration against the pins this pass
     /// invented, so it reads the same whether one package is exempt or
     /// five.
-    pub update_only: Option<BTreeSet<(ItemKind, String)>>,
+    ///
+    /// A set named here comes current itself, its members with it, where an
+    /// add names a set the scope already installs. How far a named item's
+    /// exemption reaches is [`Targets::reach`].
+    pub update_only: Option<Targets>,
     /// The base of the manifest copy this plan reconciles to, where the
     /// manifest arrived whole from an editor rather than being read here.
     /// The plan's manifest write binds its precondition to it, so a file
@@ -602,6 +607,27 @@ pub struct PlanOptions {
     pub judge_pins: bool,
 }
 
+/// The declarations a plan scoped to some packages brings current, and how
+/// far that reaches past them: [`PlanOptions::update_only`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Targets {
+    pub declarations: BTreeSet<Held>,
+    pub reach: Reach,
+}
+
+/// What reads fresh with a named item beside its own declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    /// A targeted update: whatever carries the item's revision too, the
+    /// declaration that required it and the sets that carry it, since a
+    /// dependency cannot move while what it reads its bytes through holds.
+    Carriers,
+    /// An add: the declarations it writes and nothing else. A package that
+    /// required the item before the add is not what the person named, and
+    /// stays at the commit its record names.
+    Declared,
+}
+
 impl PlanOptions {
     /// A plan scoped to one package: it resolves at its source's tip while
     /// every other follower in the scope holds at the commit its lock
@@ -617,7 +643,25 @@ impl PlanOptions {
     /// having grouped its rows by the scope they live in.
     pub fn for_packages(targets: impl IntoIterator<Item = (ItemKind, String)>) -> Self {
         PlanOptions {
-            update_only: Some(targets.into_iter().collect()),
+            update_only: Some(Targets {
+                declarations: targets
+                    .into_iter()
+                    .map(|(kind, name)| Held::Item { kind, name })
+                    .collect(),
+                reach: Reach::Carriers,
+            }),
+            ..PlanOptions::default()
+        }
+    }
+
+    /// The plan an add makes: the items and the sets it declares come
+    /// current, and nothing else moves ([`Reach::Declared`]).
+    pub fn for_additions(declarations: impl IntoIterator<Item = Held>) -> Self {
+        PlanOptions {
+            update_only: Some(Targets {
+                declarations: declarations.into_iter().collect(),
+                reach: Reach::Declared,
+            }),
             ..PlanOptions::default()
         }
     }

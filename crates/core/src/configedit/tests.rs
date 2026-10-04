@@ -527,6 +527,192 @@ fn gemini_context_file_keeps_unrelated_keys_and_refuses_another_shape() {
     assert_eq!(unparseable, readers.to_string());
 }
 
+/// The removal takes back exactly what the add writes over an absent key,
+/// and `context` with it where nothing else is left there. A value the add
+/// cannot have written alone may hold the person's own choices and stays.
+#[test]
+fn gemini_context_file_removal_takes_back_only_what_the_add_wrote() {
+    let edit = ConfigEdit::GeminiRemoveContextFile {
+        name: "AGENTS.md".into(),
+    };
+    let after = |text: &str| -> Value { serde_json::from_str(&edit.apply(text).unwrap()).unwrap() };
+    let rows: [(&str, Value); 5] = [
+        (
+            r#"{"context": {"fileName": ["GEMINI.md", "AGENTS.md"]}}"#,
+            json!({}),
+        ),
+        (
+            r#"{"ui": {"theme": "Dark"}, "context": {"fileName": ["GEMINI.md", "AGENTS.md"], "loadMemoryFromIncludeDirectories": true}}"#,
+            json!({"ui": {"theme": "Dark"}, "context": {"loadMemoryFromIncludeDirectories": true}}),
+        ),
+        (
+            r#"{"context": {"fileName": ["GEMINI.md", "TEAM.md", "AGENTS.md"]}}"#,
+            json!({"context": {"fileName": ["GEMINI.md", "TEAM.md", "AGENTS.md"]}}),
+        ),
+        (
+            r#"{"context": {"fileName": "AGENTS.md"}}"#,
+            json!({"context": {"fileName": "AGENTS.md"}}),
+        ),
+        (r#"{"context": 3}"#, json!({"context": 3})),
+    ];
+    for (start, left) in rows {
+        assert_eq!(after(start), left, "{start}");
+    }
+}
+
+/// A JSON document a removal empties is retired rather than written, in a
+/// project; a document the person left empty, one an upsert writes, one
+/// holding a key of theirs and a file that is not JSON are not. The
+/// OpenCode cleanup retires a lone schema whatever it held before. A text
+/// file a marker block sits in is a Pi append file and follows its rule:
+/// it goes once nothing of the person's is left in it.
+#[test]
+fn a_document_a_removal_empties_is_retired() {
+    let gemini = ConfigEdit::GeminiRemoveContextFile {
+        name: "AGENTS.md".into(),
+    };
+    let ours = r#"{"context": {"fileName": ["GEMINI.md", "AGENTS.md"]}}"#;
+    let prune = ConfigEdit::OpencodePruneInstructions {
+        prefix: ".agents/".into(),
+        keep: Default::default(),
+    };
+    let block = upsert_marker_block("", "x", "kendex's block");
+    let beside = upsert_marker_block("The person's line.\n", "x", "kendex's block");
+    let rows: [(&str, Vec<ConfigEdit>, &str, bool, bool); 8] = [
+        (
+            "emptied in a project",
+            vec![gemini.clone()],
+            ours,
+            true,
+            true,
+        ),
+        (
+            "emptied, personal",
+            vec![gemini.clone()],
+            ours,
+            false,
+            false,
+        ),
+        (
+            "left empty by the person",
+            vec![gemini.clone()],
+            "{}",
+            true,
+            false,
+        ),
+        (
+            "a key of theirs",
+            vec![gemini.clone()],
+            r#"{"ui": {}, "context": {"fileName": ["GEMINI.md", "AGENTS.md"]}}"#,
+            true,
+            false,
+        ),
+        (
+            "an upsert",
+            vec![ConfigEdit::UpsertMcpServer {
+                name: "gh".into(),
+                value: json!({"command": "gh"}),
+            }],
+            "{}",
+            true,
+            false,
+        ),
+        (
+            "a lone schema under the OpenCode cleanup",
+            vec![prune],
+            r#"{"$schema": "https://opencode.ai/config.json"}"#,
+            false,
+            true,
+        ),
+        (
+            "a text file a removal leaves blank",
+            vec![ConfigEdit::RemoveMarkerBlock { name: "x".into() }],
+            &block,
+            false,
+            true,
+        ),
+        (
+            "a text file holding the person's line",
+            vec![ConfigEdit::RemoveMarkerBlock { name: "x".into() }],
+            &beside,
+            true,
+            false,
+        ),
+    ];
+    for (what, edits, current, emptied, retired) in rows {
+        assert_eq!(
+            ConfigEdit::removes_empty_document(&edits, Some(current), emptied).unwrap(),
+            retired,
+            "{what}"
+        );
+    }
+}
+
+/// The same retirement for a TOML document: Codex's config left with no
+/// key or table. The `[features] hooks = true` kendex turns on stays, since
+/// nothing tells it from the person's own setting, and so does a file left
+/// holding the person's comments, which the table does not show.
+#[test]
+fn a_toml_document_a_removal_empties_is_retired() {
+    let codex = ConfigEdit::RemoveCodexMcpServer { name: "gh".into() };
+    let codex_ours = "[mcp_servers.gh]\ncommand = \"gh\"\n";
+    let codex_mine = "model = \"o3\"\n\n[mcp_servers.gh]\ncommand = \"gh\"\n";
+    let codex_hooks = "[features]\nhooks = true\n\n[mcp_servers.gh]\ncommand = \"gh\"\n";
+    let codex_notes = "[mcp_servers.gh]\ncommand = \"gh\"\n\n# my notes\n";
+    assert_eq!(codex.apply(codex_notes).unwrap().trim(), "# my notes");
+    let rows: [(&str, Vec<ConfigEdit>, &str, bool, bool); 6] = [
+        (
+            "TOML emptied in a project",
+            vec![codex.clone()],
+            codex_ours,
+            true,
+            true,
+        ),
+        (
+            "TOML emptied, personal",
+            vec![codex.clone()],
+            codex_ours,
+            false,
+            false,
+        ),
+        (
+            "TOML holding the person's key",
+            vec![codex.clone()],
+            codex_mine,
+            true,
+            false,
+        ),
+        (
+            "TOML keeping the hooks feature",
+            vec![codex.clone()],
+            codex_hooks,
+            true,
+            false,
+        ),
+        (
+            "TOML keeping the person's comment",
+            vec![codex.clone()],
+            codex_notes,
+            true,
+            false,
+        ),
+        (
+            "TOML left empty by the person",
+            vec![codex],
+            "",
+            true,
+            false,
+        ),
+    ];
+    for (what, edits, current, emptied, retired) in rows {
+        assert_eq!(
+            ConfigEdit::removes_empty_document(&edits, Some(current), emptied).unwrap(),
+            retired,
+            "{what}"
+        );
+    }
+}
+
 #[test]
 fn output_style_selection_is_absent_only_and_removal_is_owned() {
     let insert = ConfigEdit::ClaudeOutputStyle { name: "STE".into() };

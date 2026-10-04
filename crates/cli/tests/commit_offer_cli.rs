@@ -62,7 +62,8 @@ fn git(dir: &Path, args: &[&str]) -> String {
 
 /// A repository declaring the claude harness with its root `AGENTS.md`
 /// committed: `apply --yes` renders the `CLAUDE.md` shim and the
-/// inventory, which is the offer's two-file set. Nothing is installed, so
+/// inventory and writes the ignore file beside them, which is the offer's
+/// three-file set. Nothing is installed, so
 /// no record is written; the record joins the set where an install is
 /// (`the_install_record_is_committed_with_the_renders`).
 #[allow(clippy::unwrap_used)]
@@ -210,7 +211,7 @@ fn without_a_terminal_the_line_names_the_flags_and_leave_says_nothing() {
     assert!(output.status.success(), "{text}");
     assert!(
         text.contains(
-            "2 files kendex wrote are not committed; run again with --commit, --push, --pull-request or --leave"
+            "3 files kendex wrote are not committed; run again with --commit, --push, --pull-request or --leave"
         ),
         "{text}"
     );
@@ -231,9 +232,9 @@ fn the_commit_flag_commits_the_set_with_the_commands_message() {
     let project = project(&tmp);
     let (output, text) = apply(&home, &project, &["--commit"]);
     assert!(output.status.success(), "{text}");
-    assert!(text.contains("committed 2 files as "), "{text}");
+    assert!(text.contains("committed 3 files as "), "{text}");
     assert!(
-        text.contains(" · committed 2 files"),
+        text.contains(" · committed 3 files"),
         "no ledger part: {text}"
     );
     assert!(
@@ -256,7 +257,7 @@ fn the_commit_flag_commits_the_set_with_the_commands_message() {
     fs::write(project.join("AGENTS.md"), "# app\n\nmore\n").unwrap();
     let (output, text) = apply(&home, &project, &["--commit", "--message", "docs: shim"]);
     assert!(output.status.success(), "{text}");
-    assert!(text.contains("committed 2 files as "), "{text}");
+    assert!(text.contains("committed 3 files as "), "{text}");
     assert_eq!(head_subject(&project), "docs: shim");
     assert!(
         git(&project, &["status", "--porcelain"]).contains(" M AGENTS.md"),
@@ -306,9 +307,394 @@ fn the_install_record_is_committed_with_the_renders() {
     }
     assert!(!files.contains("lock-local.json"), "{files}");
     assert!(project.join(".cache/kendex/lock-local.json").is_file());
-    // The ignore file is the person's, edited rather than owned, so it is
-    // the one thing left for them; the machine half is under it.
-    assert_eq!(git(&project, &["status", "--porcelain"]), "?? .gitignore\n");
+    // The ignore file the run wrote where none stood is carried with the
+    // rest, and the machine half is under it, so nothing is left pending.
+    assert!(files.lines().any(|line| line == ".gitignore"), "{files}");
+    assert_eq!(git(&project, &["status", "--porcelain"]), "");
+}
+
+/// A catalog declaring kendex's layout, offering the agent `scout` and the
+/// hook `guard`, whose registration lands in Claude Code's settings file.
+#[allow(clippy::unwrap_used)]
+fn scout_and_guard(home: &Path) -> PathBuf {
+    let catalog = home.join("catalog");
+    fs::create_dir_all(catalog.join("agents")).unwrap();
+    fs::create_dir_all(catalog.join("hooks")).unwrap();
+    fs::write(
+        catalog.join("agents/scout.md"),
+        "---\nname: scout\ndescription: look around\n---\nLook.\n",
+    )
+    .unwrap();
+    fs::write(
+        catalog.join("hooks/guard.sh"),
+        "#!/usr/bin/env bash\n# ---\n# name: guard\n# event: PreToolUse\n# matcher: Bash\n# description: block dangerous commands\n# ---\nexit 0\n",
+    )
+    .unwrap();
+    // Hooks are offered only by a catalog that declares kendex's layout.
+    fs::write(catalog.join("kendex.toml"), "[catalog]\n").unwrap();
+    catalog
+}
+
+/// `add --commit` commits every file the run wrote that held no change
+/// before it: the manifest, the ignore file, and the shared settings file a
+/// hook registers in, written where none stood. A file the run wrote into
+/// that already held a change of the person's is left out, since git
+/// commits whole files, stays pending, and the offer names it. The same add
+/// with nobody to ask prints the count of that same commit in its head.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    clippy::too_many_lines,
+    reason = "one table: each row an add with nobody to ask and an add that commits, in projects of their own"
+)]
+fn an_add_commits_every_file_it_wrote_and_names_one_that_held_a_change() {
+    const MANIFEST: &str = "kendex.toml";
+    const SETTINGS: &str = ".claude/settings.json";
+    struct Row {
+        what: &'static str,
+        add: [&'static str; 2],
+        /// A file committed before the add, then edited and left pending.
+        edited: Option<(&'static str, &'static str, &'static str)>,
+        carried: &'static [&'static str],
+        left: Option<&'static str>,
+    }
+    let rows = [
+        Row {
+            what: "an agent in a clean checkout",
+            add: ["--agent", "scout"],
+            edited: None,
+            carried: &[
+                ".kendex-lock.json",
+                ".gitignore",
+                ".claude/agents/scout.md",
+                MANIFEST,
+            ],
+            left: None,
+        },
+        Row {
+            what: "an agent over a manifest holding a hand edit",
+            add: ["--agent", "scout"],
+            edited: Some((
+                MANIFEST,
+                "schema = 6\n\n[install]\nharnesses = [\"claude\"]\n",
+                "# mine\nschema = 6\n\n[install]\nharnesses = [\"claude\"]\n",
+            )),
+            carried: &[".kendex-lock.json", ".gitignore", ".claude/agents/scout.md"],
+            left: Some(MANIFEST),
+        },
+        Row {
+            what: "a hook in a clean checkout",
+            add: ["--hook", "guard"],
+            edited: None,
+            carried: &[".kendex-lock.json", ".gitignore", MANIFEST, SETTINGS],
+            left: None,
+        },
+        Row {
+            what: "a hook over a settings file holding a hand edit",
+            add: ["--hook", "guard"],
+            edited: Some((SETTINGS, "{\"mine\": 1}\n", "{\"mine\": 2}\n")),
+            carried: &[".kendex-lock.json", ".gitignore", MANIFEST],
+            left: Some(SETTINGS),
+        },
+    ];
+    for row in rows {
+        let what = row.what;
+        // The add, run in a project of its own with `answer` added.
+        let add = |answer: Option<&str>| {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = rooted(&tmp);
+            let project = project(&tmp);
+            let catalog = scout_and_guard(&home);
+            if let Some((path, committed, edit)) = row.edited {
+                fs::write(project.join(path), committed).unwrap();
+                git(&project, &["add", "-A"]);
+                git(&project, &["commit", "-q", "--allow-empty", "-m", "mine"]);
+                fs::write(project.join(path), edit).unwrap();
+            }
+            let mut args = vec!["add", "--yes", "--throwaway"];
+            args.extend(answer);
+            let source = catalog.to_string_lossy().into_owned();
+            args.push(&source);
+            args.extend(row.add);
+            let output = kendex(&home, &project, &args);
+            let text = said(&output);
+            assert!(output.status.success(), "{what}: {text}");
+            (tmp, project, text)
+        };
+        let (_unasked, _, asked) = add(None);
+        let (_tmp, project, text) = add(Some("--commit"));
+        let files = git(&project, &["show", "--name-only", "--format=", "HEAD"]);
+        let status = git(&project, &["status", "--porcelain"]);
+        let count = files.lines().count();
+        assert!(
+            asked.contains(&format!(
+                ": {count} files kendex wrote are not committed; run again"
+            )),
+            "{what}: the head did not count the {count} files committed:\n{asked}"
+        );
+        assert!(
+            text.contains(&format!("committed {count} files as ")),
+            "{what}: {text}"
+        );
+        for carried in row.carried {
+            assert!(
+                files.lines().any(|line| line == *carried),
+                "{what}: {carried} is not in the commit: {files}"
+            );
+        }
+        match row.left {
+            None => {
+                assert_eq!(status, "", "{what}: {text}");
+                assert!(
+                    !text.contains("held changes before this run"),
+                    "{what}: {text}"
+                );
+            }
+            Some(left) => {
+                assert!(!files.lines().any(|line| line == left), "{what}: {files}");
+                assert_eq!(status, format!(" M {left}\n"), "{what}: {text}");
+                assert!(
+                    text.contains(&format!(
+                        "{left} held changes before this run, so the commit leaves it out"
+                    )),
+                    "{what}: {text}"
+                );
+            }
+        }
+    }
+}
+
+/// `remove --commit` commits the deletion of a render the person edited
+/// after the add committed it. The removal's plan names that render among
+/// the paths it touches, and a deleted render the committed inventory
+/// names is kendex's whole whatever touched it, so the commit carries its
+/// deletion beside the manifest, the lock and the inventory, and nothing is
+/// left pending.
+#[test]
+#[allow(clippy::unwrap_used)]
+fn a_remove_commits_the_deletion_of_a_render_the_person_edited() {
+    const RENDER: &str = ".claude/agents/scout.md";
+    let tmp = tempfile::tempdir().unwrap();
+    let home = rooted(&tmp);
+    let project = project(&tmp);
+    let source = scout_and_guard(&home).to_string_lossy().into_owned();
+    let add = kendex(
+        &home,
+        &project,
+        &[
+            "add",
+            "--yes",
+            "--throwaway",
+            "--commit",
+            &source,
+            "--agent",
+            "scout",
+        ],
+    );
+    assert!(add.status.success(), "{}", said(&add));
+    let render = project.join(RENDER);
+    let text = fs::read_to_string(&render).unwrap();
+    fs::write(&render, format!("{text}mine\n")).unwrap();
+
+    let output = kendex(
+        &home,
+        &project,
+        &["remove", "--commit", "--no-sweep", "scout"],
+    );
+    let text = said(&output);
+
+    assert!(output.status.success(), "{text}");
+    assert!(!render.exists(), "{text}");
+    let files = git(&project, &["show", "--name-only", "--format=", "HEAD"]);
+    for carried in [RENDER, "kendex.toml", ".kendex-lock.json"] {
+        assert!(
+            files.lines().any(|line| line == carried),
+            "{carried} is not in the commit: {files}\n{text}"
+        );
+    }
+    assert_eq!(git(&project, &["status", "--porcelain"]), "", "{text}");
+}
+
+/// `remove --commit` over the shared settings file a committed hook added
+/// its key to beside the person's own. Where the person's key stays, the
+/// removal edits the file from a clean state and the commit carries it.
+/// Where the person took their key out, removing the last hook empties
+/// the file and the removal deletes it: that deletion carries the person's
+/// change, though the committed inventory names the file, so the commit
+/// leaves it out and names it.
+#[test]
+#[allow(clippy::unwrap_used)]
+fn a_remove_commits_a_shared_file_it_edits_and_leaves_out_one_the_person_emptied() {
+    const SETTINGS: &str = ".claude/settings.json";
+    for took_key_out in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = rooted(&tmp);
+        let project = project(&tmp);
+        fs::write(project.join(SETTINGS), "{\"mine\": 1}\n").unwrap();
+        git(&project, &["add", "-A"]);
+        git(&project, &["commit", "-q", "-m", "mine"]);
+        let source = scout_and_guard(&home).to_string_lossy().into_owned();
+        let args = [
+            "add",
+            "--yes",
+            "--throwaway",
+            "--commit",
+            &source,
+            "--hook",
+            "guard",
+        ];
+        let add = kendex(&home, &project, &args);
+        assert!(add.status.success(), "{}", said(&add));
+        assert_eq!(
+            git(&project, &["status", "--porcelain"]),
+            "",
+            "{}",
+            said(&add)
+        );
+        let settings = project.join(SETTINGS);
+        if took_key_out {
+            let mut held: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+            assert!(
+                held.as_object_mut().unwrap().remove("mine").is_some(),
+                "{held}"
+            );
+            fs::write(&settings, serde_json::to_string_pretty(&held).unwrap()).unwrap();
+        }
+
+        let output = kendex(
+            &home,
+            &project,
+            &["remove", "--commit", "--no-sweep", "guard"],
+        );
+        let text = said(&output);
+
+        assert!(output.status.success(), "{took_key_out}: {text}");
+        assert_eq!(settings.exists(), !took_key_out, "{took_key_out}: {text}");
+        let files = git(&project, &["show", "--name-only", "--format=", "HEAD"]);
+        assert_eq!(
+            files.lines().any(|line| line == SETTINGS),
+            !took_key_out,
+            "{took_key_out}: {files}\n{text}"
+        );
+        assert_eq!(
+            text.contains(&format!(
+                "{SETTINGS} held changes before this run, so the commit leaves it out"
+            )),
+            took_key_out,
+            "{text}"
+        );
+        let left = match took_key_out {
+            true => format!(" D {SETTINGS}\n"),
+            false => String::new(),
+        };
+        assert_eq!(git(&project, &["status", "--porcelain"]), left, "{text}");
+    }
+}
+
+/// How the last commit holds the install record when the remove runs.
+#[derive(Debug, Clone, Copy)]
+enum RecordAtHead {
+    /// As the add committed it: the record says the hook writes a key in
+    /// the settings file.
+    AsAdded,
+    /// Taken out of the last commit and left on disk: the inventory there
+    /// still lists paths, and nothing at `HEAD` says which are shared.
+    Absent,
+    /// An older format this build does not read.
+    OlderFormat,
+}
+
+/// A remove left uncommitted takes away the shared settings file the
+/// committed hook was the last key in. The passive reading after it, which
+/// no action reads for, still finds the file in the committed inventory,
+/// but a shared file's deletion is never kendex's whole: it is not among
+/// the files a commit or a restore takes whole. Where the record at `HEAD`
+/// cannot say which files are shared, the reading claims no deletion the
+/// record on disk does not name as a render, so the removed script is
+/// left out with the settings file rather than taken on the inventory's
+/// word.
+#[test]
+#[allow(clippy::unwrap_used)]
+fn a_passive_reading_keeps_a_deleted_shared_file_out_of_the_renders() {
+    const SETTINGS: &str = ".claude/settings.json";
+    const LOCK: &str = ".kendex-lock.json";
+    const SCRIPT: &str = ".claude/hooks/guard.sh";
+    for (record, script_claimed) in [
+        (RecordAtHead::AsAdded, true),
+        (RecordAtHead::Absent, false),
+        (RecordAtHead::OlderFormat, false),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = rooted(&tmp);
+        let project = project(&tmp);
+        let source = scout_and_guard(&home).to_string_lossy().into_owned();
+        let add = kendex(
+            &home,
+            &project,
+            &[
+                "add",
+                "--yes",
+                "--throwaway",
+                "--commit",
+                &source,
+                "--hook",
+                "guard",
+            ],
+        );
+        assert!(add.status.success(), "{record:?}: {}", said(&add));
+        let committed = git(
+            &project,
+            &["show", &format!("HEAD:{}", ".kendex-generated.json")],
+        );
+        assert!(committed.contains(SETTINGS), "{record:?}: {committed}");
+        assert!(committed.contains(SCRIPT), "{record:?}: {committed}");
+        match record {
+            RecordAtHead::AsAdded => {}
+            RecordAtHead::Absent => {
+                git(&project, &["rm", "-q", "--cached", LOCK]);
+                git(&project, &["commit", "-q", "-m", "drop record"]);
+            }
+            RecordAtHead::OlderFormat => {
+                let valid = fs::read_to_string(project.join(LOCK)).unwrap();
+                let current = format!("\"version\": {}", kendex_core::lock::LOCK_VERSION);
+                assert_eq!(valid.matches(&current).count(), 1, "{valid}");
+                fs::write(
+                    project.join(LOCK),
+                    valid.replace(&current, "\"version\": 10"),
+                )
+                .unwrap();
+                git(&project, &["commit", "-q", "-am", "older record"]);
+                fs::write(project.join(LOCK), &valid).unwrap();
+            }
+        }
+
+        let remove = kendex(&home, &project, &["remove", "--no-sweep", "guard"]);
+        assert!(remove.status.success(), "{record:?}: {}", said(&remove));
+        assert!(
+            !project.join(SETTINGS).exists(),
+            "{record:?}: {}",
+            said(&remove)
+        );
+        assert!(
+            !project.join(SCRIPT).exists(),
+            "{record:?}: {}",
+            said(&remove)
+        );
+
+        let passive = kendex(&home, &project, &["generated-paths"]);
+        let owned: Vec<String> = serde_json::from_slice(&passive.stdout)
+            .unwrap_or_else(|error| panic!("{record:?}: {error}: {}", said(&passive)));
+        assert!(
+            !owned.iter().any(|path| path == SETTINGS),
+            "{record:?}: {owned:?}"
+        );
+        assert_eq!(
+            owned.iter().any(|path| path == SCRIPT),
+            script_claimed,
+            "{record:?}: {owned:?}"
+        );
+    }
 }
 
 /// A project whose root `AGENTS.md` carries a managed region the installed
@@ -746,10 +1132,10 @@ fn the_push_flag_pushes_or_reports_the_remotes_refusal() {
     let bare = origin(&project, "plain-origin");
     let (output, text) = apply(&home, &project, &["--push"]);
     assert!(output.status.success(), "{text}");
-    assert!(text.contains("committed 2 files as "), "{text}");
+    assert!(text.contains("committed 3 files as "), "{text}");
     assert!(text.contains("pushed to origin/main"), "{text}");
     assert!(
-        text.contains(" · committed and pushed 2 files"),
+        text.contains(" · committed and pushed 3 files"),
         "no ledger part: {text}"
     );
     assert_eq!(
@@ -771,7 +1157,7 @@ fn the_push_flag_pushes_or_reports_the_remotes_refusal() {
     let before = git(&project, &["rev-parse", "HEAD"]);
     let (output, text) = apply(&home, &project, &["--push"]);
     assert_eq!(output.status.code(), Some(1), "{text}");
-    assert!(text.contains("committed 2 files as "), "{text}");
+    assert!(text.contains("committed 3 files as "), "{text}");
     assert!(text.contains("the push was refused"), "{text}");
     assert!(text.contains("git said:"), "{text}");
     assert!(
@@ -1039,7 +1425,7 @@ fn the_pull_request_flag_opens_one_or_names_the_branch_gh_refused() {
     origin(&project, "plain-origin");
     let (output, text) = apply(&home, &project, &["--pull-request"]);
     assert!(output.status.success(), "{text}");
-    assert!(text.contains("committed 2 files as "), "{text}");
+    assert!(text.contains("committed 3 files as "), "{text}");
     assert!(text.contains(" on kendex/renders"), "{text}");
     assert!(text.contains("pushed to origin/kendex/renders"), "{text}");
     assert!(
@@ -1051,7 +1437,7 @@ fn the_pull_request_flag_opens_one_or_names_the_branch_gh_refused() {
         "{text}"
     );
     assert!(
-        text.contains(" · committed 2 files, pull request open"),
+        text.contains(" · committed 3 files, pull request open"),
         "no ledger part: {text}"
     );
     assert!(home.join("fake-bin/calls").exists(), "gh was never asked");
@@ -1144,13 +1530,15 @@ fn a_detached_head_or_an_operation_in_progress_prints_one_line() {
     let (output, text) = apply(&home, &project, &["--commit"]);
     assert!(output.status.success(), "{text}");
     assert!(
-        text.contains("2 files kendex wrote are not committed; a merge is in progress"),
+        text.contains("3 files kendex wrote are not committed; a merge is in progress"),
         "{text}"
     );
     fs::remove_file(project.join(".git/MERGE_HEAD")).unwrap();
 
     let head = git(&project, &["rev-parse", "HEAD"]);
     git(&project, &["checkout", "-q", "--detach", head.trim()]);
+    // The ignore file the first run wrote is pending from before this one,
+    // which writes nothing, so only the renders are counted.
     let (output, text) = apply(&home, &project, &["--commit"]);
     assert!(output.status.success(), "{text}");
     assert!(
@@ -1191,6 +1579,8 @@ fn the_setting_turns_off_the_asking_and_not_the_flags() {
     let (output, text) = apply(&home, &project, &[]);
     assert!(output.status.success(), "{text}");
     assert!(!text.contains("not committed"), "{text}");
+    // The first run wrote the ignore file and left it pending; this run
+    // writes nothing, so it carries the renders alone.
     let (output, text) = apply(&home, &project, &["--commit"]);
     assert!(output.status.success(), "{text}");
     assert!(text.contains("committed 2 files as "), "{text}");

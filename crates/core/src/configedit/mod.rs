@@ -141,6 +141,14 @@ pub enum ConfigEdit {
     GeminiAddContextFile {
         name: String,
     },
+    /// gemini settings.json: take back what `GeminiAddContextFile` put in
+    /// where the value is exactly what it writes over an absent key —
+    /// Gemini's default file, then `name` — and drop `context` with it
+    /// when nothing else is left there. Any other value may hold the
+    /// person's choices, and stays as it is.
+    GeminiRemoveContextFile {
+        name: String,
+    },
     /// opencode.json: ensure `instructions[]` carries `reference`; for
     /// PreToolUse:Bash hooks also `permission.bash = {"*": "ask"}`.
     OpencodeAddInstruction {
@@ -173,6 +181,15 @@ pub enum ConfigEdit {
     },
 }
 
+/// The kind of file one edit reads and writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Document {
+    Json,
+    Toml,
+    /// Text a marker block sits in, whose other lines are the person's.
+    Text,
+}
+
 impl ConfigEdit {
     /// Response styles never follow a link placed at their shared file.
     pub(crate) fn requires_regular_file(&self) -> bool {
@@ -182,39 +199,94 @@ impl ConfigEdit {
         ) || matches!(self, Self::UpsertMarkerBlock { name, .. } | Self::RemoveMarkerBlock { name } if name.starts_with("output-style-"))
     }
 
-    /// Whether the composed edits retire the document `current` holds
-    /// (`None`: absent): OpenCode cleanup leaving only our schema, or a Pi
-    /// append file left with nothing of its own
-    /// ([`crate::pi_ext::append_system_retires`]).
+    /// Whether these edits retire the document `current` holds (`None`:
+    /// absent) rather than write it. A text file a marker block sits in is a
+    /// Pi append file, retired when nothing of its own is left
+    /// ([`crate::pi_ext::append_system_retires`]). A JSON file goes when
+    /// left an empty object or the lone `$schema` OpenCode's upsert writes,
+    /// and a TOML file when left with no key or table and no text but
+    /// whitespace, since the edit keeps the person's comments and a table
+    /// does not hold them. A composed OpenCode cleanup retires one holding
+    /// only the schema whatever it held before. Any other JSON or TOML edit
+    /// retires it only where `emptied` allows and the edits took something
+    /// out of the document, so a file the person left empty stays.
     pub(crate) fn removes_empty_document(
         edits: &[Self],
         current: Option<&str>,
+        emptied: bool,
     ) -> Result<bool, String> {
-        let updated = || {
-            edits
-                .iter()
-                .try_fold(current.unwrap_or_default().to_owned(), |text, edit| {
-                    edit.apply(&text)
-                })
+        let current = current.unwrap_or_default();
+        let Some(first) = edits.first() else {
+            return Ok(false);
         };
-        let marks = |edit: &Self| {
-            matches!(
-                edit,
-                Self::UpsertMarkerBlock { .. } | Self::RemoveMarkerBlock { .. }
-            )
-        };
-        if edits.iter().any(marks) {
-            return Ok(crate::pi_ext::append_system_retires(&updated()?));
-        }
-        let prunes = |edit: &Self| matches!(edit, Self::OpencodePruneInstructions { .. });
-        if !edits.iter().any(prunes) {
+        let document = first.document();
+        if edits.iter().any(|edit| edit.document() != document) {
             return Ok(false);
         }
-        let updated = updated()?;
-        let value: Value = serde_json::from_str(&updated).map_err(|e| e.to_string())?;
-        let mut empty = Map::new();
-        opencode_schema(&mut empty);
-        Ok(value == json!({}) || value == Value::Object(empty))
+        let updated = edits
+            .iter()
+            .try_fold(current.to_owned(), |text, edit| edit.apply(&text))?;
+        match document {
+            Document::Text => Ok(crate::pi_ext::append_system_retires(&updated)),
+            Document::Json => {
+                let parse = |text: &str| -> Result<Value, String> {
+                    match text.trim().is_empty() {
+                        true => Ok(json!({})),
+                        false => serde_json::from_str(text).map_err(|e| e.to_string()),
+                    }
+                };
+                let value = parse(&updated)?;
+                let mut schema_only = Map::new();
+                opencode_schema(&mut schema_only);
+                if value != json!({}) && value != Value::Object(schema_only) {
+                    return Ok(false);
+                }
+                let prunes = edits
+                    .iter()
+                    .any(|edit| matches!(edit, Self::OpencodePruneInstructions { .. }));
+                Ok(prunes || (emptied && parse(current)? != value))
+            }
+            Document::Toml => {
+                let parse = |text: &str| -> Result<toml::Table, String> {
+                    text.parse::<toml::Table>().map_err(|e| e.to_string())
+                };
+                let value = parse(&updated)?;
+                Ok(value.is_empty()
+                    && updated.trim().is_empty()
+                    && emptied
+                    && parse(current)? != value)
+            }
+        }
+    }
+
+    /// How this edit reads and writes its file.
+    fn document(&self) -> Document {
+        match self {
+            Self::CodexEnableHooksFeature
+            | Self::UpsertCodexMcpServer { .. }
+            | Self::RemoveCodexMcpServer { .. } => Document::Toml,
+            Self::UpsertMarkerBlock { .. } | Self::RemoveMarkerBlock { .. } => Document::Text,
+            Self::ClaudeOutputStyle { .. }
+            | Self::RemoveClaudeOutputStyle { .. }
+            | Self::UpsertHook { .. }
+            | Self::RemoveHook { .. }
+            | Self::UpsertCopilotHook { .. }
+            | Self::RemoveCopilotHook { .. }
+            | Self::UpsertAntigravityHook { .. }
+            | Self::RemoveAntigravityHook { .. }
+            | Self::UpsertMcpServer { .. }
+            | Self::RemoveMcpServer { .. }
+            | Self::UpsertOpencodeMcpServer { .. }
+            | Self::RemoveOpencodeMcpServer { .. }
+            | Self::SetPluginEnabled { .. }
+            | Self::SetJsonArrayMember { .. }
+            | Self::SetGeminiMcpEnabled { .. }
+            | Self::GeminiAddContextFile { .. }
+            | Self::GeminiRemoveContextFile { .. }
+            | Self::OpencodeAddInstruction { .. }
+            | Self::OpencodeRemoveInstruction { .. }
+            | Self::OpencodePruneInstructions { .. } => Document::Json,
+        }
     }
     /// Whether the file is in sync with this edit: re-applying it changes
     /// nothing. The drift check for every config-entry kind, and what a
@@ -340,6 +412,10 @@ impl ConfigEdit {
                 Ok(())
             }
             ConfigEdit::GeminiAddContextFile { name } => gemini_add_context_file(object, name),
+            ConfigEdit::GeminiRemoveContextFile { name } => {
+                gemini_remove_context_file(object, name);
+                Ok(())
+            }
             ConfigEdit::OpencodeAddInstruction {
                 reference,
                 bash_permission,
@@ -551,6 +627,21 @@ fn gemini_add_context_file(root: &mut Map<String, Value>, name: &str) -> Result<
         Some(_) => return Err("context.fileName is neither a string nor a list".to_owned()),
     }
     Ok(())
+}
+
+/// [`gemini_add_context_file`] taken back, where the value is the one it
+/// writes over an absent key and so cannot hold anything of the person's.
+fn gemini_remove_context_file(root: &mut Map<String, Value>, name: &str) {
+    let Some(context) = root.get_mut("context").and_then(Value::as_object_mut) else {
+        return;
+    };
+    if context.get("fileName") != Some(&json!([GEMINI_DEFAULT_CONTEXT_FILE, name])) {
+        return;
+    }
+    context.shift_remove("fileName");
+    if context.is_empty() {
+        root.shift_remove("context");
+    }
 }
 
 /// How a registry spells a matcher: an entry naming none, or naming an

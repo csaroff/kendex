@@ -10,7 +10,8 @@
 //! so a hook running `git diff --cached` sees the named paths and nothing
 //! else and a refused commit leaves the person's own staged changes
 //! exactly as they were. And it commits the whole of each file it names,
-//! which is why the shared `edits` targets are out of the set.
+//! which is why a file kendex writes into joins the set only where the
+//! reading before the action shows it held nothing else.
 
 use std::path::Path;
 
@@ -18,7 +19,7 @@ use crate::engine::GeneratedPaths;
 use crate::process::Hardened;
 
 use super::pathspec::Spec;
-use super::pending::Selection;
+use super::pending::{Before, Selection};
 use super::{Failed, Refusal, Step, git};
 
 /// What the commit did.
@@ -74,6 +75,10 @@ pub struct Opened {
 /// carries both the action's change and an earlier one, both go in, and
 /// [`super::Pending::tangled`] is what names that before a person chooses.
 ///
+/// `before` is what was read before the action, and the set is the one
+/// [`super::Scan::carried`] names against it: a file the action wrote and
+/// kendex does not own whole joins it only where it was clean before.
+///
 /// The one mark a refusal leaves is the `git add`: a path that was
 /// untracked stays staged. kendex unstages exactly the paths it staged, so
 /// the index ends as it began. It unstages with `git reset`, not `git
@@ -85,14 +90,24 @@ pub fn commit(
     generated: &GeneratedPaths,
     message: &str,
     selection: &Selection,
+    before: &Before,
 ) -> Result<Committed, CommitFailure> {
-    let Some(scan) = super::paths::scan(root, generated).map_err(CommitFailure::from)? else {
+    let Some(scan) = super::paths::scan(root, generated, before).map_err(CommitFailure::from)?
+    else {
         // The read covers nothing at all, so every path the selection named
         // is one it no longer covers. `over` decides that, here as below.
         let (_, dropped) = selection.over(&[]);
         return Ok(Committed::Nothing { dropped });
     };
-    let (taken, dropped) = selection.over(&scan.owned);
+    let carried = scan.carried();
+    let covered: Vec<super::Owned> = scan
+        .owned
+        .iter()
+        .chain(&scan.beside)
+        .filter(|one| carried.contains(&one.path))
+        .cloned()
+        .collect();
+    let (taken, dropped) = selection.over(&covered);
     if taken.is_empty() {
         return Ok(Committed::Nothing { dropped });
     }

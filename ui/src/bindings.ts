@@ -346,7 +346,7 @@ export const commands = {
 	 *  project gains the personal subscription first (§4.1), then the add runs
 	 *  there — every write lands in exactly one scope. `harnesses` and `method`
 	 *  carry the picker's answer; absent, the scope's own install defaults
-	 *  decide, brought up to date against this machine by the add itself.
+	 *  decide, as [`install_targets`] marks them.
 	 *  `optional` carries the optional dependencies the picker ticked, by the
 	 *  name their parent declares them under; the engine records the choice
 	 *  against every item that offers one by that name — a name no item this
@@ -356,12 +356,12 @@ export const commands = {
 	marketplaceInstall: (scope: Scope, source: string, items: InstallItem[], bundle: string | null, destination: { scope: "global" } | { scope: "project"; root: string } | null, hold: boolean, harnesses: HarnessId[] | null, method: "symlink" | "copy" | null, optional: string[]) => typedError<Installed_Serialize, string>(__TAURI_INVOKE("marketplace_install", { scope, source, items, bundle, destination, hold, harnesses, method, optional })),
 	/**
 	 *  Where an install of these kinds could land, for the picker the install
-	 *  flow draws. Two filters, both read from core: which tools can take the
-	 *  kinds being installed at this scope — the same one the install itself
+	 *  flow draws. Three readings, all from core: which tools can take the
+	 *  kinds being installed at this scope — the same filter the install itself
 	 *  refuses by, so the picker cannot offer a choice the install turns down —
-	 *  and which are on this machine. Detection is read now rather than taken
-	 *  from the scope's manifest: a tool that arrived after the scope was set
-	 *  up has to be offerable, and one gone since must not read as present.
+	 *  which are on this machine, and which the scope's defaults name. The
+	 *  defaults are what an untouched install is sent to, so the picker checks
+	 *  those rather than whatever this machine happens to have.
 	 */
 	installTargets: (scope: Scope, kinds: ItemKind[]) => typedError<InstallTarget[], string>(__TAURI_INVOKE("install_targets", { scope, kinds })),
 	repoEffectsApply: (scope: Scope, declared: DeclaredEffects) => typedError<Said, string>(__TAURI_INVOKE("repo_effects_apply", { scope, declared })),
@@ -371,10 +371,12 @@ export const commands = {
 	 *  offer after that write can say what the write itself did.
 	 * 
 	 *  Taken before the action runs and handed back to [`commit_offer_scan`]
-	 *  afterwards. A project this cannot read contributes nothing: the reading
-	 *  after the action then finds no baseline for it and treats every pending
-	 *  change there as the action's, which over-reports rather than claiming a
-	 *  change is somebody else's.
+	 *  afterwards. The window cannot see the plan of the write it is about to
+	 *  make, so the files the write may change beside its renders are every
+	 *  file such a write can change (`GeneratedPaths::beside`), and the
+	 *  reading after it keeps only the ones whose content moved. A project
+	 *  this cannot read contributes nothing, and the write that follows makes
+	 *  no offer about it.
 	 */
 	commitOfferBaseline: (roots: string[]) => typedError<ProjectBaseline[], string>(__TAURI_INVOKE("commit_offer_baseline", { roots })),
 	/**
@@ -403,6 +405,11 @@ export const commands = {
 	commitOfferOpen: (root: string, since: {
 	root: string,
 	held: HeldPath[],
+	/**
+	 *  The files the write may change beside the ones kendex owns whole,
+	 *  `commit_offer::Baseline::writes`.
+	 */
+	writes: string[],
 } | null) => typedError<OpenOffer, string>(__TAURI_INVOKE("commit_offer_open", { root, since })),
 	/**
 	 *  What changed in one file the offer covers, for the viewer the window
@@ -412,9 +419,19 @@ export const commands = {
 	 *  sends: the scan is what decides which files kendex may show, and a
 	 *  window that has been open a while is answering about a project that has
 	 *  moved on. A path the fresh scan does not cover is `Nothing`, whatever
-	 *  it names.
+	 *  it names. `since` is the reading the offer listing the file was drawn
+	 *  against, so a file the action wrote beside its renders opens as the
+	 *  offer listed it; `null` where none was.
 	 */
-	commitOfferFileChanges: (root: string, path: string) => typedError<FileChanges, string>(__TAURI_INVOKE("commit_offer_file_changes", { root, path })),
+	commitOfferFileChanges: (root: string, path: string, since: {
+	root: string,
+	held: HeldPath[],
+	/**
+	 *  The files the write may change beside the ones kendex owns whole,
+	 *  `commit_offer::Baseline::writes`.
+	 */
+	writes: string[],
+} | null) => typedError<FileChanges, string>(__TAURI_INVOKE("commit_offer_file_changes", { root, path, since })),
 	projectChangesScan: (roots: string[]) => typedError<ProjectChanges[], string>(__TAURI_INVOKE("project_changes_scan", { roots })),
 	/**
 	 *  The exact effect of putting these paths back, without putting any of
@@ -429,7 +446,21 @@ export const commands = {
 	 *  restore may never take a path the offer has stopped covering.
 	 */
 	projectChangesRestore: (root: string, paths: string[]) => typedError<RestoreResult, string>(__TAURI_INVOKE("project_changes_restore", { root, paths })),
-	commitOfferCommit: (root: string, message: string, selection: ChangeSelection) => typedError<CommitStep, string>(__TAURI_INVOKE("commit_offer_commit", { root, message, selection })),
+	/**
+	 *  Commit one project's selection. `since` is the reading the offer was
+	 *  drawn against, `ProjectOffer::since`: the files kendex writes into and
+	 *  does not own whole ride the commit only through it, and only where the
+	 *  action changed them from a clean state.
+	 */
+	commitOfferCommit: (root: string, message: string, selection: ChangeSelection, since: {
+	root: string,
+	held: HeldPath[],
+	/**
+	 *  The files the write may change beside the ones kendex owns whole,
+	 *  `commit_offer::Baseline::writes`.
+	 */
+	writes: string[],
+} | null) => typedError<CommitStep, string>(__TAURI_INVOKE("commit_offer_commit", { root, message, selection, since })),
 	commitOfferPush: (root: string, remote: string, branch: string, tracked: boolean) => typedError<StepResult, string>(__TAURI_INVOKE("commit_offer_push", { root, remote, branch, tracked })),
 	/**
 	 *  Push a commit that already exists to a branch of its own, without
@@ -1291,9 +1322,10 @@ export type ChangesState =
 { kind: "pending"; 
 /**  The files kendex owns whole that changed. */
 files: string[]; 
-/**  The shared configuration files kendex writes one key in. */
-shared: string[]; 
-/**  How many of the person's own files changed. */
+/**
+ *  How many of the person's own files changed. With no action to
+ *  read against, a file kendex writes one key in is among them.
+ */
 others: number; 
 /**  The branch a commit would land on, or `null` where none would. */
 branch: string | null; 
@@ -2651,12 +2683,19 @@ export type InstallState =
 
 /**
  *  One row of the install picker: a tool the scope can install to, whether
- *  this machine has it, and whether it reads the shared `.agents` tree
- *  rather than a directory of its own.
+ *  this machine has it, whether an install left to the scope's defaults
+ *  lands on it, and whether it reads the shared `.agents` tree rather than
+ *  a directory of its own.
  */
 export type InstallTarget = {
 	harness: HarnessId,
 	detected: boolean,
+	/**
+	 *  The scope's `[install]` list names this tool, or, where the scope
+	 *  declares none, this machine has it: the rows an untouched picker
+	 *  checks, and the tools the install then lands on.
+	 */
+	byDefault: boolean,
 	sharesTheUniversalTree: boolean,
 };
 
@@ -3978,6 +4017,11 @@ export type PreflightCheck = {
 export type ProjectBaseline = {
 	root: string,
 	held: HeldPath[],
+	/**
+	 *  The files the write may change beside the ones kendex owns whole,
+	 *  `commit_offer::Baseline::writes`.
+	 */
+	writes: string[],
 };
 
 /**
@@ -4013,9 +4057,11 @@ export type ProjectOffer = {
 	/**  The project's folder name, which the title names. */
 	name: string,
 	/**
-	 *  The files kendex owns whole that changed, printed whole: an
-	 *  abbreviation guesses at a directory and names a different file from
-	 *  the one being committed.
+	 *  What a commit of every pending change carries,
+	 *  `commit_offer::Scan::carried`: the files kendex owns whole that
+	 *  changed, and the files this action wrote from a clean state, printed
+	 *  whole: an abbreviation guesses at a directory and names a different
+	 *  file from the one being committed.
 	 */
 	files: ChangedFile[],
 	/**
@@ -4032,13 +4078,19 @@ export type ProjectOffer = {
 	choice: boolean,
 	/**  What stops the action's work from being committed on its own. */
 	tangled: TangledFile[],
-	/**  The shared configuration files kendex writes one key in. */
+	/**
+	 *  The files this action wrote that no commit on offer carries, because
+	 *  each held a change before it — the manifest named in `manifest`
+	 *  aside. Empty where a person opened the offer: with no action to read
+	 *  against, no file beside the ones kendex owns whole is its.
+	 */
 	shared: string[],
 	/**
 	 *  The project's manifest, where this action wrote it and the commit
-	 *  does not carry it. `null` where every declaration these renders
-	 *  need is committed already, or where a person opened the offer and
-	 *  there is no action to attribute a change to.
+	 *  does not carry it because it held a change before the action.
+	 *  `null` where the commit carries it, the action did not change it,
+	 *  or a person opened the offer and there is no action to attribute a
+	 *  change to.
 	 */
 	manifest: string | null,
 	/**  How many of the person's own files changed. */
@@ -4059,6 +4111,13 @@ export type ProjectOffer = {
 	 *  `--set-upstream`.
 	 */
 	tracked: boolean,
+	/**
+	 *  The reading the offer was drawn against, which every step after it
+	 *  hands back: the commit and the file viewer carry what this offer
+	 *  listed, and nothing a later reading would. `null` where a person
+	 *  opened the offer.
+	 */
+	since: ProjectBaseline | null,
 	/**
 	 *  Packages whose files in this repository a commit of every pending
 	 *  change would carry out of date. Where the commit on offer is that

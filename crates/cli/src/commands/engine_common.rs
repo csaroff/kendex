@@ -255,6 +255,18 @@ pub fn apply_report(env: &Env, report: &EngineReport) -> Result<usize, Box<dyn s
     for warning in &report.warnings {
         ui::report::run_model_warning(&warning.message);
     }
+    // Read before the write, the only time it can be: what the project held
+    // then, at every path this plan touches, decides which files it changes
+    // beside its renders the offer after it may commit.
+    let before = kendex_core::commit_offer::Before::read(
+        &report.plan.scope,
+        &report.generated,
+        report
+            .plan
+            .ops
+            .iter()
+            .flat_map(|planned| planned.op.touched()),
+    );
     let applied = match report.plan.is_empty() {
         true => 0,
         false => {
@@ -279,7 +291,7 @@ pub fn apply_report(env: &Env, report: &EngineReport) -> Result<usize, Box<dyn s
         }
     }
     bot_instructions.add_to(&mut generated);
-    super::commit_offer::after_writing(env, &report.plan.scope, &generated)?;
+    super::commit_offer::after_writing(env, &report.plan.scope, &generated, &before)?;
     Ok(applied)
 }
 

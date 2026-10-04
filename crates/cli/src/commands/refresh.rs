@@ -1,3 +1,4 @@
+use kendex_core::commit_offer::Before;
 use kendex_core::engine::{EngineReport, PlanOptions, plan_apply};
 use kendex_core::env::Env;
 use kendex_core::lock::{load as load_lock, lock_path};
@@ -559,7 +560,8 @@ pub fn run(
                         break;
                     }
                     failures.push(error.to_string());
-                    if let Err(error) = after_writing(env, &scope, &written.report.generated) {
+                    let generated = &written.report.generated;
+                    if let Err(error) = after_writing(env, &scope, generated, &Before::Untaken) {
                         failures.push(error.to_string());
                     }
                 }

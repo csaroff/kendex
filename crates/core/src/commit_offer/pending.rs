@@ -5,7 +5,7 @@
 //! second write has to say what the second write did, not hand over
 //! everything that has piled up under one label. Names alone cannot do it —
 //! two writes reach the same render — so the answer is a reading of the
-//! project taken **before** the action ([`baseline`]) compared with the
+//! project taken **before** the action ([`Before::read`]) compared with the
 //! reading taken after it.
 //!
 //! What is compared is the content, never the path list. A file both the
@@ -14,15 +14,25 @@
 //! too: git commits whole files. That case is named rather than papered
 //! over — [`Pending::tangled`] says which file stops the separation, and
 //! the surfaces make the reader choose.
+//!
+//! The same two readings decide what a commit carries beside the files
+//! kendex owns whole. A file the action may write ([`Baseline::writes`])
+//! that it changed from a state matching the last commit holds the action's
+//! change alone, and rides every commit made after it
+//! ([`Pending::carried`]); one that held a change then stays out and is
+//! named ([`Pending::left_out`]); one the action left as it found it is the
+//! person's. Without a reading before the action none is carried.
+//! [`super::Scan::carry`] holds that answer, made once per scan, and every
+//! count, list and commit on both surfaces reads it.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::engine::GeneratedPaths;
 use crate::engine::generated_paths::companions;
 use crate::model::Scope;
 
-use super::{Failed, Scan};
+use super::{Failed, Owned};
 
 /// What stood at one path at the moment a reading was taken.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,54 +44,101 @@ pub enum Held {
     /// Nothing stood there. A path kendex has yet to write, or one a sweep
     /// has taken away.
     Gone,
-    /// Something stood there and could not be read. Nothing is known about
-    /// it, so nothing may be claimed about it either: a comparison against
-    /// this never reports "unchanged".
+    /// Something stood there and what it was is not known: it could not be
+    /// read, or it is a path the reading had no cause to expect a write at
+    /// and recorded by name alone. Nothing may be claimed about it either:
+    /// a comparison against this never reports "unchanged".
     Unreadable,
 }
 
-/// What a project's pending kendex changes held before an action ran.
+/// What a project's pending changes held before an action ran.
 ///
-/// The paths that already had a pending change are recorded, and so is the
-/// project's manifest, whose reading is taken whether it was pending or
-/// not: a manifest that was clean before and is clean now is the case the
-/// offer must stay quiet about, and only a reading taken then tells it from
-/// one this action wrote. A path absent from [`Baseline::held`] was clean,
-/// which is the whole of what a later reading needs to know about an owned
-/// path; an absent manifest row is a reading never taken, and nothing is
-/// claimed about it either way.
+/// Every path git reported changed then has a row, and a path with no row
+/// was clean: git reports every change in the checkout, so a row absent
+/// from a reading that ran is a path that matched the last commit. The
+/// files kendex owns whole and the ones the action may write carry a
+/// reading of what stood there; every other path is recorded by name as
+/// [`Held::Unreadable`], so a file an action first writes into after it —
+/// a shared configuration file a newly installed hook registers in — reads
+/// as holding an earlier change rather than as clean.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Baseline {
     pub held: BTreeMap<String, Held>,
+    /// The files the action may write beside the ones kendex owns whole, as
+    /// `git status` spells them. Only one of these, or a shared edit target
+    /// the plan after the action names, is ever the action's.
+    pub writes: BTreeSet<String>,
 }
 
-/// Read what this project's pending kendex changes hold now, to compare a
-/// later reading against.
-///
-/// Taken before the action runs. A scope that is not a project holds
-/// nothing, and a project where nothing kendex owns has changed holds its
-/// manifest's reading alone: an empty set of pending paths rather than a
-/// missing one, so every path the action then changes reads as clean
-/// before it.
-pub fn baseline(scope: &Scope, generated: &GeneratedPaths) -> Result<Baseline, Failed> {
-    let Scope::Project { root } = scope else {
-        return Ok(Baseline::default());
-    };
-    let mut readings: BTreeMap<String, Held> = super::paths::declaration(root)
-        .map(|path| {
-            let reading = held(root, &path);
-            (path, reading)
+/// What was read of a project before an action: the one input, beside the
+/// reading after it, that a commit of the action's work is judged by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Before {
+    /// Read before the action.
+    Read(Baseline),
+    /// The read before the action would not run. No file the action wrote
+    /// beside its renders is carried, and each changed one is named with
+    /// the refusal rather than as the person's earlier change.
+    Unread {
+        failed: Failed,
+        writes: BTreeSet<String>,
+    },
+    /// No read was taken: a person opened the offer, or the write ran where
+    /// no reading could be handed on. Nothing is attributed to an action,
+    /// and nothing beside the files kendex owns whole is kendex's.
+    Untaken,
+}
+
+impl Before {
+    /// Read `scope` before an action that renders `generated` and writes
+    /// `writes` beside its renders: every path the action's plan touches
+    /// where the caller holds the plan, and otherwise every file such an
+    /// action can write into ([`GeneratedPaths::beside`]). A scope that is
+    /// not a project, or a project that is not a checkout, has nothing to
+    /// read.
+    pub fn read(
+        scope: &Scope,
+        generated: &GeneratedPaths,
+        writes: impl IntoIterator<Item = PathBuf>,
+    ) -> Before {
+        let Scope::Project { root } = scope else {
+            return Before::Untaken;
+        };
+        if !root.join(".git").exists() {
+            return Before::Untaken;
+        }
+        let writes: BTreeSet<String> = writes
+            .into_iter()
+            .filter_map(|path| path.strip_prefix(root).ok().map(crate::paths::slashed))
+            .collect();
+        let sorted = match super::paths::sort(root, generated, Some(&writes)) {
+            Ok(sorted) => sorted,
+            Err(failed) => return Before::Unread { failed, writes },
+        };
+        let read = sorted
+            .owned
+            .iter()
+            .chain(&sorted.beside)
+            .map(|one| (one.path.clone(), held(root, &one.path)));
+        let named = sorted
+            .others
+            .into_iter()
+            .map(|path| (path, Held::Unreadable));
+        Before::Read(Baseline {
+            held: read.chain(named).collect(),
+            writes,
         })
-        .into_iter()
-        .collect();
-    if let Some(scan) = super::scan(scope, generated)? {
-        readings.extend(
-            scan.owned
-                .iter()
-                .map(|owned| (owned.path.clone(), held(&scan.root, &owned.path))),
-        );
     }
-    Ok(Baseline { held: readings })
+
+    /// The files the action may write beside its renders, or `None` where
+    /// nothing was read and none is the action's.
+    pub(super) fn writes(&self) -> Option<&BTreeSet<String>> {
+        match self {
+            Before::Read(baseline) => Some(&baseline.writes),
+            Before::Unread { writes, .. } => Some(writes),
+            Before::Untaken => None,
+        }
+    }
 }
 
 /// What stands at one path now.
@@ -117,7 +174,7 @@ pub enum Attribution {
     Older,
 }
 
-/// One changed path kendex owns, and what the action did to it.
+/// One changed path kendex wrote, and what the action did to it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingFile {
     pub path: String,
@@ -153,105 +210,102 @@ pub enum Tangled {
 /// A project's pending kendex changes, each with what the action did to it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pending {
-    /// Every changed path kendex owns, in the scan's order.
+    /// Every changed path kendex owns whole, in the scan's order.
     pub files: Vec<PendingFile>,
+    /// Every changed file the action wrote beside them, in the scan's
+    /// order: [`super::Scan::beside`]. One it changed from a clean state
+    /// ([`Attribution::Action`]) holds the action's change alone and rides
+    /// the commit; one that held a change before stays out.
+    pub beside: Vec<PendingFile>,
     /// The paths that say what kendex renders here — the inventory of
     /// what it owns and the record of what each render is — as the scan
     /// spells them. A commit that adds or takes away a render carries
-    /// them too. The manifest is not among them: kendex edits keys in it and
-    /// owns none of its bytes, so it is neither committed nor restored
-    /// whole. `crate::engine::generated_paths::companions` is the one place
-    /// that decides this.
+    /// them too. The manifest is not among them: it is one of the files
+    /// kendex writes into, carried only as [`Pending::beside`] allows.
+    /// `crate::engine::generated_paths::companions` is the one place that
+    /// decides this.
     declarations: BTreeSet<String>,
-    /// The project's manifest, where this action wrote it and what it
-    /// wrote is not committed. The commit leaves that change behind, so
-    /// the offer says so and the person commits the file themselves.
+    /// The project's manifest, as the scan spells it.
     manifest: Option<String>,
 }
 
-/// Compare a reading of the project against the one taken before the
-/// action.
-pub fn pending(scan: &Scan, since: &Baseline) -> Pending {
-    let files = scan
-        .owned
-        .iter()
-        .map(|owned| {
-            let now = held(&scan.root, &owned.path);
-            PendingFile {
-                path: owned.path.clone(),
-                untracked: owned.added,
-                gone: now == Held::Gone,
-                attribution: attribute(since.held.get(&owned.path), &now),
-            }
-        })
-        .collect();
-    Pending {
-        files,
-        manifest: wrote_the_manifest(scan, since),
-        declarations: companions(&scan.root)
-            .iter()
-            .filter_map(|path| {
-                path.strip_prefix(&scan.root)
-                    .ok()
-                    .map(crate::paths::slashed)
-            })
-            .collect(),
-    }
-}
-
-/// What the action did to one path, from the two readings of it.
-///
-/// An unreadable side on either reading is not a match. Reporting one as
-/// unchanged would put an older change into a commit labelled as the
-/// action's, which is the one thing this comparison exists to stop.
-fn attribute(before: Option<&Held>, now: &Held) -> Attribution {
-    match before {
-        None => Attribution::Action,
-        Some(Held::Unreadable) => Attribution::Both,
-        Some(_) if *now == Held::Unreadable => Attribution::Both,
-        Some(before) if before == now => Attribution::Older,
-        Some(_) => Attribution::Both,
-    }
-}
-
-/// The project's manifest where this action wrote it and the write is not
-/// committed, read the way every other path is: the content before the
-/// action against the content now.
-///
-/// Three answers are silence, each for its own reason. git reports the file
-/// unchanged, so the declaration these renders need is already committed
-/// and nothing is left behind. No reading was taken before the action, so
-/// what changed the file is not known and nothing may be claimed about it.
-/// Or the action left the file exactly as it found it, and the pending
-/// change in it is somebody else's to commit.
-fn wrote_the_manifest(scan: &Scan, since: &Baseline) -> Option<String> {
-    let path = scan.manifest.as_ref()?;
-    let before = since.held.get(path.as_str())?;
-    match attribute(Some(before), &held(&scan.root, path)) {
-        Attribution::Older => None,
-        Attribution::Action | Attribution::Both => Some(path.clone()),
-    }
-}
-
 impl Pending {
-    /// Whether the action changed anything kendex owns here. An action that
-    /// changed nothing in this project has nothing to offer about it,
-    /// whatever else is pending.
+    /// Compare the reading after the action against the one taken before
+    /// it. `beside` is every changed file the action may have written; one
+    /// it left as it found it is the person's, and is not kept.
+    pub(super) fn read(
+        root: &Path,
+        owned: &[Owned],
+        beside: &[Owned],
+        since: &Baseline,
+    ) -> Pending {
+        let read = |one: &Owned| {
+            let now = held(root, &one.path);
+            PendingFile {
+                path: one.path.clone(),
+                untracked: one.added,
+                gone: now == Held::Gone,
+                attribution: attribute(since.held.get(&one.path), &now),
+            }
+        };
+        Pending {
+            files: owned.iter().map(read).collect(),
+            beside: beside
+                .iter()
+                .map(read)
+                .filter(|file| file.attribution != Attribution::Older)
+                .collect(),
+            manifest: super::paths::declaration(root),
+            declarations: companions(root)
+                .iter()
+                .filter_map(|path| path.strip_prefix(root).ok().map(crate::paths::slashed))
+                .collect(),
+        }
+    }
+
+    /// Whether a commit of only the action's work carries anything here.
+    /// An action whose only change is to a file it leaves out
+    /// ([`Pending::left_out`]) has nothing of its own to commit, and an
+    /// offer about it would put only earlier work in front of the reader.
     pub fn acted(&self) -> bool {
-        self.files
+        !self.action_set().is_empty()
+    }
+
+    /// The files the action wrote beside the ones kendex owns whole that a
+    /// commit of its work carries: each one it changed from a clean state,
+    /// so committing the whole file commits nothing but the action's
+    /// change. Every commit either surface makes after the action carries
+    /// them.
+    pub fn carried(&self) -> BTreeSet<String> {
+        self.beside
             .iter()
-            .any(|file| file.attribution != Attribution::Older)
+            .filter(|file| file.attribution == Attribution::Action)
+            .map(|file| file.path.clone())
+            .collect()
+    }
+
+    /// The files the action wrote that no commit carries, because each
+    /// held a change before the action that a commit of the whole file
+    /// would carry too. The offer names each one, and the person commits
+    /// it.
+    pub fn left_out(&self) -> Vec<&str> {
+        self.beside
+            .iter()
+            .filter(|file| file.attribution == Attribution::Both)
+            .map(|file| file.path.as_str())
+            .collect()
     }
 
     /// The paths a commit of only this action's work carries: the ones the
-    /// action changed, and the declarations a change to which paths exist
-    /// cannot stand without.
+    /// action changed, the files it wrote into from a clean state, and the
+    /// declarations a change to which paths exist cannot stand without.
     pub fn action_set(&self) -> BTreeSet<String> {
         let mut chosen: BTreeSet<String> = self
             .files
             .iter()
             .filter(|file| file.attribution != Attribution::Older)
             .map(|file| file.path.clone())
+            .chain(self.carried())
             .collect();
         if self.changes_which_paths_exist() {
             chosen.extend(
@@ -264,10 +318,14 @@ impl Pending {
         chosen
     }
 
-    /// Every pending path kendex owns — what "all pending kendex changes"
-    /// covers.
+    /// Every pending path kendex owns, and the files it wrote into from a
+    /// clean state — what "all pending kendex changes" covers.
     pub fn every_path(&self) -> BTreeSet<String> {
-        self.files.iter().map(|file| file.path.clone()).collect()
+        self.files
+            .iter()
+            .map(|file| file.path.clone())
+            .chain(self.carried())
+            .collect()
     }
 
     /// Whether committing only the action's work and committing everything
@@ -308,19 +366,20 @@ impl Pending {
         tangled
     }
 
-    /// The manifest this action wrote that the commit does not carry, and
-    /// nothing where every declaration these renders need is committed
-    /// already.
+    /// The manifest where the action wrote it and no commit carries it: it
+    /// held a change before the action, so it is one of
+    /// [`Pending::left_out`]. Nothing where the commit carries it or the
+    /// action left it as it found it.
     ///
-    /// kendex folds keys into that file and owns none of its bytes, so no
-    /// commit kendex makes can include it. What a commit of renders
-    /// without it costs is reproducibility and, in a clone, the renders:
-    /// the lock rides the same commit and names them, both sweeps judge by
-    /// the written lock, and a recorded install the committed manifest
-    /// does not ask for is an orphan the next apply there removes. The
-    /// declaration that asks for them is what this names.
+    /// What a commit of renders without it costs is reproducibility and,
+    /// in a clone, the renders: the lock rides the same commit and names
+    /// them, both sweeps judge by the written lock, and a recorded install
+    /// the committed manifest does not ask for is an orphan the next apply
+    /// there removes. The declaration that asks for them is what this
+    /// names.
     pub fn manifest_not_carried(&self) -> Option<&str> {
-        self.manifest.as_deref()
+        let manifest = self.manifest.as_deref()?;
+        self.left_out().into_iter().find(|path| *path == manifest)
     }
 
     /// Whether the action's own work adds or takes away a path kendex
@@ -332,6 +391,21 @@ impl Pending {
                 && !self.declarations.contains(&file.path)
                 && (file.untracked || file.gone)
         })
+    }
+}
+
+/// What the action did to one path, from the two readings of it.
+///
+/// An unreadable side on either reading is not a match. Reporting one as
+/// unchanged would put an older change into a commit labelled as the
+/// action's, which is the one thing this comparison exists to stop.
+fn attribute(before: Option<&Held>, now: &Held) -> Attribution {
+    match before {
+        None => Attribution::Action,
+        Some(Held::Unreadable) => Attribution::Both,
+        Some(_) if *now == Held::Unreadable => Attribution::Both,
+        Some(before) if before == now => Attribution::Older,
+        Some(_) => Attribution::Both,
     }
 }
 

@@ -95,7 +95,7 @@ fn regular_file(path: &Path) -> Result<bool> {
     }
 }
 
-fn relative_name(root: &Path, path: &Path) -> String {
+pub(super) fn relative_name(root: &Path, path: &Path) -> String {
     let relative = path.strip_prefix(root).unwrap_or(path);
     crate::paths::slashed(relative)
 }
@@ -127,7 +127,7 @@ pub(super) fn claude_standing(root: &Path, agents_file: &Path) -> Result<ShimSta
 
 /// A shim kendex cannot read is reported uncompared (invariant 12), never
 /// as passing, and never at the cost of the whole scope.
-fn uncomparable(name: &str, error: &CoreError) -> String {
+pub(super) fn uncomparable(name: &str, error: &CoreError) -> String {
     format!(
         "{} cannot be compared ({error}) — fix its permissions or remove it",
         crate::names::shown(name)
@@ -165,6 +165,14 @@ pub(super) fn old_link(root: &Path, agents: &[PathBuf]) -> Result<Option<ShimSta
 /// The edit the Gemini shim is: `context.fileName` names `AGENTS.md`.
 pub(super) fn gemini_edit() -> ConfigEdit {
     ConfigEdit::GeminiAddContextFile {
+        name: AGENTS_FILE.to_owned(),
+    }
+}
+
+/// The edit that takes the Gemini shim back: `context.fileName` no longer
+/// names `AGENTS.md` where the shim's edit is all it holds.
+pub(super) fn gemini_retirement() -> ConfigEdit {
+    ConfigEdit::GeminiRemoveContextFile {
         name: AGENTS_FILE.to_owned(),
     }
 }

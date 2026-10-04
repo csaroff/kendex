@@ -18,9 +18,9 @@ export const COMMIT_OFFER_STANDING =
   "These are the files kendex writes in this repository. Nothing is committed yet.";
 
 export const FILES_LABEL = "Files";
-export const SHARED_LABEL = "Shared files";
-export const SHARED_NOTE =
-  "kendex writes one key in each of these. Committing them would commit your own changes to them too, so kendex leaves them to you.";
+export const LEFT_OUT_LABEL = "Left out of this commit";
+export const LEFT_OUT_NOTE =
+  "This action changed each of these, and each already held changes of yours. Committing the whole file would commit those too, so kendex leaves them out. Commit them yourself.";
 export const OTHER_LABEL = "Other changes";
 export const otherNote = (others: number) =>
   `${others} other file${plural(others)} in this repository changed. kendex does not commit these.`;
@@ -47,14 +47,16 @@ export const carriesEarlier = (path: string) =>
   `${path} was already changed before this action. git commits whole files, so committing it commits that earlier change too.`;
 export const declaresWhatChanged = (path: string) =>
   `${path} records what kendex installs here and was already changed before this action. This action adds or removes a file, so the commit cannot leave it out.`;
-/** The file this action declared what it wrote in. kendex folds keys into
- *  that document and owns none of its bytes, so no commit it makes can
- *  include it, and the reader is told which file to commit rather than
- *  finding out later. Stated at its real size: this is about somebody else
+/** The file this action declared what it wrote in, where the action
+ *  changed it while it held the person's own changes: a commit of the whole
+ *  file would carry those too, so kendex leaves it out, and the reader is
+ *  told which file to commit rather than finding out later. A manifest the
+ *  action changed from a clean state rides the commit and draws no such
+ *  section. Stated at its real size: this is about somebody else
  *  reproducing the install, not about anything breaking. */
 export const MANIFEST_LEFT_LABEL = "This commit leaves out your package list";
 export const manifestLeft = (path: string) =>
-  `This action changed ${path}, which lists what this project installs. kendex writes keys in that file and leaves the rest of it to you, so it never commits it. Commit ${path} yourself: until you do, a checkout made from this commit holds the files without the list that asks for them, and nobody else can reproduce this install from it.`;
+  `This action changed ${path}, which lists what this project installs. It already held changes of yours, and committing the whole file would commit those too, so kendex leaves it out. Commit ${path} yourself: until you do, a checkout made from this commit holds the files without the list that asks for them, and nobody else can reproduce this install from it.`;
 
 export const ACCEPT_EARLIER_LABEL =
   "Commit the earlier changes in these files too";
