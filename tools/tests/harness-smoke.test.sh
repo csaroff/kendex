@@ -29,9 +29,14 @@ SMOKE="$REPO/tools/harness-smoke"
 # row pins the path it then prints. macOS hands mktemp a /var path that is a
 # symlink to /private/var, so an unresolved TMP makes every such row want a
 # path the script will never say.
-TMP="$(mktemp -d)" || { echo "harness-smoke.test: mktemp -d failed" >&2; exit 1; }
+mkdir -p "$REPO/tmp"
+TMP="$(mktemp -d "$REPO/tmp/harness-smoke-test.XXXXXX")" || { echo "harness-smoke.test: mktemp -d failed" >&2; exit 1; }
 TMP="$(cd -- "$TMP" && pwd -P)" || { echo "harness-smoke.test: resolving the scratch directory failed" >&2; exit 1; }
 trap 'rm -rf -- "${TMP:?}"' EXIT
+# Scratch must not inherit the enclosing worktree's git repository. Fixture
+# repositories below this ceiling still use their own .git directories.
+# Git can climb from the ceiling itself, so use the scratch root's parent.
+export GIT_CEILING_DIRECTORIES="${TMP%/*}"
 REPO_HEAD="$(git -C "$REPO" rev-parse --verify HEAD)" ||
   { echo "harness-smoke.test: this checkout has no HEAD commit" >&2; exit 1; }
 
@@ -638,6 +643,7 @@ for a; do
   prev=$a
 done
 case "$1 ${2:-}" in
+  "--version ") printf 'GitHub Copilot CLI 1.0.91.\n'; exit 0 ;;
   "skill list")
     [ "$STANDIN_SETTINGS" != bad ] ||
       printf "Repository settings file '.claude/settings.json' could not be loaded:\nSettings config error: hooks.preToolUse[0].matcher: matcher cannot be empty\n"
@@ -660,6 +666,32 @@ case "$1 ${2:-}" in
     jq -R '{sourcePath: .}' standin-sources | jq -s .
     exit 0 ;;
 esac
+if [ -f .github/hooks/interactive.json ]; then
+  mode=$(jq -r '.hooks.userPromptSubmitted[0].args[1]' .github/hooks/interactive.json)
+  token=$(jq -r '.hooks.userPromptSubmitted[0].args[2]' .github/hooks/interactive.json)
+  result=positive reply=$token
+  if [ "$mode" = none ]; then
+    result=negative reply=NO-HOOK-TOKEN
+    [ "${STANDIN_INTERACTIVE_ANSWER:-yes}" != leak ] || reply=$token
+  fi
+  printf '{"sessionId":"lead-1"}\n' >>smoke-events/calls
+  printf '%s\n' "$reply" >"../../logs/copilot-answer-interactive-$result.md"
+  [ "${STANDIN_COMPACT:-manual}" != manual ] || printf '{"trigger":"manual"}\n' >>smoke-events/compact
+  exit 0
+fi
+if [ -f smoke-events/answer ] && jq -e '[.hooks[][] | has("exec")] | any' .github/hooks/smoke-events.json >/dev/null; then
+  event=$(jq -r '.hooks | keys[0]' .github/hooks/smoke-events.json)
+  mode=$(jq -r '.hooks[][] | .args[1]' .github/hooks/smoke-events.json)
+  token=$(jq -r '.hooks[][] | .args[2]' .github/hooks/smoke-events.json)
+  answer=${STANDIN_ANSWER:-yes}
+  [ "$answer" = nohook ] || printf '{"sessionId":"lead-1"}\n' >>smoke-events/calls
+  case "$event:$answer" in agentStop:yes | subagentStop:yes) printf '{"sessionId":"lead-1"}\n' >>smoke-events/calls ;; esac
+  if [ "$answer" = leak ] || { [ "$mode" != none ] && [ "$answer" != silent ]; }; then reply=$token; else reply=NO-HOOK-TOKEN; fi
+  printf '%s\n' "$reply"
+  [ -z "$share" ] || printf '%s\n' "$reply" >"$share"
+  [ "$answer" != error ] || exit 1
+  exit 0
+fi
 case "$prompt" in
   "Reply exactly as your agent instructions say.")
     printf 'SessionStart %s/.github/hooks/smoke-session.sh\n' "$PWD" >>smoke-fired
@@ -672,7 +704,9 @@ case "$prompt" in
     [ "$STANDIN_CROSS" != 1 ] ||
       printf 'PreToolUse %s/.claude/hooks/smoke-tool.sh\nPreToolUse %s/.claude/hooks/smoke-claude-only.sh\n' "$PWD" "$PWD" >>smoke-fired
     printf 'ok\n' ;;
-  "Use your task tool"*) printf '%s\n' "$STANDIN_SUB" ;;
+  "Use your task tool"*)
+    printf '%s%s\n' "$STANDIN_SUB" "$STANDIN_SUB"
+    [ -z "$share" ] || printf '%s\n' "$STANDIN_SUB" >"$share" ;;
   "Run the smoke-child custom agent"*)
     t="$PWD/session-state/lead-1/events.jsonl"
     own="$PWD/session-state/sub-1/events.jsonl"
@@ -811,8 +845,11 @@ package_table() { # ROWS — label|row|result|clause, each against the last run
 # No lane session runs on Copilot, so its two lane rows stay pending and hold a
 # run where every other row works at exit 3.
 package_run "$SMOKE"
+for answer_event in sessionStart userPromptSubmitted agentStop subagentStop; do
+  package_case "a live hook-only token and silent control pass $answer_event" "answer:$answer_event" pass "model repeated the hook-only token"
+done
 pkg_unanswered="$(awk '$1 == "copilot" && ($3 == "fail" || $3 == "unanswerable" || $3 == "pending") { print $2 }' "$TMP/pkg-out" | LC_ALL=C sort | tr '\n' ' ')"
-if [ "$PKG_RC" = 3 ] && [ "$pkg_unanswered" = "lane-mail lane-question " ]; then
+if [ "$PKG_RC" = 3 ] && [ "$pkg_unanswered" = "answer:userPromptSubmitted-interactive event:preCompact lane-mail lane-question " ]; then
   ok "a run where every other copilot row works exits 3 on the two pending lane rows"
 else
   bad "a run where every other copilot row works exits 3 on the two pending lane rows" "rc=$PKG_RC, rows not passing: ${pkg_unanswered:--}"
@@ -848,7 +885,8 @@ a subagentStart naming no subagent passes|event:subagentStart|pass|naming no age
 a subagentStop naming the subagent's session and agent passes|event:subagentStop|pass|own session sub-1 as agentId, smoke-child as agentType
 an agentStop at each agent's end, both naming the lead's transcript, passes|event:agentStop|pass|fired it twice
 an errorOccurred for each try of a failed model call passes|event:errorOccurred|pass|fired it 2 time(s)
-a hook on an event the session never raises is skipped, naming the event rows|hook:reviewer-stop-check|skipped|raises no SubagentStop; the copilot event rows"
+a hook on an event the session never raises is skipped, naming the event rows|hook:reviewer-stop-check|skipped|raises no SubagentStop; the copilot event rows
+a compaction hook is skipped by a session that requests no compaction|hook:lane-mail-compact|skipped|raises no PreCompact; the copilot event rows"
 dup_rows="$(awk '$1 == "copilot" { print $2 }' "$TMP/pkg-out" | sort | uniq -d)"
 if [ -z "$dup_rows" ] && [ "$(awk '$1 == "copilot" && $2 ~ /:/' "$TMP/pkg-out" | wc -l)" -gt 0 ]; then
   ok "every package row prints once"
@@ -962,7 +1000,7 @@ package_case "control: a trigger check that takes any record replays the helper 
 plant "$STAND_SMOKE" 's/^    \*:enforced) row "\$1" "\$2" pending /    *:enforced-never) row "$1" "$2" pending /'
 package_run "$STAND_SMOKE"
 package_case "control: a no-session row that ignores the enforced cell is unanswerable" lane-mail unanswerable "runs no lane session on copilot"
-plant "$STAND_SMOKE" 's/^    \*:enforced) row "\$1" "\$2" pending /    *:enforced) row "$1" "$2" skipped /'
+plant "$STAND_SMOKE" 's/^    \*:enforced) row "\$1" "\$2" pending /    *:enforced) row "$1" "$2" skipped /; s/^    row copilot answer:userPromptSubmitted-interactive pending /    row copilot answer:userPromptSubmitted-interactive skipped /; s/^    row copilot event:preCompact pending /    row copilot event:preCompact skipped /'
 package_run "$STAND_SMOKE" STANDIN_SKILLS="$PKG_SKILLS_ALL
 smoke-skill"
 package_case "control: an unmeasured enforced row read skipped" lane-mail skipped "runs no lane session on copilot"
@@ -991,6 +1029,19 @@ package_run "$STAND_SMOKE" STANDIN_NESTED_ROOT=1
 package_case "control: a nested reading that ignores the root listing differs where the root lists it" instruction:nested differs "for the working directory only"
 # Controls on the event rows and the package table's hook attribution: each
 # rule planted out passes the payload or the run its row fails.
+for answer_case in 'silent|sessionStart|grep -qxF "$token" "$transcript"|true' \
+  'leak|sessionStart|! grep -qF "$token" "$transcript"|true' \
+  'nohook|sessionStart|\[ "$count" -gt 0 \]|true' \
+  'error|sessionStart|\[ "$STATUS" -eq 0 \]|true' \
+  'once|agentStop|\[ "$count" -ge 2 \]|true'; do
+  IFS='|' read -r answer_mode answer_event answer_pattern answer_replacement <<<"$answer_case"
+  package_run "$SMOKE" "STANDIN_ANSWER=$answer_mode"
+  package_case "answer refuses $answer_mode" "answer:$answer_event" fail "positive="
+  cp "$STAND_SMOKE.intact" "$STAND_SMOKE"
+  plant "$STAND_SMOKE" "s/$answer_pattern/$answer_replacement/"
+  package_run "$STAND_SMOKE" "STANDIN_ANSWER=$answer_mode"
+  package_case "control: removed answer check passes $answer_mode" "answer:$answer_event" pass "model repeated the hook-only token"
+done
 EV_BAD="STANDIN_EVENTS=start sub-start substart-id sub-stop-own subagentstop-task lead-stop end"
 plant "$STAND_SMOKE" 's/^      if \[ -n "\$lead" \] \&\& \[ "\$ids" = "\$lead" \]; then$/      if [ -n "$lead" ]; then/'
 package_run "$STAND_SMOKE" "$EV_BAD"
@@ -1013,9 +1064,37 @@ package_case "control: a hook row that never looks under its judge fails a wrapp
 plant "$STAND_SMOKE" 's/^    \[ "\$line" = "\$args" \] || continue$/    :/'
 package_run "$STAND_SMOKE" STANDIN_WRAP=session-end-row
 package_case "control: a hook row that takes any read of its judge passes a wrapper whose arguments never ran" hook:session-end-row pass "reading the payload Copilot sent"
-plant "$STAND_SMOKE" "s/^PKG_UNRAISED='SubagentStop'\$/PKG_UNRAISED=''/"
+plant "$STAND_SMOKE" "s/^PKG_UNRAISED='SubagentStop PreCompact'\$/PKG_UNRAISED=''/"
 package_run "$STAND_SMOKE"
 package_case "control: with every event read as raised, a SubagentStop hook is judged on a session that runs no subagent" hook:reviewer-stop-check pass "reading the payload Copilot sent"
+package_case "control: with every event read as raised, a compaction hook is judged without compaction" hook:lane-mail-compact pass "reading the payload Copilot sent"
+plant "$STAND_SMOKE" 's/elif grep -qxF '\''SMOKE-RULES-REACHED-VIA-AGENT'\'' "\$transcript"/elif true || grep -qxF '\''SMOKE-RULES-REACHED-VIA-AGENT'\'' "$transcript"/'
+package_run "$STAND_SMOKE" STANDIN_SUB=SMOKE-RULES-REACHED
+package_case "control: no subagent token check accepts the lead token alone" instruction:subagent pass "SMOKE-RULES-REACHED-VIA-AGENT"
+# The disposable copy opens the fixture input instead of a terminal. The
+# interactive commands and every verdict check remain in the smoke runner.
+plant "$STAND_SMOKE" 's/^COPILOT_INTERACTIVE=0$/COPILOT_INTERACTIVE=1/; s@</dev/tty@</dev/null@'
+package_run "$STAND_SMOKE"
+package_case "interactive prompt context passes with a silent control" answer:userPromptSubmitted-interactive pass "hook-only token repeated in interactive session, absent with silent hook"
+package_case "manual compaction capture passes its dedicated row" event:preCompact pass "/compact fired preCompact with trigger manual"
+package_run "$STAND_SMOKE" STANDIN_INTERACTIVE_ANSWER=leak
+package_case "interactive silent-control token leak fails" answer:userPromptSubmitted-interactive fail "positive=pass negative=fail"
+# Pin the one interactive negative check before planting it out. Enabling the
+# terminal fixture alone would change the copy even if this edit missed.
+interactive_negative='if [ "$result" = negative ] && ! grep -qF "$token" "$transcript"; then negative=pass; fi'
+if [ "$(sed -n '/token="SMOKE-INTERACTIVE-/,/^answer_config()/p' "$STAND_SMOKE.intact" | grep -Fc "$interactive_negative")" -ne 1 ]; then
+  printf 'interactive negative check: expected one match\n' >&2
+  exit 2
+fi
+plant "$STAND_SMOKE" 's/^COPILOT_INTERACTIVE=0$/COPILOT_INTERACTIVE=1/; s@</dev/tty@</dev/null@; /token="SMOKE-INTERACTIVE-/,/^answer_config()/s/&& ! grep -qF "\$token" "\$transcript"/\&\& { true || ! grep -qF "$token" "$transcript"; }/'
+package_run "$STAND_SMOKE" STANDIN_INTERACTIVE_ANSWER=leak
+package_case "control: disabled interactive negative check passes the same leak" answer:userPromptSubmitted-interactive pass "hook-only token repeated in interactive session, absent with silent hook"
+plant "$STAND_SMOKE" 's/^COPILOT_INTERACTIVE=0$/COPILOT_INTERACTIVE=1/; s@</dev/tty@</dev/null@'
+package_run "$STAND_SMOKE" STANDIN_COMPACT=none
+package_case "no manual compaction capture fails its dedicated row" event:preCompact fail "/compact recorded no preCompact payload with trigger manual"
+plant "$STAND_SMOKE" 's/^COPILOT_INTERACTIVE=0$/COPILOT_INTERACTIVE=1/; s@</dev/tty@</dev/null@; s/^  if \(.*smoke-events\/compact.*\); then$/  if true || { \1; }; then/'
+package_run "$STAND_SMOKE" STANDIN_COMPACT=none
+package_case "control: no capture check passes absent manual compaction" event:preCompact pass "/compact fired preCompact with trigger manual"
 
 # The skill-load session's other verdicts, on the committed table, whose
 # copilot cells of skill-load-check and skill-load-record read enforced; the
