@@ -71,7 +71,49 @@ mv "$SK_LINEAR_STUB/scripts/moved.sh" "$SK_LINEAR_STUB/scripts/linear.sh"
 
 GH="$(sk_tracker_root github '' org/repo)"
 sk_run -- post --root "$GH" --channel C777 --text '#2 org/other#3 KEN-1'
-assert_eq "$RC=$(sk_state '.messages.C777[-1].text')" '0=[#2](https://github.com/org/repo/issues/2) [org/other#3](https://github.com/org/other/issues/3) KEN-1' 'post selects the GitHub consumer tracker'
+assert_eq "$RC=$(sk_state '.messages.C777[-1].text')" '0=[#2](https://github.com/org/repo/pull/2) [org/other#3](https://github.com/org/other/pull/3) KEN-1' 'post selects the sending repository for PRs'
+git -C "$GH" -c user.name=Fixture -c user.email=fixture@example.test commit --allow-empty --no-gpg-sign -qm fixture || exit 1
+COMMIT="$(git -C "$GH" rev-parse HEAD)" || exit 1
+SHORT="${COMMIT:0:7}"
+sk_run -- post --root "$GH" --channel C777 --text "repo#2 $SHORT unknown#3"
+assert_eq "$RC=$(sk_state '.messages.C777[-1].text')" "0=[repo#2](https://github.com/org/repo/pull/2) [$SHORT](https://github.com/org/repo/commit/$COMMIT) unknown#3" 'post delivers PR and commit links with unresolved text'
+assert_eq "$(printf '%s\n' "$ERR" | grep -c '^slack: reference-link-unavailable=unknown#3 ')" '1' 'post reports the unresolved reference on stderr'
+
+# The detector fixture is not an authenticated credential. Its commit suffix
+# must stay intact so both callers refuse the original secret-pattern match.
+sk_bind "$GH"
+sk_poll "$GH"
+GH_CH="$(sk_channel "$GH")"
+for mode in original control; do
+  if [ "$mode" = control ]; then
+    sk_mutant pre-expansion markup.py '    preserve = secret_pattern\(\)\.search\([^\n]+\) is not None' '    preserve = False'
+  fi
+  for edge in post notice; do
+    BEFORE="$(sk_state ".messages.$GH_CH | length")"
+    case "$edge" in
+      post)
+        sk_run -- post --root "$GH" --text "xoxb-$COMMIT"
+        GOT="$RC=$(sed -n '/^slack: secret-value=/p' <<<"$ERR")=$(sk_state ".messages.$GH_CH | length")"
+        WANT="2=slack: secret-value=text=$BEFORE"
+        ;;
+      notice)
+        sk_lm "$GH" notice --item overseer --to owner --file "$(sk_text "commit-secret-$mode" "$mode xoxb-$COMMIT")" > "$SK_TMP/notice.out"
+        ID="$(field "$(cat "$SK_TMP/notice.out")" id)"
+        sk_poll "$GH"
+        STATE="$(jq -r --arg id "$ID" 'select(.t == "out" and .id == $id and .state != "inflight") | [.state, (.reason // "")] | join(" ")' "$(sk_journal "$GH")")"
+        GOT="$RC=$(sed -n '/^slack: secret-value=/p' <<<"$ERR")=$STATE=$(sk_state ".messages.$GH_CH | length")"
+        WANT="0=slack: secret-value=id=$ID=refused secret-value=$BEFORE"
+        ;;
+    esac
+    if [ "$mode" = original ]; then
+      assert_eq "$GOT" "$WANT" "$edge refuses a matching value before commit expansion"
+    else
+      sk_assert_red "$GOT" "$WANT" "control: $edge refusal fails when expansion hides the match"
+    fi
+  done
+done
+sk_bin_reset
+
 NONE="$(sk_tracker_root none '' '')"
 sk_run -- post --root "$NONE" --channel C777 --text 'KEN-1 #2'
 assert_eq "$RC=$(sk_state '.messages.C777[-1].text')" '0=KEN-1 #2' 'post with no tracker remains unchanged'
@@ -79,11 +121,11 @@ assert_lacks "$OUT" 'tracker-links-unavailable=' 'no tracker prints no notice'
 
 # The launcher must not export its own loaded team to every served root.
 printf '[env]\nLINEAR_TEAM = "LaunchTeam"\n' > "$SK_TMP/home/kendex.settings.toml"
-sk_run -- post --root "$GH" --channel C777 --text '#2'
-assert_eq "$RC=$(sk_state '.messages.C777[-1].text')" '0=[#2](https://github.com/org/repo/issues/2)' 'launch checkout team does not replace another root tracker'
+sk_run -- post --root "$GH" --channel C777 --text '#2 KEN-1'
+assert_eq "$RC=$(sk_state '.messages.C777[-1].text')" '0=[#2](https://github.com/org/repo/pull/2) KEN-1' 'launch checkout team does not replace another root tracker'
 sk_mutant launcher ../slack '  unset LINEAR_TEAM' '  export LINEAR_TEAM'
-sk_run -- post --root "$GH" --channel C777 --text '#2'
-assert_eq "$RC=$(sk_state '.messages.C777[-1].text')" '0=#2' 'control: leaking launch settings selects the wrong tracker'
+sk_run -- post --root "$GH" --channel C777 --text '#2 KEN-1'
+assert_eq "$RC=$(sk_state '.messages.C777[-1].text')" '0=[#2](https://github.com/org/repo/pull/2) [KEN-1](https://linear.app/workspace/issue/KEN-1)' 'control: leaking launch settings selects the wrong tracker'
 sk_bin_reset
 rm "$SK_TMP/home/kendex.settings.toml"
 
