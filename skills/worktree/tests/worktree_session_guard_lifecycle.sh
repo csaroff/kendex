@@ -383,6 +383,113 @@ second_code=$?
 set -e
 assert_eq "$second_code" "75" "with the mutex free only the first owner holds the lease"
 
+# A claim behind a holder that never lets go refuses by name once the guard's
+# own wait runs out, rather than waiting until its caller kills it. A flock
+# first on PATH shortens whatever `-w` the guard passes to one second, so the
+# row proves the bound is passed and refused on, not its length.
+BOUND_BIN="$TMP_ROOT/bound-bin"
+mkdir -p "$BOUND_BIN"
+cat >"$BOUND_BIN/flock" <<EOF
+#!/usr/bin/env bash
+args=()
+while [[ \$# -gt 0 ]]; do
+  case "\$1" in
+    -w) args+=(-w 1); shift 2 ;;
+    *) args+=("\$1"); shift ;;
+  esac
+done
+exec $(command -v flock) "\${args[@]}"
+EOF
+chmod +x "$BOUND_BIN/flock"
+BOUND_WT="$MUTEX_ROOT/trees/bounded"
+git -C "$MUTEX_ROOT/main" worktree add -q -b bounded "$BOUND_WT" main
+bounded_wait_row() { # GUARD
+  local lock="$MUTEX_ROOT/main/.git/kendex-worktree-session-guard.lock" bound_rc=0 bound_err
+  exec 8>"$lock"
+  flock -x 8
+  bound_err=$(PATH="$BOUND_BIN:$PATH" timeout 5 "$1" claim "$BOUND_WT" --owner OWNER-B 2>&1 >/dev/null) || bound_rc=$?
+  exec 8>&-
+  assert_eq "rc=$bound_rc record=${bound_err%%$'\n'*} state=$(guard_status_code "$BOUND_WT" "$MUTEX_ROOT/main")" \
+    "rc=1 record=worktree-guard-lock-timeout: $lock state=3" \
+    "a claim the mutex holds past the guard's bound refuses by name and writes no lease"
+}
+bounded_wait_row "$GUARD_SCRIPT"
+
+# Must-fail control: a guard copy that waits on flock with no bound is cut off
+# by the row's own timeout instead.
+BOUND_CONTROL="$TMP_ROOT/bound-control"
+cp -R "$WORKTREE_PACKAGE_DIR/scripts" "$BOUND_CONTROL"
+BOUND_ANCHOR='flock -x -w "$GUARD_MUTEX_WAIT_SECONDS" 9'
+assert_eq "$(grep -cF -- "$BOUND_ANCHOR" "$BOUND_CONTROL/worktree-session-guard")" "1" \
+  "control: the flock bound anchor appears once in the guard"
+BOUND_ANCHOR=$BOUND_ANCHOR awk '{ i = index($0, ENVIRON["BOUND_ANCHOR"]); if (i) $0 = substr($0, 1, i - 1) "flock -x 9" substr($0, i + length(ENVIRON["BOUND_ANCHOR"])); print }' \
+  "$WORKTREE_PACKAGE_DIR/scripts/worktree-session-guard" >"$BOUND_CONTROL/worktree-session-guard"
+assert_eq "$(grep -cF -- "$BOUND_ANCHOR" "$BOUND_CONTROL/worktree-session-guard")" "0" \
+  "control: the planted guard drops the flock bound"
+bound_control_log="$(PASS=0 FAIL=0; bounded_wait_row "$BOUND_CONTROL/worktree-session-guard")"
+assert_eq "$(grep -c '^  FAIL  ' <<<"$bound_control_log")" "1" \
+  "control: the planted guard fails the bounded-wait row"
+
+echo "=== claim --owner --adopt takes over the session's env-owned lease ==="
+
+# A session-start hook claims under the env ladder; the workflow then claims
+# the same tree under the issue ID with --adopt. Any other --owner claim, such
+# as cleanup's own, is refused by that lease, and refresh refuses --adopt. A
+# row: label|args|env|rc|owner after|first stderr line, args following the
+# worktree path. Each starts from a lease alice took with no --owner.
+HANDOVER_WT="$MUTEX_ROOT/trees/handover"
+git -C "$MUTEX_ROOT/main" worktree add -q -b handover "$HANDOVER_WT" main
+HANDOVER_CONFLICT="worktree-guard-owner-conflict: path=$HANDOVER_WT owner=alice"
+HANDOVER="the env owner's lease passes to an adopting --owner|claim --owner ISSUE-1 --adopt|USER=alice|0|ISSUE-1|
+the ladder's top rung is the env owner|claim --owner ISSUE-1 --adopt|KENDEX_SESSION_OWNER=alice USER=bob|0|ISSUE-1|
+another env owner is refused|claim --owner ISSUE-1 --adopt|USER=bob|75|alice|$HANDOVER_CONFLICT
+an explicit owner without --adopt is refused|claim --owner ISSUE-1|USER=alice|75|alice|$HANDOVER_CONFLICT
+refresh refuses --adopt|refresh --owner ISSUE-1 --adopt|USER=alice|1|alice|worktree-guard-option-command: --adopt=refresh"
+handover_rows() { # GUARD
+  local guard="$1" label argspec envspec expected_rc expected_owner expected_record handover_rc handover_err verb
+  local -a handover_args handover_env
+  while IFS='|' read -r label argspec envspec expected_rc expected_owner expected_record; do
+    read -r verb argspec <<<"$argspec"
+    read -r -a handover_args <<<"$argspec"
+    read -r -a handover_env <<<"$envspec"
+    "$guard" release "$HANDOVER_WT" --force >/dev/null 2>&1 || :
+    env -u KENDEX_SESSION_OWNER -u HT_SESSION_OWNER USER=alice "$guard" claim "$HANDOVER_WT" >/dev/null
+    handover_rc=0
+    handover_err="$(env -u KENDEX_SESSION_OWNER -u HT_SESSION_OWNER "${handover_env[@]}" \
+      "$guard" "$verb" "$HANDOVER_WT" "${handover_args[@]}" 2>&1 >/dev/null)" || handover_rc=$?
+    assert_eq "rc=$handover_rc owner=$("$guard" status "$HANDOVER_WT" --repo "$MUTEX_ROOT/main" | jq -r .owner) record=${handover_err%%$'\n'*}" \
+      "rc=$expected_rc owner=$expected_owner record=$expected_record" "$label"
+  done <<<"$HANDOVER"
+}
+handover_rows "$GUARD_SCRIPT"
+
+# Must-fail controls, each a guard copy with one text replaced: an env owner
+# that never matches refuses the takeover, so both takeover rows go red; a
+# guard that adopts on every claim admits on an env match alone, so the
+# unflagged claim goes red; an --adopt that refresh accepts lets refresh take
+# the lease over, so the refresh row goes red. A row: label|text|replacement|
+# rows expected to fail.
+HANDOVER_ANCHOR='env_owner="${KENDEX_SESSION_OWNER:-${HT_SESSION_OWNER:-${USER:-}}}"'
+HANDOVER_GATE="require_flag_applies --adopt 'claim'"
+HANDOVER_CONTROLS="env owner never matches|$HANDOVER_ANCHOR|$HANDOVER_ANCHOR; env_owner=|the env owner's lease passes to an adopting --owner;the ladder's top rung is the env owner
+adopt on every claim|$HANDOVER_ANCHOR|$HANDOVER_ANCHOR; adopt=true|an explicit owner without --adopt is refused
+refresh takes --adopt|$HANDOVER_GATE|require_flag_applies --adopt 'claim refresh'|refresh refuses --adopt"
+control_n=0
+while IFS='|' read -r control_label control_text control_replacement expected_fails; do
+  control_n=$((control_n + 1))
+  control_dir="$TMP_ROOT/handover-control-$control_n"
+  cp -R "$WORKTREE_PACKAGE_DIR/scripts" "$control_dir"
+  assert_eq "$(grep -cF -- "$control_text" "$GUARD_SCRIPT")" "1" \
+    "control: $control_label replaces text the guard holds once"
+  CONTROL_TEXT=$control_text CONTROL_REPLACEMENT=$control_replacement awk '{ i = index($0, ENVIRON["CONTROL_TEXT"]); if (i) $0 = substr($0, 1, i - 1) ENVIRON["CONTROL_REPLACEMENT"] substr($0, i + length(ENVIRON["CONTROL_TEXT"])); print }' \
+    "$GUARD_SCRIPT" >"$control_dir/worktree-session-guard"
+  assert_eq "$(grep -cF -- "$control_replacement" "$control_dir/worktree-session-guard")" "1" \
+    "control: $control_label is planted once"
+  handover_control_log="$(PASS=0 FAIL=0; handover_rows "$control_dir/worktree-session-guard")"
+  assert_eq "$(sed -n 's/^  FAIL  //p' <<<"$handover_control_log" | paste -s -d ';' -)" "$expected_fails" \
+    "control: the planted guard ($control_label) fails its rows"
+done <<<"$HANDOVER_CONTROLS"
+
 echo "=== release refusal records ==="
 
 git -C "$REUSE_ROOT/main" worktree add -q -b manual "$REUSE_ROOT/manual" main

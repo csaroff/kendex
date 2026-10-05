@@ -518,6 +518,10 @@ enabled = true
 [hooks.session-start-row]
 source = "."
 
+[hooks.worktree-session-claim]
+source = "."
+harnesses = ["claude", "codex", "pi"]
+
 [hooks.session-end-row]
 source = "."
 
