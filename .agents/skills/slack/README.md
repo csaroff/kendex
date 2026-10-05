@@ -99,14 +99,14 @@ The master's watch writes a bare read line count to `<root>/tmp/lane-mail/overse
 | Where you write | What happens |
 |-----------------|--------------|
 | Top-level | The overseer receives it as a directive; :eyes: marks it delivered, :white_check_mark: read |
-| In an open question's thread, any reply | The overseer receives your words as an answer to that question, with eyes when they land. The question stays open until the overseer closes it or its deadline passes |
+| In an open question's thread, any reply | The overseer receives your words as an answer to that question, with eyes when they land. The question stays open until the overseer closes it, or until its deadline passes where it names an option that stands |
 | In any thread, at any age, including "Also send to channel" | The overseer receives it as a directive with small parent context, unless it answers an open question |
 | A file, with or without text | The overseer receives the text, then the saved path of each file |
 | A message with no text and no file | Not routed; the relay replies once, and once more after its journal is moved aside |
 | From anyone not in `SLACK_OWNERS` | Not routed; the relay replies once, then ignores that message until its journal is moved aside, which answers it once more |
 | An edit or a deletion | Ignored |
 
-A question answered in the overseer's chat shows in its Slack thread as "Answered in the chat"; one nobody answered by its deadline shows as "No answer by the deadline", with the option that stood. After changing `SLACK_OWNERS`, run `slack setup` for each bound checkout: a plain restart never invites an added owner, who could then steer a channel they cannot see.
+A question answered in the overseer's chat shows in its Slack thread as "Answered in the chat"; one nobody answered by its deadline shows as "No answer by the deadline", with the option that stood. A reserved question, a decision only you can take, has no option that stands. If you have not answered by its deadline, the relay posts it once more in its thread, mentioning you, or in a new thread where its own is gone; a reply there answers it. After changing `SLACK_OWNERS`, run `slack setup` for each bound checkout: a plain restart never invites an added owner, who could then steer a channel they cannot see.
 
 ## Credential boundary
 

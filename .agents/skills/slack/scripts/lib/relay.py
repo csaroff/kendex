@@ -47,7 +47,10 @@ A start whose journal holds no `start` line seeds both positions before it
 reads anything: Slack from the binding moment, so a channel's earlier history is never delivered,
 and the mailbox from its newest envelope, so notices and answers already
 there are never re-posted. Open asks are posted whatever their age inside
-SLACK_THREAD_DAYS, since they still want an answer.
+SLACK_THREAD_DAYS, since they still want an answer. A reserved ask, which no
+default closes, is posted once more in its thread, naming the owner, on the
+first poll past its deadline while it stays open; the journal's `overdue`
+line keeps that post from ever repeating.
 
 While SLACK_MASTER_FILE is younger than SLACK_MASTER_MAX_AGE a master session
 answers the overseer, and the relay posts no envelope from the mailbox;
@@ -200,6 +203,11 @@ def fingerprint() -> str:
     except OSError as err:
         raise Refusal("code-unreadable", f"{path} ({err.strerror})") from err
     return digest.hexdigest()[:12]
+
+
+def overdue_id(ask_id: str) -> str:
+    """The journal id of a reserved ask's one post past its deadline."""
+    return f"{ask_id}:overdue"
 
 
 def mention(binding: Binding) -> str:
@@ -591,11 +599,16 @@ class RootRelay:
 
     def routes(self, events: List[Dict], seen: int = 0) -> List[Tuple[Dict, str]]:
         """Each envelope not yet carried and what it takes: `ask`, `notice`,
-        `answer`, `resolution`, `seen` for a notice the master read on resume, or `skip`
+        `answer`, `resolution`, `seen` for a notice the master read on resume,
+        `overdue` for a carried reserved ask open past its deadline, or `skip`
         for another that never posts."""
         closures = {str(e["id"]): e for e in events
                     if e.get("box") == "to-lane" and e.get("mail_class") == "close"}
         closed = {e.get("re") for e in closures.values()}
+        # An owner answer leaves its ask open until the overseer closes it,
+        # but the owner is no longer the one it waits on.
+        answered = {e.get("re") for e in events
+                    if e.get("box") == "to-lane" and e.get("mail_class") == "resolution"}
         by_id = {str(e["id"]): e for e in events}
         horizon = self.settings.horizon(self.clock())
         state = self.state
@@ -609,6 +622,10 @@ class RootRelay:
                     routed.append((envelope, "resolution"))
                 if envelope["kind"] == "resolution":
                     continue
+            if (envelope.get("reserved") is True and env_id in state.carried and env_id not in closed
+                    and env_id not in answered and overdue_id(env_id) not in state.carried
+                    and at_epoch(str(envelope["deadline"])) <= self.clock()):
+                routed.append((envelope, "overdue"))
             if env_id in state.carried or env_id in self.skipped:
                 continue
             at = at_epoch(str(envelope["at"]))
@@ -651,6 +668,8 @@ class RootRelay:
             if route == "ask":
                 if self.post_ask(envelope) and landed is not None:
                     landed.append(str(envelope["id"]))
+            elif route == "overdue":
+                self.post_overdue(envelope)
             elif route == "notice":
                 self.post_notice(envelope)
             elif route == "answer":
@@ -714,10 +733,11 @@ class RootRelay:
             self.post_refused(err, envelope, kind)
             return None
 
-    def post_ask(self, envelope: Dict) -> bool:
-        """Whether the ask landed and its `open` line was journaled."""
+    def ask_pieces(self, envelope: Dict, header: str) -> List[Union[str, Verbatim]]:
+        """The whole question under `header`: its text, any draft, and its
+        options, recommendation and deadline, a blank line between each."""
         options = ", ".join(envelope.get("options") or [])
-        lines = [f"{mention(self.binding)} Question from {envelope.get('from', 'overseer')}:", envelope.get("text", "")]
+        lines = [header, envelope.get("text", "")]
         draft = envelope.get("draft")
         if draft:
             # The owner approves this exact text, so it is posted whole and
@@ -729,7 +749,9 @@ class RootRelay:
             tail.append(f"Options: {options}.")
         if envelope.get("recommend"):
             tail.append(f"Recommended: {envelope['recommend']}.")
-        if envelope.get("deadline"):
+        if envelope.get("reserved") is True:
+            tail.append(f"No default: this decision waits for your reply in this thread, due {local_time(str(envelope['deadline']))}.")
+        elif envelope.get("deadline"):
             tail.append(f"It stands at {local_time(str(envelope['deadline']))} unless you reply in this thread.")
         if tail:
             lines.append(" ".join(tail))
@@ -738,13 +760,45 @@ class RootRelay:
             if pieces:
                 pieces.append("\n\n")
             pieces.append(line)
+        return pieces
+
+    def post_ask(self, envelope: Dict) -> bool:
+        """Whether the ask landed and its `open` line was journaled."""
+        pieces = self.ask_pieces(envelope, f"{mention(self.binding)} Question from {envelope.get('from', 'overseer')}:")
         ts = self._send(envelope, "ask", pieces, None)
         if ts is None:
             return False
         excerpt = "".join(piece if isinstance(piece, str) else piece.text for piece in pieces)
         self._out(envelope, "ask", "open", thread=ts,
                   parent=self.parent_of({"ts": ts, "text": excerpt}, "bot", str(envelope["id"])))
+        # A reserved ask first posted past its deadline is its own reminder.
+        if envelope.get("reserved") is True and at_epoch(str(envelope["deadline"])) <= self.clock():
+            self._out(dict(envelope, id=overdue_id(str(envelope["id"]))), "overdue", "resolved", thread=ts)
         return True
+
+    def post_overdue(self, envelope: Dict) -> None:
+        """A reserved ask past its deadline, posted again in its thread once,
+        under its own journal id so no later poll posts it again. With no
+        thread to post in, one whose post response was lost or one Slack
+        deleted, the reminder's own thread becomes the ask's, so a reply
+        there answers the ask."""
+        ask_id = str(envelope["id"])
+        reminder = dict(envelope, id=overdue_id(ask_id))
+        thread_ts = self.state.post_thread(ask_id)
+        header = f"{mention(self.binding)} Overdue, no default"
+        # A new thread may be the owner's first sight of the question, so it
+        # carries the whole question; the original thread already shows it.
+        pieces: List[Union[str, Verbatim]] = (
+            [f"{header}: {envelope.get('text', '')}"] if thread_ts is not None
+            else self.ask_pieces(envelope, f"{header}. Question from {envelope.get('from', 'overseer')}:"))
+        landed = self._send(reminder, "overdue", pieces, thread_ts)
+        if landed is None:
+            return
+        if thread_ts is None:
+            excerpt = "".join(piece if isinstance(piece, str) else piece.text for piece in pieces)
+            self._out(envelope, "ask", "open", thread=landed,
+                      parent=self.parent_of({"ts": landed, "text": excerpt}, "bot", ask_id))
+        self._out(reminder, "overdue", "resolved", thread=thread_ts or landed)
 
     def post_notice(self, envelope: Dict) -> None:
         ref = envelope.get("ref")

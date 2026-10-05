@@ -5,8 +5,13 @@
 # is one fenced block longer than any backtick run in it; past the
 # markdown_text cap it is one mrkdwn block with Slack's control characters
 # escaped, and a text mrkdwn cannot hold in a block is refused. The question
-# keeps its tracker links; the draft is never linked. An ask with no draft is
-# listen.test.sh's. Each rule has its own control on a copy of the scripts.
+# keeps its tracker links; the draft is never linked. A reserved ask is posted
+# naming no default, and once more in its thread on the first poll past its
+# deadline while it stays open and unanswered, never again; one first posted
+# past its deadline is its own reminder; one with no thread to post in, its
+# post response lost or its thread deleted, is reminded with the whole
+# question in a thread a reply in answers. Any other ask is listen.test.sh's. Each rule has its own
+# control on a copy of the scripts.
 set -uo pipefail
 . "$(dirname "$0")/lib/harness.sh"
 
@@ -91,6 +96,125 @@ sk_assert_red "$POSTED" "text|$MRKDWN_WANT" "control: an unescaped mrkdwn draft 
 sk_mutant not-literal markup.py 'if "```" in self\.text:' 'if "```" in self.text and False:'
 draft_ask control-not-literal "$FENCED_DRAFT"
 sk_assert_red "$JOURNALED" "refused text-not-literal" "control: a draft posted past its backtick run fails the refusal assertion"
+sk_bin_reset
+
+echo "=== slack reserved ask ==="
+# reserved_ask NAME WAIT — a reserved ask posted from a fresh root, then
+# polled once more. Sets ROOT, CH, ASK, ASK_TS (empty when nothing posted)
+# and POSTED, the ask's text. A post fault armed before it hits its post.
+reserved_ask() {
+  ROOT="$(sk_tracker_root "$1" Team '')"
+  sk_bind "$ROOT"
+  CH="$(sk_channel "$ROOT")"
+  ASK="$(sk_lm "$ROOT" ask --item overseer --to owner --file "$(sk_text "$1" 'Cut the 2.0.0 release?')" --options cut,hold --reserved --wait "$2")"
+  ASK="${ASK#id=}"
+  [ -z "${3:-}" ] || sk_ctl /_test/fault "$3" >/dev/null
+  sk_poll "$ROOT"
+  ASK_TS="$(sk_state "[.messages.${CH}[] | select(.text | contains(\"Cut the 2.0.0 release?\")) | .ts][0] // \"\"")"
+  POSTED="$(sk_state "[.messages.${CH}[] | select(.ts == \"$ASK_TS\") | .text][0] // \"\"")"
+  sk_poll "$ROOT"
+}
+# past_deadline: the ask's deadline moved into the past in the fixture's own
+# mailbox, then two polls, each a fresh relay reading the journal.
+past_deadline() {
+  local box
+  box="$(sk_box "$ROOT")"
+  jq -c --arg id "$ASK" 'if .id == $id then .deadline = "2000-01-01T00:00:00Z" else . end' "$box/to-overseer.jsonl" > "$SK_TMP/box.jsonl"
+  mv "$SK_TMP/box.jsonl" "$box/to-overseer.jsonl"
+  sk_poll "$ROOT"
+  sk_poll "$ROOT"
+}
+# reminders: the relay's posts in the ask's thread that open with the owner mention.
+reminders() { sk_state "[.messages.${CH}[] | select(.user == \"UBOT\" and .thread_ts == \"$ASK_TS\" and (.text | startswith(\"<@\")))] | length"; }
+# reminder_ts: the thread the journal records for the ask's one reminder.
+reminder_ts() { jq -r --arg id "$ASK:overdue" 'select(.t == "out" and .id == $id and .state == "resolved") | .thread' "$(sk_journal "$ROOT")"; }
+# reminder_options: whether the reminder's own post shows the ask's options.
+reminder_options() { sk_state "[.messages.${CH}[] | select(.ts == \"$(reminder_ts)\") | .text | contains(\"Options: cut, hold.\")][0] // false"; }
+# answers_to_ask: the owner answers the mailbox holds for the ask.
+answers_to_ask() { jq -s --arg id "$ASK" '[.[] | select(.kind == "answer" and .re == $id)] | length' "$(sk_box "$ROOT")/to-lane.jsonl" 2>/dev/null || echo 0; }
+# reply_to_reminder: an owner reply in the reminder's thread, then a poll.
+reply_to_reminder() { sk_inject "$CH" U001 'hold' "$(reminder_ts)" >/dev/null; sk_poll "$ROOT"; }
+
+reserved_ask reserved 30
+assert_has "$POSTED" "No default: " "a reserved ask posts naming no default"
+assert_eq "$(reminders)" "0" "before its deadline the reserved ask is posted once"
+past_deadline
+assert_eq "$(reminders)" "1" "past its deadline the open reserved ask is posted once more in its thread, and never again"
+
+reserved_ask reserved-closed 30
+sk_lm "$ROOT" resolve --item overseer --id "$ASK" >/dev/null
+past_deadline
+assert_eq "$(reminders)" "0" "a reserved ask the overseer closed with no answer is not posted again past its deadline"
+
+reserved_ask reserved-answered 30
+sk_inject "$CH" U001 'hold' "$ASK_TS" >/dev/null
+sk_poll "$ROOT"
+past_deadline
+assert_eq "$(answers_to_ask)|$(reminders)" "1|0" "a reserved ask the owner answered in its thread, still open, is not posted again past its deadline"
+
+reserved_ask reserved-late 0
+assert_eq "$([ -n "$ASK_TS" ] && echo posted)|$(reminders)" "posted|0" "a reserved ask first posted past its deadline is posted once, its own reminder"
+
+reserved_ask reserved-lost 30 '{"method": "chat.postMessage", "drop": true, "times": 1}'
+past_deadline
+reply_to_reminder
+assert_eq "$([ -n "$(reminder_ts)" ] && echo reminded)|$(reminder_options)|$(answers_to_ask)" "reminded|true|1" \
+  "a reserved ask whose post response was lost is reminded with its options in a thread of its own, and a reply there answers the ask"
+
+reserved_ask reserved-deleted 30
+sk_ctl /_test/delete "{\"channel\":\"$CH\",\"ts\":\"$ASK_TS\"}" >/dev/null
+sk_poll "$ROOT"
+past_deadline
+reply_to_reminder
+assert_eq "$([ "$(reminder_ts)" != "$ASK_TS" ] && echo moved)|$(reminder_options)|$(answers_to_ask)" "moved|true|1" \
+  "a reserved ask whose thread Slack deleted is reminded with its options in a new thread, and a reply there answers the ask"
+
+sk_mutant reserved-tail relay.py 'if envelope.get\("reserved"\) is True:' 'if False:'
+reserved_ask control-tail 30
+sk_assert_red "$(grep -c 'No default: ' <<<"$POSTED")" "1" "control: without the reserved tail the ask names no missing default"
+
+sk_mutant reserved-early relay.py '\n\s+and at_epoch\(str\(envelope\["deadline"\]\)\) <= self\.clock\(\)\):' '):'
+reserved_ask control-early 30
+sk_assert_red "$(reminders)" "0" "control: without the deadline rule the reminder posts before the deadline"
+
+sk_mutant reserved-again relay.py ' and overdue_id\(env_id\) not in state\.carried' ''
+reserved_ask control-again 30
+past_deadline
+sk_assert_red "$(reminders)" "1" "control: without the journal rule the reminder posts on every poll"
+
+sk_mutant reserved-closed relay.py 'state\.carried and env_id not in closed' 'state.carried'
+reserved_ask control-closed 30
+sk_lm "$ROOT" resolve --item overseer --id "$ASK" >/dev/null
+past_deadline
+sk_assert_red "$(reminders)" "0" "control: without the closed rule a closed reserved ask is posted again"
+
+sk_mutant reserved-answered relay.py 'and env_id not in answered and' 'and'
+reserved_ask control-answered 30
+sk_inject "$CH" U001 'hold' "$ASK_TS" >/dev/null
+sk_poll "$ROOT"
+past_deadline
+sk_assert_red "$(answers_to_ask)|$(reminders)" "1|0" "control: without the answered rule an answered reserved ask is posted again"
+
+sk_mutant reserved-late relay.py 'if envelope\.get\("reserved"\) is True and at_epoch' 'if False and at_epoch'
+reserved_ask control-late 0
+sk_assert_red "$([ -n "$ASK_TS" ] && echo posted)|$(reminders)" "posted|0" "control: without the first-post rule a late reserved ask is posted twice"
+
+sk_mutant reserved-unposted relay.py 'ts = self\._send\(envelope, "ask", pieces, None\)' 'ts = "1.000001"'
+reserved_ask control-unposted 0
+sk_assert_red "$([ -n "$ASK_TS" ] && echo posted)|$(reminders)" "posted|0" "control: an ask journaled open but never sent fails the posted assertion"
+
+sk_mutant reserved-rebind relay.py 'self\._out\(envelope, "ask", "open", thread=landed,' 'None and self._out(envelope, "ask", "open", thread=landed,'
+reserved_ask control-rebind 30 '{"method": "chat.postMessage", "drop": true, "times": 1}'
+past_deadline
+reply_to_reminder
+sk_assert_red "$([ -n "$(reminder_ts)" ] && echo reminded)|$(answers_to_ask)" "reminded|1" \
+  "control: without the rebind a reply to the reminder of a lost ask is no answer"
+
+sk_mutant reserved-short relay.py 'if thread_ts is not None\n' 'if True\n'
+reserved_ask control-short 30 '{"method": "chat.postMessage", "drop": true, "times": 1}'
+past_deadline
+sk_assert_red "$([ -n "$(reminder_ts)" ] && echo reminded)|$(reminder_options)" "reminded|true" \
+  "control: a replacement reminder built from the question text alone shows no options"
 sk_bin_reset
 
 sk_summary
