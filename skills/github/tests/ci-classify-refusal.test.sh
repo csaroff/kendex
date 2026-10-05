@@ -11,12 +11,16 @@
 #          `state-err:silent4` (the state lookup exits 4 with no message),
 #          `mergeable:<CONFLICTING|UNKNOWN>` GitHub's mergeable answer,
 #          `required:<context>` a base-branch ruleset requiring that one
-#          context, `env:N=V` the caller's environment; `-` for none
+#          context, `thread:<false|true>` one bot review thread with that
+#          isResolved, `review:<decision>` that reviewDecision over a latest
+#          review of the same state, else COMMENTED, `env:N=V` the
+#          caller's environment; `-` for none
 #   argv   the arguments as written; `-` for none
 #   rc     the exit status
 #   out    every stdout line by kind, in order, joined by `;`: `cause=<w>`,
-#          `issue=<the raw issue>`, `note` (the cause-none advice; wording
-#          unpinned), `head-run=<ids>`, `fail=<name state= workflow= run=>`,
+#          `issue=<the raw issue>`, `retry=<scope>` (the same-head retry
+#          the orch merge attempt routes on), `note` (the cause-none
+#          advice; wording unpinned), `head-run=<ids>`, `fail=<name state= workflow= run=>`,
 #          `superseded=<workflow=|status= run=>` (its trailing remark
 #          dropped); any other line verbatim, so a forged line shows; `-`
 #          when empty. A `;` inside an issue text would read as a second
@@ -35,6 +39,8 @@ CLASSIFY="$REPO_ROOT/skills/github/scripts/commands/ci-classify-refusal.sh"
 
 # shellcheck source=lib/check-stub.sh
 source "$TEST_DIR/lib/check-stub.sh"
+# shellcheck source=lib/mutant-copy.sh
+source "$TEST_DIR/lib/mutant-copy.sh"
 REPO="$TMPDIR/repo"
 
 # --- the checks fixtures -------------------------------------------------------
@@ -68,6 +74,11 @@ checks_of() {
   esac
 }
 
+# A review thread a bot opened, which the reply check passes; resolved or not.
+thread_node() {
+  printf '[{"isResolved":%s,"comments":{"totalCount":1,"nodes":[{"author":{"login":"copilot-pull-request-reviewer","__typename":"Bot","databaseId":3003},"authorAssociation":"NONE","body":"Guard-the-empty-list."}]}}]' "$1"
+}
+
 # --- the world ------------------------------------------------------------------
 W_ENV=()
 RUN_DIR=""
@@ -84,6 +95,8 @@ word() {
     mergeable:*) W_ENV+=("STUB_MERGEABLE=$v") ;;
     required:*) W_ENV+=("STUB_GATE_RULES=$(jq -c --arg c "$v" '[{type: "required_status_checks", parameters: {required_status_checks: [{context: $c}]}}]' <<<null)") ;;
     env:*) W_ENV+=("$v") ;;
+    thread:*) W_ENV+=("STUB_THREADS=$(thread_node "$v")") ;;
+    review:*) W_ENV+=("STUB_REVIEW_DECISION=$v" "STUB_REVIEW_LATEST=$(jq -c --arg s "$v" '[{state: (if $s == "CHANGES_REQUESTED" then $s else "COMMENTED" end)}]' <<<null)") ;;
     -) ;;
     *) echo "UNKNOWN-WORD: $1" >&2; exit 2 ;;
   esac
@@ -104,6 +117,7 @@ out_text() {
     case "$line" in
       "cause: "*) out="$out;cause=${line#cause: }" ;;
       "issue: "*) out="$out;issue=${line#issue: }" ;;
+      "retry: "*) out="$out;retry=${line#retry: }" ;;
       "note: "*) out="$out;note" ;;
       "head-run: "*) out="$out;head-run=${line#head-run: }" ;;
       "fail: "*) out="$out;fail=${line#fail: }" ;;
@@ -150,13 +164,13 @@ run_table() {
 }
 
 run_table "the cause and its detail" "\
-a passing head is cause none, with the advice|checks:ci-required|123|0|cause=none;note|1
+a passing head is cause none, retried on the same head, with the advice|checks:ci-required|123|0|cause=none;retry=same-head;note|1
 a missing PR is fetch_error|checks:none pr:missing|123|0|cause=fetch_error;issue=not_found: PR #123 not found|0
 a silent state lookup failure is fetch_error|checks:none state-err:silent4|123|0|cause=fetch_error;issue=gh_error: gh pr view exited 4 with no diagnostic|0
 a current-run failure is ci_failed, correlated to its run, the old run superseded|checks:current-fail checks-exit:8|123|0|cause=ci_failed;issue=ci_failed: Integration (FAILURE);head-run=29099680623;fail=Integration state=FAILURE workflow=CI run=29099680623;superseded=workflow=CI run=29098545030|1
 a pending-only refusal names its run and lists no failure|checks:pending-run checks-exit:8|123|0|cause=ci_pending;issue=ci_pending: Changes (IN_PROGRESS);head-run=29099680623|1
 a failure with no run link has head-run none and run none|checks:lint-fail checks-exit:8|123|0|cause=ci_failed;issue=ci_failed: Lint (FAILURE);head-run=none;fail=Lint state=FAILURE workflow=- run=none|1
-a red check the base does not require is named although nothing blocks|checks:lint-fail-codeql-pass checks-exit:8 required:CodeQL|123|0|cause=none;ci_optional_failed: Lint (FAILURE);note|1
+a red check the base does not require is named although nothing blocks|checks:lint-fail-codeql-pass checks-exit:8 required:CodeQL|123|0|cause=none;ci_optional_failed: Lint (FAILURE);retry=same-head;note|1
 a red optional check beside a red required one is named optional and never on fail|checks:two-fails checks-exit:8 required:Lint|123|0|cause=ci_failed;issue=ci_failed: Lint (FAILURE);ci_optional_failed: CodeQL (FAILURE);head-run=29099680623;fail=Lint state=FAILURE workflow=CI run=29099680623|1
 a rerun on its original, lower id is the head run by start time|checks:rerun-lower-id checks-exit:8|123|0|cause=ci_failed;issue=ci_failed: Lint (FAILURE);head-run=29098545030;fail=Lint state=FAILURE workflow=CI run=29098545030;superseded=workflow=CI run=29099680623|1
 a failing status-only check names its run, not none|checks:status-fail checks-exit:8|123|0|cause=ci_failed;issue=ci_failed: CI Required (FAILURE);head-run=29099700000;fail=CI Required state=FAILURE workflow=- run=29099700000|1
@@ -166,7 +180,12 @@ a newline, return or tab in a check name never forges a line|checks:hostile-name
 a reply check with no verdict outranks a pending check as fetch_error|checks:pending-run checks-exit:8 env:STUB_THREADS_FAIL=true|123|0|cause=fetch_error;issue=ci_pending: Changes (IN_PROGRESS);issue=review_replies_unread: check-review-replies: read-failed pr=123|1
 a failing reply rule outranks a pending check as review_replies|checks:pending-run checks-exit:8 env:STUB_THREADS=[{\"comments\":{\"totalCount\":2,\"nodes\":[{\"author\":{\"login\":\"copilot-pull-request-reviewer\",\"__typename\":\"Bot\",\"databaseId\":3003},\"authorAssociation\":\"NONE\",\"body\":\"Guard-the-empty-list.\"},{\"author\":{\"login\":\"pr-author\",\"__typename\":\"User\",\"databaseId\":1001},\"body\":\"Declined:frozen\"}]}}]|123|0|cause=review_replies;issue=ci_pending: Changes (IN_PROGRESS);issue=review_replies: unreasoned-decline count=1|1
 a conflicting PR is cause merge_conflict|checks:ci-required mergeable:CONFLICTING|123|0|cause=merge_conflict;issue=conflicts: PR has merge conflicts. Resolve by rebasing onto your default branch and force-pushing|1
-a still-computing mergeable state is cause computing|checks:ci-required mergeable:UNKNOWN|123|0|cause=computing;issue=unknown: GitHub still computing mergeable status; retry, or arm with --auto|1
+a missing approval on a passing head is cause none, not retried|checks:ci-required review:REVIEW_REQUIRED|123|0|cause=none;note|1
+an unresolved review thread on a passing head is cause none, not retried|checks:ci-required thread:false|123|0|cause=none;note|1
+a resolved review thread on a passing head is retried on the same head|checks:ci-required thread:true|123|0|cause=none;retry=same-head;note|1
+an unreadable thread count on a passing head is cause none, not retried|checks:ci-required env:STUB_THREAD_STATE_FAIL=true|123|0|cause=none;note|1
+a changes-requested review on a passing head is cause changes_requested, not retried|checks:ci-required review:CHANGES_REQUESTED|123|0|cause=changes_requested;issue=changes_requested: Reviewer requested changes|1
+a still-computing mergeable state is cause computing, retried on the same head|checks:ci-required mergeable:UNKNOWN|123|0|cause=computing;issue=unknown: GitHub still computing mergeable status; retry, or arm with --auto;retry=same-head|1
 a merged PR is cause merged before any check|checks:none state:MERGED merged-at|123|0|cause=merged|0
 a closed PR is cause closed|checks:none state:CLOSED|123|0|cause=closed|0
 "
@@ -175,6 +194,37 @@ run_table "the usage refusals" "\
 no PR number exits 2 before any call|checks:ci-required|-|2|-|0
 a non-numeric PR exits 2|checks:ci-required|abc|2|-|0
 two PR numbers exit 2|checks:ci-required|123 456|2|-|0
+"
+
+# Each control replaces one line of the retry gate in a copy of the scripts
+# tree, keeping the retry: same-head line, and runs the rows that rule
+# decides against that copy: they print what the cut rule held back.
+control() { # NAME FROM TO ROWS
+  local live="$CLASSIFY"
+  CLASSIFY=$(mutant_copy_edit "$TMPDIR/mutant-$1" "$2" "$3" commands/ci-classify-refusal.sh)
+  run_table "must-fail: the $1 rule cut" "$4"
+  CLASSIFY="$live"
+}
+control computing '    computing) return 0 ;;' '    computing) return 1 ;;' "\
+a still-computing mergeable state is not retried|checks:ci-required mergeable:UNKNOWN|123|0|cause=computing;issue=unknown: GitHub still computing mergeable status; retry, or arm with --auto|1
+"
+control none '    none) ;;' '    none) return 1 ;;' "\
+a passing head is not retried|checks:ci-required|123|0|cause=none;note|1
+"
+control other-causes '    *) return 1 ;;' '    *) ;;' "\
+a changes-requested review is retried|checks:ci-required review:CHANGES_REQUESTED|123|0|cause=changes_requested;issue=changes_requested: Reviewer requested changes;retry=same-head|1
+a conflicting PR is retried|checks:ci-required mergeable:CONFLICTING|123|0|cause=merge_conflict;issue=conflicts: PR has merge conflicts. Resolve by rebasing onto your default branch and force-pushing;retry=same-head|1
+"
+control not-approved "    if jq -e 'any(.warnings[]?; startswith(\"not_approved:\"))' >/dev/null <<<\"\$check_json\"; then" \
+  "    if jq -e 'any(.warnings[]?; startswith(\"not_approved-cut:\"))' >/dev/null <<<\"\$check_json\"; then" "\
+a missing approval is retried|checks:ci-required review:REVIEW_REQUIRED|123|0|cause=none;retry=same-head;note|1
+"
+control unresolved-thread '    [ "$unresolved" -eq 0 ]' '    [ "$unresolved" -ge 0 ]' "\
+an unresolved review thread is retried|checks:ci-required thread:false|123|0|cause=none;retry=same-head;note|1
+"
+control unread-threads '    if ! threads=$(bash "$SCRIPT_DIR/pr-threads.sh" "$pr_num" --unresolved 2>"$check_err") ||' \
+  '    if ! { threads=$(bash "$SCRIPT_DIR/pr-threads.sh" "$pr_num" --unresolved 2>"$check_err") || threads='"'"'{"unresolved_count":0}'"'"'; } ||' "\
+an unreadable thread count read as zero is retried|checks:ci-required env:STUB_THREAD_STATE_FAIL=true|123|0|cause=none;retry=same-head;note|1
 "
 
 printf '\npass: %d   fail: %d\n' "$PASS" "$FAIL"
