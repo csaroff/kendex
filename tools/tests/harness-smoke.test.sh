@@ -311,9 +311,10 @@ stand_case() { # LABEL WANT-STATUS WANT-FIRST [ARG...] — ARGs follow --only cl
     bad "$1" "want rc=$2 first=$3, got rc=$rc first=${said:--}$reached"
   fi
 }
-plant() { # FILE SED-SCRIPT — an edit that has to change the file
-  sed "$2" "$1.intact" >"$1"
-  if cmp -s "$1" "$1.intact"; then
+plant() { # FILE SED-SCRIPT [BASE] — an edit to BASE, FILE.intact by default, that has to change it
+  local base="${3:-$1.intact}"
+  sed "$2" "$base" >"$1"
+  if cmp -s "$1" "$base"; then
     printf 'the planted edit changed nothing: %s\n' "$2" >&2
     exit 2
   fi
@@ -496,7 +497,9 @@ fi
 # for the announcement the overseer's directive brings, runs the inbox command
 # under it, which moves the cursor, and answers. STANDIN_ECHO=0 answers without
 # repeating the announcement, as a lane that polled its inbox by itself would.
-# Each run waits out the row's own delay before the directive is sent.
+# Each run waits out the row's own delay before the directive is sent, which
+# the copy these rows run shortens from thirty seconds to one; it reaches
+# lane-mail through the stand-in tree's own skills directory.
 echo "=== a monitored delivery passes, and one with no announcement fails ==="
 cat >"$ROWS_BIN/claude" <<'STANDIN'
 #!/usr/bin/env bash
@@ -537,19 +540,20 @@ verdict_case() { # LABEL QUESTION SMOKE ENV=VAL RESULT CLAUSE — CLAUSE is the 
     bad "$1" "want $5 with '$6', got: ${STAND_ROW:--}"
   fi
 }
+ln -s -- "$REPO/skills" "$STAND/skills"
+plant "$STAND_SMOKE" 's/^WAKE_DELAY=30$/WAKE_DELAY=1/'
+cp "$STAND_SMOKE" "$STAND_SMOKE.wake"
 ANNOUNCED_CLAUSE="'lane-mail: mail=SMOKE-2 new=1'"
 verdict_case "a lane its monitor woke, that read the directive and repeated the announcement, passes" \
-  mail-wake "$SMOKE" STANDIN_ECHO=1 pass "delivery=monitor:"
+  mail-wake "$STAND_SMOKE" STANDIN_ECHO=1 pass "delivery=monitor:"
 verdict_case "a lane that moved the cursor and answered with no announcement fails on it" \
-  mail-wake "$SMOKE" STANDIN_ECHO=0 fail "$ANNOUNCED_CLAUSE"
+  mail-wake "$STAND_SMOKE" STANDIN_ECHO=0 fail "$ANNOUNCED_CLAUSE"
 
-# The controls run a copy of the script in the stand-in tree, which reaches
-# lane-mail through its own skills directory, with one guard changed.
-ln -s -- "$REPO/skills" "$STAND/skills"
-plant "$STAND_SMOKE" 's/^WAKE_ANNOUNCED="lane-mail: mail=\$WAKE_ITEM new=1"$/WAKE_ANNOUNCED="lane-mail: mail=$MAIL_ITEM new=1"/'
+# The controls change one guard in that copy.
+plant "$STAND_SMOKE" 's/^WAKE_ANNOUNCED="lane-mail: mail=\$WAKE_ITEM new=1"$/WAKE_ANNOUNCED="lane-mail: mail=$MAIL_ITEM new=1"/' "$STAND_SMOKE.wake"
 verdict_case "control: an announcement guard that misses the real announcement fails the monitored delivery" \
   mail-wake "$STAND_SMOKE" STANDIN_ECHO=1 fail "'lane-mail: mail=SMOKE-1 new=1'"
-plant "$STAND_SMOKE" '/! grep -qF -- "\$WAKE_ANNOUNCED"/s/^  elif /  elif false \&\& /'
+plant "$STAND_SMOKE" '/! grep -qF -- "\$WAKE_ANNOUNCED"/s/^  elif /  elif false \&\& /' "$STAND_SMOKE.wake"
 verdict_case "control: with no announcement guard an answer with no announcement passes" \
   mail-wake "$STAND_SMOKE" STANDIN_ECHO=0 pass "delivery=monitor:"
 cp "$STAND_SMOKE.intact" "$STAND_SMOKE"
@@ -802,16 +806,16 @@ case "$prompt" in
       n=$((n + 1))
       denied=""
       if [ "$STANDIN_HOOKS" != 0 ] && { [ "$STANDIN_FEED" != helper ] || [ "$n" -eq 1 ]; }; then
+        if [ "$STANDIN_SHAPE" = bad ]; then
+          payload=$(jq -nc --arg c "$cmd" '{toolName:"bash",toolArgs:{cmd:$c}}')
+        else
+          payload=$(jq -nc --arg c "$cmd" '{toolName:"bash",toolArgs:{command:$c}}')
+        fi
         for h in $STANDIN_HOOK_NAMES; do
           [ "$h" != "$STANDIN_SKIP_HOOK" ] || continue
-          if [ "$STANDIN_SHAPE" = bad ]; then
-            payload=$(jq -nc --arg c "$cmd" '{toolName:"bash",toolArgs:{cmd:$c}}')
-          else
-            payload=$(jq -nc --arg c "$cmd" '{toolName:"bash",toolArgs:{command:$c}}')
-          fi
           hook="$PWD/.github/hooks/$h.sh"
           # shellcheck disable=SC2086 # drop is empty or `-u NAME`
-          said=$( (cd "${STANDIN_HOOK_CWD:-$PWD}" && env $drop bash "$hook" <<<"$payload") 2>&1 >/dev/null) && hrc=0 || hrc=$?
+          said=$({ cd "${STANDIN_HOOK_CWD:-$PWD}" && ${drop:+env} $drop bash "$hook" <<<"$payload"; } 2>&1 >/dev/null) && hrc=0 || hrc=$?
           if [ "$hrc" = 2 ] && [ -z "$denied" ]; then
             case "$STANDIN_DENIAL" in
               reason) denied="Denied by preToolUse hook: ${said%%$'\n'*}" ;;
@@ -924,6 +928,20 @@ else
   bad "every package row prints once" "twice: ${dup_rows:-none printed}"
 fi
 
+# Settings that each reach a row none of the others reaches share one run: the
+# transcript, the subagent's answer, the task tool's agents, the instruction
+# listing, the mixed install's own copy and the tool call's environment. It
+# runs before the listings drop reviewer-doc, so only the task tool's listing
+# leaves that agent out.
+package_run "$SMOKE" STANDIN_DENIAL=none STANDIN_SUB=SMOKE-RULES-REACHED STANDIN_TASK_AGENTS= STANDIN_INSTR=junk \
+  STANDIN_MIXED=0 STANDIN_TOOL_PROJECT_DIR=1
+package_table "a session that wrote no transcript leaves the refusal unanswerable|hook:block-argv-kill|unanswerable|wrote no transcript
+the parent's own answer, with no subagent suffix, fails|instruction:subagent|fail|did not relay an answer the subagent built
+agents on disk that the task tool does not offer fail|agent:reviewer-doc|fail|does not list it
+an instruction listing with no JSON is unanswerable|instruction:AGENTS.md|unanswerable|printed no JSON
+and so is the nested row it would compare against|instruction:nested|unanswerable|printed no JSON
+a Copilot that ran no copy fails the mixed install|mixed-hook|fail|ran no copy of smoke-tool
+a tool call carrying COPILOT_PROJECT_DIR fails the environment row|helper:env|fail|a Copilot tool call carries COPILOT_PROJECT_DIR"
 PKG_SKILLS_ALL="$(grep -vx worktree <<<"$PKG_SKILLS_ALL")"
 PKG_AGENTS_ALL="$(grep -vx reviewer-doc <<<"$PKG_AGENTS_ALL")"
 package_run "$SMOKE" STANDIN_REFUSE=0 STANDIN_NESTED_ROOT=1 STANDIN_DUP=2 STANDIN_SUB=NO-RULES-VIA-AGENT STANDIN_OMIT=CLAUDE.md
@@ -949,15 +967,6 @@ a judge's read under another wrapper's arguments is not this wrapper's run|hook:
 package_run "$SMOKE" STANDIN_DENIAL=generic
 package_table "a refusal the model was shown only as an exit code fails|hook:block-argv-kill|fail|the model's tool result does not name the hook; the transcript's denials: Denied by preToolUse hook: hook exited with code 2
 and so does a bare cd's|hook:block-bare-cd|fail|the model's tool result does not name the hook"
-package_run "$SMOKE" STANDIN_DENIAL=none
-package_case "a session that wrote no transcript leaves the refusal unanswerable" hook:block-argv-kill unanswerable "wrote no transcript"
-package_run "$SMOKE" STANDIN_SUB=SMOKE-RULES-REACHED
-package_case "the parent's own answer, with no subagent suffix, fails" instruction:subagent fail "did not relay an answer the subagent built"
-package_run "$SMOKE" STANDIN_TASK_AGENTS=
-package_case "agents on disk that the task tool does not offer fail" agent:reviewer-doc fail "does not list it"
-package_run "$SMOKE" STANDIN_INSTR=junk
-package_case "an instruction listing with no JSON is unanswerable" instruction:AGENTS.md unanswerable "printed no JSON"
-package_case "and so is the nested row it would compare against" instruction:nested unanswerable "printed no JSON"
 package_run "$SMOKE" STANDIN_FEED=helper
 package_case "a hook whose trigger never reached it is unanswerable, not pass" hook:block-repo-copy unanswerable "the trigger never reached this hook"
 package_run "$SMOKE" STANDIN_SHAPE=bad STANDIN_HOOK_CWD=/ STANDIN_DROP_ENV=1 STANDIN_SKIP_HOOK=block-unsafe-rm
@@ -965,16 +974,12 @@ package_table "a payload with the command under another name fails|helper:payloa
 a hook run outside the project root differs|helper:cwd|differs|a hook runs in /
 a launch environment that does not reach the hook fails|helper:env|fail|is missing from the hook's or the tool call's environment
 a hook that never ran while others did fails|hook:block-unsafe-rm|fail|never ran at PreToolUse, while other hooks read their payloads"
-package_run "$SMOKE" STANDIN_TOOL_PROJECT_DIR=1
-package_case "a tool call carrying COPILOT_PROJECT_DIR fails the environment row" helper:env fail "a Copilot tool call carries COPILOT_PROJECT_DIR"
 package_run "$SMOKE" STANDIN_CROSS=1
 package_case "a Copilot that also ran the .claude/hooks copies fails the mixed install" mixed-hook fail "ran the Claude Code copies, smoke-tool 1 time(s) and smoke-claude-only 1 time(s)"
 package_run "$SMOKE" STANDIN_SETTINGS=bad
 package_case "a Copilot that could not load .claude/settings.json fails the mixed install" mixed-hook fail "could not be loaded"
 package_run "$SMOKE" STANDIN_SETTINGS=exit
 package_case "a skill listing that exits non-zero leaves the mixed install unanswerable" mixed-hook unanswerable "copilot skill list exited 1: Error: settings are invalid"
-package_run "$SMOKE" STANDIN_MIXED=0
-package_case "a Copilot that ran no copy fails the mixed install" mixed-hook fail "ran no copy of smoke-tool"
 package_run "$SMOKE" STANDIN_HOOKS=0
 package_table "tool calls with no hook run fail every hook row|hook:block-repo-copy|fail|ran no repository hook
 and the helper rows with them|helper:payload|fail|ran no repository hook"
