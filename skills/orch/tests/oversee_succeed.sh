@@ -281,7 +281,7 @@ fi
 # project from the working directory, and the work directory is none.
 lh=""
 [ -z "\${LANE_HOST_ACCOUNTS:-}" ] || lh="ORCH_LANE_HOST=$TEST_DIR/fixtures/lane-host LANE_HOST_STUB_ACCOUNTS=\$LANE_HOST_ACCOUNTS LANE_HOST_STUB_LOG=$TMP_ROOT/host.log"
-cd "\${RUN_DIR:-$TMP_ROOT/work}" && exec env -i HOME="$H" PATH="$BIN:$PATH" TMUX="\$TMUX" TMUX_PANE="\$TMUX_PANE" \\
+cd "\${RUN_DIR:-$TMP_ROOT/work}" && exec env -i HOME="$H" PATH="\${PATH_PREFIX:+\$PATH_PREFIX:}$BIN:$PATH" TMUX="\$TMUX" TMUX_PANE="\$TMUX_PANE" \\
   LANES_HOME="$H" FIXTURE_DIR="$FIXTURE_DIR" OVERSEE_WATCH_STATE_DIR="$TMP_ROOT/state-\$row" \\
   \$lane \\
   ORCH_LANES_FETCH_CMD="$FETCHER" ORCH_LANE_DIRS="\${LANE_DIRS:-$H/.claude:$H/.eclaude:$H/.codex}" ORCH_OVERSEER_PREFERENCE="\$pref" \\
@@ -1803,6 +1803,118 @@ new_caller "$UNDER_MARK"
 SUCCEED_BIN="$COPILOTACCT/oversee-succeed" run_succeed printcopilotnonectl '' --print-launch-line --harness copilot -- --allow-all
 assert_eq "$RC|$(grep -cF 'detail=relative-home' <<<"$OUT")" "3|1" \
   "control: without the account refusal an unknown account reaches the retained reader gate"
+fleet_state
+
+# A Copilot CLI pane reports `node`, its npm loader, or `copilot`, the binary
+# started directly, and no reading names a harness before its first turn end;
+# with no record and no --harness the harness is the process under the pane
+# carrying one of Copilot's own names, `MainThread` the native binary on Linux
+# or `copilot`, within two levels, and the account is the COPILOT_HOME, else
+# HOME/.copilot, that process was started with (lib/lane-context.sh §
+# lane_context_pane_shape). A Copilot run a Codex session starts sits under its
+# tool shells, deeper. Each process is a copy of sleep under that name, so ps
+# reads the name and no stub runs. A host with no per-process environment to
+# read names the harness and no account, and refuses the line.
+mkdir -p "$TMP_ROOT/procs"
+for proc in MainThread copilot other; do cp "$(command -v sleep)" "$TMP_ROOT/procs/$proc"; done
+copilot_node_caller() { # TREE [ENV] — a node or copilot pane with no fleet record
+  local p="$TMP_ROOT/procs" run
+  local env="${2:-export COPILOT_HOME='$H/.1copilot' HOME='$H'}"
+  case "$1" in
+    MainThread | copilot | other) run="'$p/$1' 100000 & exec '$BIN/node' 100000" ;;
+    # The pane shell stays and runs the loader as its foreground job, so the
+    # binary sits two levels down, the layout a shell's `copilot` command makes.
+    loader) run="exec bash -mc \"sh -c \\\"'$p/MainThread' 100000 & exec '$BIN/node' 100000\\\"; :\"" ;;
+    direct) run="exec '$p/copilot' 100000" ;;
+    deep) run="sh -c \"sh -c \\\"'$p/copilot' 100000; :\\\"; :\" & exec '$BIN/node' 100000" ;;
+  esac
+  fleet_state
+  new_caller "$NO_CONTEXT" "$NO_CONTEXT" "cat '$TMP_ROOT/caller.screen'; $env; $run"
+}
+copilot_model_line() { # ACCOUNT
+  printf '%s\n' "$COPILOT_ENV COPILOT_HOME='$1' copilot --autopilot --max-autopilot-continues 3 --context long_context --no-auto-update --model claude-fable-5.1 --reasoning-effort high --allow-all -i '$BRIEF'"
+}
+# expect_copilot ACCOUNT — the first line a node Copilot pane prints on this host.
+expect_copilot() {
+  if lane_process_env_readable; then
+    printf '0|%s\n' "$(copilot_model_line "$1")"
+  else
+    printf '1|oversee-succeed: copilot-account-unknown pane=%s\n' "$CALLER_PANE"
+  fi
+}
+# SOURCE names the harness ahead of the pane and leaves the account to it: a
+# fleet record naming harness copilot and no account, as register wrote one
+# from a Copilot pane with no --account, or --harness copilot.
+while IFS='|' read -r tree env source expected; do
+  copilot_node_caller "$tree" ${env:+"$env"}
+  args=()
+  case "$source" in
+    record)
+      jq --arg server "$SERVER_PID" --arg pane "$CALLER_PANE" --argjson start "$SERVER_START" \
+        '.overseer = {runtime: "tmux", generation: 1, server: $server, pane: $pane, harness: "copilot", server_start: $start}' \
+        "$FLEET_STATE" > "$FLEET_STATE.tmp" && mv "$FLEET_STATE.tmp" "$FLEET_STATE" ;;
+    harness) args=(--harness copilot) ;;
+  esac
+  case "$expected" in
+    copilot:*) expected="$(expect_copilot "${expected#copilot:}")" ;;
+    *) expected="1|oversee-succeed: $expected pane=$CALLER_PANE" ;;
+  esac
+  run_succeed "nodecopilot$tree$source" '' --print-launch-line ${args[@]+"${args[@]}"} -- --model claude-fable-5.1 --reasoning-effort high --allow-all
+  assert_eq "$RC|$(sed -n 1p <<<"$OUT")" "$expected" \
+    "a pane over the $tree process tree, the harness named by ${source:-the pane}, prints its line ${env:+(}${env}${env:+)}"
+done <<ROWS
+MainThread|||copilot:$H/.1copilot
+copilot|||copilot:$H/.1copilot
+loader|||copilot:$H/.1copilot
+direct|||copilot:$H/.1copilot
+MainThread|unset COPILOT_HOME; export HOME='$H'||copilot:$H/.copilot
+MainThread||record|copilot:$H/.1copilot
+MainThread||harness|copilot:$H/.1copilot
+other|||harness-unnamed
+deep|||harness-unnamed
+ROWS
+# A process table that cannot be read names nothing: the pane is unreadable.
+mkdir -p "$TMP_ROOT/psfail"
+printf '#!/bin/sh\nexit 1\n' > "$TMP_ROOT/psfail/ps"
+chmod +x "$TMP_ROOT/psfail/ps"
+copilot_node_caller MainThread
+PATH_PREFIX="$TMP_ROOT/psfail" run_succeed nodepsfail '' --print-launch-line -- --allow-all
+assert_eq "$RC|$(sed -n 1p <<<"$OUT")" "1|oversee-succeed: pane-unreadable pane=$CALLER_PANE field=process-table" \
+  "a node pane whose process table cannot be read refuses as an unreadable pane"
+# The same pane at its headroom mark succeeds onto the second Copilot account
+# with the predecessor's model, effort and flags, from no record.
+printf '%s\n' '{"quota_snapshots":{"premium_interactions":{"entitlement":1000,"remaining":30}}}' > "$FIXTURE_DIR/.1copilot.json"
+COP_MODEL_SUCCESSOR="lane=$H/.2copilot;--autopilot;--max-autopilot-continues;3;--context;long_context;--no-auto-update;--model;claude-fable-5.1;--reasoning-effort;high;--allow-all;-i;$BRIEF;"
+copilot_node_caller loader
+LANE_DIRS="$COPILOT_PAIR" run_succeed nodecopsucceed '' -- --model claude-fable-5.1 --reasoning-effort high --allow-all
+if lane_process_env_readable; then
+  assert_eq "$RC|$(layout)|$(caller_open)|$(recorded copilot)" "0|0 overseer;|no|$COP_MODEL_SUCCESSOR" \
+    "a node pane over Copilot's binary with no record succeeds onto the second copilot account at its headroom mark"
+else
+  assert_eq "$RC|$(sed -n 1p <<<"$OUT")|$(recorded copilot)" "1|oversee-succeed: copilot-account-unknown pane=$CALLER_PANE|none" \
+    "a node pane over Copilot's binary on a host with no process environment refuses for want of an account"
+fi
+# Controls, one per rule of the reader and of the caller's use of its account.
+# Each mutates a copy and runs the MainThread row's pane unless it names one.
+while IFS='@' read -r name file old new tree env expected; do
+  dir="$(mutant_scripts "$name" "$file")" || exit 1
+  mutate_file "$dir/$file" "$old" "$new"
+  copilot_node_caller "$tree" ${env:+"$env"}
+  case "$expected" in
+    copilot:*) expected="$(expect_copilot "${expected#copilot:}")" ;;
+    *) expected="1|oversee-succeed: $expected pane=$CALLER_PANE" ;;
+  esac
+  SUCCEED_BIN="$dir/oversee-succeed" run_succeed "$name" '' --print-launch-line -- --model claude-fable-5.1 --reasoning-effort high --allow-all
+  assert_eq "$RC|$(sed -n 1p <<<"$OUT")" "$expected" "control $name: $file without its rule reads the $tree pane wrongly"
+done <<ROWS
+nodecopilotctl@lib/lane-context.sh@    node | copilot)@    node-x)@MainThread@@harness-unnamed
+nodedepthctl@lib/lane-context.sh@"\$name_re" 1 2 pids)@"\$name_re" 1 "" pids)@deep@@copilot:$H/.1copilot
+nodeselfctl@lib/lane-context.sh@"\$name_re" 1 2 pids)@"\$name_re" 0 2 pids)@direct@@harness-unnamed
+nodecophomectl@lib/lane-context.sh@            COPILOT_HOME=*)@            COPILOT_HOME-X=*)@MainThread@@copilot:$H/.copilot
+nodehomectl@lib/lane-context.sh@copilot_home="\$home/.copilot"@copilot_home=""@MainThread@unset COPILOT_HOME; export HOME='$H'@copilot-account-unknown
+nodeacctctl@oversee-succeed@|| CALLER_CFG="\$LANE_PANE_ACCOUNT"@|| :@MainThread@@copilot-account-unknown
+ROWS
+printf '%s\n' '{"quota_snapshots":{"premium_interactions":{"entitlement":1000,"remaining":200}}}' > "$FIXTURE_DIR/.1copilot.json"
 fleet_state
 
 # The printed line is replayed verbatim into a DEAD pane, and nobody is at that
