@@ -29,7 +29,7 @@ cp -R "$SKILL_DIR" "$TMP_ROOT/.agents/skills/linear"
 git -C "$TMP_ROOT" init -q
 
 # Writes require a configured Linear team, as in any real project
-printf '[env]\nLINEAR_TEAM = "Fixture"\n' >"$TMP_ROOT/kendex.settings.toml"
+printf '[env]\nLINEAR_TEAM = "PROJ"\n' >"$TMP_ROOT/kendex.settings.toml"
 
 UUID="aaaaaaaa-bbbb-cccc-dddd-000000000042"
 URL="https://linear.app/test/issue/PROJ-42"
@@ -63,6 +63,8 @@ case "\$query" in
   entity_unconfirmed)
     printf '%s' "{\"data\":{\"\$op\":{\"success\":true,\"entity\":\$unconfirmed_entity}}}___HTTP_CODE___200" ;;
   esac ;;
+*"teams(filter:"*)
+  printf '%s' '{"data":{"teams":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"team-uuid","key":"PROJ","name":"Claude"}]}}}___HTTP_CODE___200' ;;
 *"issue(id:"*)
   printf '%s' '{"data":{"issue":{"id":"$UUID"}}}___HTTP_CODE___200' ;;
 *)

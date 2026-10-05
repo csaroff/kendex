@@ -65,7 +65,7 @@ case "$query" in
   fi
   ;;
 *"teams(filter:"*)
-  printf '%s' '{"data":{"teams":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"team-uuid"}]}}}___HTTP_CODE___200'
+  printf '%s' '{"data":{"teams":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"team-uuid","key":"CC","name":"Claude"}]}}}___HTTP_CODE___200'
   ;;
 *"issue(id:"*)
   printf '{"data":{"issue":%s}}___HTTP_CODE___200' "$issue"
@@ -92,7 +92,7 @@ run_issues() {
   local log="$TMP_ROOT/$name.jsonl"
   : >"$log"
   (cd "$TMP_ROOT" && env -i HOME="$TMP_ROOT" PATH="$TMP_ROOT/bin:$PATH" \
-    LINEAR_API_KEY_OVERRIDE=test-token LINEAR_TEAM=TestTeam LINEAR_REQUIRE_REACH= \
+    LINEAR_API_KEY_OVERRIDE=test-token LINEAR_TEAM=CC LINEAR_REQUIRE_REACH= \
     CURL_PAYLOAD_LOG="$log" \
     "$BASH" "$TMP_ROOT/.agents/skills/linear/scripts/linear.sh" issues "$@") \
     >"$TMP_ROOT/$name.out" 2>"$TMP_ROOT/$name.err" || rc=$?

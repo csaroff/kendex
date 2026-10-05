@@ -1,0 +1,1 @@
+- `linear.sh` refuses, before any write, an issue create, field change, archive or trash outside `LINEAR_TEAM`; reads, comments and relations still reach every team.

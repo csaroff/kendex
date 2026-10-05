@@ -55,7 +55,7 @@ printf '%s\n' "$payload" >>"${CURL_LOG:?}"
 query="$(jq -r '.query' <<<"$payload")"
 case "$query" in
 *"teams(filter:"*)
-  printf '%s' '{"data":{"teams":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"team-uuid","name":"TestTeam"}]}}}___HTTP_CODE___200'
+  printf '%s' '{"data":{"teams":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"team-uuid","key":"ISS","name":"TestTeam"}]}}}___HTTP_CODE___200'
   ;;
 *"projects(filter:"*)
   printf '%s' '{"data":{"projects":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"live-uuid","state":"backlog"}]}}}___HTTP_CODE___200'
@@ -128,7 +128,7 @@ run() {
   local rc=0 err
   : >"$CURL_LOG"
   (cd "$PROJECT" && CURL_LOG="$CURL_LOG" PATH="$PROJECT/bin:$PATH" \
-    LINEAR_API_KEY_OVERRIDE=test-token LINEAR_TEAM=TestTeam LINEAR_REQUIRE_REACH= "$LINEAR" "$@") >"$TMP_ROOT/out.txt" 2>"$TMP_ROOT/err" || rc=$?
+    LINEAR_API_KEY_OVERRIDE=test-token LINEAR_TEAM=ISS LINEAR_REQUIRE_REACH= "$LINEAR" "$@") >"$TMP_ROOT/out.txt" 2>"$TMP_ROOT/err" || rc=$?
   err="$(sed "s#$TMP_ROOT#<root>#g" "$TMP_ROOT/err" | paste -sd';' -)"
   printf 'rc=%s wire=%s%s' "$rc" "$(wire)" "${err:+ $err}"
 }
@@ -158,23 +158,23 @@ expected() {
 # after the upload strands the asset in Linear storage with no issue
 # referencing it. The ambiguity rows need the lookup, not just the arguments,
 # so they are the ones proving the whole resolution runs ahead of the upload.
-CREATE='issues create --title t --team TestTeam --labels agent:rust --priority 3 --description d'
+CREATE='issues create --title t --team ISS --labels agent:rust --priority 3 --description d'
 printf 'x' >"$TMP_ROOT/asset.bin"
 ROWS='
-issues create files the issue under the project own milestone|$CREATE --project Dup --milestone Alpha|0|GetProject(name=Dup),GetMilestone(name=Alpha,projectId=live-uuid),GetTeam(name=TestTeam),GetLabel(name=agent:rust),CreateIssue(input.projectMilestoneId=alpha-here)|-
---project wins over the project the issue is already in|issues update ISS-1 --project Dup --milestone Alpha|0|GetIssue(),GetProject(name=Dup),GetMilestone(name=Alpha,projectId=live-uuid),UpdateIssue(input.projectMilestoneId=alpha-here)|-
+issues create files the issue under the project own milestone|$CREATE --project Dup --milestone Alpha|0|GetProject(name=Dup),GetMilestone(name=Alpha,projectId=live-uuid),GetTeam(name=ISS),GetLabel(name=agent:rust),CreateIssue(input.projectMilestoneId=alpha-here)|-
+--project wins over the project the issue is already in|issues update ISS-1 --project Dup --milestone Alpha|0|GetTeam(name=ISS),GetIssue(),GetProject(name=Dup),GetMilestone(name=Alpha,projectId=live-uuid),UpdateIssue(input.projectMilestoneId=alpha-here)|-
 two milestones of that name in the project is a refusal, not a pick|$CREATE --project Dup --milestone Twin|1|GetProject(name=Dup),GetMilestone(name=Twin,projectId=live-uuid)|ambiguous:Twin
 a failed lookup reports the API failure, not a miss|$CREATE --project Dup --milestone Boom|1|GetProject(name=Dup),GetMilestone(name=Boom,projectId=live-uuid)|failed:Boom
 an unmatched name reports a miss, not an API failure|$CREATE --project Dup --milestone Ghost|1|GetProject(name=Dup),GetMilestone(name=Ghost,projectId=live-uuid)|notfound:Ghost
 a milestone name with no project to scope it is refused before any lookup|$CREATE --milestone Alpha|1||unscoped:Alpha
-issues update scopes the name to the issue own project|issues update ISS-1 --milestone Alpha|0|GetIssue(),GetMilestone(name=Alpha,projectId=old-uuid),UpdateIssue(input.projectMilestoneId=alpha-old)|-
-a milestone UUID needs no project and no lookup|issues update ISS-2 --milestone 11111111-2222-3333-4444-555555555555|0|GetIssue(),UpdateIssue(input.projectMilestoneId=11111111-2222-3333-4444-555555555555)|-
-an uppercase UUID is a UUID too|issues update ISS-2 --milestone 11111111-2222-3333-4444-5555555555AA|0|GetIssue(),UpdateIssue(input.projectMilestoneId=11111111-2222-3333-4444-5555555555AA)|-
+issues update scopes the name to the issue own project|issues update ISS-1 --milestone Alpha|0|GetTeam(name=ISS),GetIssue(),GetMilestone(name=Alpha,projectId=old-uuid),UpdateIssue(input.projectMilestoneId=alpha-old)|-
+a milestone UUID needs no project and no lookup|issues update ISS-2 --milestone 11111111-2222-3333-4444-555555555555|0|GetTeam(name=ISS),GetIssue(),UpdateIssue(input.projectMilestoneId=11111111-2222-3333-4444-555555555555)|-
+an uppercase UUID is a UUID too|issues update ISS-2 --milestone 11111111-2222-3333-4444-5555555555AA|0|GetTeam(name=ISS),GetIssue(),UpdateIssue(input.projectMilestoneId=11111111-2222-3333-4444-5555555555AA)|-
 a project-less name refuses the create before its upload|$CREATE --milestone Alpha --attach $TMP_ROOT/asset.bin|1||unscoped:Alpha
-a name refuses the update of an issue in no project before its upload|issues update ISS-2 --milestone Alpha --attach $TMP_ROOT/asset.bin|1|GetIssue()|unscoped:Alpha
+a name refuses the update of an issue in no project before its upload|issues update ISS-2 --milestone Alpha --attach $TMP_ROOT/asset.bin|1|GetTeam(name=ISS),GetIssue()|unscoped:Alpha
 an unreadable --attach path refuses before any lookup|$CREATE --project Dup --milestone Alpha --attach $TMP_ROOT/nope.bin|1||unreadable:nope.bin
 an ambiguous name refuses the create before its upload|$CREATE --project Dup --milestone Twin --attach $TMP_ROOT/asset.bin|1|GetProject(name=Dup),GetMilestone(name=Twin,projectId=live-uuid)|ambiguous:Twin
-an ambiguous name refuses the update before its upload|issues update ISS-1 --project Dup --milestone Twin --attach $TMP_ROOT/asset.bin|1|GetIssue(),GetProject(name=Dup),GetMilestone(name=Twin,projectId=live-uuid)|ambiguous:Twin
+an ambiguous name refuses the update before its upload|issues update ISS-1 --project Dup --milestone Twin --attach $TMP_ROOT/asset.bin|1|GetTeam(name=ISS),GetIssue(),GetProject(name=Dup),GetMilestone(name=Twin,projectId=live-uuid)|ambiguous:Twin
 '
 
 while IFS='|' read -r label args rc wire msg; do

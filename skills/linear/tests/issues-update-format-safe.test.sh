@@ -38,6 +38,8 @@ case "$query" in
   printf '%s' "{\"data\":{\"issueUpdate\":{\"success\":true,\"issue\":$issue_json}}}___HTTP_CODE___200" ;;
 *"workflowStates(filter:"*)
   printf '%s' '{"data":{"workflowStates":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"state-todo","name":"Todo"}]}}}___HTTP_CODE___200' ;;
+*"teams(filter:"*)
+  printf '%s' '{"data":{"teams":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"team-uuid","key":"PROJ","name":"Claude"}]}}}___HTTP_CODE___200' ;;
 *"issue(id:"*)
   printf '%s' "{\"data\":{\"issue\":$issue_json}}___HTTP_CODE___200" ;;
 *)
@@ -49,7 +51,7 @@ chmod +x "$TMP_ROOT/bin/curl"
 LINEAR="$TMP_ROOT/.agents/skills/linear/scripts/linear.sh"
 
 run_update() {
-  (cd "$TMP_ROOT" && PATH="$TMP_ROOT/bin:$PATH" LINEAR_API_KEY_OVERRIDE=test-token LINEAR_TEAM=TestTeam \
+  (cd "$TMP_ROOT" && PATH="$TMP_ROOT/bin:$PATH" LINEAR_API_KEY_OVERRIDE=test-token LINEAR_TEAM=PROJ \
     bash "$LINEAR" issues update "$@")
 }
 

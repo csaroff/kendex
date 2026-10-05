@@ -87,7 +87,7 @@ case "$query" in
   esac
   ;;
 *"teams(filter:"*)
-  printf '%s' '{"data":{"teams":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"team-uuid"}]}}}___HTTP_CODE___200'
+  printf '%s' '{"data":{"teams":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"team-uuid","key":"TEAM","name":"Team"}]}}}___HTTP_CODE___200'
   ;;
 *)
   printf '%s' '{"data":{}}___HTTP_CODE___200'
@@ -96,7 +96,7 @@ esac
 SH
 chmod +x "$PROJECT/bin/curl"
 
-printf '[env]\nLINEAR_TEAM = "Configured"\n' >"$PROJECT/kendex.settings.toml"
+printf '[env]\nLINEAR_TEAM = "TEAM"\n' >"$PROJECT/kendex.settings.toml"
 
 printf 'PNGDATA' >"$TMP_ROOT/shot.png"
 printf '%%PDF-1.4' >"$TMP_ROOT/notes.pdf"

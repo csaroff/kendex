@@ -50,7 +50,8 @@ for id in T-1 T-2; do
     >"$TMP_ROOT/state/$id.json"
 done
 
-# The issue read answers with the issue's description file; the update
+# The team read answers the cross-team guard's read of LINEAR_TEAM. The issue
+# read answers with the issue's description file; the update
 # answers Done with the description it was sent, or that file's when it was
 # sent none, as Linear keeps a description an update leaves out, and records
 # the issue so the list read answers it as the update left it.
@@ -61,6 +62,9 @@ payload="$(sed -n 's/^data = //p' <<<"$config" | jq -r)"
 query="$(jq -r '.query' <<<"$payload")"
 id="$(jq -r '.variables.id // empty' <<<"$payload")"
 case "$query" in
+*"teams(filter:"*)
+  printf '%s' '{"data":{"teams":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"team-uuid","key":"T","name":"Claude"}]}}}'
+  ;;
 *"workflowStates(filter:"*)
   printf '%s' '{"data":{"workflowStates":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"state-done"}]}}}'
   ;;
@@ -85,7 +89,7 @@ chmod +x "$TMP_ROOT/bin/curl"
 
 complete() { # ID MET
   (cd "$R" && env -i PATH="$TMP_ROOT/bin:$PATH" HOME="$TMP_ROOT/home" \
-    LINEAR_API_KEY_OVERRIDE=test-token LINEAR_TEAM=TestTeam DESCRIPTIONS="$TMP_ROOT/descriptions" STATE="$TMP_ROOT/state" \
+    LINEAR_API_KEY_OVERRIDE=test-token LINEAR_TEAM=T DESCRIPTIONS="$TMP_ROOT/descriptions" STATE="$TMP_ROOT/state" \
     "$BASH" "$R/.agents/skills/linear/scripts/linear.sh" issues complete "$1" --done-when-met "$2")
 }
 
