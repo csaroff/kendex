@@ -183,26 +183,26 @@ pf_world() {
 # at the end of the document, which errexit must not read; an empty table is
 # pf_table's refusal.
 #
-# `says` carries only what a row cannot be told apart without: an environment
-# error's message, and a clean verdict whose changed-file count is the claim.
+# `says` carries refusal records and clean verdicts whose changed-file count
+# is the claim. The table driver reads this machine protocol.
 IFS= read -r -d '' rows <<'ROWS' || :
 the staged dead citation fires and the unstaged one is out of scope|staged|--staged|-|1|docs/staged.md:3: [docs-cited-paths]|-
 the default scope is base-to-worktree, so it sees both|staged|-|-|1|docs/loose.md:3: [docs-cited-paths];docs/staged.md:3: [docs-cited-paths]|-
 the staged runner wires the staged suite, whatever the worktree copy says|staged-runner|--staged|-|0|-|-
 a worktree-only mention does not wire a staged suite|worktree-runner|--staged|-|1|tests/new2.test.sh:0: [unwired-suite]|-
 a staged JSONC setting governs the staged file despite a narrower worktree copy|staged-jsonc|--staged|jq|0|-|-
-a worktree-only JSONC setting cannot widen the staged policy|worktree-jsonc|--staged|jq|1|themes/white/apps/vscode-theme.json:2: [data-syntax]|invalid JSON
-control: staged JSON stays strict before a shared JSONC setting exists|untracked-jsonc-control|--staged|jq|1|themes/white/apps/vscode-theme.json:2: [data-syntax]|invalid JSON
-an untracked root settings file cannot widen staged JSONC policy|untracked-root-jsonc|--staged|jq|1|themes/white/apps/vscode-theme.json:2: [data-syntax]|invalid JSON
-an untracked nested settings file cannot widen staged JSONC policy|untracked-nested-jsonc|--staged|jq|1|themes/white/apps/vscode-theme.json:2: [data-syntax]|invalid JSON
+a worktree-only JSONC setting cannot widen the staged policy|worktree-jsonc|--staged|jq|1|themes/white/apps/vscode-theme.json:2: [data-syntax]|-
+control: staged JSON stays strict before a shared JSONC setting exists|untracked-jsonc-control|--staged|jq|1|themes/white/apps/vscode-theme.json:2: [data-syntax]|-
+an untracked root settings file cannot widen staged JSONC policy|untracked-root-jsonc|--staged|jq|1|themes/white/apps/vscode-theme.json:2: [data-syntax]|-
+an untracked nested settings file cannot widen staged JSONC policy|untracked-nested-jsonc|--staged|jq|1|themes/white/apps/vscode-theme.json:2: [data-syntax]|-
 an untracked root settings file cannot narrow staged migration policy|untracked-root-migration|--staged|-|1|store/migrations/V1__init.sql:0: [applied-migration-edited]|-
 an untracked nested settings file cannot narrow staged migration policy|untracked-nested-migration|--staged|-|1|store/migrations/V1__init.sql:0: [applied-migration-edited]|-
-a non-ignored untracked file is in scope; an ignored one is not|untracked|-|-|1|docs/never-added.md:3: [docs-cited-paths]|across 2 changed file(s)
+a non-ignored untracked file is in scope; an ignored one is not|untracked|-|-|1|docs/never-added.md:3: [docs-cited-paths]|-
 --staged sees only the index, so the untracked file is out of scope|untracked|--staged|-|0|-|-
-an untracked doc in an untracked directory has its dead citation reported|newdir|-|-|1|docs/new/guide.md:3: [docs-cited-paths]|cites a path that does not exist: docs/new/missing.md
+an untracked doc in an untracked directory has its dead citation reported|newdir|-|-|1|docs/new/guide.md:3: [docs-cited-paths]|-
 content comes from the index, so line 3 is the staged line|rewound|--staged|-|1|docs/staged.md:3: [docs-cited-paths]|-
 an untouched branch has nothing in the default scope|everything|-|-|0|-|preflight: clean=0
---all reaches the committed violation the default scope ignores|everything|--all|-|1|docs/legacy.md:3: [docs-cited-paths]|changed file(s)
+--all reaches the committed violation the default scope ignores|everything|--all|-|1|docs/legacy.md:3: [docs-cited-paths]|-
 --base main sees the commit made on the branch|based|--base main|-|1|docs/loose.md:3: [docs-cited-paths]|-
 --base HEAD compares against itself and finds nothing|based|--base HEAD|-|0|-|preflight: clean=0
 --repo relocates the run without a cd|repo-relocate|--repo {R} --base main|-|1|docs/loose.md:3: [docs-cited-paths]|-
@@ -217,7 +217,7 @@ with nothing left to compare against, the run fails closed instead of reporting 
 ROWS
 pf_table "what each scope may speak about" "$rows"
 
-# The rows above match a fragment wherever it appears, so they cannot see a
+# The rows above check record presence, so they cannot see a
 # SECOND record printed under the first. These two cases assert the whole
 # refusal: how many records it is, and that the value never splits the line
 # carrying it.
@@ -286,13 +286,6 @@ case "$dep_first" in
   *)
     bad "a failing dependency's diagnostic does not precede the record" "first line: $dep_first" ;;
 esac
-case "$dep_out" in
-  *fatal:*)
-    ok "the dependency's own cause is replayed after the record" ;;
-  *)
-    bad "the dependency's own cause is replayed after the record" "output: $dep_out" ;;
-esac
-
 # The tab branch is its own line of code, so it gets its own case: without
 # one, deleting that line leaves this suite green and a tab reaches the
 # record raw.

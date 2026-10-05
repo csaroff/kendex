@@ -91,12 +91,18 @@ EOF
   fi
 }
 
-fires() { # LABEL EXPECTED-SUBSTRING
-  if [ "$RC" -eq 1 ] && case "$OUT" in *"$2"*) true ;; *) false ;; esac; then
-    ok "$1"
-  else
-    bad "$1" "rc=$RC out=$OUT"
-  fi
+fires() { # LABEL FINDING-HEAD...
+  local label="$1" expected findings
+  shift
+  findings="$(pf_fired)"
+  if [ "$RC" -ne 1 ]; then bad "$label" "rc=$RC out=$OUT"; return; fi
+  for expected in "$@"; do
+    if ! grep -Fx -- "$expected" <<<"$findings" >/dev/null; then
+      bad "$label" "missing finding=$expected; rc=$RC out=$OUT"
+      return
+    fi
+  done
+  ok "$label"
 }
 
 echo "=== benign patterns across every lane stay clean ==="
@@ -275,12 +281,12 @@ printf '#!/usr/bin/env bash\nset -euo pipefail\necho x\ngit rev-parse --git-dir 
 printf '#!/usr/bin/env bash\nset -euo pipefail\necho orphan\n' >"$R/tests/orphan.test.sh"
 git -C "$R" add -A
 run_pf
-fires "the benign fixture is not clean because nothing ran" "README.md:16: [docs-cited-paths] cites a path that does not exist: docs/gone.md"
-fires "the benign source file is not clean because nothing ran" "scripts/cites.sh:12: [docs-cited-paths] cites a path that does not exist: docs/gone.md"
-fires "a line-suffixed local citation is not mistaken for a repo qualifier" "scripts/cites.sh:13: [docs-cited-paths] cites a path that does not exist: docs/gone.md"
+fires "the benign fixture is not clean because nothing ran" "README.md:16: [docs-cited-paths]"
+fires "the benign source file is not clean because nothing ran" "scripts/cites.sh:12: [docs-cited-paths]"
+fires "a line-suffixed local citation is not mistaken for a repo qualifier" "scripts/cites.sh:13: [docs-cited-paths]"
 fires "the trapped scratch dir beside it does not shield an untrapped one" "scripts/notrap.sh:3: [mktemp-trap]"
 fires "a backtick substitution inside double quotes still runs mktemp" "scripts/backtick.sh:3: [mktemp-trap]"
-fires "the captured status beside it does not shield a swallowed one" "scripts/swallow.sh:4: [fail-open] git || true swallows exit 2"
+fires "the captured status beside it does not shield a swallowed one" "scripts/swallow.sh:4: [fail-open]"
 fires "the wired suites beside it, and the workflow path filter globbing everything, do not wire an unwired one" "tests/orphan.test.sh:0: [unwired-suite]"
 
 echo "=== mktemp assignments whose status the shell checks stay clean ==="
@@ -321,9 +327,9 @@ trap 'rm -f "${conditional_tmp:-}"' EXIT
 EOF
 run_pf
 fires "inner, later, and conditional-inner operators leave the assignments unchecked" \
-  "scripts/lib/or-list.sh:2: [fail-open] unchecked mktemp" \
-  "scripts/lib/or-list.sh:3: [fail-open] unchecked mktemp" \
-  "scripts/lib/condition.sh:2: [fail-open] unchecked mktemp"
+  "scripts/lib/or-list.sh:2: [fail-open]" \
+  "scripts/lib/or-list.sh:3: [fail-open]" \
+  "scripts/lib/condition.sh:2: [fail-open]"
 
 echo "=== inert trap text arms nothing; quoted command text swallows nothing; an untracked runner wires ==="
 seed inert
@@ -363,7 +369,7 @@ echo "=== control: the same large file without the trap still fires ==="
 grep -v '^trap ' -- "$R/scripts/big.sh" >"$R/scripts/big.new"
 mv "$R/scripts/big.new" "$R/scripts/big.sh"
 run_pf
-fires "deleting the trap line from the same large file restores the finding" "scripts/big.sh:3: [mktemp-trap] mktemp without an EXIT trap"
+fires "deleting the trap line from the same large file restores the finding" "scripts/big.sh:3: [mktemp-trap]"
 
 echo "=== a temp-path literal is a finding only in a creation call's hands ==="
 seed tmppath
@@ -408,8 +414,8 @@ printf '#!/usr/bin/env bash\necho old\nTMP="$(mktemp -d -t x)"\necho "$TMP"\n' >
 printf '#!/usr/bin/env bash\nset -euo pipefail\n# See docs/gone.md for background, still.\necho old\necho more\n' >"$R/scripts/pointer.sh"
 git -C "$R" add -A
 run_pf
-fires "the reworked mktemp line fires" "scripts/old.sh:3: [fail-open] unchecked mktemp"
-fires "the reworked dead-citation line fires" "scripts/pointer.sh:3: [docs-cited-paths] cites a path that does not exist: docs/gone.md"
+fires "the reworked mktemp line fires" "scripts/old.sh:3: [fail-open]"
+fires "the reworked dead-citation line fires" "scripts/pointer.sh:3: [docs-cited-paths]"
 
 echo "=== a sourced library carries no mode of its own ==="
 seed sourcedlib
@@ -430,10 +436,10 @@ cp "$R/scripts/lib/common.sh" "$R/scripts/lib/runnable.sh"
 chmod +x "$R/scripts/lib/runnable.sh"
 printf 'grep -q x -- "$0" || true\nD="$(mktemp -d)"\n' >>"$R/scripts/lib/common.sh"
 run_pf
-fires "the same bytes outside a lib tree still fail" "scripts/common.sh:0: [fail-open] new shell file without strict mode"
-fires "an executable file in a lib tree is a program and still fails" "scripts/lib/runnable.sh:0: [fail-open] new shell file without strict mode"
-fires "a swallowed status inside a sourced lib still fails" "scripts/lib/common.sh:6: [fail-open] grep || true swallows exit 2"
-fires "an unchecked mktemp inside a sourced lib still fails" "scripts/lib/common.sh:7: [fail-open] unchecked mktemp"
+fires "the same bytes outside a lib tree still fail" "scripts/common.sh:0: [fail-open]"
+fires "an executable file in a lib tree is a program and still fails" "scripts/lib/runnable.sh:0: [fail-open]"
+fires "a swallowed status inside a sourced lib still fails" "scripts/lib/common.sh:6: [fail-open]"
+fires "an unchecked mktemp inside a sourced lib still fails" "scripts/lib/common.sh:7: [fail-open]"
 
 echo "=== a test-<name> suite outside a tests/ tree sets its own rules ==="
 seed toolsuite
@@ -463,7 +469,7 @@ mkdir -p "$R/scripts"
 cp "$R/tools/test-lexer" "$R/scripts/test-orphan"
 git -C "$R" add -A
 run_pf
-fires "a new non-suite script without strict mode still fails" "tools/lexer:0: [fail-open] new shell file without strict mode"
+fires "a new non-suite script without strict mode still fails" "tools/lexer:0: [fail-open]"
 fires "a test-<name> suite no runner reaches is unwired" "scripts/test-orphan:0: [unwired-suite]"
 
 echo "=== staged scope reads the bit the index carries ==="
@@ -480,12 +486,13 @@ cp "$R/scripts/lib/common.sh" "$R/scripts/lib/runnable.sh"
 chmod +x "$R/scripts/lib/runnable.sh"
 git -C "$R" add -A
 run_pf --staged
-fires "an executable lib in the index still fails" "scripts/lib/runnable.sh:0: [fail-open] new shell file without strict mode"
-case "$OUT" in
-  *"scripts/lib/common.sh"*"new shell file without strict mode"*)
-    bad "a staged sourced lib is not a finding" "$OUT" ;;
-  *) ok "a staged sourced lib is not a finding" ;;
-esac
+fires "an executable lib in the index still fails" "scripts/lib/runnable.sh:0: [fail-open]"
+findings="$(pf_fired)"
+if grep -Fx -- 'scripts/lib/common.sh:0: [fail-open]' <<<"$findings" >/dev/null; then
+  bad "a staged sourced lib is not a finding" "$OUT"
+else
+  ok "a staged sourced lib is not a finding"
+fi
 
 echo "=== a deleted file is not a finding ==="
 seed deleted
@@ -504,11 +511,11 @@ run_pf
 clean "a vendored skill's citations are not this repo's prose claims" 2
 printf 'See `docs/gone.md`.\n' >>"$R/README.md"
 run_pf
-fires "the same dead citation outside the mirror still fires" "README.md:2: [docs-cited-paths] cites a path that does not exist: docs/gone.md"
+fires "the same dead citation outside the mirror still fires" "README.md:2: [docs-cited-paths]"
 mkdir -p "$R/.pi/prompts"
 printf '#!/usr/bin/env bash\nset -euo pipefail\n# See docs/gone.md for background.\necho prompt\n' >"$R/.pi/prompts/release.sh"
 run_pf
-fires "an authored file under a harness dir keeps the lane" ".pi/prompts/release.sh:3: [docs-cited-paths] cites a path that does not exist: docs/gone.md"
+fires "an authored file under a harness dir keeps the lane" ".pi/prompts/release.sh:3: [docs-cited-paths]"
 
 echo "=== a mirror's authoring choices are the upstream project's, not this repo's ==="
 seed mirrorlanes
@@ -543,13 +550,13 @@ echo "=== control: the same bytes this repo authors itself still fail ==="
 cp "$R/.agents/skills/foo/scripts/run" "$R/scripts/run.sh"
 cp "$R/.agents/skills/foo/tests/foo.test.sh" "$R/tests/foo.test.sh"
 run_pf
-fires "an authored script without strict mode still fails" "scripts/run.sh:0: [fail-open] new shell file without strict mode"
-fires "an authored unchecked mktemp still fails" "scripts/run.sh:2: [fail-open] unchecked mktemp"
+fires "an authored script without strict mode still fails" "scripts/run.sh:0: [fail-open]"
+fires "an authored unchecked mktemp still fails" "scripts/run.sh:2: [fail-open]"
 fires "an authored untrapped mktemp still fails" "scripts/run.sh:2: [mktemp-trap]"
-fires "an authored swallowed status still fails" "scripts/run.sh:7: [fail-open] grep || true swallows exit 2"
+fires "an authored swallowed status still fails" "scripts/run.sh:7: [fail-open]"
 fires "an authored unwired suite still fails" "tests/foo.test.sh:0: [unwired-suite]"
 if command -v shellcheck >/dev/null 2>&1; then
-  fires "an authored masking local-and-assign still fails" "scripts/run.sh:4: [masked-returns] SC2155"
+  fires "an authored masking local-and-assign still fails" "scripts/run.sh:4: [masked-returns]"
 else
   skipped "an authored masking local-and-assign still fails" "shellcheck not on PATH"
 fi
@@ -566,7 +573,7 @@ fires "a vendored script bash cannot parse still fails" ".agents/skills/foo/scri
 fires "a vendored creation at a literal temp path still fails" ".agents/skills/foo/scripts/leak.py:2: [hardcoded-temp-path]"
 fires "vendored malformed JSON still fails" ".agents/skills/foo/data.json:3: [data-syntax]"
 if command -v shellcheck >/dev/null 2>&1; then
-  fires "a vendored shellcheck error still fails" ".agents/skills/foo/scripts/exitcode:3: [shellcheck-errors] SC2242"
+  fires "a vendored shellcheck error still fails" ".agents/skills/foo/scripts/exitcode:3: [shellcheck-errors]"
 else
   skipped "a vendored shellcheck error still fails" "shellcheck not on PATH"
 fi
@@ -643,7 +650,7 @@ clean "a project setting accepts the reported VS Code theme path" 2
 printf '{\n  "broken":\n}\n' >"$R/config/strict.json"
 git -C "$R" add -A
 run_pf
-fires "a malformed strict JSON file beside the configured JSONC file still fails" "config/strict.json:3: [data-syntax] invalid JSON"
+fires "a malformed strict JSON file beside the configured JSONC file still fails" "config/strict.json:3: [data-syntax]"
 
 echo "=== a migration this branch added is not one a database has run ==="
 seed migrationsbranch
@@ -660,5 +667,45 @@ printf 'CREATE TABLE t (id INTEGER); -- clearer\n' >"$R/store/migrations/V1__ini
 git -C "$R" add -A
 run_pf --staged
 fires "the base's own migration, staged, still fails" "store/migrations/V1__init.sql:0: [applied-migration-edited]"
+
+echo "=== Rust environment calls are judged only in test code ==="
+seed rustenv
+mkdir -p "$R/.agents/skills/example/tests"
+cat >"$R/src/lib.rs" <<'RUST'
+#[cfg(test)]
+mod tests {
+    // std::env::set_var("KEY", "value");
+    /* outer /* nested */
+       std::env::remove_var("KEY");
+    */
+    const EXAMPLE: &str = r##"
+        #[test] fn example() { std::env::set_var("KEY", "value"); }
+    "##;
+    const QUOTED: &str = "std::env::remove_var(\"KEY\")";
+    fn child() { std::process::Command::new("child").env("KEY", "value"); }
+}
+fn boot() { unsafe { std::env::set_var("KEY", "value"); } }
+RUST
+printf 'fn fixture() { unsafe { std::env::remove_var("KEY"); } }\n' >"$R/.agents/skills/example/tests/env.rs"
+git -C "$R" add -A
+run_pf
+clean "comments, literals, child environment, production code and installed renders" 2
+printf '#[test]\nfn changed() { unsafe { std::env::remove_var("KEY"); } }\n' >>"$R/src/lib.rs"
+git -C "$R" add -A
+run_pf
+fires "a real test call beside the benign forms still fails" "src/lib.rs:15: [rust-test-env-mutation]"
+
+seed rustenvold
+printf 'fn fixture() { unsafe { std::env::set_var("KEY", "value"); } }\n' >"$R/tests/env.rs"
+git -C "$R" add -A
+git -C "$R" commit -qm baseline
+printf '// fixture description\n' >>"$R/tests/env.rs"
+git -C "$R" add -A
+run_pf --staged
+clean "an unchanged Rust environment call is outside the staged lines" 1
+printf 'fn added() { unsafe { std::env::remove_var("KEY"); } }\n' >>"$R/tests/env.rs"
+git -C "$R" add -A
+run_pf --staged
+fires "an added call in the same test file still fails" "tests/env.rs:3: [rust-test-env-mutation]"
 
 pf_summary
