@@ -140,7 +140,9 @@ mkdir -p "$LANE_A" "$LANE_B"
 row() {
   ROW="$TMP_ROOT/rows/$1"
   mkdir -p "$ROW"
-  STATE="$ROW/state"
+  # In the checkout every launch runs from, where an overseer's state sits, so
+  # the overseer binding reads the fleet's repository off the state directory.
+  STATE="$REPO/tmp/rows/$1/state"
   CLAIMS="$ROW/watch"
 }
 
@@ -678,7 +680,10 @@ refusal() {
       PATH="$ROW/bin:$PATH" launch one 5 --lane "$LANE_A" CC-1 ;;
     path)
       # workflow-state answers every verb but `path oversee`, so the fleet
-      # state exists and only its path cannot be had.
+      # state exists and only its path cannot be had. The state records the
+      # overseer's directory, so the overseer binding judges that directory
+      # and leaves the path read to the cap.
+      "$ws" --state-dir "$STATE" update oversee --arg cwd "$REPO" '.overseer = {cwd: $cwd}' >/dev/null
       # shellcheck disable=SC2016  # the stub's own text, never expanded here.
       mv -- "$ws" "$ws.real"
       printf '%s\n' '#!/usr/bin/env bash' '[[ " $* " != *" path oversee "* ]] || exit 1' 'exec "$0.real" "$@"' > "$ws"
