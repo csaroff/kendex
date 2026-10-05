@@ -74,6 +74,12 @@
 #       lists it in between; a pass that fails before reporting leaves the
 #       absence for the next pass; each repeat-mode refusal exits 2 with its
 #       keyed first line
+#   8d. ORCH_CONNECTED_REPOS: each listed repository is read by the merged
+#       lookup and the heartbeat's open pull request list after the --repo
+#       values or the resolved default, in repeat mode too, once and in one
+#       spelling, with the append's control; a setting orch-env cannot read
+#       exits 2 before any pass, in repeat mode with no --repo too, each with
+#       its control
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib/git-env.sh"
 
@@ -1690,6 +1696,128 @@ for row in \
   assert_eq "$(sed -n 1p "$err")" "${want//%S/$STUB_DIR}" "$label: names its key and value first" "$err"
   [[ -z "$detail" ]] || assert_contains "$(sed -n 3p "$err")" "$detail" "$label: the detail line names the rule that refused it"
 done
+
+# --- 8d. ORCH_CONNECTED_REPOS adds watched repositories --------------------
+# Each entry the setting lists is read after the --repo values, the items
+# repository first, and an entry a --repo already names is read once. The
+# reads proven are the merged lookup for the item and the heartbeat's open
+# pull request list. The repeat row hands its pass a --repo for every
+# repository the wrapper settled, and that pass reads the setting again and
+# skips what those already name.
+# connected_case NAME SETTING MODE [WATCH] — MODE is `repo` (--repo owner/repo),
+# `default` (no --repo, `gh repo view` answering owner/repo), `repeat`
+# (--repo owner/repo under --repeat over one running record for issue-5, the
+# state taken away after the first pass) or `repeat-default` (`repeat` with no
+# --repo, `gh repo view` answering owner/repo), each one long pass. SETTING
+# `absent` sets nothing.
+# Sets CONNECTED_MERGED and CONNECTED_OPEN to the repository of each merged
+# lookup and each heartbeat open pull request line, in the order asked.
+connected_case() {
+  local name="$1" setting="$2" mode="$3" env_args=() args=()
+  new_case "$name"
+  printf '9\tissue-9\titems side\n' > "$STUB_DIR/open.owner_repo.txt"
+  printf '77\tissue-9\tconsumer side\n' > "$STUB_DIR/open.other_repo.txt"
+  [[ "$setting" == absent ]] || env_args+=("ORCH_CONNECTED_REPOS=$setting")
+  case "$mode" in
+    repo) args=(--repo owner/repo --max-loops 1 --since 2026-08-15T09:00:00Z --item issue-5) ;;
+    default)
+      printf 'owner/repo\n' > "$STUB_DIR/repoview.txt"
+      args=(--no-repo --max-loops 1 --since 2026-08-15T09:00:00Z --item issue-5) ;;
+    repeat)
+      write_state "$STUB_DIR/state.json" "$(lane_record issue-5 '' '' /w/issue-5 running)"
+      repeat_sleep_stub 'unlink "$STUB_DIR/state.json"'
+      env_args+=(PATH="$STUB_DIR/bin:$TMP_ROOT/bin:$PATH")
+      args=(--repo owner/repo --max-loops 1 --repeat 0 --state "$STUB_DIR/state.json") ;;
+    repeat-default)
+      printf 'owner/repo\n' > "$STUB_DIR/repoview.txt"
+      write_state "$STUB_DIR/state.json" "$(lane_record issue-5 '' '' /w/issue-5 running)"
+      repeat_sleep_stub 'unlink "$STUB_DIR/state.json"'
+      env_args+=(PATH="$STUB_DIR/bin:$TMP_ROOT/bin:$PATH")
+      args=(--no-repo --max-loops 1 --repeat 0 --state "$STUB_DIR/state.json") ;;
+  esac
+  err="$TMP_ROOT/e-$name"
+  out="$(WATCH_BIN="${4:-}" run_watch ${env_args[@]+"${env_args[@]}"} -- "${args[@]}" 2>"$err" </dev/null)" && rc=0 || rc=$?
+  CONNECTED_MERGED="$(awk '/--head issue-5 --state merged/ { for (i = 1; i < NF; i++) if ($i == "--repo") { printf "%s%s", sep, $(i + 1); sep = " " } }' "$STUB_DIR/gh.calls")"
+  CONNECTED_OPEN="$(awk -F'\t' '$2 ~ /^[0-9]+$/ && $3 == "issue-9" { printf "%s%s", sep, $1; sep = " " }' <<<"$out")"
+}
+for row in \
+  "connected_listed|Other/Repo owner/repo|repo|0|owner/repo other/repo|a listed repository is read after --repo, once, in one spelling" \
+  "connected_default|other/repo|default|0|owner/repo other/repo|a listed repository is read after the resolved default" \
+  "connected_repeat|other/repo owner/repo|repeat|2|owner/repo other/repo|repeat mode's pass reads a listed repository the wrapper handed it" \
+  "connected_repeat_default|other/repo|repeat-default|2|owner/repo other/repo|repeat mode with no --repo reads the resolved default, then a listed repository" \
+  "connected_absent|absent|repo|0|owner/repo|with no setting only --repo is read"; do
+  IFS='|' read -r name setting mode want_rc want label <<<"$row"
+  connected_case "$name" "$setting" "$mode"
+  assert_eq "rc=$rc merged=$CONNECTED_MERGED open=$CONNECTED_OPEN" "rc=$want_rc merged=$want open=$want" "$label" "$err"
+done
+# The control for the append: the entries are still read and printed, and
+# none joins the watched set, so the run reads the --repo alone. Each listed
+# entry's spelling and the skip are lib/gh-repo.sh's orch_connected_repos
+# rules, whose controls are in connected-repos.test.sh.
+CONNECTED_MUTANT_DIR="$TMP_ROOT/connected-add"
+CONNECTED_MUTANT="$(mutant_scripts connected-add/orch oversee-watch)/oversee-watch" || exit 1
+ln -s "$REPO_ROOT/skills/github" "$CONNECTED_MUTANT_DIR/github"
+mutate_file "$CONNECTED_MUTANT" '  REPOS+=(${connected_list[@]+"${connected_list[@]}"})' '  true || REPOS+=(${connected_list[@]+"${connected_list[@]}"})'
+connected_case connected-add "Other/Repo owner/repo" repo "$CONNECTED_MUTANT"
+assert_eq "rc=$rc merged=$CONNECTED_MERGED open=$CONNECTED_OPEN" "rc=0 merged=owner/repo open=owner/repo" \
+  "control: without the append only the --repo is read" "$err"
+# The control for the empty-set return: with it gone the wrapper, which has
+# resolved no default, settles a set of the listed entry alone, and each pass
+# reads that set and never the overseer's own repository.
+NODEFAULT_MUTANT_DIR="$TMP_ROOT/connected-nodefault"
+NODEFAULT_MUTANT="$(mutant_scripts connected-nodefault/orch oversee-watch)/oversee-watch" || exit 1
+ln -s "$REPO_ROOT/skills/github" "$NODEFAULT_MUTANT_DIR/github"
+mutate_file "$NODEFAULT_MUTANT" '  [[ ${#REPOS[@]} -gt 0 ]] || return 0' '  true || [[ ${#REPOS[@]} -gt 0 ]] || return 0'
+connected_case connected-nodefault other/repo repeat-default "$NODEFAULT_MUTANT"
+assert_eq "rc=$rc merged=$CONNECTED_MERGED open=$CONNECTED_OPEN" "rc=2 merged=other/repo open=other/repo" \
+  "control: without the empty-set return a repeat pass reads the listed repository alone" "$err"
+# A setting orch-env refuses to read ends the watch before any pass rather than
+# watching fewer repositories: ORCH_CONSUMER_REPOS is the retired setting
+# orch-env refuses on every read. MODE is `single` (--repo owner/repo, one run)
+# or `repeat` (no --repo, --repeat 0 over one running record, the sleep stub
+# counting each repeat delay in slept and taking the state away, so a wrapper
+# that reached a pass ends on the next read).
+connected_unread_case() { # NAME MODE [WATCH]
+  local args=(--repo owner/repo) env_args=()
+  new_case "$1"
+  if [[ "$2" == repeat ]]; then
+    printf 'owner/repo\n' > "$STUB_DIR/repoview.txt"
+    write_state "$STUB_DIR/state.json" "$(lane_record issue-5 '' '' /w/issue-5 running)"
+    repeat_sleep_stub 'echo x >> "$STUB_DIR/slept"' 'unlink "$STUB_DIR/state.json"'
+    env_args=(PATH="$STUB_DIR/bin:$TMP_ROOT/bin:$PATH")
+    args=(--no-repo --max-loops 1 --repeat 0 --state "$STUB_DIR/state.json")
+  fi
+  err="$TMP_ROOT/e-$1"
+  out="$(WATCH_BIN="${3:-}" run_watch ${env_args[@]+"${env_args[@]}"} ORCH_CONSUMER_REPOS=x/y -- "${args[@]}" 2>"$err" </dev/null)" && rc=0 || rc=$?
+  CONNECTED_UNREAD="$(grep -c '^oversee-watch: connected-repos-unread setting=ORCH_CONNECTED_REPOS$' "$err" || true)"
+  CONNECTED_SLEPT="$(grep -c . "$STUB_DIR/slept" 2>/dev/null || true)"
+  CONNECTED_SLEPT="${CONNECTED_SLEPT:-0}"
+}
+for row in \
+  "connected_unread|single|a setting orch-env cannot read exits 2 naming it, with no pass run" \
+  "connected_unread_repeat|repeat|in repeat mode with no --repo the wrapper exits 2 naming it, before any pass"; do
+  IFS='|' read -r name mode label <<<"$row"
+  connected_unread_case "$name" "$mode"
+  assert_eq "rc=$rc unread=$CONNECTED_UNREAD slept=$CONNECTED_SLEPT out=$out" "rc=2 unread=1 slept=0 out=" "$label" "$err"
+done
+UNREAD_MUTANT_DIR="$TMP_ROOT/connected-unread-mutant"
+UNREAD_MUTANT="$(mutant_scripts connected-unread-mutant/orch oversee-watch)/oversee-watch" || exit 1
+ln -s "$REPO_ROOT/skills/github" "$UNREAD_MUTANT_DIR/github"
+mutate_file "$UNREAD_MUTANT" '    || die connected-repos-unread' '    || true || die connected-repos-unread'
+connected_unread_case connected_unread_control single "$UNREAD_MUTANT"
+assert_eq "rc=$rc unread=$CONNECTED_UNREAD" "rc=0 unread=0" \
+  "control: with the refusal removed the watch runs on without the setting" "$err"
+# The repeat row's control: with the read after the empty-set return, the
+# wrapper reads nothing, and the pass refuses the setting and sleeps before
+# the read that ends the run.
+EARLY_MUTANT_DIR="$TMP_ROOT/connected-early-mutant"
+EARLY_MUTANT="$(mutant_scripts connected-early-mutant/orch oversee-watch)/oversee-watch" || exit 1
+ln -s "$REPO_ROOT/skills/github" "$EARLY_MUTANT_DIR/github"
+mutate_file "$EARLY_MUTANT" '  connected="$(orch_connected_repos' '  [[ ${#REPOS[@]} -gt 0 ]] || return 0
+  connected="$(orch_connected_repos'
+connected_unread_case connected_unread_repeat_control repeat "$EARLY_MUTANT"
+assert_eq "rc=$rc unread=$CONNECTED_UNREAD slept=$CONNECTED_SLEPT" "rc=2 unread=1 slept=1" \
+  "control: with the read after the empty-set return the wrapper sleeps after a refused pass" "$err"
 
 # --- 9. --help -------------------------------------------------------------
 err="$TMP_ROOT/e9"
