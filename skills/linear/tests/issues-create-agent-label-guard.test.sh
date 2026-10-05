@@ -92,7 +92,7 @@ run() {
   *) printf '[env]\nLINEAR_TEAM = "Configured"\nLINEAR_AGENT_LABELS = "%s"\n' "$taxonomy" >"$PROJECT/kendex.settings.toml" ;;
   esac
   : >"$CURL_LOG"
-  out="$(cd "$PROJECT" && env -u LINEAR_TEAM -u LINEAR_AGENT_LABELS PATH="$PROJECT/bin:$PATH" LINEAR_API_KEY=test-token \
+  out="$(cd "$PROJECT" && env -u LINEAR_TEAM -u LINEAR_AGENT_LABELS LINEAR_REQUIRE_REACH= PATH="$PROJECT/bin:$PATH" LINEAR_API_KEY=test-token \
     CURL_LOG="$CURL_LOG" bash "$LINEAR" issues create "$@" 2>"$TMP_ROOT/err")" || rc=$?
   err="$(paste -sd';' "$TMP_ROOT/err")"
   case "$view" in
