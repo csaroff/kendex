@@ -27,7 +27,7 @@ Problems with a kendex-owned skill go through `kendex report`; check ownership i
 .agents/skills/linear/scripts/linear.sh <resource> <action> [options]
 ```
 
-Every read and write goes to Linear's API as it runs; nothing is stored locally. `linear.sh <resource> --help` prints per-resource options. `--format` values: `safe` (the default, flat and null-safe), `compact` (a smaller shape for workflow routing), `ids` (identifiers only), `table`, `raw` (the GraphQL nesting, so never assume top-level jq paths). `safe` renames fields: `identifier`→`id`, `id`→`uuid`, `state.name`→`state`, `state.type`→`state_type`, `sortOrder`→`sort_order`.
+Every read and write goes to Linear's API as it runs; no tracker data is stored locally. `linear.sh <resource> --help` prints per-resource options. `--format` values: `safe` (the default, flat and null-safe), `compact` (a smaller shape for workflow routing), `ids` (identifiers only), `table`, `raw` (the GraphQL nesting, so never assume top-level jq paths). `safe` renames fields: `identifier`→`id`, `id`→`uuid`, `state.name`→`state`, `state.type`→`state_type`, `sortOrder`→`sort_order`.
 
 ## Commands
 
@@ -62,7 +62,7 @@ linear.sh labels list --max --format=safe
 
 A list of issues, projects, labels, project labels, teams, users, cycles, documents or initiatives returns its first `--limit` rows (75 by default, a positive whole number) and prints a `linear-list: truncated` line on stderr when rows were left unread; `--max` reads every page. `milestones list`, `statuses list`, `comments list` and `attachments list` always read every row and take neither. A read follows each nested collection (labels, relations, children, comments) to its end. A read that cannot finish its chain (a failed later page, a missing or repeated cursor, or a chain still open after 400 pages) exits nonzero with no output, never a partial result. An audit that must see the whole backlog passes `--max`.
 
-A rate-limited request exits nonzero with one JSON line on stderr carrying `"code":"RATELIMITED"` and `requests_reset`, the UTC time the request quota refills. Rate-limited, 5xx and unanswered requests, attachment downloads among them, are retried twice, each wait doubling or the answer's `Retry-After` when that is longer; a `Retry-After` over 60 seconds, or any other HTTP error, fails on its first answer. Holding an activation or completion until the reset: [patterns/workflow-actions.md § Quota Holds](patterns/workflow-actions.md#quota-holds).
+A rate-limited request exits nonzero with one JSON line on stderr carrying `"code":"RATELIMITED"` and `requests_reset`, the UTC time the request quota refills. A rate-limited request is retried twice. A query or attachment download answered 5xx or not at all is retried twice too, but such a mutation is sent once, since Linear may already have applied it: stderr then carries a `linear-http: write=unconfirmed` line, and the write is read back before it is sent again. Each wait doubles, or is the answer's `Retry-After` when that is longer; a `Retry-After` over 60 seconds, or any other HTTP error, fails on its first answer. Holding an activation or completion until the reset: [patterns/workflow-actions.md § Quota Holds](patterns/workflow-actions.md#quota-holds).
 
 ## Team Target
 
