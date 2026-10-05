@@ -1,0 +1,1 @@
+- The kendex refresh pull request lists retired settings and defaults and unset or unreadable queue settings, and flags Fable or Astra pins even without orch.

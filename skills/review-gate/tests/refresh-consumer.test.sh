@@ -170,6 +170,9 @@ if [ "$TEST_CLASS_EXIT" -ne 0 ]; then
   printf 'wiring-error: cause=output-unwritable\n' >&2
   exit "$TEST_CLASS_EXIT"
 fi
+# The real classifier prints a queue-only line on every verdict, ahead of the
+# class line; a row's setting notes replace the clean one.
+printf '%s\n' "${TEST_CLASS_NOTES:-queue-only: queue_only=false cause=no-queue-path}" >&2
 printf 'class: class=%s measured=%s %s\n' "$TEST_CLASS" "$TEST_MEASURED" "$TEST_REASON" >&2
 printf 'change_class=%s\n' "$TEST_CLASS"
 SH
@@ -375,6 +378,123 @@ TOML
   reset_default
   cp "$TMP/models-runner" "$runner"
 done
+cp "$TMP/models-settings" "$repo/kendex.settings.toml"
+commit "$repo"
+git -C "$repo" push -q origin main
+# A consumer holding a retired key, a retired default and no
+# HARNESS_CI_QUEUE_PATHS gets all three named in its refresh pull request
+# body, and the render still arms. Each control drops one runner input.
+cp "$runner" "$TMP/stale-runner"
+for mode in report committed-control notes-control; do
+  reset_default
+  cp "$TMP/stale-runner" "$runner"
+  printf '[env]\nPR_REVIEW_GATE = "on"\nSECOND_OPINION_TIMEOUT = "300"\nSECOND_OPINION_COUNT = "1"\n' >"$repo/kendex.settings.toml"
+  case "$mode" in
+    committed-control)
+      file_edit "$repo" .agents/skills/review-gate/scripts/refresh-consumer.sh 1 \
+        '^    committed\+=\(' 's/^    committed+=(/    : # &/' ;;
+    notes-control)
+      file_edit "$repo" .agents/skills/review-gate/scripts/refresh-consumer.sh 1 \
+        'setting_notes\+=\(' 's/setting_notes+=("\$line")/:/' ;;
+  esac
+  commit "$repo"
+  git -C "$repo" push -q origin main
+  rm -f -- "$repo/.env.local" "$TMP/state/armed"
+  : >"$TMP/state/calls"
+  CLASS_NOTES=$'setting-unset: setting=HARNESS_CI_QUEUE_PATHS\nqueue-only: queue_only=true cause=queue-list-undeclared'
+  run_refresh "stale-$mode" pass render
+  unset CLASS_NOTES
+  committed_rows=0 note_rows=0
+  for row in '<code>PR_REVIEW_GATE</code>' '<code>SECOND_OPINION_TIMEOUT = &quot;300&quot;</code>'; do
+    ! grep -qF -- "- $row" "$TMP/state/body" || committed_rows=$((committed_rows + 1))
+  done
+  for row in '<code>setting-unset: setting=HARNESS_CI_QUEUE_PATHS</code>' \
+    '<code>queue-only: queue_only=true cause=queue-list-undeclared</code>'; do
+    ! grep -qxF -- "- $row" "$TMP/state/body" || note_rows=$((note_rows + 1))
+  done
+  case "$mode" in
+    report)
+      if refresh_class_matches render pushed cause=renders-match-their-sources PATCH &&
+          grep -qxF '## Consumer settings' "$TMP/state/body" && [ "$committed_rows" -eq 2 ] && [ "$note_rows" -eq 2 ] &&
+          ! grep -qF 'SECOND_OPINION_COUNT' "$TMP/state/body" &&
+          [ "$(git --git-dir="$TMP/remote" show refs/heads/kendex/refresh:kendex.settings.toml)" = "$(git --git-dir="$TMP/remote" show main:kendex.settings.toml)" ]; then
+        ok 'retired settings and the unset queue setting appear under Consumer settings and the render still arms'
+      else bad 'consumer settings report' "$OUT"; fi ;;
+    committed-control)
+      if [ "$RC" -eq 0 ] && [ "$committed_rows" -eq 0 ] && [ "$note_rows" -eq 2 ]; then
+        ok 'control: a dropped committed scan turns the retired-setting assertion red'
+      else bad 'committed scan control' "$OUT"; fi ;;
+    notes-control)
+      if [ "$RC" -eq 0 ] && [ "$committed_rows" -eq 2 ] && [ "$note_rows" -eq 0 ]; then
+        ok 'control: dropped classifier notes turn the queue-setting assertion red'
+      else bad 'classifier notes control' "$OUT"; fi ;;
+  esac
+done
+# change-class prints a queue-only line on every verdict. Only a cause that
+# names the repository's settings joins Consumer settings: a clean consumer
+# and a refresh whose own path is a queue path keep the section out. The
+# control forwards every queue-only line.
+for row in \
+  'clean||' \
+  'queue-path|queue-only: queue_only=true cause=queue-path path=.github/workflows/ci.yml glob=.github/workflows/*|' \
+  'settings-unreadable|queue-only: queue_only=true cause=queue-settings-unreadable|- <code>queue-only: queue_only=true cause=queue-settings-unreadable</code>' \
+  'forward-control||'; do
+  IFS='|' read -r name notes expected <<<"$row"
+  reset_default
+  cp "$TMP/stale-runner" "$runner"
+  rm -f -- "${repo:?}/kendex.settings.toml"
+  if [ "$name" = forward-control ]; then
+    file_edit "$repo" .agents/skills/review-gate/scripts/refresh-consumer.sh 1 \
+      "cause=queue-list-undeclared' \\|" \
+      "s/'queue-only: '\\*' cause=queue-list-undeclared'/'queue-only: '*/"
+  fi
+  commit "$repo"
+  git -C "$repo" push -q origin main
+  : >"$TMP/state/calls"
+  CLASS_NOTES="$notes"
+  run_refresh "notes-$name" pass render
+  unset CLASS_NOTES
+  rows="$(grep -F -- '- <code>' "$TMP/state/body")" || rows=""
+  if [ "$name" = forward-control ]; then
+    if [ "$RC" -eq 0 ] && grep -qxF '## Consumer settings' "$TMP/state/body"; then
+      ok 'control: forwarding every queue-only line turns the clean-consumer assertion red'
+    else bad 'queue-only forwarding control' "$OUT"; fi
+  elif [ -z "$expected" ]; then
+    if refresh_class_matches render pushed cause=renders-match-their-sources PATCH &&
+        ! grep -qxF '## Consumer settings' "$TMP/state/body" && [ -z "$rows" ]; then
+      ok "$name classifier queue-only line adds no Consumer settings section"
+    else bad "$name classifier queue-only line" "$OUT"; fi
+  elif refresh_class_matches render pushed cause=renders-match-their-sources PATCH &&
+      grep -qxF '## Consumer settings' "$TMP/state/body" && [ "$rows" = "$expected" ]; then
+    ok "$name classifier queue-only line appears under Consumer settings"
+  else bad "$name classifier queue-only line" "$OUT"; fi
+done
+# A report that cannot read the retired list stops before publication or
+# merge changes.
+for mode in refusal refusal-control; do
+  reset_default
+  cp "$TMP/stale-runner" "$runner"
+  rm -f -- "${repo:?}/.agents/skills/review-gate/retired-settings.json"
+  if [ "$mode" = refusal-control ]; then
+    file_edit "$repo" .agents/skills/review-gate/scripts/refresh-consumer.sh 1 \
+      'refresh-error=settings-report' '/refresh-error=settings-report/{n;s/exit 1/: # exit 1/;}'
+  fi
+  commit "$repo"
+  git -C "$repo" push -q origin main
+  before="$(git --git-dir="$TMP/remote" rev-parse refs/heads/kendex/refresh)" || exit 1
+  : >"$TMP/state/calls"
+  run_refresh "unreadable-$mode" pass render
+  if [ "$mode" = refusal ]; then
+    if refresh_stopped_at_settings "$before" "refresh-error=settings-report value=$repo/.agents/skills/review-gate/scripts/refresh-report.py"; then
+      ok 'an unreadable retired list stops before publication or merge changes'
+    else bad 'unreadable retired list refusal' "$OUT"; fi
+  elif [ "$RC" -eq 0 ] && ! refresh_stopped_at_settings "$before" "refresh-error=settings-report value=$repo/.agents/skills/review-gate/scripts/refresh-report.py"; then
+    ok 'control: a dropped report refusal publishes without the report'
+  else bad 'report refusal control' "$OUT"; fi
+done
+reset_default
+cp "$TMP/stale-runner" "$runner"
+cp "$SKILL_DIR/retired-settings.json" "$repo/.agents/skills/review-gate/retired-settings.json"
 cp "$TMP/models-settings" "$repo/kendex.settings.toml"
 commit "$repo"
 git -C "$repo" push -q origin main
@@ -787,6 +907,12 @@ printf 'exit 89\n' >>"$TMP/settings-trusted/.agents/skills/orch/scripts/lib/over
 for row in 'absent|absent' 'parser-update|install' 'first-install|install' 'token-absence|install'; do
   IFS='|' read -r name ORCH_MODE <<<"$row"
   reset_default
+  if [ "$name" = absent ]; then
+    # A consumer without orch still gets its committed settings scanned.
+    printf 'PR_REVIEW_GATE = "on"\nSECOND_OPINION_CODEX_CMD = "codex exec -m gpt-6-astra"\n' >>"$repo/kendex.settings.toml"
+    commit "$repo"
+    git -C "$repo" push -q origin main
+  fi
   if [ "$name" = first-install ]; then
     rm -rf -- "$repo/.agents/skills/orch" "$TMP/settings-trusted/.agents/skills/orch"
     commit "$repo"
@@ -796,8 +922,10 @@ for row in 'absent|absent' 'parser-update|install' 'first-install|install' 'toke
   run_refresh "boundary-$name" pass render
   if [ "$name" = absent ]; then
     if [ "$RC" -eq 0 ] && ! grep -qxF '## Settings' "$TMP/state/body" &&
-        grep -qxF "refresh-settings=orch-absent value=$repo/.agents/skills/orch" <<<"$OUT"; then
-      ok 'absent optional orch refreshes without Settings'
+        grep -qxF "refresh-settings=orch-absent value=$repo/.agents/skills/orch" <<<"$OUT" &&
+        grep -qF -- '- <code>PR_REVIEW_GATE</code>' "$TMP/state/body" &&
+        grep -qxF -- '- <code>SECOND_OPINION_CODEX_CMD = &quot;codex exec -m gpt-6-astra&quot;</code>' "$TMP/state/body"; then
+      ok 'absent optional orch refreshes without Settings and still names a retired setting and an Astra pin'
     else bad 'absent optional orch' "$OUT"; fi
   elif [ "$RC" -eq 0 ] && grep -qF 'deprecated entry <code>claude:1:high</code>' "$TMP/state/body"; then
     ok "$name uses the credential-free release parser"
@@ -828,8 +956,7 @@ PY_PARSER_CONTROL
   if [ "$name" = absent ]; then
     # A forced parser block must break the same successful absent-orch row.
     file_edit "$TMP/settings-trusted" .agents/skills/review-gate/scripts/refresh-consumer.sh 1 \
-      '^if \[ -e "\$ROOT/.agents/skills/orch" \]' \
-      's/^if \[ -e "\$ROOT\/\.agents\/skills\/orch" \].*; then$/if true; then # &/'
+      '^  orch=absent$' 's/^  orch=absent$/  orch=present # &/'
     reset_default
     before="$(git --git-dir="$TMP/remote" rev-parse refs/heads/kendex/refresh)" || exit 1
     : >"$TMP/state/calls"
@@ -837,6 +964,19 @@ PY_PARSER_CONTROL
     if refresh_stopped_at_settings "$before" "refresh-error=settings-extraction value=$repo/.agents/skills/orch"; then
       ok 'control: forced parser block breaks absent optional orch'
     else bad 'absent optional orch control' "$OUT"; fi
+    cp "$TMP/boundary-runner" "$runner"
+    # A committed scan run only beside orch drops the same retired row.
+    file_edit "$TMP/settings-trusted" .agents/skills/review-gate/scripts/refresh-consumer.sh 1 \
+      '^if \[ -f kendex\.settings\.toml \]; then$' \
+      's/^if \[ -f kendex\.settings\.toml \]; then$/if [ "$3" = present ] \&\& [ -f kendex.settings.toml ]; then # \&/'
+    reset_default
+    : >"$TMP/state/calls"
+    run_refresh absent-scan-control pass render
+    if [ "$RC" -eq 0 ] && grep -qxF "refresh-settings=orch-absent value=$repo/.agents/skills/orch" <<<"$OUT" &&
+        ! grep -qF -- '<code>PR_REVIEW_GATE</code>' "$TMP/state/body" &&
+        ! grep -qF -- '<code>SECOND_OPINION_CODEX_CMD' "$TMP/state/body"; then
+      ok 'control: a committed scan behind orch turns the absent-orch scan assertion red'
+    else bad 'absent orch committed scan control' "$OUT"; fi
     cp "$TMP/boundary-runner" "$runner"
   fi
 done
@@ -846,7 +986,7 @@ from pathlib import Path
 import sys
 p = Path(sys.argv[1]).resolve()
 s = p.read_text()
-old = '  if ! env -i PATH="$PATH" HOME="$HOME" bash -s -- "$SCRIPT_DIR" "$ROOT" >"$TMP/settings.json" <<\'SETTINGS_PARSE\''
+old = 'if ! env -i PATH="$PATH" HOME="$HOME" bash -s -- "$SCRIPT_DIR" "$ROOT" "$orch" >"$TMP/settings.json" <<\'SETTINGS_PARSE\''
 assert s.count(old) == 1
 changed = s.replace(old, '# ' + old + '\n' + old.replace('env -i ', 'env '))
 assert changed != s
@@ -878,8 +1018,8 @@ for output in noise extra-field empty; do
   else bad "$output parser output refusal" "$OUT"; fi
   if [ "$output" = extra-field ]; then
     file_edit "$TMP/settings-trusted" .agents/skills/review-gate/scripts/refresh-consumer.sh 1 \
-      '^  if \[ "\$settings_lines" -ne 1 \] \|\|' \
-      's/^  if \[ "\$settings_lines" -ne 1 \].*; then$/  if false; then # &/'
+      '^if \[ "\$settings_lines" -ne 1 \] \|\|' \
+      's/^if \[ "\$settings_lines" -ne 1 \].*; then$/if false; then # &/'
     reset_default
     : >"$TMP/state/calls"
     run_refresh malformed-control pass render
