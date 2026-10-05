@@ -52,6 +52,17 @@ use crate::model::{HarnessId, ItemKind, Scope};
 /// and run `kendex apply`. The old managed ignore rule enables that recovery,
 /// and the moved record proves ownership only where its `renderedHash`
 /// matches the destination. Every other destination remains a conflict.
+///
+/// Version 11 gained [`Lock::shims`] without a bump, at two costs to a
+/// build that predates the field. That build drops the field when it
+/// writes the record again, which leaves a later retirement no record of
+/// the shim; where retirement still finds it is
+/// `engine::instruction_shims::recorded_shims`'s, and a build that knows
+/// the field fails the record row of its `kendex verify` by the shim's
+/// name until an apply records it again (`attest::record`). And the older
+/// build's own `kendex verify` lays a record that carries the field out
+/// again without it, so it fails the record row as not laid out as kendex
+/// writes it until the verifying build is one that knows the field.
 pub const LOCK_VERSION: u32 = 11;
 
 /// The lock file a project scope carries, committed with the renders it
@@ -87,6 +98,34 @@ pub struct Lock {
     /// A lock written before this was recorded simply has none.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub bundles: BTreeMap<String, BundleRev>,
+    /// The instruction shims this scope keeps as a key in a settings
+    /// document whose other keys are the person's, written by a pass or
+    /// found already in sync while the harness was installed. A key has no
+    /// bytes of its own to prove whose it is; how the retirement and the
+    /// commit offer read this record is
+    /// `engine::instruction_shims::recorded_shims`'s.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub shims: BTreeSet<KeyedShim>,
+}
+
+/// One instruction shim written as a key into a document whose other keys
+/// are the person's. Where that document sits follows from the scope, as a
+/// hook registration's registry does, so the record names no path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Type)]
+#[serde(rename_all = "kebab-case")]
+pub enum KeyedShim {
+    /// `context.fileName` in the project's Gemini settings, naming
+    /// `AGENTS.md` beside Gemini's own default file.
+    GeminiContextFile,
+}
+
+impl KeyedShim {
+    /// The shim as the record spells it, for a reader naming it.
+    pub fn spelled(self) -> &'static str {
+        match self {
+            KeyedShim::GeminiContextFile => "gemini-context-file",
+        }
+    }
 }
 
 /// One source's resolution at the last write.
