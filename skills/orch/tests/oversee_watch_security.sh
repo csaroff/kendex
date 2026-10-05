@@ -236,23 +236,61 @@ assert_eq "$RC|$(events)|$(unread)" "0|none|none" \
 
 # The cause a failed list read is named by, from what gh printed: a missing
 # permission and an alert feature turned off are told apart by GitHub's own
-# words, and any other failure keeps its HTTP status.
+# words, and any other failure keeps its HTTP status. Code or secret scanning
+# turned off, as on a repository without GitHub's paid security products, is
+# off rather than unread: no unread line and no stderr line. Each control row
+# runs a copy with one rule of that choice removed (all: no feature-off is
+# off; any-kind: Dependabot's too; any-cause: every paid-kind failure) and
+# shows the line that rule keeps or drops.
+SECURITY_CAUSE_MUTANTS="$TMP_ROOT/security-cause"
+for mutant in all any-kind any-cause; do
+  lib="$(mutant_scripts "security-cause/$mutant/orch" lib/security-alerts.sh)/lib/security-alerts.sh" || exit 1
+  ln -s "$REPO_ROOT/skills/github" "$SECURITY_CAUSE_MUTANTS/$mutant/github"
+  case "$mutant" in
+    all) mutate_file "$lib" '[[ "$cause" == feature-off && "$kind" != dependabot ]] ||' 'false ||' ;;
+    any-kind) mutate_file "$lib" '[[ "$cause" == feature-off && "$kind" != dependabot ]] ||' '[[ "$cause" == feature-off ]] ||' ;;
+    any-cause) mutate_file "$lib" '[[ "$cause" == feature-off && "$kind" != dependabot ]] ||' '[[ "$kind" != dependabot ]] ||' ;;
+  esac
+done
 for row in \
-  "dependabot|$HTTP_403|permission" \
-  "code-scanning|gh: Resource not accessible by personal access token (HTTP 403)|permission" \
-  "dependabot|gh: Dependabot alerts are disabled for this repository. (HTTP 403)|feature-off" \
-  "secret-scanning|gh: Secret scanning is disabled on this repository. (HTTP 404)|feature-off" \
-  "code-scanning|gh: GitHub Code Security or GitHub Advanced Security is not enabled (HTTP 403)|feature-off" \
-  "code-scanning|gh: Advanced Security must be enabled for this repository to use code scanning. (HTTP 403)|feature-off" \
-  "code-scanning|gh: no analysis found (HTTP 404)|feature-off" \
-  "code-scanning|gh: You have exceeded a secondary rate limit. (HTTP 403)|http-403" \
-  "secret-scanning|gh: Bad Gateway (HTTP 502)|http-502"; do
-  IFS='|' read -r kind text cause <<<"$row"
+  "|dependabot|$HTTP_403|permission" \
+  "|code-scanning|gh: Resource not accessible by personal access token (HTTP 403)|permission" \
+  "|dependabot|gh: Dependabot alerts are disabled for this repository. (HTTP 403)|feature-off" \
+  "|secret-scanning|gh: Secret scanning is disabled on this repository. (HTTP 404)|off" \
+  "|code-scanning|gh: GitHub Code Security or GitHub Advanced Security is not enabled (HTTP 403)|off" \
+  "|code-scanning|gh: Advanced Security must be enabled for this repository to use code scanning. (HTTP 403)|off" \
+  "|code-scanning|gh: no analysis found (HTTP 404)|off" \
+  "|code-scanning|gh: You have exceeded a secondary rate limit. (HTTP 403)|http-403" \
+  "|secret-scanning|gh: Bad Gateway (HTTP 502)|http-502" \
+  "all|secret-scanning|gh: Secret scanning is disabled on this repository. (HTTP 404)|feature-off" \
+  "any-kind|dependabot|gh: Dependabot alerts are disabled for this repository. (HTTP 403)|off" \
+  "any-cause|code-scanning|gh: Resource not accessible by personal access token (HTTP 403)|off"; do
+  IFS='|' read -r mutant kind text cause <<<"$row"
   new_case security_cause
   printf '%s\n' "$text" > "$STUB_DIR/$kind-fail"
-  run --
-  assert_eq "$RC|$(unread)" "0|EVENT security-alerts-unread reads=owner/repo/$kind:$cause" "$text is cause $cause" "$ERR"
+  watch="$REPO_ROOT/skills/orch/scripts/oversee-watch"
+  [[ -z "$mutant" ]] || watch="$SECURITY_CAUSE_MUTANTS/$mutant/orch/scripts/oversee-watch"
+  WATCH_BIN="$watch" run --
+  want="EVENT security-alerts-unread reads=owner/repo/$kind:$cause|1"
+  [[ "$cause" != off ]] || want="none|0"
+  assert_eq "$RC|$(unread)|$(grep -c '^oversee-watch: security-alerts-read-failed ' "$ERR" || true)" "0|$want" \
+    "${mutant:+control $mutant: }$text is ${cause/#off/off, not unread}" "$ERR"
 done
+
+# A scanning feature turned off keeps the rows reported before it, so its
+# alert is not news when the feature comes back on; while off, the other
+# lists are still read.
+new_case security_feature_off_rows
+one_of_each
+run --
+printf 'gh: Advanced Security must be enabled for this repository to use code scanning. (HTTP 403)\n' > "$STUB_DIR/code-scanning-fail"
+printf '[%s,%s]\n' "$DEPENDABOT" "$DEPENDABOT_DEV" > "$STUB_DIR/dependabot.json"
+run --
+off="$RC|$(events)|$(unread)"
+rm -f -- "${STUB_DIR:?}/code-scanning-fail"
+run --
+assert_eq "$off|$RC|$(events)|$(unread)" "0|$LINE_DEPENDABOT_DEV|none|0|none|none" \
+  "code scanning turned off keeps its rows, and its alert is not news once it is back on" "$ERR"
 
 # Refusals of a list's content: a line with no whole number, and a value with
 # white space in it, are an unread list, never an empty one.
