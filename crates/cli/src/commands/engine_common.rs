@@ -39,7 +39,7 @@ pub fn print_synced(synced: &kendex_core::remote::Synced) {
 }
 
 /// The pass a writing verb closes on; the call sites are the list and
-/// `docs/architecture/trash.md` § Boundaries owns it. The trash is brought
+/// `docs/architecture/trash.md` § Rules owns it. The trash is brought
 /// within its bounds (`kendex_core::trash::retain`) once the verb's own
 /// writes are done, and what went is said in the verb's own output, so a
 /// person who never runs `kendex trash` still learns that kendex is
@@ -84,6 +84,19 @@ pub fn print_report(
     blocked
 }
 
+/// Whether a warning's message is a protocol line that opens with its own
+/// target as the key. Such a line is read from its first byte by another
+/// program — the consumer refresh report (KEN-2797) forwards every
+/// `kendex refresh` line opening `doc-drift-check: ` from a `2>&1`
+/// capture — so it prints bare in both looks, as `run_model_warning`
+/// prints its line: no `warning: ` key, no glyph, no indent and no second
+/// target in front of it.
+pub(super) fn keyed_by_target(target: &str, message: &str) -> bool {
+    message
+        .strip_prefix(target)
+        .is_some_and(|rest| rest.starts_with(": "))
+}
+
 /// Per-item warnings belong to the attention report, including a compact
 /// refresh, rather than the operation list a compact refresh omits.
 pub(super) fn warning_lines(
@@ -99,7 +112,10 @@ pub(super) fn warning_lines(
             Some(harness) => format!("{} ({})", warning.name, harness.display_name()),
             None => warning.name.clone(),
         };
-        lines.extend(style.report_warning(&format!("{target}: {}", warning.message)));
+        match keyed_by_target(&target, &warning.message) {
+            true => lines.push(ui::escaped(&warning.message)),
+            false => lines.extend(style.report_warning(&format!("{target}: {}", warning.message))),
+        }
         if let Some(fix) = &warning.remediation {
             lines.extend(style.report_detail(&[Span::Prose("fix: "), Span::Prose(fix)], "  "));
         }

@@ -23,9 +23,6 @@ LINEAR_TEAM_PREFIX = "KEN"
 # such an issue is invisible to agent routing. Empty = guard off.
 LINEAR_AGENT_LABELS = "agent:maintainer, agent:researcher, agent:multi, agent:human, agent:runtime, agent:rust, agent:iced, agent:frontend, agent:swift"
 
-# Catalog source ceiling; harness renders use the generated inventory exemption.
-DOC_LIMITS_CLASSES = "agents/*.md=5k"
-
 # Non-empty makes `issues create` hold the presence half of the creation bar
 # in the project-management skill's SKILL.md, § Disposition → **Name what
 # reaches it**: it refuses a body with no `Reached by:` line, and a
@@ -221,7 +218,7 @@ REVIEW_GATE_STANDARD_CONTEXTS = "CI"
 
 # The bypass actors this organization's standard admits, as TYPE:ID:MODE
 # (docs/decisions/D013-admin-merge-green-prs.md, and the overseer app of
-# docs/plans/review-gate-platform.md § Copilot-down fallback): on the merge
+# the KEN-2067 design note § Copilot-down fallback, attached to that issue): on the merge
 # queue ruleset the lanes app, always, and the overseer app in pull-request
 # mode; on the required checks ruleset the overseer app alone.
 REVIEW_GATE_STANDARD_QUEUE_BYPASS = "Integration:4925608:always;Integration:5115517:pull_request"
