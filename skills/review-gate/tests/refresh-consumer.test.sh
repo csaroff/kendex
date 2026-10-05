@@ -108,7 +108,11 @@ case "$1" in
       done
     fi
     ;;
-  verify) [ "$TEST_VERIFY" = pass ] ;;
+  # A hand-deleted declaration's file stays after refresh; apply removes it.
+  apply)
+    [ "${TEST_APPLY_EXIT:-0}" -eq 0 ] || exit "$TEST_APPLY_EXIT"
+    rm -f -- .claude/hooks/leftover.sh ;;
+  verify) [ ! -e .claude/hooks/leftover.sh ] && [ "$TEST_VERIFY" = pass ] ;;
   *) exit 2 ;;
 esac
 SH
@@ -597,6 +601,70 @@ reset_default
 run_refresh bad-verify fail render
 after="$(git --git-dir="$TMP/remote" rev-parse refs/heads/kendex/refresh)"
 if [ "$RC" -ne 0 ] && [ "$after" = "$first" ]; then ok 'bad-verify refuses before push'; else bad 'bad-verify refuses before push' "$OUT"; fi
+# A declaration deleted from kendex.toml by hand leaves a file refresh keeps
+# and verify fails on. The runner's apply after refresh removes it, so the
+# deletion lands in the rolling pull request before the verify that gates
+# publication; the control drops the apply. A failed apply stops the run before
+# publication; its control drops the refusal.
+cp "$runner" "$TMP/apply-runner"
+for row in apply apply-control apply-failure apply-failure-control; do
+  reset_default
+  cp "$TMP/apply-runner" "$runner"
+  case "$row" in
+    apply | apply-control)
+      mkdir -p "$repo/.claude/hooks"
+      printf 'leftover\n' >"$repo/.claude/hooks/leftover.sh" ;;
+    *) rm -f -- "${repo:?}/.claude/hooks/leftover.sh" ;;
+  esac
+  case "$row" in
+    apply-control)
+      file_edit "$repo" .agents/skills/review-gate/scripts/refresh-consumer.sh 1 \
+        '^kendex apply --scope project --yes --leave' 's/^kendex apply /: # &/' ;;
+    apply-failure-control)
+      file_edit "$repo" .agents/skills/review-gate/scripts/refresh-consumer.sh 1 \
+        'refresh-error=apply' '/refresh-error=apply/{n;s/exit 1/: # exit 1/;}' ;;
+  esac
+  commit "$repo"
+  git -C "$repo" push -q origin main
+  before="$(git --git-dir="$TMP/remote" rev-parse refs/heads/kendex/refresh)" || exit 1
+  : >"$TMP/state/calls"
+  : >"$TMP/state/kendex"
+  case "$row" in apply-failure*) APPLY_EXIT=5 ;; esac
+  run_refresh "apply-$row" pass render
+  unset APPLY_EXIT
+  after="$(git --git-dir="$TMP/remote" rev-parse refs/heads/kendex/refresh)" || exit 1
+  # The kendex calls in order, without their arguments.
+  calls="$(awk '{ print $1 }' "$TMP/state/kendex" | tr '\n' ' ')"
+  case "$row" in
+    apply)
+      if [ "$RC" -eq 0 ] && [ "$calls" = 'refresh apply verify --version ' ] &&
+          grep -qxF 'apply --scope project --yes --leave' "$TMP/state/kendex" &&
+          [ "$after" != "$before" ] &&
+          ! git --git-dir="$TMP/remote" cat-file -e refs/heads/kendex/refresh:.claude/hooks/leftover.sh 2>/dev/null; then
+        ok 'apply after refresh removes a leftover in the rolling pull request before the gating verify'
+      else bad 'leftover apply' "$OUT"; fi ;;
+    apply-control)
+      if [ "$RC" -ne 0 ] && [ "$after" = "$before" ] &&
+          ! grep -qE '^api --method (POST|PATCH)|^pr merge ' "$TMP/state/calls"; then
+        ok 'control: a runner without the apply fails verify on the leftover and publishes nothing'
+      else bad 'apply control' "$OUT"; fi ;;
+    apply-failure)
+      if [ "$RC" -eq 1 ] && grep -qxF 'refresh-error=apply value=5' <<<"$OUT" &&
+          [ "$calls" = 'refresh apply ' ] && [ "$after" = "$before" ] &&
+          ! grep -qE '^git push$|^api --method (POST|PATCH)|^pr merge ' "$TMP/state/calls"; then
+        ok 'a failed apply stops the run before publication'
+      else bad 'apply failure' "$OUT"; fi ;;
+    apply-failure-control)
+      if [ "$RC" -eq 0 ] && [ "$after" != "$before" ]; then
+        ok 'control: a dropped apply refusal publishes'
+      else bad 'apply refusal control' "$OUT"; fi ;;
+  esac
+done
+reset_default
+cp "$TMP/apply-runner" "$runner"
+rm -f -- "${repo:?}/.claude/hooks/leftover.sh"
+commit "$repo"
+git -C "$repo" push -q origin main
 # The body must update with the current class, including when the rolling
 # tree is unchanged. Every class arms the head it published; each row starts
 # unarmed, so an arm a previous row left cannot answer for it.
