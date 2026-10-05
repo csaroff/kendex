@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use kendex_core::engine::PlanOptions;
 use kendex_core::env::Env;
 use kendex_core::manifest::ManifestFile;
 use kendex_core::model::Scope;
@@ -108,11 +109,16 @@ fn updatable(row: &&Row) -> bool {
 /// The declared packages `settle_scope` would install in this scope, read
 /// the way it reads them and writing nothing: what a verb shows before it
 /// asks for the yes that lets the settle write, and the names it then
-/// hands the settle.
-pub fn pending_settle(env: &Env, scope: &Scope) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+/// hands the settle. `options` are the verb's plan options, so each
+/// package is read at the commit that plan reads it at.
+pub fn pending_settle(
+    env: &Env,
+    scope: &Scope,
+    options: &PlanOptions,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let settings = settings::load(env)?;
     let (root, other_roots) = pi_ext::paired_roots(env, &settings, scope);
-    Ok(settleable(env, scope, &root, &other_roots)?
+    Ok(settleable(env, scope, &root, &other_roots, options)?
         .into_iter()
         .filter_map(|(name, settlement)| match settlement {
             Settlement::Copy(_) => Some(name),
@@ -126,10 +132,11 @@ pub fn pending_settle(env: &Env, scope: &Scope) -> Result<Vec<String>, Box<dyn s
 pub(super) fn deferred_settle(
     env: &Env,
     scope: &Scope,
+    options: &PlanOptions,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let settings = settings::load(env)?;
     let (root, other_roots) = pi_ext::paired_roots(env, &settings, scope);
-    Ok(settleable(env, scope, &root, &other_roots)?
+    Ok(settleable(env, scope, &root, &other_roots, options)?
         .into_iter()
         .filter_map(|(name, settlement)| match settlement {
             Settlement::Copy(_) => None,
@@ -155,11 +162,12 @@ pub fn settle_scope(
     env: &Env,
     scope: &Scope,
     names: &[String],
+    options: &PlanOptions,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let settings = settings::load(env)?;
     let (root, other_roots) = pi_ext::paired_roots(env, &settings, scope);
     let _guard = kendex_core::apply::lock_scopes_for_write(env, std::slice::from_ref(scope))?;
-    let rows = settleable(env, scope, &root, &other_roots)?
+    let rows = settleable(env, scope, &root, &other_roots, options)?
         .into_iter()
         .filter(|(name, _)| names.contains(name))
         .filter_map(|(name, settlement)| match settlement {
@@ -179,7 +187,7 @@ pub fn settle_scope(
         notes: Vec::new(),
         shadows: pi_ext::ShadowScan::default(),
     };
-    Ok(install_rows(env, &plan)?.count)
+    Ok(install_rows(env, &plan, options)?.count)
 }
 
 /// What a settle may install, decided once and here: a declared package
@@ -201,12 +209,14 @@ pub fn settle_scope(
 /// bytes differ from the source, which a lockless scope refuses to record
 /// rather than replaces; and one whose metadata will not read, resolve or
 /// compare is left as it stands: no read of one package stops the scope,
-/// only the record's.
+/// only the record's. Each package's source is read at the commit a plan
+/// under `options` reads it at.
 fn settleable(
     env: &Env,
     scope: &Scope,
     root: &Path,
     other_roots: &[PathBuf],
+    options: &PlanOptions,
 ) -> Result<Vec<(String, Settlement)>, Box<dyn std::error::Error>> {
     let Ok(ManifestFile::Current(manifest)) = manifest::load(&manifest::manifest_path(env, scope))
     else {
@@ -216,6 +226,7 @@ fn settleable(
         return Ok(Vec::new());
     }
     let lock = kendex_core::lock::load(&kendex_core::lock::lock_path(env, scope))?;
+    let manifest = kendex_core::engine::held_declarations(&manifest, &lock, options);
     let mut found = Vec::new();
     for (name, decl) in &manifest.pi_extensions {
         let key = kendex_core::lock::entry_key(
@@ -520,7 +531,7 @@ fn update(env: &Env, plans: &[ScopePlan]) -> CliResult {
     let mut updated = 0usize;
     let mut failures: Vec<String> = Vec::new();
     for plan in plans {
-        let installed = install_rows(env, plan)?;
+        let installed = install_rows(env, plan, &PlanOptions::default())?;
         updated += installed.count;
         failures.extend(
             installed
@@ -554,13 +565,21 @@ struct Installed {
 /// Install every row the plan marks stale or missing, recording each
 /// install as it completes and, once every one landed, the declared
 /// packages the scope already held. A failed install keeps its provenance
-/// and no completion, so the next pass finds it stale again.
-fn install_rows(env: &Env, plan: &ScopePlan) -> Result<Installed, Box<dyn std::error::Error>> {
+/// and no completion, so the next pass finds it stale again. The record
+/// compares each package with its source read at the commit a plan under
+/// `options` reads it at, the commit the plan's rows were installed from.
+fn install_rows(
+    env: &Env,
+    plan: &ScopePlan,
+    options: &PlanOptions,
+) -> Result<Installed, Box<dyn std::error::Error>> {
     let mut installed = Installed {
         count: 0,
         failed: Vec::new(),
     };
-    let manifest = kendex_core::engine::ops::manifest_for_reading(env, &plan.scope)?;
+    let declared = kendex_core::engine::ops::manifest_for_reading(env, &plan.scope)?;
+    let lock = kendex_core::lock::load(&kendex_core::lock::lock_path(env, &plan.scope))?;
+    let manifest = kendex_core::engine::held_declarations(&declared, &lock, options);
     for row in &plan.rows {
         let (source_dir, verb) = match &row.status {
             Status::Stale { source_dir } => (source_dir, "updated"),
@@ -574,7 +593,7 @@ fn install_rows(env: &Env, plan: &ScopePlan) -> Result<Installed, Box<dyn std::e
         pi_ext::clear_install_completion(env, &plan.scope, &row.name)?;
         match pi_ext::install(env, &plan.root, source_dir, decl.enabled) {
             Ok(outcome) => {
-                record_pi_installs(env, plan, Some(&row.name))?;
+                record_pi_installs(env, plan, &manifest, Some(&row.name))?;
                 installed.count += 1;
                 out(&format!(
                     "  {verb} {} -> {}",
@@ -595,7 +614,7 @@ fn install_rows(env: &Env, plan: &ScopePlan) -> Result<Installed, Box<dyn std::e
         }
     }
     if installed.failed.is_empty() {
-        record_pi_installs(env, plan, None)?;
+        record_pi_installs(env, plan, &manifest, None)?;
     }
     Ok(installed)
 }
@@ -631,19 +650,21 @@ fn offer_to_commit(env: &Env, plans: &[ScopePlan]) -> CliResult {
     Ok(())
 }
 
-fn record_pi_installs(env: &Env, plan: &ScopePlan, completed: Option<&str>) -> CliResult {
-    let Some(manifest) = manifest::load_current(&manifest::manifest_path(env, &plan.scope))? else {
-        return Ok(());
-    };
+fn record_pi_installs(
+    env: &Env,
+    plan: &ScopePlan,
+    manifest: &manifest::Manifest,
+    completed: Option<&str>,
+) -> CliResult {
     let path = kendex_core::lock::lock_path(env, &plan.scope);
     let mut lock = kendex_core::lock::load(&path)?;
     let before = lock.clone();
     let drift = match completed {
-        Some(name) => pi_ext::record_matching_name(env, &plan.scope, &manifest, &mut lock, name)?,
+        Some(name) => pi_ext::record_matching_name(env, &plan.scope, manifest, &mut lock, name)?,
         None => pi_ext::record_matching_manifest(
             env,
             &plan.scope,
-            &manifest,
+            manifest,
             &mut lock,
             pi_ext::RecordBasis::Recorded,
             None,

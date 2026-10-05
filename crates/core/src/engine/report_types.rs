@@ -555,8 +555,9 @@ pub struct PlanOptions {
     /// entries record, so a sibling follower does not move as a side
     /// effect. A package the lock cannot place (never installed, or
     /// installations disagreeing on their commit) resolves fresh, which
-    /// is what a whole-scope apply does for it anyway. Refresh and the
-    /// whole-scope apply never set this.
+    /// is what a whole-scope apply does for it anyway. The whole-scope
+    /// apply never sets this, and refresh sets it only as
+    /// [`PlanOptions::locked`].
     ///
     /// A set of them is one pass, not several: `Update all` over a place
     /// with five followers reconciles the scope once instead of planning,
@@ -570,6 +571,20 @@ pub struct PlanOptions {
     /// add names a set the scope already installs. How far a named item's
     /// exemption reaches is [`Targets::reach`].
     pub update_only: Option<Targets>,
+    /// Keep the record's commit for each source the plan's own reads did
+    /// not resolve at the source's own revision, rather than recording
+    /// what its mirror resolves to now. Under a hold naming no package,
+    /// only a declaration the record cannot place reads there, and its
+    /// source's record moves to what the plan read; every other source
+    /// keeps the record's account of where it sits, unless it is now
+    /// declared at another repository or revision than that account was
+    /// written for. The Pi settle resolves outside the plan, so a Pi
+    /// package the record cannot place installs and records its own entry
+    /// at the source's tip while its source's entry is kept. Only
+    /// [`PlanOptions::locked`] sets this: `verify --at-record` weighs the
+    /// record against where each source resolves now, and reads that off
+    /// the record this pass would write.
+    pub keep_source_records: bool,
     /// The base of the manifest copy this plan reconciles to, where the
     /// manifest arrived whole from an editor rather than being read here.
     /// The plan's manifest write binds its precondition to it, so a file
@@ -655,6 +670,25 @@ impl PlanOptions {
                 reach: Reach::Carriers,
             }),
             ..PlanOptions::default()
+        }
+    }
+
+    /// A plan that names no package: every follower the record can place
+    /// holds at the commit its lock entries record, so a re-render reads
+    /// what is installed; one it cannot place resolves fresh, as
+    /// [`PlanOptions::update_only`] says. What `verify --at-record` checks
+    /// against.
+    pub fn at_record() -> Self {
+        PlanOptions::for_packages([])
+    }
+
+    /// [`PlanOptions::at_record`] for a write: the record also keeps where
+    /// it says each source sits, so a re-render of a project-side change
+    /// moves no catalog the record places. What `refresh --locked` writes.
+    pub fn locked() -> Self {
+        PlanOptions {
+            keep_source_records: true,
+            ..PlanOptions::at_record()
         }
     }
 
