@@ -5,6 +5,7 @@
 #![cfg(unix)]
 
 use crate::test_util;
+use test_util::rooted;
 
 use std::fs;
 use std::path::Path;
@@ -141,6 +142,69 @@ fn a_declared_marketplace_indexes_metadata_and_bundles() {
             .any(|m| m["kind"] == "skill" && m["name"] == "gh"),
         "{json}"
     );
+}
+
+/// Every package carries the tools that never run it, the tools that take
+/// it only as advice, and the tools where a fallback does a hook's job,
+/// computed by core from its kind and, for a hook, its own header: the
+/// fields the community directory renders.
+#[test]
+#[allow(clippy::unwrap_used)]
+fn each_package_carries_its_unsupported_and_advisory_tools() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = rooted(&tmp);
+    let root = home.join("cat");
+    fs::create_dir_all(root.join("hooks")).unwrap();
+    fs::create_dir_all(root.join("mcp")).unwrap();
+    skill(&root, "gh", "");
+    // The index cuts a description at 500 characters; the tool sentences
+    // sit past that cut, where only the whole header text reaches them.
+    let filler = "It reads the payload before the call. ".repeat(14);
+    assert!(filler.len() > 500, "the filler reaches past the cut");
+    fs::write(
+        root.join("hooks/guard.sh"),
+        format!(
+            "#!/usr/bin/env bash\n# ---\n# name: guard\n# event: PreToolUse\n\
+             # description: Guard. {filler}Not run on pi: its payload is unmeasured. \
+             On codex: a watcher reads its pane instead.\n\
+             # harnesses: [claude, codex, opencode, gemini, copilot]\n# ---\nexit 0\n"
+        ),
+    )
+    .unwrap();
+    fs::write(root.join("mcp/gh.toml"), "command = \"gh-mcp\"\n").unwrap();
+    fs::write(root.join("kendex.toml"), "[catalog]\n").unwrap();
+
+    let json = index_json(&home, &root);
+    let packages = json["packages"].as_array().unwrap();
+    let package = |kind: &str, name: &str| {
+        packages
+            .iter()
+            .find(|p| p["kind"] == kind && p["name"] == name)
+            .unwrap_or_else(|| panic!("{kind} {name} is indexed: {json}"))
+    };
+    let skill = package("skill", "gh");
+    assert_eq!(skill["unsupported"], serde_json::json!([]));
+    assert_eq!(skill["advisory"], serde_json::json!([]));
+    let server = package("mcp-server", "gh");
+    assert_eq!(
+        server["unsupported"],
+        serde_json::json!([{ "tool": "pi", "reason": null }])
+    );
+    let hook = package("hook", "guard");
+    assert_eq!(
+        hook["unsupported"],
+        serde_json::json!([
+            { "tool": "cursor", "reason": null },
+            { "tool": "pi", "reason": "its payload is unmeasured" },
+            { "tool": "antigravity", "reason": null },
+        ])
+    );
+    assert_eq!(hook["advisory"], serde_json::json!(["opencode"]));
+    assert_eq!(
+        hook["fallback"],
+        serde_json::json!([{ "tool": "codex", "reason": "a watcher reads its pane instead" }])
+    );
+    assert_eq!(skill["fallback"], serde_json::json!([]));
 }
 
 /// The invariant the directory rests on: what the summary says a

@@ -13,6 +13,7 @@ use crate::error::{CoreError, Result};
 use crate::manifest::Manifest;
 use crate::model::{HarnessId, ItemKind, Scope};
 use crate::paths::slashed;
+use crate::source::header::{InstalledFrom, installed_text};
 use crate::source_read::{ItemBytes, SealedSource};
 
 /// One file inside the package, path relative to the package root with
@@ -55,6 +56,11 @@ pub struct PackageMeta {
     pub enabled: bool,
     pub fork: Option<crate::manifest::ForkProvenance>,
     pub catalog: Option<CatalogGroupMeta>,
+    /// The tools the package runs on ([`super::support`]), a hook's read
+    /// from its own header at the installed revision. Best effort: a header
+    /// that cannot be read there says why, and the rest of the record
+    /// stands.
+    pub support: super::support::RecordSupport,
 }
 
 /// The sealed root and item path the declaration reads right now — its own
@@ -263,6 +269,24 @@ pub fn package_meta(env: &Env, scope: &Scope, kind: ItemKind, name: &str) -> Res
         .iter()
         .find_map(|entry| entry.source_commit.clone())
         .map(|commit| labeled_version(env, scope, &manifest, kind, name, commit));
+    // Only a hook declares the tools it runs on in its header; every other
+    // kind is answered by the capability table, with no read to fail.
+    let support = match kind {
+        ItemKind::Hook => {
+            let installed = entries.first().map(|entry| InstalledFrom {
+                source: entry.source.clone(),
+                repo: entry.source_repo.clone(),
+                commit: entry.source_commit.clone(),
+            });
+            match installed_text(env, scope, &manifest, kind, name, installed.as_ref()) {
+                Ok(text) => super::support::tool_support(kind, Some(&text)).into(),
+                Err(cause) => super::support::RecordSupport::Unread {
+                    cause: crate::names::shown(&cause),
+                },
+            }
+        }
+        _ => super::support::tool_support(kind, None).into(),
+    };
     Ok(PackageMeta {
         repo_url: repo.as_deref().and_then(safe_repo_url),
         repo,
@@ -282,6 +306,7 @@ pub fn package_meta(env: &Env, scope: &Scope, kind: ItemKind, name: &str) -> Res
             .cloned(),
         catalog: catalog_meta(env, scope, &manifest, kind, name),
         source: decl.source,
+        support,
     })
 }
 

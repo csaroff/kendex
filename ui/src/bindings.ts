@@ -620,8 +620,10 @@ export const commands = {
 	 *  `None` where nothing is declared under this name — a derived bundle member
 	 *  or dependency, an unmanaged or vendor copy. That is this command's whole
 	 *  half of [`no_managed_package`]: `detail::package_meta` reads a source's
-	 *  repository off the manifest rather than binding to one, so the other
-	 *  variant cannot escape it; that half is [`package_versions`]'s, which does
+	 *  repository off the manifest rather than binding to one, and a hook's
+	 *  header off the source only best effort, a read that fails standing in
+	 *  the record as its cause, so the other variant cannot escape it; that
+	 *  half is [`package_versions`]'s, which does
 	 *  bind. The CLI's own `show` keeps core's refusal either way: it was asked
 	 *  about one package and has nothing else to draw.
 	 */
@@ -640,6 +642,13 @@ export const commands = {
 	enabled: boolean,
 	fork: ForkProvenance_Serialize | null,
 	catalog: CatalogGroupMeta | null,
+	/**
+	 *  The tools the package runs on ([`super::support`]), a hook's read
+	 *  from its own header at the installed revision. Best effort: a header
+	 *  that cannot be read there says why, and the rest of the record
+	 *  stands.
+	 */
+	support: RecordSupport,
 } | null, string>(__TAURI_INVOKE("package_meta", { scope, kind, name })),
 	/**
 	 *  Every saved item, read against this machine. One read for the whole
@@ -2203,6 +2212,16 @@ export type Excluded = {
 	why: string,
 };
 
+/**  One tool that runs a hook while a fallback there does the hook's job. */
+export type FallbackTool = {
+	tool: HarnessId,
+	/**
+	 *  The hook's own `On <id>: <reason>.` sentence naming the fallback,
+	 *  control characters shown rather than acted on.
+	 */
+	reason: string,
+};
+
 /**
  *  What this action does to the file, read from the operations it will
  *  run rather than from what happens to sit on disk. A person pressing a
@@ -3680,6 +3699,13 @@ export type PackageMeta_Deserialize = {
 	enabled: boolean,
 	fork: ForkProvenance_Deserialize | null,
 	catalog: CatalogGroupMeta | null,
+	/**
+	 *  The tools the package runs on ([`super::support`]), a hook's read
+	 *  from its own header at the installed revision. Best effort: a header
+	 *  that cannot be read there says why, and the rest of the record
+	 *  stands.
+	 */
+	support: RecordSupport,
 };
 
 export type PackageMeta_Serialize = {
@@ -3697,6 +3723,13 @@ export type PackageMeta_Serialize = {
 	enabled: boolean,
 	fork: ForkProvenance_Serialize | null,
 	catalog: CatalogGroupMeta | null,
+	/**
+	 *  The tools the package runs on ([`super::support`]), a hook's read
+	 *  from its own header at the installed revision. Best effort: a header
+	 *  that cannot be read there says why, and the rest of the record
+	 *  stands.
+	 */
+	support: RecordSupport,
 };
 
 /**
@@ -3770,6 +3803,21 @@ export type PackagePreview = {
 	 */
 	state: InstallState,
 	collision: string | null,
+	/**
+	 *  The tools that never run the package, from its own header
+	 *  ([`crate::package::support`]).
+	 */
+	unsupported: UnsupportedTool[],
+	/**
+	 *  The tools that take the package, a hook, only as instructions the
+	 *  model may ignore. Not in `unsupported`.
+	 */
+	advisory: HarnessId[],
+	/**
+	 *  The tools that run the package, a hook, while a fallback there does
+	 *  its job. Not in `unsupported`.
+	 */
+	fallback: FallbackTool[],
 };
 
 /**
@@ -4225,6 +4273,21 @@ export type Reach =
  *  at all. `why` is the whole reason, from whichever reader judged it.
  */
 { at: "unavailable"; why: string };
+
+/**  What an installed package's record says about the tools it runs on. */
+export type RecordSupport = 
+/**
+ *  [`ToolSupport`], read from the package's own header at the
+ *  installed revision, or from the capability table alone for a kind
+ *  that declares nothing.
+ */
+{ state: "read"; unsupported: UnsupportedTool[]; advisory: HarnessId[]; fallback: FallbackTool[] } | 
+/**
+ *  The hook's header could not be read at the installed revision, so
+ *  nothing says which tools run it. `cause` is why, control characters
+ *  shown rather than acted on.
+ */
+{ state: "unread"; cause: string };
 
 /**  A step that did not go through. */
 export type Refused = {
@@ -5567,6 +5630,18 @@ export type Unsubscribed_Deserialize = {
  */
 export type Unsubscribed_Serialize = {
 	undone?: string[],
+};
+
+/**  One tool the package does not run on. */
+export type UnsupportedTool = {
+	tool: HarnessId,
+	/**
+	 *  Why, in the package's own words where it states them: a hook's
+	 *  `Not run on <id>: <reason>.` sentence, control characters shown
+	 *  rather than acted on ([`crate::names::shown`]). `None` where nothing
+	 *  states one, as for a kind the tool takes no package of.
+	 */
+	reason: string | null,
 };
 
 /**  One declared package's update standing. */

@@ -89,6 +89,7 @@ const META: PackageMeta_Serialize = {
   enabled: true,
   fork: null,
   catalog: null,
+  support: { state: "read", unsupported: [], advisory: [], fallback: [] },
 };
 
 /** One place's answer, as the command gives it. `declares` false is the
