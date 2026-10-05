@@ -88,6 +88,15 @@ outputs:
   change_class:
     description: render, trivial, micro, small or standard.
     value: ${{ steps.classify.outputs.change_class }}
+  queue_only:
+    description: >-
+      true where the change must run in a merge group before it lands, false
+      where it need not: the value of the shipped change-class's
+      `queue-only:` line, which github.sh pr-merge asks again before the
+      admin route. Empty where the classifier root predates this
+      output, and where the step failed, whose wiring error is the answer;
+      read empty as true.
+    value: ${{ steps.classify.outputs.queue_only }}
   docs_only:
     description: >-
       true where the shipped harness-only --mode docs accepts every changed
@@ -144,12 +153,11 @@ outputs:
     value: ${{ steps.classify.outputs.proof_record }}
   lane_verdicts:
     description: >-
-      One lane_<name>=true|false line per lane the declaration names: false
-      wherever lanes is false; otherwise true where a changed path matches
-      one of the lane's globs, true for every lane where a changed path no
-      lane claims is outside the docs set or where no changed path was read,
-      and false everywhere else. Empty where no declaration was read. A workflow republishes the lines as step outputs of its
-      own, since a composite action publishes only the outputs it declares.
+      One lane_<name>=true|false line per lane the declaration names, decided
+      as skills/harness-ci/references/wiring.md § Per-lane verdicts sets out.
+      Empty where no declaration was read. A workflow republishes the lines as
+      step outputs of its own, since a composite action publishes only the
+      outputs it declares.
     value: ${{ steps.classify.outputs.lane_verdicts }}
   changed_skills:
     description: Blank-separated first path segments under skills/ the diff touched.
