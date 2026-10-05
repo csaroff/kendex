@@ -427,8 +427,10 @@ repo_root() {
   git rev-parse --show-toplevel
 }
 EOF
+mkdir -p "$R/pkg/scripts/lib"
+cp "$R/scripts/lib/common.sh" "$R/pkg/scripts/lib/common.sh"
 run_pf
-clean "a new sourced lib without a strict-mode preamble is not a finding" 1
+clean "a new sourced lib without a strict-mode preamble, at the root or nested, is not a finding" 2
 
 echo "=== control: the same bytes executed, and real fail-open shapes inside a lib, still fail ==="
 cp "$R/scripts/lib/common.sh" "$R/scripts/common.sh"
@@ -440,6 +442,37 @@ fires "the same bytes outside a lib tree still fail" "scripts/common.sh:0: [fail
 fires "an executable file in a lib tree is a program and still fails" "scripts/lib/runnable.sh:0: [fail-open]"
 fires "a swallowed status inside a sourced lib still fails" "scripts/lib/common.sh:6: [fail-open]"
 fires "an unchecked mktemp inside a sourced lib still fails" "scripts/lib/common.sh:7: [fail-open]"
+
+echo "=== a project setting names its own sourced-library trees ==="
+seed sourcedlibsetting
+mkdir -p "$R/tools/lib/sub"
+cat >"$R/tools/lib/owned-root.sh" <<'EOF'
+# shellcheck shell=bash
+# Sourced by the tools beside it: the caller's shell owns the mode.
+owned_root() {
+  git rev-parse --show-toplevel
+}
+EOF
+cp "$R/tools/lib/owned-root.sh" "$R/tools/lib/sub/nested.sh"
+printf '[env]\nPREFLIGHT_SOURCED_LIB_GLOBS = "tools/lib"\n' >"$R/kendex.settings.toml"
+run_pf
+clean "a new non-executable shell file at any depth under a configured tree is not a finding" 3
+
+echo "=== control: the setting replaces the shipped tree and reaches no sibling directory ==="
+mkdir -p "$R/scripts/lib" "$R/tools/libs"
+cp "$R/tools/lib/owned-root.sh" "$R/scripts/lib/common.sh"
+cp "$R/tools/lib/owned-root.sh" "$R/tools/libs/near.sh"
+run_pf
+fires "the shipped scripts/lib tree is no longer exempt, and a sibling directory never was" \
+  "scripts/lib/common.sh:0: [fail-open]" \
+  "tools/libs/near.sh:0: [fail-open]"
+
+echo "=== control: an emptied setting exempts no tree ==="
+printf '[env]\nPREFLIGHT_SOURCED_LIB_GLOBS = ""\n' >"$R/kendex.settings.toml"
+run_pf
+fires "an empty sourced-library set holds every new shell file to the strict-mode shape" \
+  "tools/lib/owned-root.sh:0: [fail-open]" \
+  "scripts/lib/common.sh:0: [fail-open]"
 
 echo "=== a test-<name> suite outside a tests/ tree sets its own rules ==="
 seed toolsuite
