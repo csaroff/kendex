@@ -4,9 +4,12 @@
 # reaches the output; under a diff scope only a finding on an added line
 # counts, and a range judges each commit it holds against that commit's
 # parents; the repository cannot switch a finding off through gitleaks' own
-# allowlists; a missing or too-old gitleaks is a gap notice that passes,
-# except under CI on a range or --all scan; a gitleaks run that fails, or a
-# report the lane cannot read, is exit 2. Each row builds a fresh repository
+# allowlists, nor through its own exclusion list under --policy-root, which
+# still refuses that list or its setting when malformed, and refuses a policy
+# root it cannot enter or that is no git repository; a
+# missing or too-old gitleaks is a gap notice that passes, except under CI on
+# a range or --all scan; a gitleaks run that fails, or a report the lane
+# cannot read, is exit 2. Each row builds a fresh repository
 # and pins the exit status with the first stable line.
 #
 # The credentials are assembled at run time, so this file holds none a scan
@@ -262,6 +265,51 @@ put fixtures/cred.txt "aws = $CRED\n"
 row "a reasoned row in the excludes list passes the path" \
   "rc=0 secrets: summary=violations=0 files=1 scope=staged skipped=0" "$R"
 
+echo "=== --policy-root reads the exclusion policy from that repository, never the judged one ==="
+# CI passes the default branch's checkout, so a pull request that adds a
+# match-everything row, to the default list or to a list its own setting
+# names, is still judged by the default branch's rows.
+repo trusted-policy
+put tools/secrets-excludes "fixtures/*\tfake credentials the suite asserts against\n"
+POLICY="$R"
+while IFS='|' read -r name setting file; do
+  repo "$name"
+  [ -z "$setting" ] || put .kendex/settings.toml "[env]\nCOMMIT_GUARDS_SECRETS_EXCLUDES = \"$file\"\n"
+  put "$file" "*\tthe pull request excludes every path\n"
+  put fixtures/cred.txt "aws = $CRED\n"
+  put cred.txt "aws = $CRED\n"
+  row "$name: under --policy-root the judged repository's row is not read" \
+    "rc=1 secrets: secret=cred.txt:1:aws-access-token" "$R" --policy-root "$POLICY"
+  carries fixtures/cred.txt
+  assert_eq "$name: the policy root's own row still excludes its path" "absent" "$HAS"
+  row "$name: without it the repository's own row governs, as at commit time" \
+    "rc=0 secrets: summary=violations=0 files=0 scope=staged skipped=0" "$R"
+done <<'ROWS'
+own-list||tools/secrets-excludes
+own-setting|yes|tools/pr-excludes
+ROWS
+row "a policy root that cannot be entered refuses" \
+  "rc=2 secrets: policy-root=$TMP/no-checkout" "$R" --policy-root "$TMP/no-checkout"
+NOT_REPO="$TMP/not-a-repo"
+mkdir -p "$NOT_REPO"
+row "a policy root outside any git repository refuses" \
+  "rc=2 secrets: policy-root=$NOT_REPO" "$R" --policy-root "$NOT_REPO"
+
+echo "=== --policy-root still refuses a malformed setting or list in the judged repository ==="
+# Once merged the judged repository's list is the policy root's, so a
+# malformed one would fail every later scan, the repairing pull request's too.
+while IFS='|' read -r name setting list expect; do
+  repo "$name"
+  [ -z "$setting" ] || put .kendex/settings.toml "[env]\nCOMMIT_GUARDS_SECRETS_EXCLUDES = \"$setting\"\n"
+  [ -z "$list" ] || put tools/secrets-excludes "$list"
+  put ok.txt "nothing to see\n"
+  row "$name" "$expect" "$R" --policy-root "$POLICY"
+done <<'ROWS'
+a well-formed judged list is validated and the scan runs||docs/*\tgenerated prose\n|rc=0 secrets: summary=violations=0 files=2 scope=staged skipped=0
+a judged setting the lane cannot use refuses|/abs/excludes||rc=2 secrets: path-absolute=excludes:/abs/excludes
+a judged row without a reason refuses||docs/*\n|rc=2 secrets: exclusion-reason=tools/secrets-excludes:1
+ROWS
+
 echo "=== the tool: missing or too old is a gap outside CI and on --staged, a refusal on a CI range or --all ==="
 NO_TOOL_PATH="$TMP/no-tool-bin"
 mkdir -p "$NO_TOOL_PATH"
@@ -397,6 +445,20 @@ git -C "$MERGE" checkout -q evil
 gg_mutant LANE secrets 'grep -Fxq -- "$COMMIT" "$shallow"' 'grep -Fxq -- "$COMMIT" /dev/null'
 row "control: a shallow boundary read as a root commit judges every line it holds" \
   "rc=1 secrets: secret=key.pem:1:private-key" "$SHALLOW" --against HEAD^1
+# One row per rule of the --policy-root block, its subject and policy root
+# named as fixtures under $TMP. The remedy naming the policy root is prose.
+while IFS='^' read -r label from to subject root expect; do
+  gg_mutant LANE secrets "$from" "$to"
+  row "control: $label" "$expect" "$TMP/$subject" --policy-root "$TMP/$root"
+done <<'ROWS'
+a lane that stays in the judged repository reads its own row^cd -- "$POLICY_ROOT" 2>"$GG_TMP/policy-root.err"^true^own-setting^trusted-policy^rc=0 secrets: summary=violations=0 files=0 scope=staged skipped=0
+a lane that ignores an unenterable policy root reads the judged repository's own row^|| gg_fail_cause policy-root "$POLICY_ROOT" "$GG_TMP/policy-root.err" "cannot enter the policy root"^|| true^own-setting^no-checkout^rc=0 secrets: summary=violations=0 files=0 scope=staged skipped=0
+without the repository check a non-git policy root fails under the wrong key^git rev-parse --show-toplevel >/dev/null 2>"$GG_TMP/policy-root.err"^true^own-setting^not-a-repo^rc=2 secrets: repository-root=1
+a lane that loads no list from the policy root fails the path its row excludes^gg_load_excludes "$EXCLUDES_FILE"^true^excluded^trusted-policy^rc=1 secrets: secret=fixtures/cred.txt:1:aws-access-token
+a lane that never returns to the judged repository scans the policy root and passes^cd -- "$START_DIR" || gg_fail repository-cd^true || gg_fail repository-cd^own-setting^trusted-policy^rc=0 secrets: summary=violations=0 files=1 scope=staged skipped=0
+a lane that skips the judged setting passes its absolute path^JUDGED_EXCLUDES="$(gg_resolve_path "$EXCLUDES_OPT" COMMIT_GUARDS_SECRETS_EXCLUDES "tools/secrets-excludes" excludes)"^JUDGED_EXCLUDES=tools/secrets-excludes^a judged setting the lane cannot use refuses^trusted-policy^rc=0 secrets: summary=violations=0 files=2 scope=staged skipped=0
+a lane that skips the judged list passes its malformed row^gg_load_excludes "$JUDGED_EXCLUDES"^true^a judged row without a reason refuses^trusted-policy^rc=0 secrets: summary=violations=0 files=2 scope=staged skipped=0
+ROWS
 gg_mutant LANE secrets '--config "$GG_TMP/gitleaks.toml"' '--log-level warn'
 row "control: without the config flag the environment's configuration allowlists the path" \
   "rc=0 secrets: summary=violations=0 files=1 scope=staged skipped=0" "$ENV_TOML" "$ENV_CONFIG"
