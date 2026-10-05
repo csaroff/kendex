@@ -545,17 +545,17 @@ fn compute(
                 continue;
             };
             super::catalog::notes(&config, &decl.source, &mut state);
+            // Ahead of the catalog lookup: a carried hook installs nothing.
+            // Its installed copies are stranded, so the sweep takes them the
+            // way it takes a harness dropped from a declaration.
+            if let Some(warning) = retired_hook(kind, name) {
+                state
+                    .processed
+                    .insert((kind, name.clone()), provenance.clone());
+                state.warnings.push(warning);
+                continue;
+            }
             let Some(item_path) = find_item(&sealed, &config, kind, name) else {
-                if let Some(warning) = retired_hook(kind, name) {
-                    // The declaration is accounted for: its installed
-                    // copies are stranded, so the sweep takes them the way
-                    // it takes a harness dropped from a declaration.
-                    state
-                        .processed
-                        .insert((kind, name.clone()), provenance.clone());
-                    state.warnings.push(warning);
-                    continue;
-                }
                 state.mark_incomplete();
                 state
                     .notes
@@ -665,13 +665,11 @@ impl ItemCtx<'_> {
     }
 }
 
-/// The note for a declaration the catalog does not carry. It names what the
-/// source does offer of that kind, so a declaration left on a name the
-/// catalog retired reads its remedy in the line that refuses it.
 /// Hooks the catalog retired that a consumer manifest may still declare.
 /// A declaration naming one is skipped with a warning carrying the manifest
-/// edit, where every other name the catalog does not carry is refused, so a
-/// refresh at that consumer still runs. KEN-2892 removes the route one
+/// edit and derives no companion, whether or not the catalog still carries
+/// the hook, where every other name the catalog does not carry is refused,
+/// so a refresh at that consumer still runs. KEN-2892 removes the route one
 /// minor release after it ships, the owner's ruling for this one route.
 const RETIRED_HOOKS: &[&str] = &["doc-drift-check"];
 
@@ -682,7 +680,7 @@ const RETIRED_HOOKS: &[&str] = &["doc-drift-check"];
 /// refresh report (KEN-2797) forwards every `kendex refresh` line opening
 /// `<hook>: `, and the CLI prints a message keyed by its own name as that
 /// line.
-fn retired_hook(kind: ItemKind, name: &str) -> Option<super::ItemWarning> {
+pub(super) fn retired_hook(kind: ItemKind, name: &str) -> Option<super::ItemWarning> {
     (kind == ItemKind::Hook && RETIRED_HOOKS.contains(&name)).then(|| super::ItemWarning {
         kind,
         name: name.to_owned(),
@@ -694,6 +692,9 @@ fn retired_hook(kind: ItemKind, name: &str) -> Option<super::ItemWarning> {
     })
 }
 
+/// The note for a declaration the catalog does not carry. It names what the
+/// source does offer of that kind, so a declaration left on a name the
+/// catalog retired reads its remedy in the line that refuses it.
 fn not_offered_note(
     sealed: &SealedSource,
     config: &SourceConfig,
