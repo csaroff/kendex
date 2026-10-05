@@ -78,14 +78,23 @@ elif [ "$version" = latest ]; then
   version="$(curl -fsSL "https://api.github.com/repos/$repo/releases/latest" \
     | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1)"
 else
-  version="v${version#v}"
+  # The release workflow tags a main build main-build-N-A-SHA, with no v.
+  case "$version" in
+    main-build-*) ;;
+    *) version="v${version#v}" ;;
+  esac
 fi
 [ -n "$version" ] || { message release-unavailable latest "The latest release could not be resolved." >&2; exit 1; }
 plain="${version#v}"
-record_channel=release
+# A main build names its AppImage after the version it built, which its tag
+# does not carry, so the build's own feed names every download; its command
+# follows the main channel whichever option chose the build.
+case "$version" in
+  rolling-main|main-build-*) main_feed=1; record_channel=main ;;
+  *) main_feed=0; record_channel=release ;;
+esac
 if [ "$git_channel" -eq 1 ]; then
   plain="main"
-  record_channel=main
 fi
 base="https://github.com/$repo/releases/download/$version"
 
@@ -119,7 +128,7 @@ feed_url() {
 command_url="$base/kendex-$target"
 app_url="$base/kendex_${plain}_${appimage_arch:-}.AppImage"
 icon_ref="$version"
-if [ "$git_channel" -eq 1 ]; then
+if [ "$main_feed" -eq 1 ]; then
   pointer="$base/feed.json"
   if ! curl -fSL --proto '=https' -o "$work/feed.json" "$pointer"; then
     message main-pointer-download-failed "$pointer" "The main build pointer could not be downloaded." >&2
@@ -138,6 +147,8 @@ if [ "$git_channel" -eq 1 ]; then
     message main-pointer-invalid commit "The main build pointer has no source commit." >&2
     exit 1
   }
+fi
+if [ "$git_channel" -eq 1 ]; then
   # Until a release commit's own main build publishes, the pointer still
   # names a build from before that release. A build whose version core is
   # behind the installed command's is a downgrade, refused by the rule
