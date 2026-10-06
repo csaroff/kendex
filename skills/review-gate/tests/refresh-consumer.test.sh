@@ -109,7 +109,6 @@ case "$1" in
   refresh)
     : >"$TEST_STATE/refreshed"
     printf '%s\n' "$TEST_CONTENT" >rendered.txt
-    [ -z "${TEST_REFRESH_LINES:-}" ] || printf '%s\n' "$TEST_REFRESH_LINES"
     if [ -n "${TEST_REFRESH_ADDS:-}" ]; then
       mkdir -p "$(dirname "$TEST_REFRESH_ADDS")"
       printf 'added by the refresh\n' >"$TEST_REFRESH_ADDS"
@@ -140,6 +139,7 @@ case "$1" in
     [ "${TEST_APPLY_EXIT:-0}" -eq 0 ] || exit "$TEST_APPLY_EXIT"
     rm -f -- .claude/hooks/leftover.sh ;;
   verify) [ ! -e .claude/hooks/leftover.sh ] && [ "$TEST_VERIFY" = pass ] ;;
+  help) [ "$TEST_LISTS_PRUNE" != yes ] || printf '      --prune\n' ;;
   *) exit 2 ;;
 esac
 SH
@@ -232,6 +232,22 @@ runner="$repo/.agents/skills/review-gate/scripts/refresh-consumer.sh"
 run_refresh current pass render
 if [ "$RC" -eq 0 ] && [ ! -s "$TMP/state/creates" ] && grep -qxF 'refresh-state=current pr=none class=none' <<<"$OUT"; then ok 'current consumer opens no pull request'; else bad 'current consumer opens no pull request' "$OUT"; fi
 if grep -qxF 'Engine version: `kendex 7.8.9 (release-build)`.' "$TMP/state/summary"; then ok 'current run summary reports the exact engine version'; else bad 'current run engine version missing'; fi
+# The refresh passes --prune where the installed kendex lists it, and leaves
+# it out under a release that predates the flag.
+for lists in yes no; do
+  reset_default
+  : >"$TMP/state/kendex"
+  LISTS_PRUNE="$lists"
+  run_refresh current pass render
+  unset LISTS_PRUNE
+  case "$lists" in
+    yes) expected='refresh --scope project --yes --leave --prune' ;;
+    *) expected='refresh --scope project --yes --leave' ;;
+  esac
+  if [ "$RC" -eq 0 ] && grep -qxF "$expected" "$TMP/state/kendex"; then
+    ok "refresh passes --prune only where kendex lists it (lists=$lists)"
+  else bad "prune probe lists=$lists" "$OUT"; fi
+done
 reset_default
 run_refresh stale pass render
 first="$(git --git-dir="$TMP/remote" rev-parse refs/heads/kendex/refresh)"
@@ -506,43 +522,6 @@ for row in \
     ok "$name classifier queue-only line appears under Consumer settings"
   else bad "$name classifier queue-only line" "$OUT"; fi
 done
-# kendex refresh names a retired [hooks] entry on one bare line and exits 0.
-# Only a refresh line with that exact prefix joins Consumer settings; the
-# control drops the forwarding arm.
-RETIRE_LINE='doc-drift-check: retired hook, entry skipped; delete [hooks.doc-drift-check] from kendex.toml'
-for row in \
-  "retire-line|$RETIRE_LINE|- <code>$RETIRE_LINE</code>" \
-  "other-prefix|warning: $RETIRE_LINE|" \
-  "retire-control|$RETIRE_LINE|"; do
-  IFS='|' read -r name lines expected <<<"$row"
-  reset_default
-  cp "$TMP/stale-runner" "$runner"
-  rm -f -- "${repo:?}/kendex.settings.toml"
-  if [ "$name" = retire-control ]; then
-    file_edit "$repo" .agents/skills/review-gate/scripts/refresh-consumer.sh 1 \
-      "'doc-drift-check: '\\*\\) setting_notes\\+=\\(" '/doc-drift-check/s/setting_notes+=("\$line")/:/'
-  fi
-  commit "$repo"
-  git -C "$repo" push -q origin main
-  : >"$TMP/state/calls"
-  REFRESH_LINES="$lines"
-  run_refresh "retire-$name" pass render
-  unset REFRESH_LINES
-  rows="$(grep -F -- '- <code>' "$TMP/state/body")" || rows=""
-  if [ "$name" = retire-control ]; then
-    if [ "$RC" -eq 0 ] && ! grep -qxF '## Consumer settings' "$TMP/state/body" && [ -z "$rows" ]; then
-      ok 'control: a dropped refresh-line arm turns the retire-line assertion red'
-    else bad 'refresh-line forwarding control' "$OUT"; fi
-  elif [ -z "$expected" ]; then
-    if refresh_class_matches render pushed cause=renders-match-their-sources PATCH &&
-        ! grep -qxF '## Consumer settings' "$TMP/state/body" && [ -z "$rows" ]; then
-      ok "a refresh line under another prefix ($name) is not forwarded"
-    else bad "$name refresh line" "$OUT"; fi
-  elif refresh_class_matches render pushed cause=renders-match-their-sources PATCH &&
-      grep -qxF '## Consumer settings' "$TMP/state/body" && [ "$rows" = "$expected" ]; then
-    ok 'the retire line kendex refresh prints appears under Consumer settings'
-  else bad 'retire line under Consumer settings' "$OUT"; fi
-done
 # A report that cannot read the retired list stops before publication or
 # merge changes.
 for mode in refusal refusal-control; do
@@ -669,7 +648,7 @@ for row in apply apply-control apply-failure apply-failure-control; do
   calls="$(awk '{ print $1 }' "$TMP/state/kendex" | tr '\n' ' ')"
   case "$row" in
     apply)
-      if [ "$RC" -eq 0 ] && [ "$calls" = 'refresh apply verify --version ' ] &&
+      if [ "$RC" -eq 0 ] && [ "$calls" = 'help refresh apply verify --version ' ] &&
           grep -qxF 'apply --scope project --yes --leave' "$TMP/state/kendex" &&
           [ "$after" != "$before" ] &&
           ! git --git-dir="$TMP/remote" cat-file -e refs/heads/kendex/refresh:.claude/hooks/leftover.sh 2>/dev/null; then
@@ -682,7 +661,7 @@ for row in apply apply-control apply-failure apply-failure-control; do
       else bad 'apply control' "$OUT"; fi ;;
     apply-failure)
       if [ "$RC" -eq 1 ] && grep -qxF 'refresh-error=apply value=5' <<<"$OUT" &&
-          [ "$calls" = 'refresh apply ' ] && [ "$after" = "$before" ] &&
+          [ "$calls" = 'help refresh apply ' ] && [ "$after" = "$before" ] &&
           ! grep -qE '^git push$|^api --method (POST|PATCH)|^pr merge ' "$TMP/state/calls"; then
         ok 'a failed apply stops the run before publication'
       else bad 'apply failure' "$OUT"; fi ;;

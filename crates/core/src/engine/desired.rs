@@ -9,12 +9,13 @@ use crate::hash::{hash_bytes, hash_files};
 use crate::lock::Lock;
 use crate::manifest::{self, ItemDecl, Manifest, Method};
 use crate::model::{HarnessId, ItemKind, Scope};
-use crate::source::{SourceConfig, SourceState, find_item, list_items};
+use crate::source::{SourceConfig, SourceState, list_items};
 use crate::source_read::SealedSource;
 
 use super::desired_item::{build, no_harness_note};
 use super::desired_kinds;
 use super::desired_source::{read_catalog, resolve_source};
+use super::expansion::{Offer, OpenCatalog};
 
 type RenderedFiles<'a> = (&'a Path, Vec<(PathBuf, Vec<u8>)>);
 
@@ -304,6 +305,14 @@ pub struct DesiredState {
     /// another catalog installed it, invariant 4's conflict
     /// (`plan_pass::plan_rebound`).
     pub processed: BTreeMap<(ItemKind, String), String>,
+    /// Items their catalog retired that this pass met, declared or derived
+    /// ([`DesiredState::retire`]); `EngineReport::retired`.
+    pub retired: BTreeMap<(ItemKind, String), Retirement>,
+    /// Whether this pass prunes retired items (`PlanOptions::prune_retired`).
+    pub prune_retired: bool,
+    /// The entry keys of the record this pass read: where a retired item
+    /// is kept ([`Retirement::kept`]).
+    pub(super) recorded: BTreeSet<String>,
     /// Manifest with upstream skill additions merged in — present only when
     /// the merge changed something and must be written back.
     pub manifest_update: Option<Manifest>,
@@ -412,6 +421,43 @@ impl DesiredState {
         self.declaration_status = super::DeclarationStatus::Incomplete;
     }
 
+    /// Records an item the declared `source`'s catalog retired, kept on
+    /// the tools the record holds it on unless this pass prunes. The
+    /// person's own declaration outranks a derivation naming the same item.
+    pub(super) fn retire(
+        &mut self,
+        kind: ItemKind,
+        name: &str,
+        source: &str,
+        migration: &str,
+        declared: bool,
+    ) {
+        let recorded = |harness: &HarnessId| {
+            let key = crate::lock::entry_key(kind, name, *harness);
+            !self.prune_retired && self.recorded.contains(&key)
+        };
+        let kept = HarnessId::ALL.into_iter().filter(recorded).collect();
+        let (source, migration) = (source.to_owned(), migration.to_owned());
+        let key = (kind, name.to_owned());
+        if declared || !self.retired.contains_key(&key) {
+            let retirement = Retirement {
+                source,
+                migration,
+                declared,
+                kept,
+            };
+            self.retired.insert(key, retirement);
+        }
+    }
+
+    /// Whether an item its catalog retired is kept nowhere this pass:
+    /// pruned, or never recorded. Such an item is owed no installation.
+    pub(super) fn retired_unkept(&self, kind: ItemKind, name: &str) -> bool {
+        self.retired
+            .get(&(kind, name.to_owned()))
+            .is_some_and(|retirement| retirement.kept.is_empty())
+    }
+
     /// A declaration whose source item cannot be parsed. Un-marking it keeps
     /// what it already installed out of the orphan sweep: a source file
     /// someone broke this morning must never uninstall a working artifact.
@@ -453,6 +499,10 @@ pub(super) mod hold;
 ///
 /// `held` names the declarations a single-package update pinned itself, so
 /// the closure can tell them from the holds the person chose.
+///
+/// A prune takes a retired item's own declaration out of the manifest, so
+/// the repeat no longer meets it: what the first pass retired carries over.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn desired_state(
     env: &Env,
     scope: &Scope,
@@ -461,6 +511,7 @@ pub(super) fn desired_state(
     hold_upstream_skills: bool,
     held: Option<&hold::HeldPins>,
     judge_pins: bool,
+    prune_retired: bool,
 ) -> Result<DesiredState> {
     let first = compute(
         env,
@@ -470,6 +521,7 @@ pub(super) fn desired_state(
         hold_upstream_skills,
         held,
         judge_pins,
+        prune_retired,
     )?;
     let Some(merged) = first.manifest_update else {
         return Ok(first);
@@ -482,11 +534,16 @@ pub(super) fn desired_state(
         hold_upstream_skills,
         held,
         judge_pins,
+        prune_retired,
     )?;
     second.manifest_update = Some(merged);
+    for (key, retirement) in first.retired {
+        second.retired.entry(key).or_insert(retirement);
+    }
     Ok(second)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compute(
     env: &Env,
     scope: &Scope,
@@ -495,6 +552,7 @@ fn compute(
     hold_upstream_skills: bool,
     held: Option<&hold::HeldPins>,
     judge_pins: bool,
+    prune_retired: bool,
 ) -> Result<DesiredState> {
     if manifest.sources.contains_key(manifest::BUILTIN_SOURCE_NAME) {
         manifest::check_source_alias(manifest::BUILTIN_SOURCE_NAME)?;
@@ -502,6 +560,8 @@ fn compute(
     let mut state = DesiredState {
         agent_names: crate::source::agent_names::Uses::new(manifest),
         judge_pins,
+        prune_retired,
+        recorded: lock.entries.keys().cloned().collect(),
         ..DesiredState::default()
     };
     let mut updated_manifest = manifest.clone();
@@ -539,29 +599,23 @@ fn compute(
             else {
                 continue;
             };
-            let Some((sealed, config)) =
-                read_catalog(&root, &provenance, name, &decl.source, &mut state)?
+            let Some(catalog) = read_catalog(&root, &provenance, name, &decl.source, &mut state)?
             else {
                 continue;
             };
-            super::catalog::notes(&config, &decl.source, &mut state);
-            // Ahead of the catalog lookup: a carried hook installs nothing.
-            // Its installed copies are stranded, so the sweep takes them the
-            // way it takes a harness dropped from a declaration.
-            if let Some(warning) = retired_hook(kind, name) {
-                state
-                    .processed
-                    .insert((kind, name.clone()), provenance.clone());
-                state.warnings.push(warning);
-                continue;
-            }
-            let Some(item_path) = find_item(&sealed, &config, kind, name) else {
-                state.mark_incomplete();
-                state
-                    .notes
-                    .push(not_offered_note(&sealed, &config, kind, name, &decl.source));
+            super::catalog::notes(&catalog.config, &decl.source, &mut state);
+            let Some(item_path) = item_path(
+                &catalog,
+                kind,
+                name,
+                decl,
+                &provenance,
+                &expansion,
+                &mut state,
+            ) else {
                 continue;
             };
+            let OpenCatalog { sealed, config, .. } = catalog;
             state
                 .processed
                 .insert((kind, name.clone()), provenance.clone());
@@ -599,6 +653,7 @@ fn compute(
             )?;
         }
     }
+    manifest_changed |= settle_retired(env, scope, manifest, &mut state, &mut updated_manifest);
     desired_kinds::desired_plugins(env, scope, manifest, &mut state);
     super::desired_custom_hooks::desired_custom_hooks(env, scope, manifest, &mut state);
 
@@ -606,6 +661,39 @@ fn compute(
         state.manifest_update = Some(updated_manifest);
     }
     Ok(state)
+}
+
+/// Where the catalog keeps one planned item, by the one lookup
+/// ([`OpenCatalog::offer`]); `None` where it renders nothing. A retired
+/// one is recorded for `settle_retired`, its provenance read as any
+/// resolved item's is, for invariant 4 (`plan_pass::plan_rebound`).
+fn item_path(
+    catalog: &OpenCatalog,
+    kind: ItemKind,
+    name: &str,
+    decl: &ItemDecl,
+    provenance: &str,
+    expansion: &super::expansion::Expansion,
+    state: &mut DesiredState,
+) -> Option<PathBuf> {
+    match catalog.offer(kind, name) {
+        Offer::Item(_, path) => Some(path),
+        Offer::Retired(migration) => {
+            let key = (kind, name.to_owned());
+            state.processed.insert(key, provenance.to_owned());
+            let derived_from = expansion.derived_from(kind, name);
+            let declared = matches!(derived_from, None | Some(crate::lock::Reason::Requested));
+            state.retire(kind, name, &decl.source, migration, declared);
+            None
+        }
+        Offer::NotOffered | Offer::Silent => {
+            state.mark_incomplete();
+            let (sealed, config) = (&catalog.sealed, &catalog.config);
+            let note = not_offered_note(sealed, config, kind, name, &decl.source);
+            state.notes.push(note);
+            None
+        }
+    }
 }
 
 /// Why each of an item's installations is wanted, as the closure derived it.
@@ -665,31 +753,98 @@ impl ItemCtx<'_> {
     }
 }
 
-/// Hooks the catalog retired that a consumer manifest may still declare.
-/// A declaration naming one is skipped with a warning carrying the manifest
-/// edit and derives no companion, whether or not the catalog still carries
-/// the hook, where every other name the catalog does not carry is refused,
-/// so a refresh at that consumer still runs. KEN-2892 removes the route one
-/// minor release after it ships, the owner's ruling for this one route.
-const RETIRED_HOOKS: &[&str] = &["doc-drift-check"];
+/// An item its catalog retired (`[retired]`), as this pass met it; what a
+/// pass does with one is `PlanOptions::prune_retired`'s.
+#[derive(Debug, Clone)]
+pub struct Retirement {
+    /// The declared source whose catalog retired it.
+    source: String,
+    /// The catalog's one-line migration, empty where it gave none.
+    migration: String,
+    /// The person's own declaration brought it in, the one a manifest edit
+    /// drops; false for a bundle member or a requirement.
+    declared: bool,
+    /// The tools it stays on as recorded: each the record this pass read
+    /// holds it on, none under a prune.
+    pub(super) kept: Vec<HarnessId>,
+}
 
-/// The warning a retired hook's declaration gets in place of the refusal.
-/// The message is the whole line: it opens with the hook's name as its key
-/// and carries the edit itself, so the line a program reads is complete
-/// with nothing before the key and nothing beneath it. The consumer
-/// refresh report (KEN-2797) forwards every `kendex refresh` line opening
-/// `<hook>: `, and the CLI prints a message keyed by its own name as that
-/// line.
-pub(super) fn retired_hook(kind: ItemKind, name: &str) -> Option<super::ItemWarning> {
-    (kind == ItemKind::Hook && RETIRED_HOOKS.contains(&name)).then(|| super::ItemWarning {
+/// The notice a retired item gets in place of the not-found refusal, so a
+/// refresh at a consumer still wanting it runs: one line keyed by the
+/// item's name, saying where it stands and how to remove it, ending with
+/// the catalog's migration. A derived one kept nowhere gets none: nothing
+/// of it is installed; a requirer's warning names it, and a bundle member
+/// is silent. The commands in the line are the owner's ruled exception to
+/// engine rule 18.
+fn retired(kind: ItemKind, name: &str, retirement: &Retirement) -> Option<super::ItemWarning> {
+    let source = &retirement.source;
+    let line = match (retirement.declared, retirement.kept.is_empty()) {
+        (true, false) => format!(
+            "{name}: retired by {source}; kept; remove it with kendex refresh --prune (or kendex remove {name})"
+        ),
+        (true, true) => format!(
+            "{name}: retired by {source}; not installed; drop its declaration with kendex refresh --prune"
+        ),
+        (false, true) => return None,
+        (false, false) => {
+            format!("{name}: retired by {source}; kept; remove it with kendex refresh --prune")
+        }
+    };
+    let message = match retirement.migration.is_empty() {
+        true => line,
+        false => format!("{line}; {}", retirement.migration),
+    };
+    Some(super::ItemWarning {
         kind,
         name: name.to_owned(),
         harness: None,
-        message: format!(
-            "{name}: retired hook, entry skipped; delete [hooks.{name}] from kendex.toml"
-        ),
+        message,
         remediation: None,
     })
+}
+
+/// What this pass does with the retired items it met, the Pi declarations
+/// among them read here, through the one lookup every Pi pass makes
+/// (`pi_ext::resolve_declared`); a retired item, carried or not, never
+/// renders. Kept, each gets its notice. Pruned, the person's own
+/// declaration of one leaves `updated`; returns whether it did.
+fn settle_retired(
+    env: &Env,
+    scope: &Scope,
+    manifest: &Manifest,
+    state: &mut DesiredState,
+    updated: &mut Manifest,
+) -> bool {
+    for (name, decl) in &manifest.pi_extensions {
+        let resolved = crate::pi_ext::resolve_declared(env, scope, manifest, name, decl);
+        if let Ok(crate::pi_ext::Resolved::Retired {
+            migration,
+            source_repo,
+        }) = resolved
+        {
+            let key = (ItemKind::PiExtension, name.clone());
+            state.processed.insert(key, source_repo);
+            state.retire(ItemKind::PiExtension, name, &decl.source, &migration, true);
+        }
+    }
+    if !state.prune_retired {
+        let notices: Vec<_> = state
+            .retired
+            .iter()
+            .filter_map(|((kind, name), retirement)| retired(*kind, name, retirement))
+            .collect();
+        state.warnings.extend(notices);
+        return false;
+    }
+    let mut changed = false;
+    for ((kind, name), retirement) in &state.retired {
+        let declared = retirement.declared && manifest.declared(*kind).contains_key(name);
+        if declared {
+            updated.declared_mut(*kind).remove(name);
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// The note for a declaration the catalog does not carry. It names what the

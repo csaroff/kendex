@@ -250,7 +250,10 @@ fn settleable(
         {
             continue;
         }
-        let Ok(package) = pi_ext::resolve_declared(env, scope, &manifest, name, decl) else {
+        // Nothing installs a retired package again (`Resolved::Retired`).
+        let Ok(pi_ext::Resolved::Ships(package)) =
+            pi_ext::resolve_declared(env, scope, &manifest, name, decl)
+        else {
             continue;
         };
         let existing = lock.entries.get(&key);
@@ -422,9 +425,11 @@ fn declared_sources(
     };
     for (name, decl) in &manifest.pi_extensions {
         match pi_ext::resolve_declared(env, scope, &manifest, name, decl) {
-            Ok(package) => {
+            Ok(pi_ext::Resolved::Ships(package)) => {
                 found.insert(name.clone(), package);
             }
+            // Nothing installs a retired package again.
+            Ok(pi_ext::Resolved::Retired { .. }) => {}
             Err(error) => notes.push(format!("{name}: {error}")),
         }
     }

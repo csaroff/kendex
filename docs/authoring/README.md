@@ -50,7 +50,15 @@ agents = ["agents"]
 description = "Everything a new project needs"
 skills = ["review"]
 agents = ["scout"]
+
+# Optional: items the catalog no longer ships, one table per kind (skills,
+# agents, hooks, commands, mcp-servers, output-styles, pi-extensions), each
+# name with a one-line migration, or "" for none.
+[retired.hooks]
+old-check = "declare new-check"
 ```
+
+A consumer still declaring a retired item refreshes with one notice keyed by its name that carries its migration, and the item stays installed as it is; one never installed is not installed. `kendex refresh --prune` removes it, its declaration, and any workflow adopted from its templates that still holds the template's bytes; a copy you edited, the item's or such a workflow, stays, and verify keeps failing it. An armed hook that requires a retired item is withheld on each tool it requires that item on, with a warning naming the item and carrying its migration where the catalog gives one: every tool the hook runs on for a skill in `requires-skills`, and for a hook in `requires`, the tools its `requires-on` line names, or every tool it runs on without one. This holds whether the retired item is kept or pruned, and a kept retired item stays installed until `kendex refresh --prune` even where every hook requiring it is withheld. Any other item that requires a retired item installs, with that warning. A catalog that retires an item drops it, in the same change, from every list that requires it: a skill's `dependencies`, and a hook's `requires` and `requires-skills`.
 
 Without a `[marketplace]` table the directory listing falls back to what GitHub knows. A `kendex.toml` that exists but does not parse makes the whole catalog a finding, never a silently different catalog.
 

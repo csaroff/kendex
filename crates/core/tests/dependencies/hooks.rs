@@ -1243,10 +1243,12 @@ fn kept_chain_rows() -> [KeptChainRow; 4] {
             (true, true),
         ),
         (
-            "left over under refresh's sweep",
+            "left over under the sweep of a removal naming something else",
             "",
             true,
             PlanOptions {
+                remove_orphans: true,
+                removal_filter: Some(vec![(None, "unrelated".to_owned())]),
                 sweep_unneeded: true,
                 ..PlanOptions::default()
             },

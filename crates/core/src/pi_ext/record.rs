@@ -35,16 +35,38 @@ pub fn clear_install_completion(env: &Env, scope: &crate::model::Scope, name: &s
     Ok(())
 }
 
+/// What a Pi declaration's catalog answers for it.
+#[derive(Debug, Clone)]
+pub enum Resolved {
+    Ships(DeclaredPackage),
+    /// The catalog retired it (`[retired.pi-extensions]`), whether or not it
+    /// still carries the package: nothing installs, settles or re-records
+    /// it. The plan keeps or prunes what is recorded, as
+    /// `PlanOptions::prune_retired` states, and holds a record another
+    /// catalog wrote to invariant 4 by `source_repo`, as for any item.
+    Retired {
+        migration: String,
+        source_repo: String,
+    },
+}
+
 pub fn resolve_declared(
     env: &Env,
     scope: &crate::model::Scope,
     manifest: &crate::manifest::Manifest,
     name: &str,
     decl: &crate::manifest::ItemDecl,
-) -> Result<DeclaredPackage> {
+) -> Result<Resolved> {
     let ready =
         crate::source::require_ready_at(env, scope, &decl.source, manifest, decl.rev.as_deref())?;
     let sealed = crate::source_read::SealedSource::open(&ready.root)?;
+    let config = crate::source::source_config_for(&sealed, &ready.provenance)?;
+    if let Some(migration) = config.retired(crate::model::ItemKind::PiExtension, name) {
+        return Ok(Resolved::Retired {
+            migration: migration.to_owned(),
+            source_repo: ready.provenance,
+        });
+    }
     let direct = sealed.root().join("pi-extensions").join(name);
     let source_dir = if sealed.is_file(&direct.join("package.json")) {
         direct
@@ -57,12 +79,12 @@ pub fn resolve_declared(
             ),
         })?
     };
-    Ok(DeclaredPackage {
+    Ok(Resolved::Ships(DeclaredPackage {
         source_dir,
         source: decl.source.clone(),
         source_repo: ready.provenance,
         source_commit: ready.commit,
-    })
+    }))
 }
 
 /// Build a durable record only when the installed copy matches the declared
@@ -187,9 +209,21 @@ fn record_matching<'a>(
     let mut switches = Vec::new();
     for (name, decl) in declarations {
         let key = crate::lock::entry_key(ItemKind::PiExtension, name, HarnessId::Pi);
-        let result = resolve_declared(env, scope, manifest, name, decl).and_then(|package| {
-            matching_lock_entry(&root, name, &package, lock.entries.get(&key), basis)
+        let result = resolve_declared(env, scope, manifest, name, decl).and_then(|resolved| {
+            Ok(match resolved {
+                Resolved::Ships(package) => Some(matching_lock_entry(
+                    &root,
+                    name,
+                    &package,
+                    lock.entries.get(&key),
+                    basis,
+                )?),
+                Resolved::Retired { .. } => None,
+            })
         });
+        let Some(result) = result.transpose() else {
+            continue;
+        };
         let (detail, cause) = match result {
             Ok(Some(mut entry)) => {
                 let differs = entry.enabled != decl.enabled;
@@ -247,6 +281,7 @@ fn record_matching<'a>(
             cause,
             compared: None,
             also_in_the_way: Vec::new(),
+            remedy: None,
         });
     }
     if let Some(plan) = plan
@@ -298,7 +333,16 @@ pub(crate) fn ensure_toggle_ready(
 ) -> Result<()> {
     let decl = &manifest.pi_extensions[name];
     let root = scope_root(env, scope)?;
-    let package = resolve_declared(env, scope, manifest, name, decl)?;
+    let package = match resolve_declared(env, scope, manifest, name, decl)? {
+        Resolved::Ships(package) => package,
+        Resolved::Retired { .. } => {
+            return Err(CoreError::PiPackage {
+                name: name.to_owned(),
+                message: "its catalog retired it, so it stays as it is until it is removed"
+                    .to_owned(),
+            });
+        }
+    };
     let key = crate::lock::entry_key(
         crate::model::ItemKind::PiExtension,
         name,

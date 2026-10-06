@@ -286,6 +286,7 @@ pub(super) fn orphans(
         cause,
         compared: None,
         also_in_the_way: Vec::new(),
+        remedy: None,
     };
     for (key, verdict) in verdicts {
         let entry = &lock.entries[key];
@@ -294,12 +295,15 @@ pub(super) fn orphans(
                 new_lock.entries.insert(key.clone(), entry.clone());
             }
             Verdict::Left { unneeded } => {
-                drift.push(row(
-                    entry,
-                    DriftState::Orphaned,
-                    "left over from an earlier setup; nothing needs it anymore".into(),
-                    None,
-                ));
+                drift.push(DriftRow {
+                    remedy: Some(super::RowRemedy::Remove),
+                    ..row(
+                        entry,
+                        DriftState::Orphaned,
+                        "left over from an earlier setup; nothing needs it anymore".into(),
+                        None,
+                    )
+                });
                 if unneeded {
                     sweepable.push(super::SetChange::dropped(entry));
                 }
@@ -404,16 +408,24 @@ fn verdicts<'a>(
             ));
             continue;
         }
+        // An item its catalog retired stays where it is kept
+        // (`Retirement::kept`) unless the person names it; anywhere else it
+        // goes as a departed declaration does.
+        let retirement = state.retired.get(&(entry.kind, entry.name.clone()));
+        if retirement.is_some_and(|retired| retired.kept.contains(&entry.harness)) && !named {
+            verdicts.push((key, Verdict::Retained));
+            continue;
+        }
         // Declared but skipped this pass (pending/disabled source, missing
         // from source): keep the record, it is not an orphan. A declaration
         // that did resolve has already said everything it wants installed,
         // so an entry it did not ask for — a harness dropped from its list —
         // is stranded and must be cleaned up like any other orphan.
-        let departed_harness = state
-            .processed
-            .contains_key(&(entry.kind, entry.name.clone()));
-        let unreachable_source =
-            manifest.declared(entry.kind).contains_key(&entry.name) && !departed_harness;
+        let departed_harness = retirement.is_some()
+            || state
+                .processed
+                .contains_key(&(entry.kind, entry.name.clone()));
+        let unreachable_source = still_declared(manifest, entry) && !departed_harness;
         // An installation something else brought in was derived from a
         // declaration, and the catalog it came from is where that reason is
         // written down. With that catalog offline, "nothing requires it" is not
@@ -431,12 +443,14 @@ fn verdicts<'a>(
             continue;
         }
         let unneeded = derived_only(entry);
+        // Refresh's unfiltered sweep takes every record nothing declares or
+        // derives anymore, a declaration deleted from the manifest or
+        // renamed included, so a consumer holds only what its manifest and
+        // catalog ship. A named removal does not sweep unrelated requested
+        // items.
         let unfiltered = options.removal_filter.is_none();
-        // Refresh's unfiltered sweep retires agents dropped by a manifest
-        // rename. A named removal does not sweep unrelated requested agents.
-        let dropped_agent = unfiltered && entry.kind == ItemKind::Agent;
         let removable = (options.remove_orphans && (named || unfiltered))
-            || (options.sweep_unneeded && (unneeded || departed_harness || dropped_agent));
+            || (options.sweep_unneeded && (unneeded || departed_harness || unfiltered));
         if !removable {
             verdicts.push((key, Verdict::Left { unneeded }));
             continue;
@@ -450,7 +464,11 @@ fn verdicts<'a>(
             emitted.paths.retain(|path| !guard.keep.contains(path));
         }
         let takes_edits = named || options.overwrite_edited;
-        let verdict = match !takes_edits && edit_holds(env, scope, &removable_entry) {
+        let edited = match entry.kind {
+            ItemKind::PiExtension => pi_edit_holds(env, scope, entry),
+            _ => edit_holds(env, scope, &removable_entry),
+        };
+        let verdict = match !takes_edits && edited {
             true => Verdict::Held,
             false => Verdict::Removed {
                 named,
@@ -574,6 +592,31 @@ fn pi_removal(
             pre,
         },
     }))
+}
+
+/// Whether the manifest still declares this record's item. A plugin
+/// declares under its own table, on the one tool its declaration names.
+fn still_declared(manifest: &Manifest, entry: &LockEntry) -> bool {
+    match entry.kind {
+        ItemKind::Plugin => manifest
+            .plugins
+            .get(&entry.name)
+            .is_some_and(|decl| decl.harness == entry.harness),
+        kind => manifest.declared(kind).contains_key(&entry.name),
+    }
+}
+
+/// [`edit_holds`] for a Pi package: an automatic removal takes it only
+/// where its installed files are the bytes its completed record names.
+/// Files already gone hold nothing.
+fn pi_edit_holds(env: &Env, scope: &Scope, entry: &LockEntry) -> bool {
+    let state = crate::pi_ext::scope_root(env, scope).and_then(|root| {
+        crate::pi_ext::installed_state(&root, &entry.name, entry.rendered_hash.as_deref())
+    });
+    !matches!(
+        state,
+        Ok(crate::pi_ext::PackageState::Current { .. } | crate::pi_ext::PackageState::Missing)
+    )
 }
 
 /// Whether this installation only ever existed for another item's sake —
