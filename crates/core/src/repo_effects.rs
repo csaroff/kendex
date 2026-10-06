@@ -209,17 +209,13 @@ pub fn arm(
     scope: &crate::model::Scope,
     declared: &DeclaredEffects,
 ) -> std::result::Result<crate::guard::GuardReport, ArmError> {
-    let Some(installer) = &declared.effects.installer else {
-        return Err(ArmError::NothingToRun {
-            name: declared.name.clone(),
-        });
-    };
+    let installer = declared.installer()?;
     let (repo, program, argv) = resolve_script(scope, &declared.root, installer)?;
     let report = launch_script(repo, &program, argv, None)?;
     if report.code != 0 {
         return Err(ArmError::Failed {
             name: declared.name.clone(),
-            installer: installer.clone(),
+            installer: installer.to_owned(),
             code: report.code,
             undo: declared.undo(repo),
             report: Box::new(report),
@@ -340,6 +336,17 @@ impl From<crate::error::CoreError> for ArmError {
 }
 
 impl DeclaredEffects {
+    /// The installer the package declared, or [`ArmError::NothingToRun`]
+    /// where it declared none: the one answer every surface reads.
+    pub fn installer(&self) -> std::result::Result<&str, ArmError> {
+        self.effects
+            .installer
+            .as_deref()
+            .ok_or_else(|| ArmError::NothingToRun {
+                name: self.name.clone(),
+            })
+    }
+
     /// Spell one declared script as a command run from `repo`.
     ///
     /// Repository-effect errors and disclosures must point at the installed

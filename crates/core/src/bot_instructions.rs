@@ -9,7 +9,7 @@ use crate::engine::GeneratedPaths;
 use crate::env::Env;
 use crate::error::{CoreError, Result};
 use crate::model::Scope;
-use crate::repo_effects::DeclaredEffects;
+use crate::repo_effects::{ArmError, DeclaredEffects};
 
 const PACKAGE: &str = "bot-instructions";
 
@@ -28,6 +28,26 @@ pub fn add_to_generated(env: &Env, scope: &Scope, generated: &mut GeneratedPaths
     generated.whole.extend(paths.paths);
     generated.regions.extend(paths.regions);
     Ok(())
+}
+
+/// Run the installed package's render once here, on the caller's own say-so.
+///
+/// No arming record licenses it and none is written: the invocation that
+/// calls this is the licence, spent on this one run. A consumer refresh
+/// calls it through a kendex verb with no credential in its environment,
+/// in a checkout it discards. The package's report comes back whatever its
+/// exit, because its verdict, including that the project never configured
+/// it, is the caller's to read. `None` where the project does not install
+/// the package.
+pub fn render_once(
+    env: &Env,
+    scope: &Scope,
+) -> std::result::Result<Option<crate::guard::GuardReport>, ArmError> {
+    let Some(declared) = crate::engine::installed_declaration(env, scope, PACKAGE)? else {
+        return Ok(None);
+    };
+    let report = crate::repo_effects::run_script(scope, &declared.root, declared.installer()?)?;
+    Ok(Some(report))
 }
 
 /// Paths written by one successful render.
@@ -89,6 +109,16 @@ impl Mode {
             Self::Discover => "would write ",
         }
     }
+
+    /// A file the package removes because its render no longer produces it.
+    /// The deletion is the render's like a write, so the commit offer
+    /// carries it.
+    fn removal_prefix(self) -> &'static str {
+        match self {
+            Self::Write => "removed ",
+            Self::Discover => "would remove ",
+        }
+    }
 }
 
 fn run(env: &Env, scope: &Scope, mode: Mode) -> Result<RenderedPaths> {
@@ -102,10 +132,11 @@ fn run(env: &Env, scope: &Scope, mode: Mode) -> Result<RenderedPaths> {
         let set_up_in = crate::repo_effects::set_up_in_main_checkout(scope, &declared)?;
         return Ok(skipped(declared, set_up_in));
     }
-    let Some(installer) = declared.effects.installer.clone() else {
-        return Ok(skipped(declared, None));
-    };
-    let installer = installer.as_str();
+    // An armed package that declares no installer has nothing to render
+    // with, which fails the render naming the package.
+    let installer = declared
+        .installer()
+        .map_err(|error| crate::repo_effects::err(error.to_string()))?;
     let spec = match mode {
         Mode::Write => installer.to_owned(),
         Mode::Discover => format!("{installer} --dry-run"),
@@ -154,7 +185,10 @@ fn run(env: &Env, scope: &Scope, mode: Mode) -> Result<RenderedPaths> {
             regions.insert(region);
             continue;
         }
-        let Some(relative) = line.strip_prefix(prefix) else {
+        let Some(relative) = line
+            .strip_prefix(prefix)
+            .or_else(|| line.strip_prefix(mode.removal_prefix()))
+        else {
             continue;
         };
         paths.insert(reported_path(&root, &command, line, relative)?);

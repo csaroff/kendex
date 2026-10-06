@@ -36,7 +36,9 @@ pub struct ApplyArgs {
     /// installs in this place — the old files move to the trash
     #[arg(long)]
     replace_unmanaged: bool,
-    /// Say yes to the repository changes a newly installed package asks for
+    /// Say yes to the repository changes a newly installed package asks for,
+    /// and, with --commit, --push or --pull-request, to setting up a package
+    /// that holds the commit
     #[arg(long)]
     allow_repo_effects: bool,
     // The project this run writes, named rather than walked up to. The

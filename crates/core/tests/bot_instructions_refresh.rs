@@ -403,6 +403,94 @@ fn a_doctrine_update_rerenders_enabled_surfaces_and_adds_them_to_the_change_set(
     run_package(&fixture.root, "check");
 }
 
+/// A package version that stops producing a surface leaves its marked file
+/// behind. The render removes it, and the commit offer carries the deletion
+/// beside the writes, so the commit passes the staged check.
+#[test]
+fn a_surface_the_render_no_longer_produces_is_removed_and_offered() {
+    let fixture = enabled_fixture();
+    let retired = fixture
+        .root
+        .join(".github/instructions/retired.instructions.md");
+    fs::copy(
+        fixture
+            .root
+            .join(".github/instructions/docs.instructions.md"),
+        &retired,
+    )
+    .expect("a rendered surface copies to the retired path");
+    git(&fixture.root, &["add", "-A"]);
+    commit_fixture(&fixture.root);
+
+    let mut discovered = GeneratedPaths::default();
+    bot_instructions::add_to_generated(&fixture.env, &fixture.scope, &mut discovered)
+        .expect("the commit offer discovers the render");
+    assert!(discovered.whole.contains(&retired));
+    let rendered =
+        bot_instructions::render(&fixture.env, &fixture.scope).expect("the refresh re-renders");
+    let mut generated = GeneratedPaths::default();
+    rendered.add_to(&mut generated);
+    assert!(generated.whole.contains(&retired));
+    assert!(!retired.exists());
+
+    // The desktop and the setup routes build their offer from a discovery
+    // made after the render already removed the file.
+    let mut after = GeneratedPaths::default();
+    bot_instructions::add_to_generated(&fixture.env, &fixture.scope, &mut after)
+        .expect("the commit offer discovers the render after it ran");
+    assert!(after.whole.contains(&retired));
+
+    for generated in [generated, after] {
+        let scan = offer_scan(&fixture, &generated);
+        let owned = &scan.owned;
+        assert!(
+            owned
+                .iter()
+                .any(|owned| owned.path == ".github/instructions/retired.instructions.md"),
+            "the offer carries the removal: {owned:?}"
+        );
+        assert!(staged_check_passes(&fixture.root, owned));
+    }
+}
+
+/// The verb a consumer refresh calls renders an install no record armed,
+/// found where a copy delivery put it, and leaves no record behind.
+#[test]
+fn a_render_once_runs_an_unarmed_copy_and_records_nothing() {
+    let fixture = enabled_fixture_at(false, HarnessId::Claude, CLAUDE_PACKAGE);
+    let copilot = fixture.root.join(".github/copilot-instructions.md");
+    fs::remove_file(&copilot).expect("the rendered surface is removed");
+
+    let ran = bot_instructions::render_once(&fixture.env, &fixture.scope)
+        .expect("the installed package runs")
+        .expect("the copy is found");
+    assert_eq!(ran.code, 0, "the render failed: {ran:?}");
+    assert!(copilot.exists(), "the render wrote nothing");
+    let declared = kendex_core::engine::installed_declaration(
+        &fixture.env,
+        &fixture.scope,
+        "bot-instructions",
+    )
+    .expect("the declaration reads")
+    .expect("the package declares its effect");
+    assert!(
+        !kendex_core::repo_effects::armed_here(&fixture.scope, &declared)
+            .expect("the setup record reads"),
+        "the run wrote a setup record"
+    );
+}
+
+#[test]
+fn a_render_once_where_the_package_is_not_installed_runs_nothing() {
+    let fixture = enabled_fixture();
+    fs::remove_dir_all(fixture.root.join(CODEX_PACKAGE)).expect("the package is removed");
+    assert!(
+        bot_instructions::render_once(&fixture.env, &fixture.scope)
+            .expect("an absent package is no error")
+            .is_none()
+    );
+}
+
 #[test]
 fn a_project_with_every_bot_surface_disabled_is_untouched() {
     let fixture = fixture(
