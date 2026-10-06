@@ -2,8 +2,9 @@
 
 ## Consumer-impacting changes
 
-### Unreleased
+### 4.1.0
 
+- Claude Sonnet 5.5 (`claude-sonnet-5-5`) is selectable under the `pi-claude` provider, listed ahead of Sonnet 5, with 1M context, 128k output and `xhigh`/`max` effort. Claude Code gets Claude Sonnet 5 as its safety fallback, and the bridge announces a switch to it; which declined turns re-run there is Claude Code's own routing.
 - The installed `DEVELOPMENT.md` names pi-extension-manager's resolver contract in plain text instead of a relative link, so a scope without pi-extension-manager holds no dead link.
 
 ### 4.0.11
