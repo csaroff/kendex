@@ -44,6 +44,27 @@
 #   suite=<name> seconds=<n> pass=<n> fail=<n>
 #   total suites=<n> seconds=<n> pass=<n> fail=<n>
 #
+# Two bounds hold a suite. RUN_ALL_SUITE_SECS (default 900) counts from the
+# suite's own start. RUN_ALL_DEADLINE_EPOCH, where set, is the Unix time in
+# seconds by which the whole run ends, whatever time each suite started, and
+# no suite starts once it has passed; CI's orch steps get it from the job's
+# first step, which sets it inside the job's ceiling (skill-tests.yml). A
+# suite still running at the earlier of the two is stopped: TERM to it and
+# every process under it, KILL ten seconds later to any of them still
+# running, a process that left the suite's process group included. It is then
+# a red suite, and between its output and its line come two lines: a keyed
+# line, the first form below where its own bound came first and the second
+# where the run's deadline did, and the row it reached:
+#
+#   run-all.sh: suite-timeout suite=<name> seconds=<RUN_ALL_SUITE_SECS>
+#   run-all.sh: run-deadline suite=<name> started=yes
+#   last line: <the last line it printed before the stop>
+#
+# A suite the deadline left unstarted is red as well, under an empty output
+# with `run-all.sh: run-deadline suite=<name> started=no` and
+# `last line: none`. A hang therefore fails the run under the suite's name
+# before the job's ceiling cancels the run with no name.
+#
 # The `<tree> tests:` verdict line follows the total, <tree> being the name
 # of the battery directory's parent, `orch` with no --battery, and on a red
 # run one `  - <name>` line per red suite follows the verdict.
@@ -58,6 +79,10 @@
 
 set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib/git-env.sh"
+# lane_process_table, lane_process_below, lane_process_state and
+# lane_process_start, for the stop.
+source "$(dirname "${BASH_SOURCE[0]}")/../scripts/lib/lane-state.sh" ||
+  { echo "run-all.sh: ../scripts/lib/lane-state.sh did not load; a stop would have no process reader" >&2; exit 1; }
 
 # Lane launch settings must not override the suites' own fixture settings.
 unset ORCH_STATE_DIR ORCH_LANE_HOST ORCH_TMUX_SESSION \
@@ -162,6 +187,29 @@ case "$JOBS" in
   '' | *[!0-9]* | 0) echo "run-all.sh: nproc printed '$JOBS', not a worker count" >&2; exit 1 ;;
 esac
 
+# A suite's own bound: 1.7 times the slowest suite of merge-group run
+# 37477526298, open-terminal-relaunch-route at 540s on macOS. It is the only
+# bound where no deadline is set, as on tools/guard's runs, and on a 30-minute
+# leg it stops a suite hung early in time for the ALONE suites, which wait for
+# every other suite to end, to run before the deadline.
+SUITE_SECS="${RUN_ALL_SUITE_SECS:-900}"
+case "$SUITE_SECS" in
+  '' | *[!0-9]* | 0*) echo "run-all.sh: RUN_ALL_SUITE_SECS is '$SUITE_SECS', not a positive whole number of seconds" >&2; exit 1 ;;
+esac
+# The run's deadline on the SECONDS clock, or empty for none. It is fixed at
+# the run's start, so a suite that starts late gets only the time left.
+DEADLINE=""
+if [ -n "${RUN_ALL_DEADLINE_EPOCH:-}" ]; then
+  case "$RUN_ALL_DEADLINE_EPOCH" in
+    *[!0-9]* | 0*) echo "run-all.sh: RUN_ALL_DEADLINE_EPOCH is '$RUN_ALL_DEADLINE_EPOCH', not a Unix time in whole seconds" >&2; exit 1 ;;
+  esac
+  now="$(date +%s)" || { echo "run-all.sh: date failed; no clock to hold RUN_ALL_DEADLINE_EPOCH to" >&2; exit 1; }
+  DEADLINE=$((SECONDS + RUN_ALL_DEADLINE_EPOCH - now))
+fi
+# How long a stopped suite's processes get to end on TERM, its EXIT trap's
+# cleanup among them, before KILL.
+STOP_GRACE=10
+
 OUT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/orch-run-all.XXXXXX")" ||
   { echo "run-all.sh: mktemp failed; no directory to hold suite output" >&2; exit 1; }
 trap 'rm -rf -- "$OUT_DIR"' EXIT
@@ -192,16 +240,28 @@ FAIL_FILES=()
 TOTAL_PASS=0
 TOTAL_FAIL=0
 
-report() { # BASE STATUS SECONDS
+# STOP is empty for a suite that ended on its own, and otherwise the bound
+# that stopped it, suite-timeout or run-deadline, or unstarted for one the
+# deadline never let start; LAST is the line it printed last before the stop.
+report() { # BASE STATUS SECONDS [STOP LAST]
   local pass fail counts
   printf '\n──── %s ────\n' "$1"
   cat -- "$OUT_DIR/$1.out" 2>/dev/null ||
     echo "run-all.sh: $1 left no readable output"
   # A suite killed mid-line would otherwise glue its last line to the report.
   [[ ! -s "$OUT_DIR/$1.out" || -z "$(tail -c 1 -- "$OUT_DIR/$1.out")" ]] || echo
+  case "${4:-}" in
+    '') ;;
+    suite-timeout) printf 'run-all.sh: suite-timeout suite=%s seconds=%s\n' "$1" "$SUITE_SECS" ;;
+    run-deadline) printf 'run-all.sh: run-deadline suite=%s started=yes\n' "$1" ;;
+    unstarted) printf 'run-all.sh: run-deadline suite=%s started=no\n' "$1" ;;
+    *) echo "run-all.sh: report given stop '$4', not one this runner makes" >&2; exit 1 ;;
+  esac
+  [[ -z "${4:-}" ]] || printf 'last line: %s\n' "${5:-none}"
   counts="$(counts_of "$OUT_DIR/$1.out" 2>/dev/null)" || counts="0 0"
   read -r pass fail <<<"$counts"
-  if [[ "$2" != 0 ]]; then
+  # A suite that trapped the stop and exited 0 still never finished.
+  if [[ "$2" != 0 || -n "${4:-}" ]]; then
     [[ "$fail" -gt 0 ]] || fail=1
     FAIL_FILES+=("$1")
   fi
@@ -210,20 +270,58 @@ report() { # BASE STATUS SECONDS
   printf 'suite=%s seconds=%s pass=%s fail=%s\n' "$1" "$3" "$pass" "$fail"
 }
 
+# A live process's start time, which with its pid names that one process: a
+# number freed by its exit and handed to a later process comes back with
+# another start. Status 1 for a process that has ended, a zombie included, or
+# whose state or start could not be read, so nothing signals it.
+started_at() { # PID
+  local state start
+  state="$(lane_process_state "$1")" || return 1
+  case "$state" in '' | Z) return 1 ;; esac
+  start="$(lane_process_start "$1")" || return 1
+  [ -n "$start" ] || return 1
+  printf '%s\n' "$start"
+}
+
+# PID and every process under it, one `PID START` line each. Taken before any
+# signal: a process whose parent the stop ends is no longer found under it. A
+# process table that cannot be read leaves PID alone in it.
+tree_of() { # PID
+  local table hops pid start
+  table="$(lane_process_table)" || table=""
+  while read -r hops pid; do
+    [ -n "$pid" ] || continue
+    start="$(started_at "$pid")" && printf '%s %s\n' "$pid" "$start"
+  done <<<"0 $1
+$(lane_process_below "$table" "$1" '' 0 '' pids)"
+  return 0
+}
+
+# The processes of TREE that are still the ones listed there, one pid a line.
+tree_live() { # TREE
+  local pid start
+  while read -r pid start; do
+    [ -n "$pid" ] && [ "$(started_at "$pid")" = "$start" ] && printf '%s\n' "$pid"
+  done <<<"$1"
+  return 0
+}
+
+signal_tree() { # SIGNAL TREE
+  local pid
+  for pid in $(tree_live "$2"); do kill -"$1" "$pid" 2>/dev/null; done
+  return 0
+}
+
+tree_running() { [ -n "$(tree_live "$1")" ]; } # TREE
+
 # Suites stay in the runner's process group, so HUP, TERM or KILL sent to
 # the group ends them with it. A background job ignores SIGINT, and TERM may
 # reach the runner alone, so on either this sends TERM to every running suite
 # and its descendants and waits for each before the runner exits.
-stop_tree() { # PID ; TERM to it, then to each child it had
-  local kids kid
-  kids="$(pgrep -P "$1")"
-  kill -TERM "$1" 2>/dev/null
-  for kid in $kids; do stop_tree "$kid"; done
-}
 stop_suites() {
   local k=0
   while [ "$k" -lt "$JOBS" ]; do
-    [ -z "${SLOT_PID[k]:-}" ] || stop_tree "${SLOT_PID[k]}"
+    [ -z "${SLOT_PID[k]:-}" ] || signal_tree TERM "$(tree_of "${SLOT_PID[k]}")"
     k=$((k + 1))
   done
   k=0
@@ -233,16 +331,39 @@ stop_suites() {
   done
 }
 
+# Slot K's suite at its bound: its last line kept, then TERM to its tree and,
+# after STOP_GRACE, KILL to whatever of it still runs. A process that set up its
+# own process group, as GNU timeout does, is in the tree, which no group signal
+# would reach. The slot is reaped and reported on the next pass.
+stop_overdue() { # K
+  local tree until=$((SECONDS + STOP_GRACE))
+  SLOT_STOP[$1]="${SLOT_BOUND[$1]}"
+  SLOT_LAST[$1]="$(awk 'NF { last = $0 } END { print last }' "$OUT_DIR/${SLOT[$1]}.out" 2>/dev/null)"
+  tree="$(tree_of "${SLOT_PID[$1]}")"
+  signal_tree TERM "$tree"
+  while tree_running "$tree" && [ "$SECONDS" -lt "$until" ]; do sleep 0.1; done
+  signal_tree KILL "$tree"
+}
+
 # One slot per worker, each empty or holding the suite it runs. A suite is
 # reaped once `kill -0` finds it gone, and `wait` then returns the status the
-# shell kept for it. A slot is refilled on the pass that reaps it, except that
-# a suite from ALONE starts only when no slot is busy; the loop sleeps only
-# when a pass found nothing to reap.
+# shell kept for it; one still running at its DUE time, the earlier of its own
+# bound and the deadline, which BOUND names, is stopped on that pass. A slot is
+# refilled on the pass that reaps it, except that a suite from ALONE starts
+# only when no slot is busy, and none starts past the deadline; the loop
+# sleeps only when a pass found nothing to reap.
 SLOT=()
 SLOT_PID=()
 SLOT_START=()
+SLOT_DUE=()
+SLOT_BOUND=()
+SLOT_STOP=()
+SLOT_LAST=()
 k=0
-while [ "$k" -lt "$JOBS" ]; do SLOT[k]=""; SLOT_PID[k]=""; SLOT_START[k]=0; k=$((k + 1)); done
+while [ "$k" -lt "$JOBS" ]; do
+  SLOT[k]=""; SLOT_PID[k]=""; SLOT_START[k]=0; SLOT_DUE[k]=0; SLOT_BOUND[k]=""; SLOT_STOP[k]=""; SLOT_LAST[k]=""
+  k=$((k + 1))
+done
 started=$SECONDS
 next=0
 finished=0
@@ -252,28 +373,50 @@ while [ "$finished" -lt "$RUN" ]; do
   k=0
   while [ "$k" -lt "$JOBS" ]; do
     base="${SLOT[k]}"
+    if [ -n "$base" ] && [ -z "${SLOT_STOP[k]}" ] &&
+      [ "$SECONDS" -ge "${SLOT_DUE[k]}" ] && kill -0 "${SLOT_PID[k]}" 2>/dev/null; then
+      stop_overdue "$k"
+    fi
     if [ -n "$base" ] && ! kill -0 "${SLOT_PID[k]}" 2>/dev/null; then
       wait "${SLOT_PID[k]}"
       status=$?
-      report "$base" "$status" "$((SECONDS - SLOT_START[k]))"
+      report "$base" "$status" "$((SECONDS - SLOT_START[k]))" "${SLOT_STOP[k]}" "${SLOT_LAST[k]}"
       SLOT[k]=""
       SLOT_PID[k]=""
+      SLOT_STOP[k]=""
+      SLOT_LAST[k]=""
       finished=$((finished + 1))
       running=$((running - 1))
       reaped=1
     fi
     if [ -z "${SLOT[k]}" ] && [ "$next" -lt "$RUN" ] &&
-      { [ "$next" -lt "$POOLED" ] || [ "$running" -eq 0 ]; }; then
+      { [ "$next" -lt "$POOLED" ] || [ "$running" -eq 0 ]; } &&
+      { [ -z "$DEADLINE" ] || [ "$SECONDS" -lt "$DEADLINE" ]; }; then
       printf 'start suite=%s\n' "${SUITES[next]}"
       bash "$TEST_DIR/${SUITES[next]}.sh" >"$OUT_DIR/${SUITES[next]}.out" 2>&1 </dev/null &
       SLOT_PID[k]=$!
       SLOT[k]="${SUITES[next]}"
       SLOT_START[k]=$SECONDS
+      SLOT_DUE[k]=$((SECONDS + SUITE_SECS))
+      SLOT_BOUND[k]=suite-timeout
+      if [ -n "$DEADLINE" ] && [ "$DEADLINE" -le "${SLOT_DUE[k]}" ]; then
+        SLOT_DUE[k]=$DEADLINE
+        SLOT_BOUND[k]=run-deadline
+      fi
       running=$((running + 1))
       next=$((next + 1))
     fi
     k=$((k + 1))
   done
+  # Past the deadline, once no suite runs, each suite left never started.
+  if [ -n "$DEADLINE" ] && [ "$SECONDS" -ge "$DEADLINE" ] && [ "$running" -eq 0 ]; then
+    while [ "$next" -lt "$RUN" ]; do
+      : >"$OUT_DIR/${SUITES[next]}.out"
+      report "${SUITES[next]}" none 0 unstarted
+      finished=$((finished + 1))
+      next=$((next + 1))
+    done
+  fi
   [ "$reaped" -eq 1 ] || [ "$finished" -ge "$RUN" ] || sleep 0.1
 done
 
