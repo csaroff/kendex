@@ -1,7 +1,7 @@
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { AgentToolResult, ExtensionAPI, ExtensionCommandContext, ExtensionContext, SessionEntry, Theme, ToolExecutionMode } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, type AutocompleteItem } from "@earendil-works/pi-tui";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { readdir, rm, stat } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { Type } from "typebox";
@@ -24,8 +24,9 @@ import {
 	type PanelToggleBehavior,
 	type VisiblePanelState,
 } from "./visibility.js";
-import { reportTaskPanelPersistenceFailure } from "./diagnostics.js";
-import { writeFileAtomic } from "./atomic-write.js";
+import { logTaskPanelDiagnostic, reportTaskPanelPersistenceFailure } from "./diagnostics.js";
+import { isAtomicWriteTemporary, writeFileAtomic } from "./atomic-write.js";
+import { LANE_CWD_FILE, openLaneDir, pruneLanes, type LanePruneFailure } from "../scripts/lane-retention.js";
 import {
 	isTaskPanelToolResultBoundedState,
 	taskPanelStateFingerprint,
@@ -34,10 +35,12 @@ import {
 
 const INSTALL_SYMBOL = Symbol.for("kendex.pi-task-panel.installed");
 const CONFIG_ID = "@vanillagreen/pi-task-panel";
+const PACKAGE_FOLDER = "pi-task-panel";
+const SIDECAR_FILE = "state.json";
 const STATE_TYPE = "kendex-task-panel:state";
 const TASK_PANEL_SNAPSHOT_MAX_BYTES = 64 * 1024;
-/** How many states over the session entry cap stay on disk by fingerprint; the README names this bound. */
-const TASK_PANEL_SAVED_STATES_MAX = 20;
+/** How many bytes of states over the session entry cap stay on disk by fingerprint per session; the README names this bound. */
+const TASK_PANEL_SAVED_STATES_MAX_BYTES = 32 * 1024 * 1024;
 
 interface TaskPanelBoundedManifest {
 	version: 2;
@@ -125,28 +128,113 @@ function sessionIdForContext(ctx: ExtensionContext): string {
 	return `ephemeral-${process.pid}`;
 }
 
+function sessionsRoot(): string {
+	return join(piUserDir(), "kendex", "sessions");
+}
+
+/** The session's lane directory, holding the sidecar and the saved states; lane retention prunes it at session_start. */
+function laneDir(ctx: ExtensionContext): string {
+	return join(sessionsRoot(), safeFileName(sessionIdForContext(ctx)), PACKAGE_FOLDER);
+}
+
 function sidecarStatePath(ctx: ExtensionContext): string {
-	return join(piUserDir(), "kendex", "sessions", safeFileName(sessionIdForContext(ctx)), "pi-task-panel", "state.json");
+	return join(laneDir(ctx), SIDECAR_FILE);
+}
+
+/**
+ * Records each lane directory pi-task-panel 3.0.5 and earlier wrote: it holds
+ * no `LANE_CWD_FILE`, so `pruneLanes` never prunes it. Its working directory is
+ * unknown, so the record names the lane directory itself and only the age rule
+ * applies. The record takes the sidecar's date, which every save wrote last,
+ * so a lane whose files all aged out goes whole in the prune that follows.
+ * The starting session's own lane has its record from `keepLaneLive` by then.
+ * Kept until 4.0.0, per the kendex compatibility rule.
+ */
+function recordLegacyLanes(): LanePruneFailure[] {
+	const failed: LanePruneFailure[] = [];
+	const report = (path: string, error: unknown) => failed.push({ path, error: error instanceof Error ? error.message : String(error) });
+	// A missing path answers undefined; any other failure is reported.
+	const lstatOf = (path: string) => {
+		try {
+			return lstatSync(path);
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code !== "ENOENT" && code !== "ENOTDIR") report(path, error);
+			return undefined;
+		}
+	};
+	const root = sessionsRoot();
+	let sessions: string[];
+	try {
+		sessions = readdirSync(root);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") report(root, error);
+		return failed;
+	}
+	for (const session of sessions) {
+		const dir = join(root, session, PACKAGE_FOLDER);
+		if (!lstatOf(join(root, session))?.isDirectory() || !lstatOf(dir)?.isDirectory()) continue;
+		const record = join(dir, LANE_CWD_FILE);
+		try {
+			lstatSync(record);
+			continue;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+				report(record, error);
+				continue;
+			}
+		}
+		try {
+			openLaneDir(dir, dir);
+			const sidecar = lstatOf(join(dir, SIDECAR_FILE));
+			if (sidecar) utimesSync(record, sidecar.atime, sidecar.mtime);
+		} catch (error) {
+			report(dir, error);
+		}
+	}
+	return failed;
 }
 
 /** The file holding a state over the session entry cap, named by the fingerprint its manifest and bounded details carry. */
 function savedStatePath(ctx: ExtensionContext, fingerprint: string): string {
-	return join(dirname(sidecarStatePath(ctx)), "states", `${safeFileName(fingerprint)}.json`);
+	return join(savedStatesDir(ctx), `${safeFileName(fingerprint)}.json`);
+}
+
+function savedStatesDir(ctx: ExtensionContext): string {
+	return join(laneDir(ctx), "states");
+}
+
+/** A saved state's size and age; undefined once another session's lane prune removed it. */
+async function savedStateFile(path: string): Promise<{ path: string; modified: number; size: number } | undefined> {
+	try {
+		const info = await stat(path);
+		return { path, modified: info.mtimeMs, size: info.size };
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw error;
+	}
 }
 
 /**
- * Keeps `written`, the saved state this save wrote, and the newest
- * `TASK_PANEL_SAVED_STATES_MAX - 1` other saved states beside it, and removes
- * the rest. Consecutive saves can share a timestamp, so `written` is kept by
- * name. Only `.json` names count: a `writeFileAtomic` temporary file is not a
- * saved state.
+ * Keeps `written`, the saved state this save wrote, and the newest other saved
+ * states that fit beside it in `TASK_PANEL_SAVED_STATES_MAX_BYTES`, and
+ * removes the rest. The first file past the bound goes with every older one,
+ * so the kept files are the newest tree points. Consecutive saves can share a
+ * timestamp, so `written` is kept by name. A `writeFileAtomic` temporary file
+ * is removed: a session's saves run one at a time, so none belongs to a write
+ * in flight.
  */
 async function pruneSavedStates(written: string): Promise<void> {
 	const directory = dirname(written);
-	const names = (await readdir(directory)).filter((name) => name.endsWith(".json") && name !== basename(written));
-	const files = await Promise.all(names.map(async (name) => ({ path: join(directory, name), modified: (await stat(join(directory, name))).mtimeMs })));
+	const names = (await readdir(directory)).filter((name) => name !== basename(written));
+	await Promise.all(names.filter(isAtomicWriteTemporary).map((name) => rm(join(directory, name), { force: true })));
+	const files = (await Promise.all(names.filter((name) => name.endsWith(".json")).map((name) => savedStateFile(join(directory, name)))))
+		.filter((file) => file !== undefined);
 	files.sort((left, right) => right.modified - left.modified);
-	await Promise.all(files.slice(TASK_PANEL_SAVED_STATES_MAX - 1).map((file) => rm(file.path, { force: true })));
+	let bytes = (await stat(written)).size;
+	const firstDropped = files.findIndex((file) => (bytes += file.size) > TASK_PANEL_SAVED_STATES_MAX_BYTES);
+	if (firstDropped === -1) return;
+	await Promise.all(files.slice(firstDropped).map((file) => rm(file.path, { force: true })));
 }
 
 
@@ -882,6 +970,10 @@ export default function taskPanel(pi: ExtensionAPI): void {
 		sidecarSaves = sidecarSaves.then(async () => {
 			let sidecarOk = true;
 			try {
+				// Rewritten on every save: another session's prune removes a lane
+				// whose files all aged out, and a lane without its record is never
+				// pruned again.
+				openLaneDir(laneDir(ctx), ctx.cwd);
 				// A state the session keeps only as a manifest is also saved by its
 				// fingerprint, so an older tree point restores its own list. A failed
 				// write here fails the save, and the session entry keeps the full state.
@@ -944,13 +1036,65 @@ export default function taskPanel(pi: ExtensionAPI): void {
 		let missingFingerprint: string | undefined;
 		for (const entry of ctx.sessionManager.getBranch()) {
 			const record = branchStateRecord(entry, ctx.cwd);
-			if (record) missingFingerprint = apply(record);
+			if (!record) continue;
+			missingFingerprint = apply(record);
 		}
 		if (missingFingerprint !== undefined) {
 			reportTaskPanelPersistenceFailure("branch-state-missing", new Error(`fingerprint=${missingFingerprint} sidecar=${sidecar?.fingerprint ?? "absent"}`), ctx);
 		}
 		updatePanelAfterTaskChange(state, ctx.cwd);
 		syncWidget(ctx);
+	};
+
+	/** Marks a resumed session's lane live as one unit: records the working
+	 *  directory the session runs in now and dates the sidecar and every saved
+	 *  state now, so the prune that follows keeps whatever branch a later tree
+	 *  move or reload reads. A session that never saved has no lane and gets
+	 *  none. `pruneSavedStates` evicts by the same timestamps, so each saved
+	 *  state is dated one second before the next newer one and keeps its place
+	 *  in save order, also on a file system that keeps whole seconds. A
+	 *  leftover temporary file is not a saved state and ages out. */
+	const keepLaneLive = (ctx: ExtensionContext) => {
+		const dir = laneDir(ctx);
+		if (!existsSync(dir)) return;
+		const failed = (path: string, error: unknown) => {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+			logTaskPanelDiagnostic("session lane refresh failed", { path, error: error instanceof Error ? error.message : String(error) });
+		};
+		try {
+			openLaneDir(dir, ctx.cwd);
+		} catch (error) {
+			failed(dir, error);
+			return;
+		}
+		const now = Date.now();
+		const date = (path: string, at: number) => {
+			try {
+				utimesSync(path, at / 1000, at / 1000);
+			} catch (error) {
+				failed(path, error);
+			}
+		};
+		date(sidecarStatePath(ctx), now);
+		const states = savedStatesDir(ctx);
+		let names: string[];
+		try {
+			names = readdirSync(states).filter((name) => name.endsWith(".json"));
+		} catch (error) {
+			failed(states, error);
+			return;
+		}
+		const saved: Array<{ path: string; modified: number }> = [];
+		for (const name of names) {
+			const path = join(states, name);
+			try {
+				saved.push({ path, modified: statSync(path).mtimeMs });
+			} catch (error) {
+				failed(path, error);
+			}
+		}
+		saved.sort((left, right) => right.modified - left.modified);
+		saved.forEach((file, rank) => date(file.path, now - rank * 1000));
 	};
 
 	const syncWidget = (ctx: ExtensionContext) => {
@@ -1268,7 +1412,16 @@ export default function taskPanel(pi: ExtensionAPI): void {
 	installSettingsCacheRefresh(pi);
 	pi.on("session_start", (_event, ctx) => {
 		recordProjectTrust(ctx);
+		// Restore first, so a session resumed after its files aged out still
+		// shows its list, and keep its lane live, so the prune leaves those
+		// files for the next tree move or reload. Legacy lanes get their record
+		// before the prune reads records.
 		restore(ctx);
+		keepLaneLive(ctx);
+		const legacyFailures = recordLegacyLanes();
+		for (const failure of [...legacyFailures, ...pruneLanes(sessionsRoot(), [PACKAGE_FOLDER]).failed]) {
+			logTaskPanelDiagnostic("session file prune failed", { path: failure.path, error: failure.error });
+		}
 	});
 	pi.on("session_tree", async (_event, ctx) => {
 		// restore reads the sidecar, which a queued save may not have written yet.
