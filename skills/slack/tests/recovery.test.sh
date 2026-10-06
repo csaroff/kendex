@@ -160,9 +160,12 @@ ROWS
 done
 
 # A temporary conversations.replies refusal leaves catch-up due on the same
-# RootRelay. Its other thread and outbound post still complete on the first poll.
+# RootRelay, and outbound mail still posts on the first poll. The newer thread
+# is read first, so both faults leave it to that poll; the next poll reads the
+# refused one. The rate control re-raises every refusal out of the poll's
+# catch-up, as a slack-rate-limited one must not be.
 for mode in normal control; do
-while read -r parent fault; do
+while read -r parent fault want; do
   ROOT="$(sk_new_root "read-$mode-$parent-$fault")"
   sk_bind "$ROOT"
   CH="$(sk_channel "$ROOT")"
@@ -180,27 +183,113 @@ while read -r parent fault; do
   sk_lm "$ROOT" notice --item overseer --to owner --file "$(sk_text retry-outbound 'Read retry outbound.')" >/dev/null
   NOTE="$(jq -r 'select(.text == "Read retry outbound.") | .id' "$(sk_box "$ROOT")/to-overseer.jsonl")"
   case "$fault" in
-    rate) sk_ctl /_test/fault "{\"method\":\"conversations.replies\",\"ts\":\"$PARENT\",\"status\":429,\"times\":4,\"retry_after\":0}" >/dev/null ;;
+    rate) sk_ctl /_test/fault "{\"method\":\"conversations.replies\",\"ts\":\"$PARENT\",\"status\":429,\"retry_after\":0}" >/dev/null ;;
     cut) sk_ctl /_test/fault "{\"method\":\"conversations.replies\",\"ts\":\"$PARENT\",\"cut\":\"chunked\"}" >/dev/null ;;
   esac
   if [ "$mode" = control ]; then
-    sk_mutant thread-retry relay.py '        return missing' '        return True'
+    case "$fault" in
+      rate) sk_mutant rate-poll relay.py 'if err\.key != "slack-rate-limited":\n                    raise' 'if True:\n                    raise' ;;
+      cut) sk_mutant thread-retry relay.py '        return missing' '        return True' ;;
+    esac
   fi
   sk_recovery "$ROOT" catchup-retry
-  GOT="$(printf '%s\n' "$OUT" | tail -n 1 | jq -cr --arg reply "$REPLY" --arg good "$GOOD_REPLY" --arg note "$NOTE" '[.error,.polls[0].caught_up,(.polls[0].delivered | index($good) != null),(.polls[0].carried | index($note) != null),(.polls[1].delivered | index($reply) != null),.polls[1].caught_up]')"
+  GOT="$(printf '%s\n' "$OUT" | tail -n 1 | jq -cr --arg reply "$REPLY" --arg good "$GOOD_REPLY" --arg note "$NOTE" '[.error,.polls[0].caught_up,(.polls[0].delivered | index($good) != null),(.polls[0].carried | index($note) != null),(.polls[1].delivered | index($reply) != null),(.polls[1].delivered | index($good) != null),.polls[1].caught_up]')"
   if [ "$mode" = normal ]; then
-    assert_eq "$GOT" '["",false,true,true,true,true]' "$parent/$fault: same-instance catch-up retries the refused read while the first poll delivers healthy replies and outbound mail"
+    assert_eq "$GOT" "$want" "$parent/$fault: same-instance catch-up retries the refused read while the first poll posts outbound mail"
     assert_eq "$(jq -s --arg d "$CH:$REPLY" '[.[] | select(.delivery_id == $d)] | length' "$(sk_box "$ROOT")/to-lane.jsonl")|$(asks "$CH" 'Read retry outbound.')" '1|1' "$parent/$fault: read recovery delivers the reply and outbound notice once"
   else
-    sk_assert_red "$GOT" '["",false,true,true,true,true]' "$parent/$fault: completing refused catch-up breaks same-instance recovery"
+    sk_assert_red "$GOT" "$want" "$parent/$fault: completing a refused catch-up, or failing the poll on a rate limit, breaks same-instance recovery"
   fi
   sk_bin_reset
 done <<'ROWS'
-known rate
-known cut
-unknown rate
-unknown cut
+known rate ["",false,true,true,true,true,true]
+known cut ["",false,true,true,true,true,true]
+unknown rate ["",false,true,true,true,true,true]
+unknown cut ["",false,true,true,true,true,true]
 ROWS
+done
+
+# More threads hold an offline reply than Slack's allowance lets the catch-up
+# read in one window. Each window's 429 ends that poll's catch-up with nothing
+# slept; a poll 30 seconds into the Retry-After reads nothing; the next window
+# resumes past the threads already read, newest first, until the oldest reply
+# lands and the catch-up completes, every reply once. Every thread is an owner
+# directive with no parent recorded, so ALLOW 1 lands one reply a window only
+# while the thread read records the parent from its own page and makes no
+# parent read. Each control breaks one rule: the resume, the order, the hold,
+# the hold's length, the rate limit ending the catch-up, and the page parent.
+WANT='["",[],0,true,false,true,true]'
+while read -r allow control; do
+  ROOT="$(sk_new_root "allowance-$allow-$control")"
+  sk_bind "$ROOT"
+  CH="$(sk_channel "$ROOT")"
+  sk_poll "$ROOT"
+  TOPICS=()
+  for n in 1 2 3 4 5; do TOPICS+=("$(sk_inject "$CH" U001 "Allowance topic $n.")"); done
+  sk_poll "$ROOT"
+  REPLIES=()
+  for n in 1 2 3 4 5; do REPLIES+=("$(sk_inject "$CH" U001 "Offline reply $n." "${TOPICS[$((n - 1))]}")"); done
+  case "$control" in
+    resume) sk_mutant resume relay.py '\} - due, key=float' '}, key=float' ;;
+    order) sk_mutant newest-first relay.py 'key=float, reverse=True\)' 'key=float)' ;;
+    hold) sk_mutant hold relay.py 'self\.clock\(\) >= self\.catch_up_at' 'True' ;;
+    short-hold) sk_mutant short-hold relay.py 'self\.clock\(\) \+ err\.retry_after' 'self.clock() + 1' ;;
+    rate-ends) sk_mutant rate-ends relay.py 'if err\.key in \("slack-auth-failed", "slack-rate-limited"\):' 'if err.key == "slack-auth-failed":' ;;
+    page-parent) sk_mutant page-parent relay.py 'thread\.ts and thread\.parent is None\]' 'thread.ts and False]' ;;
+  esac
+  sk_recovery "$ROOT" allowance "$allow"
+  GOT="$(printf '%s\n' "$OUT" | tail -n 1 | jq -cr --arg new "${REPLIES[4]}" --arg old "${REPLIES[0]}" '[
+    .error,
+    [.polls[].slept[]],
+    ([.polls | to_entries[] | select(.key % 2 == 1) | .value.replies] | add),
+    (.polls[0].delivered | index($new) != null),
+    (.polls[0].delivered | index($old) != null),
+    (.polls[-1].delivered | index($old) != null),
+    .polls[-1].caught_up]')"
+  ONCE="$(for r in "${REPLIES[@]}"; do jq -s --arg d "$CH:$r" '[.[] | select(.delivery_id == $d)] | length' "$(sk_box "$ROOT")/to-lane.jsonl"; done | sort -u | tr '\n' ' ')"
+  if [ "$control" = none ]; then
+    assert_eq "$GOT|$ONCE" "$WANT|1 " "allow $allow: a rate-limited catch-up holds for Retry-After and resumes newest first until every offline reply lands once"
+  else
+    sk_assert_red "$GOT" "$WANT" "allow $allow: the $control control breaks the resumed catch-up"
+  fi
+  sk_bin_reset
+done <<'ROWS'
+1 none
+2 none
+2 resume
+2 order
+2 hold
+2 short-hold
+2 rate-ends
+1 page-parent
+ROWS
+
+# A reply also sent to the channel reaches the catch-up through history, where
+# its directive thread has no parent recorded, so its delivery reads the
+# parent. With one conversations.replies call a window, the second broadcast's
+# parent read takes the 429, which ends the catch-up with nothing slept; a
+# later window lands it, each broadcast once. The control lets that parent
+# read wait out the 429.
+for control in none parent-retry; do
+  ROOT="$(sk_new_root "allowance-broadcast-$control")"
+  sk_bind "$ROOT"
+  CH="$(sk_channel "$ROOT")"
+  sk_poll "$ROOT"
+  TOPICS=()
+  for n in 1 2; do TOPICS+=("$(sk_inject "$CH" U001 "Broadcast topic $n.")"); done
+  sk_poll "$ROOT"
+  CASTS=()
+  for n in 1 2; do CASTS+=("$(sk_inject "$CH" U001 "Offline broadcast $n." "${TOPICS[$((n - 1))]}" '"subtype": "thread_broadcast"')"); done
+  [ "$control" = none ] || sk_mutant parent-retry relay.py 'retries=0 if path == "catch-up" else RETRIES' 'retries=RETRIES'
+  sk_recovery "$ROOT" allowance 1
+  GOT="$(printf '%s\n' "$OUT" | tail -n 1 | jq -cr '[.error, [.polls[].slept[]], .polls[-1].caught_up]')"
+  ONCE="$(for c in "${CASTS[@]}"; do jq -s --arg d "$CH:$c" '[.[] | select(.delivery_id == $d)] | length' "$(sk_box "$ROOT")/to-lane.jsonl"; done | tr '\n' ' ')"
+  if [ "$control" = none ]; then
+    assert_eq "$GOT|$ONCE" '["",[],true]|1 1 ' "a broadcast's catch-up parent read yields to the 429 and every broadcast lands once"
+  else
+    sk_assert_red "$GOT" '["",[],true]' "the parent-retry control waits out the broadcast parent read's 429"
+  fi
+  sk_bin_reset
 done
 
 # An acknowledged live reply whose parent is deleted remains in pending_live

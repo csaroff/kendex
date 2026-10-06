@@ -92,9 +92,9 @@ EXPLAIN = {
         " written. fix= names the remedy."
     ),
     "slack-rate-limited": (
-        "Slack answered 429 on every retry allowed. The relay makes a refused"
-        " post or read again on its next poll, and a history read it cut off"
-        " stays due until it lands; it makes a refused connect again on its"
+        "Slack answered 429 on every retry allowed, none for a catch-up read. The"
+        " relay resumes a cut-off catch-up once Slack's Retry-After passes, makes"
+        " a refused post or read again on its next poll, and a refused connect again on its"
         " reconnect wait. A `slack post` or `slack setup` refused this way"
         " sent nothing and must be run again."
     ),
@@ -200,13 +200,15 @@ class Refusal(Exception):
 
     `error` is Slack's own error code on a `slack-api-failed` refusal, carried
     as data for the callers that act on one code and empty otherwise; the
-    printed value carries it as text for a reader."""
+    printed value carries it as text for a reader. `retry_after` is Slack's
+    Retry-After in seconds on `slack-rate-limited`."""
 
-    def __init__(self, key: str, value: str = "", *extra_keyed: tuple, error: str = "") -> None:
+    def __init__(self, key: str, value: str = "", *extra_keyed: tuple, error: str = "", retry_after: float = 0.0) -> None:
         super().__init__(f"{key}={value}")
         self.key = key
         self.value = value
         self.error = error
+        self.retry_after = retry_after
         self.extra_keyed = list(extra_keyed)
 
 

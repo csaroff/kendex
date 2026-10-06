@@ -28,7 +28,8 @@ on the next poll. So a message sent while the relay was disconnected, one whose
 envelope never arrived, and one acknowledged before a stop cut its delivery
 off land on a catch-up within that lookback, and lane-mail's delivery id judges any repeat.
 The connection opens before the catch-up reads, so no message falls between
-them.
+them. A rate limit ends a catch-up, which the first poll past Slack's
+Retry-After resumes, newest thread first, past the threads it read.
 
 Each poll, every SLACK_POLL_SECONDS, per root: re-resolve the owners when
 the setting moved, retry previously unmarked deliveries, run the catch-up
@@ -89,7 +90,7 @@ import time
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, NoReturn, Optional, Set, Tuple, Union
 
-from api import Slack
+from api import RETRIES, Slack
 from mailbox import LaneMail
 from markup import Verbatim, outbound, plain
 from refusals import Refusal, keyed, notice, print_refusal
@@ -233,9 +234,10 @@ class RootRelay:
         # Socket Mode acknowledges before delivery. History cannot recover
         # an old-thread reply, so its root retains the event until handled.
         self.pending_live: Dict[str, Dict] = {}
-        # False until a catch-up has read the channel since the last connect
-        # or the last refused event delivery.
-        self.caught_up = False
+        # The threads the due catch-up has read; None once one has read the
+        # channel since the last connect or the last refused event delivery.
+        self.due: Optional[Set[str]] = set()
+        self.catch_up_at = 0.0  # Slack's Retry-After, waited across polls
         self.discovered = False
         # The status record carries the compaction day across restarts; the
         # journal holds deliveries and positions alone.
@@ -289,8 +291,14 @@ class RootRelay:
                     raise
                 self.thread_refused(err, str(message.get("thread_ts") or message["ts"]))
                 self.pending_live.pop(str(message["ts"]))
-        if not self.caught_up:
-            self.catch_up(bot_user)
+        if self.due is not None and self.clock() >= self.catch_up_at:
+            try:
+                self.catch_up(bot_user, self.due)
+            except Refusal as err:
+                if err.key != "slack-rate-limited":
+                    raise
+                print_refusal(err)
+                self.catch_up_at = self.clock() + err.retry_after
         self.mark_read()
         now = self.clock()
         touched = self.master_touched()
@@ -311,13 +319,13 @@ class RootRelay:
         """Whether catch-up re-reads a known thread within its lookback."""
         return not thread.missing and (thread.open or max(float(thread.ts), thread.active) >= self.settings.horizon(self.clock()))
 
-    def parent_context(self, thread_ts: str, message: Optional[Dict] = None) -> Dict:
+    def parent_context(self, thread_ts: str, message: Optional[Dict] = None, retries: int = RETRIES) -> Dict:
         """Read a parent's small context once, persisting it across restarts."""
         thread = self.state.threads.get(thread_ts)
         if thread is not None and thread.parent is not None:
             return thread.parent
         if message is None:
-            messages = self.api.get("conversations.replies", channel=self.channel, ts=thread_ts, limit=1)["messages"]
+            messages = self.api.get("conversations.replies", retries=retries, channel=self.channel, ts=thread_ts, limit=1)["messages"]
             if not messages or str(messages[0]["ts"]) != thread_ts:
                 raise Refusal("slack-api-failed", f"conversations.replies parent={thread_ts} missing", error="thread_not_found")
             message = messages[0]
@@ -334,13 +342,13 @@ class RootRelay:
             parent["envelope"] = envelope
         return parent
 
-    def catch_up(self, bot_user: str) -> None:
+    def catch_up(self, bot_user: str, due: Set[str]) -> None:
         """Discover parents once; retained eligible parents supply old-thread
         discovery on reconnect without repeating the channel lookback."""
         horizon = self.settings.horizon(self.clock())
         position = self.state.seen_ts
         oldest = position if self.discovered or float(position) <= horizon else f"{horizon:.6f}"
-        messages = list(self.api.paged("conversations.history", "messages", channel=self.channel, oldest=oldest))
+        messages = list(self.api.paged("conversations.history", "messages", retries=0, channel=self.channel, oldest=oldest))
         messages.sort(key=lambda m: float(m["ts"]))
         new = [m for m in messages if float(m["ts"]) > float(position)]
         for message in new:
@@ -350,7 +358,7 @@ class RootRelay:
         parents = {str(m["ts"]): m for m in messages if float(m["ts"]) >= horizon or m.get("latest_reply")}
         replied = {str(m["ts"]): float(m.get("latest_reply") or 0) for m in messages}
         complete = True
-        for thread_ts in dict.fromkeys([*parents, *self.state.threads]):
+        for thread_ts in sorted({*parents, *self.state.threads} - due, key=float, reverse=True):
             if thread_ts not in self.state.threads:
                 try:
                     self.parent_context(thread_ts, parents[thread_ts])
@@ -361,18 +369,22 @@ class RootRelay:
             if self.live(thread) and (
                 thread.open or thread.ts not in replied or replied[thread.ts] > float(thread.seen)
             ):
-                complete = self.read_replies(thread, bot_user) and complete
+                if self.read_replies(thread, bot_user):
+                    due.add(thread_ts)
+                else:
+                    complete = False
         if new:
             self.journal.append(t="seen", ts=new[-1]["ts"])
-        self.caught_up = complete
+        self.due = None if complete else due
         self.discovered = self.discovered or complete
 
     def thread_refused(self, err: Refusal, thread_ts: str) -> bool:
         """Report one thread's refusal without stopping the root. Slack's
         thread_not_found closes only the journal's ask, not lane-mail's ask.
-        Authentication failure still stops the relay, not just one thread.
-        Returns whether the refusal needs no later catch-up retry."""
-        if err.key == "slack-auth-failed":
+        Authentication failure still stops the relay, and a rate limit the
+        catch-up, not just one thread. Returns whether the refusal needs no
+        later catch-up retry."""
+        if err.key in ("slack-auth-failed", "slack-rate-limited"):
             raise err
         thread = self.state.threads.get(thread_ts)
         envelope = thread.envelope if thread is not None else ""
@@ -405,12 +417,15 @@ class RootRelay:
         """Read one thread; return whether catch-up can finish without retry."""
         # Binding owns the lower boundary; thread.seen owns delivery progress.
         oldest = max(thread.seen, self.binding.bound_at, key=float)
+        since = oldest if thread.parent else None  # with no parent recorded, its page records it
         try:
             replies = list(
-                self.api.paged("conversations.replies", "messages", channel=self.channel, ts=thread.ts, oldest=oldest)
+                self.api.paged("conversations.replies", "messages", retries=0, channel=self.channel, ts=thread.ts, oldest=since)
             )
         except Refusal as err:
             return self.thread_refused(err, thread.ts)
+        for parent in [r for r in replies if r["ts"] == thread.ts and thread.parent is None]:
+            self.parent_context(thread.ts, parent)
         replies = [r for r in replies if r["ts"] != thread.ts and float(r["ts"]) > float(oldest)]
         replies.sort(key=lambda m: float(m["ts"]))
         for reply in replies:
@@ -454,7 +469,7 @@ class RootRelay:
                 notice("delivered", f"ts={ts} id={answer_id} path={path}")
                 self.mark_seen([ts])
                 return
-        parent = self.parent_context(thread_ts) if thread_ts != ts else None
+        parent = self.parent_context(thread_ts, retries=0 if path == "catch-up" else RETRIES) if thread_ts != ts else None
         envelope = self.mail.send_directive(text, delivery, parent)
         self.journal.append(t="in", channel=self.channel, ts=ts, kind="directive", id=envelope, thread=thread_ts)
         notice("delivered", f"ts={ts} id={envelope} path={path}")
@@ -1098,7 +1113,7 @@ class Relay:
         self.opened = True
         for root in self.roots:
             root.journal.append(t=kind, at=self.since)
-            root.caught_up = False
+            root.due = set()
         notice(kind + "ed", self.since)
         return True
 
@@ -1170,4 +1185,4 @@ class Relay:
             root.on_message(event, self.bot_user)
         except Refusal as err:
             self.root_failed(root, err)
-            root.caught_up = False
+            root.due = set()

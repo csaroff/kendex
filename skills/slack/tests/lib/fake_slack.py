@@ -19,7 +19,9 @@ which refuses or times out before the redirected request is written, or with
 halfway through: `length` under its full Content-Length, `chunked` inside
 its first chunk, or with `chunked: true` the whole file in two chunks and
 no Content-Length. API cuts run the method before cutting its response.
-An optional `ts` limits a fault to that thread. A download's method is `download`.
+An optional `ts` limits a fault to that thread, and an optional `after` lets
+that many matching calls through first, Slack's allowance for a window. A
+download's method is `download`.
 POST /_test/delete removes a parent and its replies by channel and ts.
 
 Socket Mode: apps.connections.open, called with the app token, answers the
@@ -183,7 +185,10 @@ class Workspace:
 
 
     def top_level(self, channel: str):
-        return [m for m in self.messages.get(channel, []) if not m.get("thread_ts") or m["thread_ts"] == m["ts"]]
+        """conversations.history: parents and unthreaded messages, and a reply
+        sent to the channel too, as Slack lists a thread_broadcast."""
+        return [m for m in self.messages.get(channel, [])
+                if not m.get("thread_ts") or m["thread_ts"] == m["ts"] or m.get("subtype") == "thread_broadcast"]
 
     def thread(self, channel: str, ts: str):
         message = next((m for m in self.messages.get(channel, []) if m["ts"] == ts), None)
@@ -327,6 +332,9 @@ class Handler(BaseHTTPRequestHandler):
                 if fault["method"] == method and fault["times"] > 0 and (
                     "ts" not in fault or fault["ts"] == params.get("ts")
                 ):
+                    if fault.get("after", 0) > 0:
+                        fault["after"] -= 1
+                        continue
                     fault["times"] -= 1
                     if fault.get("drop"):
                         self.close_connection = True
