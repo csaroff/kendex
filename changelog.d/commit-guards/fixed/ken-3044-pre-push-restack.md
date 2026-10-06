@@ -1,0 +1,1 @@
+- pre-push no longer refuses a push for version bumps already on the remote's default branch, where it can establish that branch.
