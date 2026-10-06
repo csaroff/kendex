@@ -5,13 +5,14 @@
 # output whole under its header followed by one
 # `suite=<name> seconds=<n> pass=<n> fail=<n>` line. One
 # `total suites=<n> seconds=<n> pass=<n> fail=<n>` line follows the last
-# suite, and the `orch tests:` verdict follows the total, with one
-# `  - <name>` line per red suite on a red run. Every run below is a
-# sandbox holding a copy of run-all.sh and suites written here, with `nproc`
-# stubbed on PATH, so the real scheduler runs over suites whose outcome and
-# timing the case controls.
+# suite, and the `<tree> tests:` verdict follows the total, <tree> being
+# the name of the battery directory's parent, with one `  - <name>` line per
+# red suite on a red run. Every run below is a sandbox holding a copy of
+# run-all.sh and suites written here, with `nproc` stubbed on PATH, so the
+# real scheduler runs over suites whose outcome and timing the case
+# controls.
 #
-# Three surfaces:
+# Surfaces:
 #   1. the report — each suite's start line comes once, before its output;
 #      each summary shape a suite prints becomes that suite's pass and fail
 #      counts, the last summary line winning, a suite's seconds cover its
@@ -28,6 +29,12 @@
 #      to the runner alone, ends the run and the suite it was running
 #   6. a name filter — a bare one selects each suite whose name holds it,
 #      one written `=name` that suite alone, and `!` rejects either way
+#   7. caller lane state — an ORCH_STATE_DIR the caller set never reaches a
+#      suite, which still sets its own
+#   8. --battery — the suites of the directory it names run in place of the
+#      runner's own, and the verdict line names that directory's tree
+#   9. --alone — with --battery, the suites it names run alone, and a suite
+#      sharing a name with one in the runner's own ALONE list runs pooled
 #
 # Bash 3.2 compatible.
 
@@ -84,10 +91,11 @@ green_battery() { # DIR
   done
 }
 
-# Runs a battery with nproc answering NPROC (`fail` makes it exit 1), and
+# Runs a battery with nproc answering NPROC (`fail` makes it exit 1), the
+# settings in its environment and each ARG after `--` on its command line, and
 # leaves the combined output in $OUT and the exit status in $RC.
-run_battery() { # DIR NPROC [VAR=VALUE]...
-  local dir="$1" stub="$1.bin"
+run_battery() { # DIR NPROC [VAR=VALUE]... [-- ARG...]
+  local dir="$1" stub="$1.bin" settings=()
   mkdir -p "$stub"
   if [[ "$2" == fail ]]; then
     printf '#!/usr/bin/env bash\nexit 1\n' >"$stub/nproc"
@@ -96,9 +104,18 @@ run_battery() { # DIR NPROC [VAR=VALUE]...
   fi
   chmod +x "$stub/nproc"
   shift 2
+  while [ "$#" -gt 0 ] && [ "$1" != -- ]; do
+    settings+=("$1")
+    shift
+  done
+  [ "$#" -eq 0 ] || shift
   RC=0
-  OUT="$(env -i PATH="$stub:$PATH" HOME="$HOME" TMPDIR="$dir.tmp" "$@" \
-    bash "$dir/run-all.sh" 2>&1)" || RC=$?
+  OUT="$(env -i PATH="$stub:$PATH" HOME="$HOME" TMPDIR="$dir.tmp" ${settings[@]+"${settings[@]}"} \
+    bash "$dir/run-all.sh" "$@" 2>&1)" || RC=$?
+}
+
+started_of() { # the suites $OUT names a start line for, one a line, in start order
+  printf '%s\n' "$OUT" | sed -n 's/^start suite=//p'
 }
 
 line_of() { # NAME ; that suite's report line, seconds masked
@@ -294,19 +311,15 @@ echo "=== 6. a name filter selects by substring, or by whole name written =name 
 B="$TMP_ROOT/filter"
 battery "$B"
 for name in lanes lanes_context other; do suite "$B" "$name" 0 ''; done
-mkdir -p "$B.bin"
-printf '#!/usr/bin/env bash\necho 2\n' >"$B.bin/nproc"
-chmod +x "$B.bin/nproc"
 # FILTERS|SUITES THAT START, sorted
 FILTER_ROWS='=lanes|lanes
 lanes|lanes lanes_context
 !=lanes|lanes_context other
 =lanes =other|lanes other'
 while IFS='|' read -r filters want; do
-  RC=0
   # shellcheck disable=SC2086 # the row's filters, split on purpose
-  OUT="$(env -i PATH="$B.bin:$PATH" HOME="$HOME" TMPDIR="$B.tmp" bash "$B/run-all.sh" $filters 2>&1)" || RC=$?
-  started="$(printf '%s\n' "$OUT" | sed -n 's/^start suite=//p' | sort | tr '\n' ' ')"
+  run_battery "$B" 2 -- $filters
+  started="$(started_of | sort | tr '\n' ' ')"
   assert_eq "rc=$RC started=$started" "rc=0 started=$want " "the filters $filters start $want"
 done <<<"$FILTER_ROWS"
 
@@ -324,6 +337,46 @@ assert_eq "$RC" 0 "the suite reads fixture state and can set its own ORCH_STATE_
 mutate_file "$B/run-all.sh" 'unset ORCH_STATE_DIR' ': ORCH_STATE_DIR'
 run_battery "$B" 1 ORCH_STATE_DIR="$B.planted" PLANTED="$B.planted" WS="$TEST_DIR/../scripts/workflow-state"
 assert_eq "rc=$RC failed=$(failed_of)" "rc=1 failed=state " "control: inherited lane state fails the fixture assertion"
+
+echo "=== 8. --battery runs another directory's suites and names its tree ==="
+B="$TMP_ROOT/runner-parent/tests"
+battery "$B"
+suite "$B" home-suite 0 'pass: 1   fail: 0'
+OTHER="$TMP_ROOT/other-tree/tests"
+mkdir -p "$OTHER"
+suite "$OTHER" other-suite 0 'pass: 2   fail: 0'
+battery_verdict() { # — what ran and the verdict line, from $OUT
+  printf 'rc=%s started=%s verdict=%s' "$RC" "$(started_of | tr '\n' ' ')" \
+    "$(printf '%s\n' "$OUT" | sed -n 's/^\(.* tests: .*\)$/\1/p')"
+}
+run_battery "$B" 2 -- --battery "$OTHER"
+assert_eq "$(battery_verdict)" "rc=0 started=other-suite  verdict=other-tree tests: all 1 file(s) passed" \
+  "--battery runs that directory's suites, none of the runner's own, and names its tree"
+mutate_file "$B/run-all.sh" 'TEST_DIR="$(cd "$2" && pwd)" || exit 1' ':'
+run_battery "$B" 2 -- --battery "$OTHER"
+assert_eq "$(battery_verdict)" "rc=0 started=home-suite  verdict=runner-parent tests: all 1 file(s) passed" \
+  "control: with the directory left unread the runner's own suites run"
+
+echo "=== 9. --battery runs alone the suites its --alone names, and no others ==="
+# Under one worker the start order is the run order: the pooled suites by
+# name, then the alone ones. The other tree holds a suite named for one in the
+# runner's own ALONE list.
+O="${ALONE_NAMES%%$'\n'*}"
+OTHER="$TMP_ROOT/alone-tree/tests"
+mkdir -p "$OTHER"
+for name in aaa-alone mmm-alone "$O" zzz-pool; do suite "$OTHER" "$name" 0 'pass: 1   fail: 0'; done
+alone_order() { # DIR [FROM TO] ; start order of a fresh runner in DIR, FROM edited to TO
+  battery "$1"
+  [ "$#" -lt 3 ] || mutate_file "$1/run-all.sh" "$2" "$3"
+  run_battery "$1" 1 -- --battery "$OTHER" --alone aaa-alone --alone mmm-alone
+  printf 'rc=%s started=%s' "$RC" "$(started_of | tr '\n' ' ')"
+}
+assert_eq "$(alone_order "$TMP_ROOT/alone-runner/tests")" "rc=0 started=$O zzz-pool aaa-alone mmm-alone " \
+  "--alone runs each suite it names after the rest, and the runner's own ALONE name runs pooled"
+assert_eq "$(alone_order "$TMP_ROOT/alone-keep/tests" '  ALONE=()' '  :')" "rc=0 started=zzz-pool aaa-alone mmm-alone $O " \
+  "control: the runner's own list kept holds back the other tree's same-named suite"
+assert_eq "$(alone_order "$TMP_ROOT/alone-drop/tests" 'ALONE+=("$2")' ':')" "rc=0 started=aaa-alone mmm-alone $O zzz-pool " \
+  "control: --alone left unread runs every suite pooled"
 
 echo
 printf 'pass: %d   fail: %d\n' "$PASS" "$FAIL"
