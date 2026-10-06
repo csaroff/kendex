@@ -13,6 +13,7 @@
 //! runs a plan can have them.
 
 use std::collections::BTreeSet;
+use std::io::IsTerminal;
 
 use kendex_core::engine::ItemSafety;
 use kendex_core::model::{ItemKind, Scope};
@@ -193,6 +194,63 @@ fn conflict_exit(scope: &Scope, blocked: &[Blocked]) -> String {
         scope_flag(scope)
     )
 }
+
+/// A run that left out something it was asked for, ended where a script
+/// reads the exit: a run with no terminal on stdin. A person at a
+/// terminal reads the ledger above and is not handed a failure for it.
+/// Comes after the ledger, the repository-effects step and the
+/// registration, so what the run wrote stands and is reported whatever
+/// this says.
+pub fn refuse_skipped(skipped: Vec<(ItemKind, String)>) -> super::CliResult {
+    if skipped.is_empty() || std::io::stdin().is_terminal() {
+        return Ok(());
+    }
+    Err(Box::new(SkippedOnConflict { items: skipped }))
+}
+
+/// The refusal a non-interactive `add` or `apply` ends on when an item it
+/// was asked for, or a package one of those requires, was skipped on
+/// conflict. Its own exit status, so automation tells a partial install
+/// from a run that refused before writing: the rest of the plan is
+/// written, the manifest included. `apply --replace-unmanaged` takes in
+/// an item whose every conflict it can replace (`Blocked::replace`, which
+/// `conflict_exit` reads); the conflict line above each item names the
+/// way out for the rest.
+#[derive(Debug)]
+pub struct SkippedOnConflict {
+    items: Vec<(ItemKind, String)>,
+}
+
+impl SkippedOnConflict {
+    pub const STATUS: u8 = 3;
+}
+
+/// A `partial-install skipped=<count>` headline, then one
+/// `skipped-on-conflict=<kind> <name>` line per item, each name escaped
+/// here, then the reason. Its breaks are its own: `ui::refusal` splits it
+/// into lines where it prints and prefixes the first, so the headline
+/// takes the prefix and every item line is spelled the same.
+impl std::fmt::Display for SkippedOnConflict {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut items: Vec<&(ItemKind, String)> = self.items.iter().collect();
+        items.sort();
+        items.dedup();
+        writeln!(out, "partial-install skipped={}", items.len())?;
+        for (kind, name) in items {
+            writeln!(
+                out,
+                "skipped-on-conflict={} {}",
+                kind.name(),
+                kendex_core::names::shown(name)
+            )?;
+        }
+        out.write_str(
+            "not installed: the conflict lines above say what holds each one back, and the way out",
+        )
+    }
+}
+
+impl std::error::Error for SkippedOnConflict {}
 
 fn plural(n: usize) -> &'static str {
     match n {

@@ -256,6 +256,18 @@ pub struct Installation {
     pub positions: Vec<super::desired::Position>,
 }
 
+/// What the request behind a pass asked for, against which a skipped
+/// package is judged: one the caller asked for, or one nobody named.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Asked {
+    /// Every declaration the scope holds, as an apply reads them.
+    #[default]
+    Declared,
+    /// The items and sets one add declared, an agent's expanded skills
+    /// among them.
+    Named(BTreeSet<Held>),
+}
+
 /// A catalog hook the plan wrote nothing for on a tool its own harnesses
 /// line leaves out, where the person's declaration of it does not name that
 /// tool. Expected state rather than a finding: the hook's header says it
@@ -345,6 +357,12 @@ pub struct EngineReport {
     /// The installations whose Missing row is a deletion of a rendering the
     /// record says stood there; the Updates read says it as `files_missing`.
     pub recorded_gone: Vec<RecordedGone>,
+    /// The conflict rows the person's own edit to the part of a shared
+    /// file kendex recorded writing accounts for (an output style's block
+    /// or Claude selection), by kind, name and tool. Their cause does not
+    /// say so, and every other surface reads them as conflicts of no known
+    /// cause; only [`EngineReport::skipped_asked`] reads this.
+    pub own_edit_rows: BTreeSet<(ItemKind, String, HarnessId)>,
     /// The paths this pass renders into the scope, split into the files
     /// kendex owns whole and the shared configuration files it writes one
     /// key in. The inventory is written from it, and the commit offer
@@ -390,6 +408,13 @@ pub struct EngineReport {
     /// each with the one notice keyed by the set that `notes` also holds;
     /// verify shows it, where it shows no note.
     pub retired_bundles: BTreeMap<String, String>,
+    /// Why each package this pass was asked to install is wanted, by
+    /// kind and name, on any tool: asked for by name, carried by a set,
+    /// or required by another package. A package every tool refused is
+    /// in it; one its catalog retired is not.
+    pub wanted: BTreeMap<(ItemKind, String), BTreeSet<crate::lock::Reason>>,
+    /// What the request behind this pass asked for.
+    pub asked: Asked,
 }
 
 /// One declaration a held plan read at the commit the record names
@@ -485,9 +510,11 @@ impl EngineReport {
             fork_edits: Vec::new(),
             resolved_sources: BTreeMap::new(),
             recorded_gone: Vec::new(),
+            own_edit_rows: BTreeSet::new(),
             generated: super::GeneratedPaths::default(),
             registrations: Registrations::default(),
             installations: BTreeMap::new(),
+            wanted: BTreeMap::new(),
             stood_in: StoodInRecord::default(),
             record: Lock::default(),
             held: Vec::new(),
@@ -495,6 +522,96 @@ impl EngineReport {
             retired: BTreeMap::new(),
             withheld: BTreeMap::new(),
             retired_bundles: BTreeMap::new(),
+            asked: Asked::Declared,
+        }
+    }
+
+    /// Each package its request asked for ([`EngineReport::asked_for`])
+    /// that this pass skipped on conflict: a row of it answers a refused
+    /// rendering ([`EngineReport::refused`]), or is a dead stop the
+    /// person's own edits do not account for, so what it asked for is not
+    /// on disk. A refused rendering counts whatever the row's cause: edits
+    /// kept in the earlier installation are why those files stay, not why
+    /// the rendering asked for is missing. A package held back by their own
+    /// edits alone keeps them where it installs, and its record. A
+    /// [`DriftCause::Retired`] row is no skip either: it is a copy nothing
+    /// renders again, held to its record on a tool the request may also
+    /// render the package on. What a run's exit is read from.
+    pub fn skipped_asked(&self) -> Vec<(ItemKind, String)> {
+        let asked = self.asked_for();
+        let refused: BTreeSet<(ItemKind, &str, HarnessId)> = self
+            .refused
+            .iter()
+            .map(|refused| (refused.kind, refused.name.as_str(), refused.harness))
+            .collect();
+        let skipped: BTreeSet<(ItemKind, String)> = self
+            .drift
+            .iter()
+            .filter(|row| {
+                let answers_refusal = row.state == DriftState::Conflict
+                    && refused.contains(&(row.kind, row.name.as_str(), row.harness));
+                answers_refusal
+                    || row.dead_stop()
+                        && row.cause != Some(DriftCause::Retired)
+                        && !self
+                            .own_edit_rows
+                            .contains(&(row.kind, row.name.clone(), row.harness))
+            })
+            .map(|row| (row.kind, row.name.clone()))
+            .filter(|item| asked.contains(item))
+            .collect();
+        skipped.into_iter().collect()
+    }
+
+    /// Each package this pass derives for what its request asked: under
+    /// [`Asked::Declared`] every package [`EngineReport::wanted`] holds,
+    /// and under [`Asked::Named`] each item named, each member of a set
+    /// named, and everything those require, however deep. A package the
+    /// request reaches only through a declaration it did not name is not
+    /// in it, and neither is one its catalog retired.
+    pub fn asked_for(&self) -> BTreeSet<(ItemKind, String)> {
+        use crate::lock::Reason;
+        let named = match &self.asked {
+            Asked::Declared => return self.wanted.keys().cloned().collect(),
+            Asked::Named(named) => named,
+        };
+        let mut reached: BTreeSet<&(ItemKind, String)> = self
+            .wanted
+            .iter()
+            .filter(|((kind, name), why)| {
+                named.contains(&Held::Item {
+                    kind: *kind,
+                    name: name.clone(),
+                }) || why.iter().any(|reason| match reason {
+                    Reason::MemberOf { bundle } => named.contains(&Held::Set {
+                        name: bundle.name.clone(),
+                    }),
+                    Reason::Requested | Reason::RequiredBy { .. } => false,
+                })
+            })
+            .map(|(item, _)| item)
+            .collect();
+        // A requirement can point at a requirer found later in the walk, so
+        // the set grows until a pass adds nothing.
+        loop {
+            let grew: Vec<&(ItemKind, String)> = self
+                .wanted
+                .iter()
+                .filter(|(item, why)| {
+                    !reached.contains(item)
+                        && why.iter().any(|reason| match reason {
+                            Reason::RequiredBy { by } => {
+                                reached.contains(&(by.kind, by.name.clone()))
+                            }
+                            Reason::Requested | Reason::MemberOf { .. } => false,
+                        })
+                })
+                .map(|(item, _)| item)
+                .collect();
+            if grew.is_empty() {
+                return reached.into_iter().cloned().collect();
+            }
+            reached.extend(grew);
         }
     }
 

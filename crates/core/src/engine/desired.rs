@@ -298,6 +298,11 @@ pub struct DesiredState {
     /// with its pin dropped (`withheld_past_pin`).
     pub judge_pins: bool,
     pub refused: Vec<Refused>,
+    /// Why each package this pass rendered, or tried to, is wanted, by
+    /// kind and name, as the closure derived it on every tool it planned.
+    /// A package refused everywhere has no item to carry its reasons, so
+    /// they live here; `EngineReport::wanted`.
+    pub(super) derived: BTreeMap<(ItemKind, String), BTreeSet<crate::lock::Reason>>,
     /// Declarations whose source resolved and whose item was found and
     /// read, each with the provenance it is planned under. What these
     /// produced is the complete truth about them, so a lock entry they did
@@ -484,6 +489,21 @@ impl Withholding {
 impl DesiredState {
     pub(super) fn mark_incomplete(&mut self) {
         self.declaration_status = super::DeclarationStatus::Incomplete;
+    }
+
+    /// Records a declaration whose item was found and read: the provenance
+    /// it is planned under, and why the closure wants it.
+    fn record_read(
+        &mut self,
+        kind: ItemKind,
+        name: &str,
+        provenance: &str,
+        expansion: &super::expansion::Expansion,
+    ) {
+        let key = (kind, name.to_owned());
+        self.processed.insert(key.clone(), provenance.to_owned());
+        let wanted = expansion.package_reasons(kind, name);
+        self.derived.insert(key, wanted);
     }
 
     /// Records an item the declared `source`'s catalog retired, kept on
@@ -749,9 +769,7 @@ fn compute(
                 continue;
             };
             let OpenCatalog { sealed, config, .. } = catalog;
-            state
-                .processed
-                .insert((kind, name.clone()), provenance.clone());
+            state.record_read(kind, name, &provenance, &expansion);
             let mut harnesses = planned.harnesses.clone();
             if harnesses.is_empty() {
                 no_harness_note(kind, name, decl, manifest, &mut state);

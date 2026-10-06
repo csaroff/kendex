@@ -67,9 +67,13 @@ pub fn run(env: &Env, scope: &Scope, id: &str, yes: bool, allow_effects: bool) -
     // mutation, so a failure here is a repository that moved under the
     // run. The steps before it are installed either way, and the error is
     // held until the close has reported them.
-    let (closing, failed) =
+    let (mut closing, failed) =
         install_steps(steps, |step, wrote| install_step(env, scope, step, wrote));
-    if failed.is_none() {
+    let skipped = std::mem::take(&mut closing.skipped);
+    // A member skipped on conflict is not a step failure, and it is not
+    // installed either: the line would claim a member the ledger then
+    // names as skipped, terminal or not.
+    if failed.is_none() && skipped.is_empty() {
         say("collection installed — kendex recorded every member at its version");
     }
     // The same close `add <package>` gives, over every step at once: a
@@ -109,7 +113,7 @@ pub fn run(env: &Env, scope: &Scope, id: &str, yes: bool, allow_effects: bool) -
     if let Some(refused) = refused {
         fail_refusal("warning: ", refused.as_ref());
     }
-    outcome
+    outcome.and_then(|()| super::ledger::refuse_skipped(skipped))
 }
 
 /// How a collection run ends: the ledger, the repository account, and the
@@ -191,6 +195,9 @@ struct Closing {
     count: Option<usize>,
     pending: Vec<kendex_core::repo_effects::DeclaredEffects>,
     blocked: Vec<Blocked>,
+    /// The blocked items the collection asked for, which a run with no
+    /// terminal ends on.
+    skipped: Vec<(kendex_core::model::ItemKind, String)>,
     scored: Vec<kendex_core::engine::ItemSafety>,
 }
 
@@ -222,15 +229,18 @@ fn closing(written: Vec<Written>) -> Closing {
         written.iter().any(|step| step.planned),
     );
     let mut blocked: Vec<Blocked> = Vec::new();
+    let mut skipped = Vec::new();
     let mut scored: Vec<kendex_core::engine::ItemSafety> = Vec::new();
     for step in written {
         blocked.extend(step.blocked);
+        skipped.extend(step.skipped);
         scored.extend(step.scored);
     }
     Closing {
         count,
         pending,
         blocked,
+        skipped,
         scored,
     }
 }
@@ -259,6 +269,7 @@ struct Written {
     /// separating a silent run from one that wrote nothing.
     planned: bool,
     blocked: Vec<Blocked>,
+    skipped: Vec<(kendex_core::model::ItemKind, String)>,
     scored: Vec<kendex_core::engine::ItemSafety>,
     applied: usize,
 }
@@ -323,9 +334,9 @@ fn install_step(
     // whole collection at once. Nothing here runs an effect.
     wrote.effects.extend(report.repo_effects.iter().cloned());
     wrote.planned = !report.plan.is_empty();
-    wrote
-        .blocked
-        .extend(print_report(env, &report, Listing::Attention));
+    let blocked = print_report(env, &report, Listing::Attention);
+    wrote.skipped.extend(report.skipped_asked());
+    wrote.blocked.extend(blocked);
     wrote.scored.extend(report.safety.iter().cloned());
     wrote.applied += apply_report(env, &report)?;
     if let Some(name) = subscribed {

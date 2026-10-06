@@ -3,7 +3,7 @@ use crate::env::Env;
 use crate::error::Result;
 use crate::lock::{Lock, LockFile, lock_path};
 use crate::manifest::{self, Manifest, ManifestFile};
-use crate::model::Scope;
+use crate::model::{ItemKind, Scope};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub mod adopt;
@@ -140,9 +140,9 @@ mod repo_effects;
 pub use repo_effects::{InstalledDeclaration, installed_declaration, installed_declarations};
 mod report_types;
 pub use report_types::{
-    DeclarationStatus, DriftCause, DriftRow, DriftState, EngineReport, ExcludedHook, ForkEdit,
-    Held, HeldPin, Installation, ItemWarning, Pin, PinnedHook, PlanOptions, Reach, Registrations,
-    RetiredStanding, RowRemedy, StoodIn, StoodInRecord, Targets,
+    Asked, DeclarationStatus, DriftCause, DriftRow, DriftState, EngineReport, ExcludedHook,
+    ForkEdit, Held, HeldPin, Installation, ItemWarning, Pin, PinnedHook, PlanOptions, Reach,
+    Registrations, RetiredStanding, RowRemedy, StoodIn, StoodInRecord, Targets,
 };
 
 pub(super) struct PlanOwnership {
@@ -192,7 +192,7 @@ pub fn plan_scope(
 
     plan_manifest_write(env, scope, options.manifest_base.as_ref(), &state, &mut ops)?;
 
-    let (fork_edits, recorded_gone) = plan_pass::plan_items(
+    let item_pass = plan_pass::plan_items(
         env,
         &state,
         scope,
@@ -245,10 +245,91 @@ pub fn plan_scope(
     // writes no record still says which commit each revision resolved to.
     let resolved_sources = resolved_revisions(&new_lock, &state);
     let installations = installations(env, scope, &manifest, &state)?;
+    let wanted = wanted(&manifest, &state);
     plan_lock_write(env, scope, declared, lock, &new_lock, &mut ops)?;
     let generated =
         generated_paths::plan(scope, &state, &instruction_shims, &drift, &trees, &mut ops)?;
 
+    let planned = Planned {
+        drift,
+        ops,
+        scope_notes,
+        set_changes,
+        repo_effects_leaving,
+        sweepable,
+        retired,
+        kept,
+        safety,
+        instruction_shims,
+        item_pass,
+        resolved_sources,
+        generated,
+        edited,
+        installations,
+        wanted,
+        readings,
+        new_lock,
+        held,
+    };
+    report(env, scope, &manifest, lock, options, state, planned)
+}
+
+/// What the passes of [`plan_scope`] planned, beside the desired state,
+/// that [`report`] reads off.
+struct Planned {
+    drift: Vec<DriftRow>,
+    ops: Vec<PlannedOp>,
+    scope_notes: Vec<String>,
+    set_changes: Vec<SetChange>,
+    repo_effects_leaving: Vec<crate::repo_effects::DeclaredEffects>,
+    sweepable: Vec<SetChange>,
+    retired: removal::Retired,
+    kept: Vec<KeptInstall>,
+    safety: Vec<ItemSafety>,
+    instruction_shims: Vec<ShimStanding>,
+    item_pass: plan_pass::ItemPass,
+    resolved_sources: BTreeMap<(String, Option<String>), crate::lock::SourceRev>,
+    generated: GeneratedPaths,
+    edited: BTreeSet<std::path::PathBuf>,
+    installations: BTreeMap<String, Installation>,
+    wanted: BTreeMap<(ItemKind, String), BTreeSet<crate::lock::Reason>>,
+    readings: scope_writes::RecordReadings,
+    new_lock: Lock,
+    held: Vec<HeldPin>,
+}
+
+/// The report of one [`plan_scope`] pass: what it planned, with the
+/// desired state moved in after every read of it.
+fn report(
+    env: &Env,
+    scope: &Scope,
+    manifest: &Manifest,
+    lock: &Lock,
+    options: &PlanOptions,
+    mut state: desired::DesiredState,
+    planned: Planned,
+) -> Result<EngineReport> {
+    let Planned {
+        drift,
+        ops,
+        scope_notes,
+        set_changes,
+        repo_effects_leaving,
+        sweepable,
+        retired,
+        kept,
+        safety,
+        instruction_shims,
+        item_pass,
+        resolved_sources,
+        generated,
+        edited,
+        installations,
+        wanted,
+        readings,
+        new_lock,
+        held,
+    } = planned;
     state.warnings.extend(state.agent_names.warnings());
     let retired_bundles = state.retired_bundles();
     let report = EngineReport {
@@ -275,16 +356,19 @@ pub fn plan_scope(
         kept,
         safety,
         instruction_shims,
-        fork_edits,
+        fork_edits: item_pass.fork_edits,
         resolved_sources,
-        recorded_gone,
+        recorded_gone: item_pass.recorded_gone,
+        own_edit_rows: item_pass.own_edit_rows,
         generated: generated.editing(edited, generated_paths::recorded(env, scope, lock)?),
         installations,
+        wanted,
         stood_in: readings.stood_in(lock),
         record: new_lock,
         held,
+        asked: Asked::Declared,
     };
-    settled(env, scope, &manifest, lock, options, &state.items, report)
+    settled(env, scope, manifest, lock, options, &state.items, report)
 }
 
 /// Finalize the kept Pi records and plan the native switches a declaration
@@ -532,6 +616,33 @@ fn installations(
         );
     }
     Ok(installations)
+}
+
+/// Why each package this pass was asked to install is wanted, by kind and
+/// name: what the closure derived for every package it rendered or
+/// refused to render, what each item planned outside that walk carries (a
+/// plugin, a custom hook, a built-in server), and for each Pi extension
+/// the manifest declares, its declaration. A package its catalog retired
+/// is not in it, whatever the record keeps: nothing renders it again.
+fn wanted(
+    manifest: &Manifest,
+    state: &desired::DesiredState,
+) -> BTreeMap<(ItemKind, String), BTreeSet<crate::lock::Reason>> {
+    let mut wanted = state.derived.clone();
+    for item in &state.items {
+        wanted
+            .entry((item.kind, item.name.clone()))
+            .or_default()
+            .extend(item.reasons.iter().cloned());
+    }
+    for name in manifest.pi_extensions.keys() {
+        wanted
+            .entry((ItemKind::PiExtension, name.clone()))
+            .or_default()
+            .insert(crate::lock::Reason::Requested);
+    }
+    wanted.retain(|item, _| !state.retired.contains_key(item));
+    wanted
 }
 
 /// The manifest this pass reads from and the state it derives: `declared`
