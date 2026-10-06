@@ -18,7 +18,8 @@ CE="$SKILL_DIR/scripts/changelog-entries"
 # Hermetic: a leaked setting would mask every row below.
 unset COMMIT_GUARDS_CHANGELOG_PATHS \
   COMMIT_GUARDS_CHANGELOG_RECORD COMMIT_GUARDS_CHANGELOG_COLLATE \
-  COMMIT_GUARDS_CHANGELOG_VERSION_PATHS COMMIT_GUARDS_SETTINGS_FILE 2>/dev/null || true
+  COMMIT_GUARDS_CHANGELOG_VERSION_PATHS COMMIT_GUARDS_CHANGELOG_PACKAGE_PATHS \
+  COMMIT_GUARDS_SETTINGS_FILE 2>/dev/null || true
 
 PASS=0
 FAIL=0
@@ -563,6 +564,160 @@ put app/package.json '{"version":"1.0.1"}\n'; frag added entry.md "$ADD\n"
 assert_eq 'a package.json beside a nested record reads the fragments' \
   "rc=1 ${ERR}patch-added=app/package.json:1.0.0:1.0.1;${ERR}entry-preview=$ADD;$(summary 1 1)" \
   "$(run COMMIT_GUARDS_CHANGELOG_VERSION_PATHS=app/package.json,COMMIT_GUARDS_CHANGELOG_RECORD=app/CHANGELOG.md '')"
+
+echo "=== a deleted version file has no version to judge ==="
+repo version-deleted
+put pi/a/package.json '{"version":"1.0.0"}\n'; stage; git -C "$R" commit -qm base
+git -C "$R" rm -q pi/a/package.json; frag fixed f.md '- Fix a typo.\n'
+assert_eq 'a deleted configured version file beside a program fragment passes' "rc=0 $(within 1)" "$(run 'COMMIT_GUARDS_CHANGELOG_VERSION_PATHS=pi/*/package.json' '')"
+
+echo "=== a package's entries move its own version, never the program's ==="
+# A fragment a pattern places through its package slot names its package;
+# skills/<name>/SKILL.md declares a versioned one, whose frontmatter
+# metadata.version its change raises, and hooks/<name>.sh a versionless one.
+# Every row commits app.json at 1.9.0, skills/pkg at the row's prior
+# version, skills/other at 1.0.0, hooks/hookx.sh and a nested
+# hooks/tests/lib/helper.sh, plus the row's base fragment, then stages its
+# own change and fragment. Fragment paths are under changelog.d.
+PKG_GLOBS='COMMIT_GUARDS_CHANGELOG_PATHS=changelog.d/*/*.md changelog.d/*/*/*.md,COMMIT_GUARDS_CHANGELOG_PACKAGE_PATHS=skills/*/SKILL.md hooks/*.sh agents/*.md'
+PKG_ENV="$PKG_GLOBS,COMMIT_GUARDS_CHANGELOG_VERSION_PATHS=app.json"
+skill() { printf -- '---\nname: %s\nmetadata:\n  author: test\n  version: "%s"\ntags: [x]\n---\n\n# %s\n' "$1" "$2" "$1"; } # NAME VERSION
+PKG='skills/pkg/SKILL.md'
+RUN='skills/pkg/run.sh'
+PKG_NOMATCH="${ERR}no-matches=changelog.d/*/*.md changelog.d/*/*/*.md"
+APP_MINOR="${ERR}minor-breaking=app.json:1.9.0:1.10.0;${ERR}entry-preview=$BREAK"
+UNBUMPED="rc=1 ${ERR}package-unbumped=$PKG:1.0.0;$(summary 1 0)"
+pkg_repo() { # NAME PRIOR BASE-FRAGMENT — committed
+  repo "$1"
+  put app.json '{"version":"1.9.0"}\n'
+  put "$PKG" "$(skill pkg "$2")\n"
+  put skills/pkg/run.sh 'echo one\n'
+  put skills/other/SKILL.md "$(skill other 1.0.0)\n"
+  put hooks/hookx.sh 'echo hook\n'
+  put hooks/tests/lib/helper.sh 'echo helper\n'
+  [ -z "$3" ] || put "changelog.d/$3" "$BREAK\n"
+  stage
+  git -C "$R" commit -qm base
+}
+for row in \
+  "package-only|package-only Breaking entry: the kendex minor passes and the package takes its major|1.10.0|1.0.0|2.0.0|$RUN||pkg/removed/entry.md|$BREAK|rc=0 $(within 1)" \
+  "program-breaking|program Breaking entry: the kendex minor is refused, it proposes a major|1.10.0|1.0.0|1.0.0|||removed/entry.md|$BREAK|rc=1 $APP_MINOR;$(summary 1 1)" \
+  "package-minor|package Breaking entry: the package's minor is refused|1.9.0|1.0.0|1.1.0|$RUN||pkg/removed/entry.md|$BREAK|rc=1 ${ERR}minor-breaking=$PKG:1.0.0:1.1.0;${ERR}entry-preview=$BREAK;$(summary 1 1)" \
+  "package-patch|package Added entry: the package's patch is refused|1.9.0|1.0.0|1.0.1|$RUN||pkg/added/entry.md|$ADD|rc=1 ${ERR}patch-added=$PKG:1.0.0:1.0.1;${ERR}entry-preview=$ADD;$(summary 1 1)" \
+  "zero-minor|a 0.x package minor with its own Breaking entry is not judged|1.9.0|0.1.0|0.2.0|$RUN||pkg/removed/entry.md|$BREAK|rc=0 $(within 1)" \
+  "unbumped|a package change with no version raise is refused|1.9.0|1.0.0|1.0.0|$RUN||||$UNBUMPED" \
+  "bumped|control: the same change with a patch raise passes|1.9.0|1.0.0|1.0.1|$RUN||||rc=0 $PKG_NOMATCH" \
+  "fragment-only|a fragment alone is no package change|1.9.0|1.0.0|1.0.0|||pkg/fixed/entry.md|- Fix a typo.|rc=0 $(within 1)" \
+  "earlier|an earlier change's Breaking entry is that release's, not this patch's|1.9.0|1.0.0|1.0.1|$RUN|pkg/removed/old.md|||rc=0 $(within 1)" \
+  "edited|so is an earlier Breaking entry this patch edits|1.9.0|1.0.0|1.0.1|$RUN|pkg/removed/old.md|pkg/removed/old.md|$BREAK Spelled out.|rc=0 $(within 1)" \
+  "other|another package's Breaking entry leaves this major unnamed|1.9.0|1.0.0|2.0.0|$RUN||other/removed/entry.md|$BREAK|rc=1 ${ERR}major-breaking=$PKG:1.0.0:2.0.0;$(summary 1 1)" \
+  "hook|a versionless hook's change and fragment are accepted, no version read|1.9.0|1.0.0|1.0.0|hooks/hookx.sh||hookx/fixed/entry.md|- Fix a typo.|rc=0 $(within 1)" \
+  "nested-helper|a fragment named for a nested hooks/tests helper names no package|1.9.0|1.0.0|1.0.0|||helper/fixed/entry.md|- Fix a typo.|rc=1 ${ERR}fragment-package=changelog.d/helper;$(summary 1 0)" \
+  "duplicate|an agent and a skill of one name are refused, naming both files|1.9.0|1.0.0|1.0.0|agents/pkg.md||||rc=2 ${ERR}package-duplicate=agents/pkg.md:$PKG" \
+  "misspelled|a Breaking fragment naming no declared package is refused, naming its directory|1.9.0|1.0.0|1.0.1|$RUN||linaer/removed/entry.md|$BREAK|rc=1 ${ERR}fragment-package=changelog.d/linaer;$(summary 1 0)" \
+  "unversioned|a package file with no metadata.version is a collection error|1.9.0|1.0.0|none|$RUN||||rc=2 ${ERR}version-read=$PKG"; do
+  IFS='|' read -r name label app_next pkg_prior pkg_next change base_frag frag fragment expected <<<"$row"
+  pkg_repo "package-$name" "$pkg_prior" "$base_frag"
+  put app.json "{\"version\":\"$app_next\"}\n"
+  case "$pkg_next" in
+    none) put "$PKG" '---\nname: pkg\n---\n' ;;
+    *) put "$PKG" "$(skill pkg "$pkg_next")\n" ;;
+  esac
+  [ -z "$change" ] || put "$change" 'echo two\n'
+  [ -z "$frag" ] || put "changelog.d/$frag" "$fragment\n"
+  stage
+  assert_eq "$label" "$expected" "$(run "$PKG_ENV" '')"
+done
+R="$TMP/package-unbumped"
+assert_eq 'the package check runs with no version files configured' "$UNBUMPED" "$(run "$PKG_GLOBS" '')"
+# A new package has no prior version to raise.
+repo package-new
+put app.json '{"version":"1.9.0"}\n'; stage; git -C "$R" commit -qm base
+put "$PKG" "$(skill pkg 1.0.0)\n"; put skills/pkg/run.sh 'echo one\n'; stage
+assert_eq 'a new package needs no raise' "rc=0 $PKG_NOMATCH" "$(run "$PKG_ENV" '')"
+# The version is the metadata block's, plain or quoted.
+for row in \
+  "plain|a plain metadata.version above a top-level version line is the version read|metadata:\n  version: 1.0.0\nversion: 9.9.9" \
+  "single|a single-quoted metadata.version is read without its quotes|metadata:\n  version: '1.0.0'"; do
+  IFS='|' read -r name label frontmatter <<<"$row"
+  repo "package-form-$name"
+  put "$PKG" "---\nname: pkg\n$frontmatter\n---\n"; put skills/pkg/run.sh 'echo one\n'; stage; git -C "$R" commit -qm base
+  put skills/pkg/run.sh 'echo two\n'; stage
+  assert_eq "$label" "$UNBUMPED" "$(run "$PKG_ENV" '')"
+done
+# A program pattern globbing deeper than its root has no package slot.
+repo package-mid-glob
+put app.json '{"version":"1.9.0"}\n'; put "$PKG" "$(skill pkg 1.0.0)\n"; stage; git -C "$R" commit -qm base
+put app.json '{"version":"1.10.0"}\n'; put packages/app/changelog.d/removed/x.md "$BREAK\n"; stage
+assert_eq 'a mid-path-glob pattern places program entries' "rc=1 $APP_MINOR;$(summary 1 1)" \
+  "$(run 'COMMIT_GUARDS_CHANGELOG_PATHS=packages/*/changelog.d/*/*.md,COMMIT_GUARDS_CHANGELOG_PACKAGE_PATHS=skills/*/SKILL.md,COMMIT_GUARDS_CHANGELOG_VERSION_PATHS=app.json' '')"
+# The record's Packages part holds the packages' releases: its Breaking
+# entry proposes no kendex major, as the same entry under Changed does.
+for row in \
+  "record-packages|a Breaking entry under the record's Packages part leaves the kendex minor alone|### Packages\n\n#### pkg 2.0.0\n\n$BREAK\n|rc=0 $PKG_NOMATCH" \
+  "record-changed|control: under Changed it refuses the kendex minor|### Changed\n\n$BREAK\n|rc=1 $APP_MINOR;$(summary 1 0)"; do
+  IFS='|' read -r name label part expected <<<"$row"
+  repo "$name"
+  put app.json '{"version":"1.9.0"}\n'; put CHANGELOG.md '## [Unreleased]\n'; stage; git -C "$R" commit -qm base
+  put app.json '{"version":"1.10.0"}\n'; put CHANGELOG.md "## [Unreleased]\n\n$part"; stage
+  assert_eq "$label" "$expected" "$(run "$PKG_ENV" '')"
+done
+
+echo "=== a staged run inside an amend compares against the amended commit's parent ==="
+# A real pre-commit hook: the amend is read off the committing git's argv in
+# /proc, which macOS lacks, so the amend rows are skipped there.
+amend_repo() { # NAME JUDGE — the package raised 1.0.0 -> 1.1.0 in HEAD, a correction staged
+  repo "$1"
+  printf '#!/bin/sh\nexec %s --staged >"%s/hook.out" 2>&1\n' "$2" "$R" >"$R/.git/hooks/pre-commit"
+  chmod +x "$R/.git/hooks/pre-commit"
+  put "$PKG" "$(skill pkg 1.0.0)\n"; put skills/pkg/run.sh 'echo one\n'; stage; git -C "$R" commit -qm base
+  put "$PKG" "$(skill pkg 1.1.0)\n"; put skills/pkg/run.sh 'echo two\n'; stage; git -C "$R" commit -qm raise
+  put skills/pkg/run.sh 'echo three\n'; stage
+}
+commit() { # ARGS — git's exit status, then the hook's stable records
+  local rc=0
+  : >"$R/hook.out"
+  COMMIT_GUARDS_CHANGELOG_PACKAGE_PATHS='skills/*/SKILL.md' git -C "$R" commit "$@" >/dev/null 2>&1 || rc=$?
+  printf 'rc=%s %s' "$rc" "$(LC_ALL=C awk '/^changelog-entries: [a-z-]+=/ { print }' "$R/hook.out" | paste -sd ';' -)"
+}
+amend_repo amend-next "$CE"
+assert_eq 'control: a new commit after the raise owes its own' \
+  "rc=1 ${ERR}package-unbumped=$PKG:1.1.0;$(summary 1 0)" "$(commit -qm next)"
+if [ -r "/proc/$$/cmdline" ]; then
+  amend_repo amend "$CE"
+  assert_eq 'an amend adding a correction under the raised package passes' "rc=0 $NOMATCH" "$(commit -q --amend --no-edit)"
+else
+  printf '  skip  %s\n' 'the amend rows need /proc/<pid>/cmdline'
+fi
+
+# Must-fail controls on a disposable copy of the scripts: each plants the
+# defect its rule exists against, and the row that pins the rule turns red.
+control() { # LABEL FIXTURE EXPECT FROM TO [SCRIPT]
+  local judge
+  gg_mutant judge "${6:-changelog-entries}" "$4" "$5"
+  judge="${judge%/*}"
+  judge="${judge%/lib}/changelog-entries"
+  R="$TMP/$2"
+  assert_eq "control: $1" "$3" "$(CE="$judge" run "$PKG_ENV" '')"
+}
+control 'under the old rule a package-only Breaking entry refuses the kendex minor' package-package-only \
+  "rc=1 $APP_MINOR;$(summary 1 1)" '[ -z "$GG_FRAGMENT_PACKAGE" ] || continue' ':'
+control 'without the unbumped refusal the unraised change passes' package-unbumped \
+  "rc=0 $PKG_NOMATCH" 'refuse package-unbumped' ': package-unbumped'
+control 'without the package lookup a misspelled package directory passes' package-misspelled \
+  "rc=0 $(within 1)" 'if [ -n "$GG_FRAGMENT_PACKAGE" ] && ! gg_package_row "$GG_FRAGMENT_PACKAGE"; then' 'if false; then'
+control 'a package glob matching across / declares the nested helper' package-nested-helper \
+  "rc=0 $(within 1)" 'gg_path_placer "$f" $GG_CHANGELOG_PACKAGES || continue' 'gg_path_matches "$f" $GG_CHANGELOG_PACKAGES || continue' lib/changelog-grammar.sh
+control 'without the duplicate refusal the agent shadows the skill' package-duplicate \
+  "rc=0 $PKG_NOMATCH" '! gg_package_row "$name"' '! false' lib/changelog-grammar.sh
+control 'version-checking a versionless package refuses the hook change' package-hook \
+  "rc=2 ${ERR}version-read=hooks/hookx.sh" '[ -n "$dir" ] || continue' '[ -n "$dir" ] || dir="$pf"'
+if [ -r "/proc/$$/cmdline" ]; then
+  gg_mutant judge changelog-entries '[ -z "$GG_COMMIT_BASE" ] || diff_args+=("$GG_COMMIT_BASE")' ':'
+  amend_repo amend-head "$judge"
+  assert_eq 'control: compared against HEAD the amend is refused' \
+    "rc=1 ${ERR}package-unbumped=$PKG:1.1.0;$(summary 1 0)" "$(commit -q --amend --no-edit)"
+fi
 
 echo "=== the usage is answered ==="
 repo help
