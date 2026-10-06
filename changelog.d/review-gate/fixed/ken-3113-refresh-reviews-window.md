@@ -1,0 +1,1 @@
+- The consumer refresh workflow reads only open refresh pull requests and those merged in the last 24 hours, so it no longer spends the app's API quota on every merged one.
