@@ -59,9 +59,9 @@ for row in \
   assert_eq "rc=$REFRESH_RC lists=$LISTS all=$REFRESH_ALL_LISTS heartbeats=$REFRESH_HEARTBEATS events=$REFRESH_EVENTS stale=$REFRESH_STALE" "rc=0 lists=1 all=$(( ${#head} > 0 )) heartbeats=$heartbeats events=$want stale=$stale" "$name" "$STUB_DIR/err"
 done
 
-# Keep the pair from the fixture above, but change its last diagnostic. Tabs
-# in gh's prefix are removed, and the last matching diagnostic wins.
-printf 'Refresh\tRefresh consumer\t2026-09-30T20:00:00Z refresh-error=old\nRefresh\tRefresh consumer\t2026-09-30T20:00:01Z kendex-hook-commit-guards: failed | check=changelog\nother output\n' > "$STUB_DIR/refresh-log.211.txt"
+# Keep the pair from the fixture above, but change its diagnostic. Tabs in
+# gh's prefix are removed.
+printf 'Refresh\tRefresh consumer\t2026-09-30T20:00:01Z kendex-hook-commit-guards: failed | check=changelog\nother output\n' > "$STUB_DIR/refresh-log.211.txt"
 refresh_watch
 CHANGED='EVENT refresh-failing owner/repo runs=2 last=211 since=2026-09-30T20:00:00Z report=repeat cause=kendex-hook-commit-guards: failed | check=changelog'
 assert_eq "rc=$REFRESH_RC events=$REFRESH_EVENTS" "rc=0 events=$CHANGED" "a changed cause is news before the repeat interval" "$STUB_DIR/err"
@@ -119,7 +119,12 @@ for row in \
   'invalid-json|json|not-json|1|' \
   'invalid-shape|json|{}|1|' \
   'log-unread|log|HTTP 410: logs expired|1|unread' \
-  'no-diagnostic|text|unrelated failed-step output|0|unread'; do
+  'no-diagnostic|text|unrelated failed-step output|0|unread' \
+  'hook-warning|text|R\tS\tT warning: kendex-hook-carrier-missing: hook=a\nR\tS\tT other output|0|kendex-hook-carrier-missing: hook=a' \
+  'failed-over-warnings|text|R\tS\tT warning: kendex-hook-carrier-missing a\nR\tS\tT FAIL check=c value=v\nR\tS\tT failed: doc-drift-check: not found\nR\tS\tT kendex-hook-carrier-missing b\nR\tS\tT Error: refresh failed: 1 problem(s)|0|failed: doc-drift-check: not found' \
+  'fail-check-over-warnings|text|R\tS\tT kendex-hook-excluded: hook=a\nR\tS\tT ok check=b value=c\nR\tS\tT FAIL check=workflow-edited value=.github/workflows/w.yml\nR\tS\tT   FAIL check=indented value=x\nR\tS\tT Error: refresh failed: 1 problem(s)\nR\tS\tT kendex-hook-excluded: hook=d|0|FAIL check=workflow-edited value=.github/workflows/w.yml' \
+  'error-over-warnings|text|R\tS\tT Error: first\nR\tS\tT refresh-error=dirty value=x\nR\tS\tT Error: refresh failed: 1 problem(s)\nR\tS\tT kendex-hook-carrier-missing b|0|Error: refresh failed: 1 problem(s)' \
+  'refresh-error-over-warnings|text|R\tS\tT refresh-error=dirty value=x\nR\tS\tT kendex-hook-carrier-missing b|0|refresh-error=dirty value=x'; do
   IFS='|' read -r name kind input notices cause <<<"$row"
   new_case "$name"
   printf '[{"databaseId":202,"attempt":1,"conclusion":"failure","createdAt":"2026-09-30T08:00:00Z"},{"databaseId":201,"attempt":1,"conclusion":"failure","createdAt":"2026-09-30T07:00:00Z"}]\n' > "$STUB_DIR/refresh.owner_repo.json"
@@ -127,7 +132,7 @@ for row in \
     runs) printf '%s\n' "$input" > "$STUB_DIR/refresh.owner_repo.err" ;;
     json) printf '%s\n' "$input" > "$STUB_DIR/refresh.owner_repo.json" ;;
     log) printf '%s\n' "$input" > "$STUB_DIR/refresh-log.202.err" ;;
-    text) printf '%s\n' "$input" > "$STUB_DIR/refresh-log.202.txt" ;;
+    text) printf '%b\n' "$input" > "$STUB_DIR/refresh-log.202.txt" ;;
   esac
   refresh_watch
   NOTICES="$(grep -c '^oversee-watch: refresh-unread ' "$STUB_DIR/err" || true)"
