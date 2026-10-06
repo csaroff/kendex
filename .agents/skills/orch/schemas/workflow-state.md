@@ -16,7 +16,7 @@ Persistent state file for orch workflows. Survives context compaction.
   "worktree": "/absolute/path/to/worktree",
   "branch": "user/proj-123",
   "qa_labels": ["needs-perf-test", "needs-safety-audit"],
-  "near_ceiling": ["byte-ceiling: near-ceiling=crates/core/src/engine/deps.rs:189000:204800:92"],
+  "near_ceiling": ["byte-ceiling: near-ceiling=assets/demo.bin:189000:204800:92"],
   "validate_rounds": [{ "round_id": "1769600000123456789-1837", "kind": "implement", "mode": "full", "seconds": 3300 }],
   "child_sessions": {
     "backend": { "status": "active", "agent_id": "agent_abc123", "runtime_agent_type": "backend", "agent_type_fallback": null, "spawned_at": "[ISO_8601_UTC]" },
@@ -73,19 +73,6 @@ Persistent state file for orch workflows. Survives context compaction.
   "rebase_map": {
     "0a1b2c3d4e5f60718293a4b5c6d7e8f901234567": "76543210f9e8d7c6b5a49382716051423344abcd"
   },
-  "pr": {
-    "size_check": {
-      "base_sha": "0a1b2c3d4e5f60718293a4b5c6d7e8f901234567",
-      "head_sha": "76543210f9e8d7c6b5a49382716051423344abcd",
-      "production_lines": 214,
-      "test_lines": 262,
-      "mirror_lines": 140,
-      "production_allowance": 250,
-      "test_allowance": 300,
-      "verdict": "pass",
-      "reason": ""
-    }
-  },
   "pr_review": {
     "mode": "approval"
   },
@@ -137,7 +124,7 @@ Persistent state file for orch workflows. Survives context compaction.
 | `worktree` | string | Absolute path to git worktree |
 | `branch` | string | Git branch name |
 | `qa_labels` | string[] | QA trigger labels from dev return |
-| `near_ceiling` | string[] | `byte-ceiling` `near-ceiling` lines from the last recorded dev return, each naming a file within reach of the byte ceiling. `dev-start.md` § Store Near-Ceiling Lines is the one writer, invoked by the implement and fix accept paths and by the retry path for a structurally valid artifact with a failing `validate`. It REPLACES the list, and a return whose probe did not answer (`near_ceiling: null`) leaves it as it stood: state describes the branch as the last recorded round left it, never an accumulation across rounds. The next round's delegation renders one `Near-ceiling:` line per entry |
+| `near_ceiling` | string[] | `byte-ceiling` `near-ceiling` lines from the last recorded dev return, each naming a binary blob within reach of the byte ceiling. `dev-start.md` § Store Near-Ceiling Lines is the one writer, invoked by the implement and fix accept paths and by the retry path for a structurally valid artifact with a failing `validate`. It REPLACES the list, and a return whose probe did not answer (`near_ceiling: null`) leaves it as it stood: state describes the branch as the last recorded round left it, never an accumulation across rounds. The next round's delegation renders one `Near-ceiling:` line per entry |
 | `child_sessions` | object | Per-agent lifecycle keyed by logical agent name: `{agent: {status, agent_id, runtime_agent_type, agent_type_fallback, spawned_at}}`. `status` is `"active"` while the session is live (`dev-start.md` § 2 stamps it at spawn) and `"closed"` once the caller's shutdown step retires it (`start-worktree.md` § 5.5). Reviewer slot accounting treats a record with a missing `status` field as active |
 | `review_agents` | string[] | Reviewer names currently expected to stay alive across fix/re-review cycles; in wave mode (`REVIEWER_SLOT_BUDGET` exceeded) only the currently launched wave |
 | `review_agent_ids` | object | Reviewer session IDs keyed by name — reuse before spawning `{"name":"id",...}` |
@@ -167,7 +154,6 @@ Persistent state file for orch workflows. Survives context compaction.
 | `declined_items` | object[] | Findings review-pr § 4 or § 7 declined, one `{description, location, reason, source}` per (location, description), a re-raised decline replacing its entry. The re-review and QA delegations list them as Declined, `review-artifact-check --issue` reports a finding at a listed location under `repeats` as a candidate carrying each decline recorded there, and § 8 carries each one's reason |
 | `audit_issues_created` | string[] | Issue IDs created by audit |
 | `rebase_map` | object | Old→new commit SHA map accumulated by orch `worktree-push` from the worktree-private `kendex-rebase-map` file, which is the only channel it reads: it holds what a completed guarded restack recorded before the push and what the push itself recorded during it. Keys are pre-rebase SHAs; values are post-rebase SHAs, or the literal `"dropped"` when the replayed commit vanished. `worktree-push` rewrites the SHAs stored elsewhere in state at push time — `fixed_items[].commit` and `pr_comment_review.fixes[].commit` become the new SHA truncated to the recorded length, or the marked form `dropped:<recorded sha>` for a dropped mapping. The map remains for artifact-sourced references (e.g. perf QA `benchmark_commit`) — resolve through it repeatedly until no key matches |
-| `pr` | object | Pull-request size state. `size_check` initializes as null and holds the latest report from `branch-size-check` without `--cut-from-round`: `base_sha` and `head_sha`, the commits it compared; `production_lines`, `test_lines` and `mirror_lines`, the added lines in each part; `production_allowance` and `test_allowance` from the issue's optional `**Expected delta**` line, null where absent; the `verdict` (`pass`, `over`, `allowance_missing`) and its `reason`, which for `allowance_missing` names which of its two causes applied: an issue that was read and states no line, or a key such as `pr-N` or `local-` that names no issue to read. Cut acceptance uses the comparison in [dev-round.md § Declared cuts](dev-round.md#declared-cuts). Cut comparisons leave the record unchanged; other measurements overwrite it. A reader binds it to a head by `head_sha`; review-gate's `pr-watch.sh` annotates its `disarmed` line with the record for the PR head and reports any other as stale |
 | `pr_review_baseline` | object | `last_threads[]` — the unresolved review-thread IDs present at the end of the last triage pass. `review-pr-comments.md` § 6.3 calls a thread new when its id is absent from this array; never store a count here |
 | `pr_comment_review` | object | PR comment review tracking: `iterations`, `fixes[]`, `issues_created[]`, `skipped[]`, `replied[]` (thread IDs answered), `proposed_rules[]` (deduplicated rules accepted from dev artifact summaries for the PR body), `patched_causes[]` — one `{cause, commit}` per patched cause, the single record [finding-disposition.md § Recurrence](../references/finding-disposition.md#recurrence) reads: this workflow writes it where the reply resolves the thread, and [dev-fix.md](../workflows/dev-fix.md) § 2 writes it for the `pr-review`, `qa-review`, and `review` loops, whose items land in `fixed_items`; `frozen_causes[]` — one `{cause, issue}` per cause frozen by [finding-disposition.md § Recurrence](../references/finding-disposition.md#recurrence), written before the `Tracked:` reply; a later finding on a listed cause is declined, never re-triaged |
 | `pr_approval` | object | Reviewer-gate override tracking: `forced` (the user chose Force merge to stop waiting for a missing verdict; item-wide, set only by `submit-pr.md` § 4's Force merge, never cleared by a push, and read by `submit-pr.md` § 6.1 gate 4 and `merge-pr.md` § 3.2 and § 5), `reviewer_down` (`PR_REVIEW_ON_TIMEOUT=proceed` auto-proceeded past the deadline with every reviewer silent), `copilot_rerequest_head` (the head `review-pr-comments.md` § 7.2 requested its one Copilot re-review on, which that section reads so a head gets one request) |
