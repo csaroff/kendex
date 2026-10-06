@@ -660,7 +660,7 @@ assert_eq "$(sed -n 1p <"$ERR")" "dev-validate-run: option-unused option=--budge
 assert_eq "$RC" "2" "and exits 2"
 
 run_script "$RUN" --poll 1
-assert_eq "$(sed -n 1p <"$ERR")" "dev-validate-run: required options=--worktree,--wait,--stop,--record,--resolve-mode,--child" \
+assert_eq "$(sed -n 1p <"$ERR")" "dev-validate-run: required options=--worktree,--wait,--stop,--record,--resolve-mode,--last-pass,--child" \
   "a call naming no mode is refused"
 assert_eq "$RC" "2" "and exits 2"
 
@@ -1643,6 +1643,60 @@ live_control mutant mutant-live-verdict $'dir="${pid_file%/pid}"\n    [[ ! -s "$
 live_control lib_mutant mutant-live-argv '[[ "$args" == $2 ]] || return 1' ':' live-reused-pid
 live_control lib_mutant mutant-unread-gone $'kill -0 "$1" 2>/dev/null || return 1\n    return 2' $'kill -0 "$1" 2>/dev/null || return 1\n    return 1' live-child-unread
 live_control mutant mutant-unread-no-run '[[ "$is" != 1 ]] || continue' '[[ "$is" == 0 ]] || continue' live-child-unread
+
+# --- --last-pass names the newest passing run and the tree it validated --------
+# The pass validates an edit not yet committed, as dev-implement validates
+# before it commits, so its tree is the edit's, never HEAD's. A failing run
+# after it makes the worktree red, and a ci run after it, which ran nothing,
+# leaves the pass standing. restack_skip.sh holds what reads the answer. Run
+# directories are named for the second they start, so a row waits a second
+# between two runs whose order it reads.
+proj_last="$(make_mode_proj proj-last "")"
+run_script "$RUN" --last-pass --worktree "$proj_last"
+assert_eq "$OUT rc=$RC" "last-pass=none rc=1" "a worktree with no run has no last pass" "$ERR"
+printf 'edit\n' > "$proj_last/edited"
+want_tree="$(GIT_INDEX_FILE="$TMP_ROOT/last-pass-index" git -C "$proj_last" add -A \
+  && GIT_INDEX_FILE="$TMP_ROOT/last-pass-index" git -C "$proj_last" write-tree)"
+run_script "$RUN" --worktree "$proj_last" --poll 1
+last_pass_dir="$(run_dir_of "$OUT")"
+LAST_PASS_WANT="run-dir=$last_pass_dir head=$(git -C "$proj_last" rev-parse HEAD) tree=$want_tree rc=0"
+run_script "$RUN" --last-pass --worktree "$proj_last"
+assert_eq "$OUT rc=$RC" "$LAST_PASS_WANT" \
+  "--last-pass names the passing run, its HEAD and the tree of the uncommitted edit it validated" "$ERR"
+sleep 1
+sed -i.bak 's/^DEV_VALIDATE_CMD = .*/DEV_VALIDATE_CMD = "false"/' "$proj_last/kendex.settings.toml"
+run_script "$RUN" --worktree "$proj_last" --poll 1
+last_red_dir="$(run_dir_of "$OUT")"
+assert_eq "$(verdict_of "$OUT")" "state=done guard-exit=1 validate=FAILING" "the later run in that worktree fails" "$ERR"
+LAST_RED_WANT="last-pass=red run-dir=$last_red_dir rc=1"
+run_script "$RUN" --last-pass --worktree "$proj_last"
+assert_eq "$OUT rc=$RC" "$LAST_RED_WANT" "a failing run after the pass names that run as red" "$ERR"
+mutant mutant-last-pass-red $'      red="$run_dir"\n      continue' '      continue'
+run_script "$MUTANT" --last-pass --worktree "$proj_last"
+assert_eq "$OUT rc=$RC" "$LAST_PASS_WANT" "control: a read that passes over a red run names the pass before it"
+proj_last_head="$(make_mode_proj proj-last-head "")"
+printf 'edit\n' > "$proj_last_head/edited"
+mutant mutant-last-pass-head 'snapshot_tree="$tree"' 'snapshot_tree="$(git -C "$worktree" rev-parse "HEAD^{tree}")"'
+run_script "$MUTANT" --worktree "$proj_last_head" --poll 1
+run_script "$RUN" --last-pass --worktree "$proj_last_head"
+assert_eq "$([[ "${OUT##* }" == "tree=$want_tree" ]] && echo edit || echo other)" "other" \
+  "control: a start that records HEAD's tree loses the uncommitted edit"
+proj_last_ci="$(ci_proj proj-last-ci CI)"
+ci_world rules
+RUN_PATH="$GH_STUB_BIN:$PATH" STUB_ANSWER=change_class=micro STUB_DOCS=false STUB_MEASURED=true \
+  run_script "$CI_SCRIPT" --worktree "$proj_last_ci" --poll 1
+last_full_dir="$(run_dir_of "$OUT")"
+sleep 1
+RUN_PATH="$GH_STUB_BIN:$PATH" STUB_ANSWER=change_class=micro STUB_DOCS=false STUB_MEASURED=true \
+  run_script "$CI_SCRIPT" --worktree "$proj_last_ci" --poll 1 --validate-mode ci --base HEAD
+assert_eq "$(start_line "$(run_dir_of "$OUT")" validate-mode) $(verdict_of "$OUT")" "ci state=done guard-exit=0 validate=pass" \
+  "a ci run after the full pass passes with no command" "$ERR"
+run_script "$RUN" --last-pass --worktree "$proj_last_ci"
+assert_eq "${OUT%% *} rc=$RC" "run-dir=$last_full_dir rc=0" "--last-pass passes over a newer ci run, which validated nothing" "$ERR"
+mutant mutant-last-pass-ci $'      *) continue ;;\n    esac\n    verdict=unfinished' $'      *) ;;\n    esac\n    verdict=unfinished'
+run_script "$MUTANT" --last-pass --worktree "$proj_last_ci"
+assert_eq "$([[ "${OUT%% *} rc=$RC" == "run-dir=$last_full_dir rc=0" ]] && echo full || echo other)" "other" \
+  "control: a read that takes any mode names the ci run"
 
 # --- A value option given twice is refused, never half-read ---------------------
 # option|the arguments that repeat it
