@@ -192,7 +192,7 @@ pub(crate) fn planning_manifest<'a>(
 ) -> (std::borrow::Cow<'a, Manifest>, Option<HeldPins>) {
     match &options.update_only {
         Some(targets) => {
-            let (held, pins) = held_manifest(manifest, lock, targets);
+            let (held, pins) = held_manifest(manifest, lock, targets, options.keep_source_records);
             (std::borrow::Cow::Owned(held), Some(pins))
         }
         None => (std::borrow::Cow::Borrowed(manifest), None),
@@ -300,11 +300,20 @@ fn release(
 /// declarations are pinned and nothing about how one is read.
 ///
 /// A declaration the lock cannot place — nothing installed, installations
-/// disagreeing on their commit, or any one of them recorded against a
-/// source this declaration does not read from — is left to resolve
-/// fresh: a wrong pin would move it somewhere nobody asked for, and fresh
-/// is what a whole-scope apply gives it anyway.
-fn held_manifest(manifest: &Manifest, lock: &Lock, targets: &Targets) -> (Manifest, HeldPins) {
+/// disagreeing on their commit, any one of them recorded against a
+/// source this declaration does not read from, or, under a write that
+/// keeps the record (`keeps_records`,
+/// [`super::super::PlanOptions::keep_source_records`]), a source declared
+/// at another repository or revision than the record's account of it was
+/// written for — is left to resolve fresh: a wrong pin would move it
+/// somewhere nobody asked for, and fresh is what a whole-scope apply gives
+/// it anyway.
+fn held_manifest(
+    manifest: &Manifest,
+    lock: &Lock,
+    targets: &Targets,
+    keeps_records: bool,
+) -> (Manifest, HeldPins) {
     let mut exempt: BTreeSet<Owner> = BTreeSet::new();
     for target in &targets.declarations {
         exempt.extend(exempted_by(manifest, lock, target, targets.reach));
@@ -324,7 +333,7 @@ fn held_manifest(manifest: &Manifest, lock: &Lock, targets: &Targets) -> (Manife
                     })
             })
             .filter_map(|(name, decl)| {
-                let repo = source_repo(manifest, &decl.source)?;
+                let repo = held_repo(manifest, lock, &decl.source, keeps_records)?;
                 let commit = held_at(lock, kind, name, &decl.source, repo)?;
                 Some((name.clone(), decl.source.clone(), repo.to_owned(), commit))
             })
@@ -349,7 +358,7 @@ fn held_manifest(manifest: &Manifest, lock: &Lock, targets: &Targets) -> (Manife
         if decl.rev.is_some() || exempted {
             continue;
         }
-        let Some(repo) = source_repo(manifest, &decl.source) else {
+        let Some(repo) = held_repo(manifest, lock, &decl.source, keeps_records) else {
             continue;
         };
         let Some(commit) = held_commit(lock, name, &decl.source, repo) else {
@@ -464,6 +473,39 @@ pub(crate) fn installed_manifest(manifest: &Manifest, lock: &Lock) -> Manifest {
 /// holding anything.
 fn source_repo<'a>(manifest: &'a Manifest, source: &str) -> Option<&'a str> {
     manifest.sources.get(source)?.repo.as_deref()
+}
+
+/// [`source_repo`] for a held plan: `None` also, under a write that keeps
+/// the record (`keeps_records`), where the record's account of the source
+/// was written for another repository or revision than it is declared at
+/// now. Every commit under such a source was read at a selector the person
+/// has since replaced, and a write that held at one would keep the record's
+/// source entry with it, so no such write would ever apply the edit. After
+/// a revision edit any other hold, `verify --at-record`'s reading included,
+/// keeps the record as it stands; a single-package update or an add writes
+/// the source's entry unchanged too (`record_readings`), so the edit stays
+/// pending for the next write that keeps the record, while
+/// `verify --at-record` reads the source at the revision declared now.
+/// After a repository edit the record installed nothing from the
+/// repository declared now, so [`held_at`] and [`held_commit`] place no
+/// follower under any hold, and a single-package update or an add records
+/// the rebind at once. A source with no account is held to its entries
+/// alone.
+fn held_repo<'a>(
+    manifest: &'a Manifest,
+    lock: &Lock,
+    source: &str,
+    keeps_records: bool,
+) -> Option<&'a str> {
+    let repo = source_repo(manifest, source)?;
+    if !keeps_records {
+        return Some(repo);
+    }
+    let rev = manifest.sources.get(source)?.rev.as_deref();
+    lock.sources
+        .get(source)
+        .is_none_or(|recorded| recorded.written_for(repo, rev))
+        .then_some(repo)
 }
 
 /// Whether this installation came from where the declaration reads now.

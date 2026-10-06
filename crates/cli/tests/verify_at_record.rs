@@ -197,14 +197,8 @@ fn at_record_declares_the_dependencies_the_recorded_commit_required() {
     );
     requires(&world, "first");
     commit(&world.catalog, "second requires first");
-    for args in [&["source", "refresh"][..], &["apply", "-y", "--leave"]] {
-        let output = kendex(&world.home, &world.project, args);
-        assert!(
-            output.status.success(),
-            "kendex {args:?}: {}",
-            said(&output)
-        );
-    }
+    let output = kendex(&world.home, &world.project, &["refresh", "-y", "--leave"]);
+    assert!(output.status.success(), "{}", said(&output));
     commit(&world.project, "refreshed");
     let (refreshed, document) = at_record(&world, None);
     assert!(refreshed.status.success(), "{}", said(&refreshed));
@@ -265,14 +259,8 @@ fn at_record_refuses_a_record_older_than_the_base_record() {
         "\nA paragraph added later.\n",
     );
     commit(&world.catalog, "the catalog moves on");
-    for args in [&["source", "refresh"][..], &["apply", "-y", "--leave"]] {
-        let output = kendex(&world.home, &world.project, args);
-        assert!(
-            output.status.success(),
-            "kendex {args:?}: {}",
-            said(&output)
-        );
-    }
+    let output = kendex(&world.home, &world.project, &["refresh", "-y", "--leave"]);
+    assert!(output.status.success(), "{}", said(&output));
     commit(&world.project, "brought current");
     git(&world.project, &["tag", "current"]);
     git(&world.project, &["checkout", "-q", INSTALLED, "--", "."]);
@@ -361,4 +349,108 @@ fn at_record_leaves_a_declared_revision_to_itself() {
     let (output, document) = at_record(&world, None);
     assert!(output.status.success(), "{}", said(&output));
     assert_eq!(record_detail(&document), "", "{document:?}");
+}
+
+/// A record whose source entry was edited by hand to another repository
+/// or revision speaks for a declaration the manifest does not make, and
+/// the record row fails under `--at-record`.
+#[test]
+#[allow(clippy::unwrap_used)]
+fn at_record_holds_the_records_source_entry_to_the_manifest() {
+    let world = world();
+    let rows: [(&str, RecordEdit); 2] = [
+        (
+            "another repository",
+            Box::new(|lock| lock["sources"]["cat"]["repo"] = "other/repo".into()),
+        ),
+        (
+            "another revision",
+            Box::new(|lock| {
+                let entry = lock["sources"]["cat"].clone();
+                lock["sources"]["cat"] = serde_json::json!({
+                    "repo": entry["repo"],
+                    "rev": "v1",
+                    "commit": entry["commit"],
+                });
+            }),
+        ),
+    ];
+    for (label, edit) in rows {
+        git(&world.project, &["checkout", "-q", "--", RECORD]);
+        edit_json(&world.project.join(RECORD), edit);
+        let (output, document) = at_record(&world, None);
+        assert!(!output.status.success(), "{label}: {}", said(&output));
+        let record = row(&document, "record", RECORD, None).unwrap();
+        assert_eq!(record.state, State::Failed, "{label}: {record:?}");
+    }
+}
+
+/// A `[sources]` revision edit no write has applied yet leaves every
+/// follower held at its recorded commit, and `--at-record` reads the
+/// source at the revision declared now: the record row fails, each held
+/// commit is listed as stale against the declared revision it differs
+/// from, and a revision the mirror cannot serve fails rather than passes.
+#[test]
+#[allow(clippy::unwrap_used)]
+fn at_record_weighs_an_unapplied_revision_edit_at_the_declared_revision() {
+    /// The revision a row declares the catalog at.
+    enum Declared {
+        Moved,
+        Installed,
+        Unserved,
+    }
+    for (label, current_first, declares) in [
+        ("forward to the moved catalog", false, Declared::Moved),
+        ("back to the install commit", true, Declared::Installed),
+        (
+            "a revision the mirror cannot serve",
+            false,
+            Declared::Unserved,
+        ),
+    ] {
+        let world = world();
+        let installed = head(&world.catalog);
+        append(
+            &world,
+            "skills/second/SKILL.md",
+            "\nA paragraph added later.\n",
+        );
+        commit(&world.catalog, "the catalog moves on");
+        let moved = head(&world.catalog);
+        let fetched = kendex(&world.home, &world.project, &["source", "refresh"]);
+        assert!(fetched.status.success(), "{label}: {}", said(&fetched));
+        if current_first {
+            let output = kendex(&world.home, &world.project, &["refresh", "-y", "--leave"]);
+            assert!(output.status.success(), "{label}: {}", said(&output));
+            commit(&world.project, "brought current");
+        }
+        let held_at = if current_first { &moved } else { &installed };
+        let declared = match declares {
+            Declared::Moved => moved.as_str(),
+            Declared::Installed => installed.as_str(),
+            Declared::Unserved => "no-such-branch",
+        };
+        let manifest = world.project.join("kendex.toml");
+        let text = fs::read_to_string(&manifest).unwrap();
+        let redeclared = text.replacen(
+            "[sources.cat]\n",
+            &format!("[sources.cat]\nrev = \"{declared}\"\n"),
+            1,
+        );
+        assert_ne!(redeclared, text, "{label}");
+        write(&manifest, &redeclared);
+        commit(&world.project, "the catalog pinned, not applied");
+
+        let (output, document) = at_record(&world, None);
+        assert!(!output.status.success(), "{label}: {}", said(&output));
+        let record = row(&document, "record", RECORD, None).unwrap();
+        assert_eq!(record.state, State::Failed, "{label}: {record:?}");
+        match declares {
+            Declared::Unserved => {}
+            Declared::Moved | Declared::Installed => assert!(
+                trails(&document).contains(&("cat", held_at.as_str(), declared)),
+                "{label}: {document:?}"
+            ),
+        }
+    }
 }

@@ -182,7 +182,8 @@ pub enum Reading {
 impl Reading {
     /// The plan this reading renders through: under `Recorded`, the
     /// single-package hold naming no package, which holds every follower.
-    /// Either judges the hook pins, which verify names.
+    /// Either judges the hook pins, which verify names, and is never
+    /// applied: verify only reads the plan.
     pub fn plan_options(self) -> crate::engine::PlanOptions {
         let options = match self {
             Reading::Current => crate::engine::PlanOptions::default(),
@@ -190,6 +191,7 @@ impl Reading {
         };
         crate::engine::PlanOptions {
             judge_pins: true,
+            never_applied: true,
             ..options
         }
     }
@@ -204,7 +206,8 @@ pub fn stale(scope: &Scope, lock: &Lock, report: &EngineReport) -> Vec<Stale> {
     let planned = &report.record.sources;
     let recorded = lock.sources.iter().filter_map(|(name, recorded)| {
         let now = planned.get(name)?;
-        (now.repo == recorded.repo && now.rev == recorded.rev)
+        recorded
+            .written_for(&now.repo, now.rev.as_deref())
             .then(|| (name.clone(), recorded.commit.clone()))
     });
     let held = report
@@ -559,7 +562,7 @@ fn source_problem(
             "source {name}: recorded, and the manifest declares no enabled repository source by that name"
         ));
     };
-    if recorded.repo != declared.repo || recorded.rev != declared.rev {
+    if !recorded.written_for(&declared.repo, declared.rev.as_deref()) {
         return Some(format!(
             "source {name}: recorded for {} at {}, declared as {} at {}",
             recorded.repo,

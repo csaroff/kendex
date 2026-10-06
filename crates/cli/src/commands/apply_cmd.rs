@@ -12,6 +12,9 @@ use crate::ui;
 
 /// Make disk match declaration — orphan cleanup included, plan shown first.
 ///
+/// A package the install record places renders at the catalog commit the
+/// record names; `kendex refresh` brings packages current.
+///
 /// The two overrides say which bytes on disk a declaration outranks: ones
 /// the user edited, and ones kendex never wrote at all. Both are refusals
 /// by default and neither implies the other.
@@ -78,12 +81,23 @@ pub fn run(env: &Env, args: ApplyArgs) -> CliResult {
     if !args.plan {
         super::project::target_registrable(env, &args.target, &scopes)?;
     }
+    // Held at the record: apply has no copy of the manifest before the
+    // edit to diff against, and needs none. A deleted table is an orphan
+    // and goes; a table with a `rev` of its own reads that revision, and
+    // so does a package a set with a `rev` carries without a table of its
+    // own; of the rest, a new table, or one whose source is now declared
+    // at another repository or revision, is one the record cannot place
+    // and resolves at that source's revision, and every other
+    // package keeps its recorded commit whatever the mirror holds. The
+    // record keeps no package's own revision, so a package whose `rev` is
+    // removed keeps the commit it was pinned at. Bringing a catalog
+    // current is refresh's.
     let options = PlanOptions {
         remove_orphans: true,
         removal_filter: None,
         overwrite_edited: args.discard_edits,
         replace_unmanaged: args.replace_unmanaged,
-        ..PlanOptions::default()
+        ..PlanOptions::locked()
     };
     for scope in scopes {
         // Read the manifest as it sits on disk, through the same loader
