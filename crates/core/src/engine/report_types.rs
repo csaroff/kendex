@@ -611,7 +611,10 @@ pub struct PlanOptions {
     /// at the source's tip while its source's entry is kept. Only
     /// [`PlanOptions::locked`] sets this: `verify --at-record` weighs the
     /// record against where each source resolves now, and reads that off
-    /// the record this pass would write.
+    /// the record this pass would write. A write also reads fresh a
+    /// declaration held at a commit this machine cannot read, where
+    /// `verify --at-record` keeps it held: skipped, the write would de-list
+    /// its renders.
     pub keep_source_records: bool,
     /// The base of the manifest copy this plan reconciles to, where the
     /// manifest arrived whole from an editor rather than being read here.

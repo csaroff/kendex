@@ -23,7 +23,10 @@
 //! declaration it reads, and a held pass compares it at the recorded
 //! commit like every other follower.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+
+use crate::env::Env;
+use crate::error::{CoreError, Result};
 
 use crate::lock::{Lock, LockEntry, Reason};
 use crate::manifest::Manifest;
@@ -194,6 +197,91 @@ pub(crate) fn planning_manifest<'a>(
         }
         None => (std::borrow::Cow::Borrowed(manifest), None),
     }
+}
+
+/// Under a write that keeps the record
+/// ([`super::super::PlanOptions::keep_source_records`]), take back each pin
+/// at a commit gone from its source's history, so its declaration resolves
+/// fresh: one more case the record cannot place. Held there it would read
+/// nothing and be skipped, and the write that skipped it would de-list what
+/// it renders. A commit this machine has merely not fetched yet, the lock a
+/// teammate committed against a newer catalog, is fetched and stays held;
+/// read fresh against a stale mirror it would undo their update. Any other
+/// hold keeps every pin, so `verify --at-record` still reports what the
+/// record names.
+pub(crate) fn release_unserved(
+    env: &Env,
+    options: &super::super::PlanOptions,
+    held: &mut Manifest,
+    pins: &mut HeldPins,
+) -> Result<()> {
+    if !options.keep_source_records {
+        return Ok(());
+    }
+    release(
+        held,
+        pins,
+        |repo, commit| crate::remote::serves(env, repo, commit),
+        |repo| crate::remote::fetch_mirror(env, repo),
+    )
+}
+
+/// [`release_unserved`] against the cache reads it is handed: `serves`
+/// answers whether a commit can be read here, `fetch` brings a repository's
+/// mirror current. Each commit is asked about once, and again once after
+/// its repository is fetched; each repository holding a commit `serves`
+/// refuses is fetched once, and a pin still refused after that is gone. A
+/// fetch that fails proves nothing about what upstream holds, so the write
+/// is refused and every pin stays. A pin on a switched-off source is read
+/// by nothing this pass, as the resolvers skip it, so it is neither asked
+/// about nor fetched for, and stays.
+fn release(
+    held: &mut Manifest,
+    pins: &mut HeldPins,
+    serves: impl Fn(&str, &str) -> bool,
+    mut fetch: impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    let mut served: BTreeMap<(String, String), bool> = BTreeMap::new();
+    let mut fetching: BTreeMap<String, String> = BTreeMap::new();
+    for pin in &pins.pins {
+        if !held
+            .sources
+            .get(&pin.source)
+            .is_some_and(|decl| decl.enabled)
+        {
+            continue;
+        }
+        let commit = (pin.repo.clone(), pin.commit.clone());
+        if !*served
+            .entry(commit)
+            .or_insert_with(|| serves(&pin.repo, &pin.commit))
+        {
+            fetching
+                .entry(pin.repo.clone())
+                .or_insert_with(|| pin.source.clone());
+        }
+    }
+    for (repo, source) in &fetching {
+        if fetch(repo).is_err() {
+            return Err(CoreError::SourcePending {
+                name: source.clone(),
+            });
+        }
+    }
+    for ((repo, commit), readable) in &mut served {
+        if !*readable && fetching.contains_key(repo) {
+            *readable = serves(repo, commit);
+        }
+    }
+    let (kept, gone) = std::mem::take(&mut pins.pins).into_iter().partition(|pin| {
+        served
+            .get(&(pin.repo.clone(), pin.commit.clone()))
+            .copied()
+            .unwrap_or(true)
+    });
+    HeldPins { pins: gone }.unpin(held);
+    pins.pins = kept;
+    Ok(())
 }
 
 /// The manifest a single-package update plans from: the targets read

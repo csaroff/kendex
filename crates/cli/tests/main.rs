@@ -72,6 +72,7 @@ mod template_cli;
 mod terms_first_run;
 mod tier_model;
 mod toggle;
+mod toggle_locked;
 mod trash_cli;
 mod unmanaged;
 mod unmanaged_copy_check;
