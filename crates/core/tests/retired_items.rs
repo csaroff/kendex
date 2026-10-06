@@ -7,7 +7,8 @@
 //! copies, an emptied Copilot registry and a Pi package's registration with
 //! them, the records and the item's own declaration. Where nothing of it is
 //! kept, pruned or never installed, it is owed nothing. An armed hook
-//! requiring it is withheld, kept or not. A rebound declaration keeps the
+//! requiring it is withheld, kept or not, and a kept retired hook whose
+//! record requires a withheld hook goes with it. A rebound declaration keeps the
 //! source conflict. Every other name the catalog does not carry keeps the
 //! refusal that fails a refresh, so a retirement cannot hide a typo.
 //! Refresh also takes what a declaration deleted by hand left, except a
@@ -21,6 +22,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use kendex_core::apply::{self, Op};
+use kendex_core::engine::desired::Withholding;
 use kendex_core::engine::ops;
 use kendex_core::engine::{
     AgentModelRequest, DeclarationStatus, DriftCause, DriftState, EngineReport, PlanOptions,
@@ -549,12 +551,14 @@ enum After {
     RemovedByName,
 }
 
-/// Which hooks stand over the retired judge: boss alone; a declared top
-/// requiring boss, so top takes on boss's withholding; or boss requiring a
-/// live helper beside the judge, so the helper is left with no requirer.
+/// Which hooks stand over the retired judge: boss alone; boss with the
+/// judge requiring boss back, the lane-mail knot; a declared top requiring
+/// boss, so top takes on boss's withholding; or boss requiring a live
+/// helper beside the judge, so the helper is left with no requirer.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Over {
     Boss,
+    Knot,
     Chain,
     WithHelper,
 }
@@ -563,9 +567,21 @@ impl Over {
     /// Every hook this shape installs over the judge.
     fn hooks(self) -> &'static [&'static str] {
         match self {
-            Over::Boss => &["boss"],
+            Over::Boss | Over::Knot => &["boss"],
             Over::Chain => &["top", "boss"],
             Over::WithHelper => &["boss", "helper"],
+        }
+    }
+}
+
+/// Edits the person's copies of hook `name`, on every tool it lands on.
+#[allow(clippy::unwrap_used)]
+fn edit(f: &Fixture, name: &str) {
+    for copy in f.installed_copies(ItemKind::Hook, name) {
+        if copy.extension().is_some_and(|ext| ext == "sh") {
+            let mut bytes = fs::read_to_string(&copy).unwrap();
+            bytes.push_str("# the person's line\n");
+            fs::write(&copy, bytes).unwrap();
         }
     }
 }
@@ -590,19 +606,36 @@ fn require(f: &Fixture, name: &str, deps: &str) {
 /// judge that is never written again, whether the judge is kept, pruned,
 /// never installed, switched off or removed by name. A hook requiring that
 /// hook is withheld with it, and a companion only it required goes too.
-/// The declarations stay complete: the retirement is the catalog's
-/// answer, so the walks outside a plan, the closure and the managed agent
-/// lookup, read it as one too.
+/// A kept judge whose record requires boss goes with boss, so neither
+/// member of the knot runs alone. The withholding takes a copy the way an
+/// orphan goes: one the person edited stays as the edit conflict, and a
+/// knot member staying keeps the other. Where the judge goes, by a prune
+/// or by name, every hook requiring it goes in the same plan, edited or
+/// not. `stays` names each hook whose
+/// copies and record the plain refresh keeps. The declarations stay
+/// complete: the retirement is the catalog's answer, so the walks outside
+/// a plan, the closure and the managed agent lookup, read it as one too.
 #[test]
 #[allow(clippy::unwrap_used, clippy::too_many_lines)]
 fn a_hook_requiring_a_retired_hook_is_withheld() {
-    for (row, over, before, after, migration) in [
+    type Row<'a> = (
+        &'a str,
+        Over,
+        Before,
+        After,
+        &'a str,
+        &'a [&'a str],
+        &'a [&'a str],
+    );
+    let rows: [Row; 13] = [
         (
             "installed, then retired: kept",
             Over::Boss,
             Before::Installed,
             After::Nothing,
             "",
+            &[],
+            &["judge"],
         ),
         (
             "installed, then retired with a migration and pruned",
@@ -610,6 +643,8 @@ fn a_hook_requiring_a_retired_hook_is_withheld() {
             Before::Installed,
             After::Pruned,
             "declare judge-next",
+            &[],
+            &[],
         ),
         (
             "retired before its first install",
@@ -617,6 +652,8 @@ fn a_hook_requiring_a_retired_hook_is_withheld() {
             Before::NeverInstalled,
             After::Nothing,
             "",
+            &[],
+            &[],
         ),
         (
             "switched off, then retired",
@@ -624,6 +661,8 @@ fn a_hook_requiring_a_retired_hook_is_withheld() {
             Before::SwitchedOff,
             After::Nothing,
             "",
+            &[],
+            &[],
         ),
         (
             "installed, retired, then removed by name",
@@ -631,6 +670,35 @@ fn a_hook_requiring_a_retired_hook_is_withheld() {
             Before::Installed,
             After::RemovedByName,
             "",
+            &[],
+            &[],
+        ),
+        (
+            "both edited, then pruned: held together",
+            Over::Boss,
+            Before::Installed,
+            After::Pruned,
+            "",
+            &["boss", "judge"],
+            &["boss", "judge"],
+        ),
+        (
+            "an edited requirer, the judge then removed by name",
+            Over::Boss,
+            Before::Installed,
+            After::RemovedByName,
+            "",
+            &["boss"],
+            &[],
+        ),
+        (
+            "under a declared hook requiring boss, the judge removed by name",
+            Over::Chain,
+            Before::Installed,
+            After::RemovedByName,
+            "",
+            &[],
+            &[],
         ),
         (
             "under a declared hook requiring boss, kept",
@@ -638,6 +706,8 @@ fn a_hook_requiring_a_retired_hook_is_withheld() {
             Before::Installed,
             After::Nothing,
             "",
+            &[],
+            &["judge"],
         ),
         (
             "beside a live companion of boss's, kept",
@@ -645,12 +715,46 @@ fn a_hook_requiring_a_retired_hook_is_withheld() {
             Before::Installed,
             After::Nothing,
             "",
+            &[],
+            &["judge"],
         ),
-    ] {
+        (
+            "the knot, kept: both go",
+            Over::Knot,
+            Before::Installed,
+            After::Nothing,
+            "",
+            &[],
+            &[],
+        ),
+        (
+            "an edited requirer, kept: held",
+            Over::Boss,
+            Before::Installed,
+            After::Nothing,
+            "",
+            &["boss"],
+            &["boss", "judge"],
+        ),
+        (
+            "the knot, the judge edited: both stay",
+            Over::Knot,
+            Before::Installed,
+            After::Nothing,
+            "",
+            &["judge"],
+            &["boss", "judge"],
+        ),
+    ];
+    for (row, over, before, after, migration, edited, stays) in rows {
         let f = installed(ItemKind::Hook, "boss");
         write_item(&f, ItemKind::Hook, "judge");
         match over {
             Over::Boss => require(&f, "boss", "judge"),
+            Over::Knot => {
+                require(&f, "boss", "judge");
+                require(&f, "judge", "boss");
+            }
             Over::Chain => {
                 require(&f, "boss", "judge");
                 write_item(&f, ItemKind::Hook, "top");
@@ -685,6 +789,9 @@ fn a_hook_requiring_a_retired_hook_is_withheld() {
                 }
             }
         }
+        for name in edited {
+            edit(&f, name);
+        }
         f.retire(ItemKind::Hook, "judge", migration);
         let done = match after {
             After::Nothing => None,
@@ -699,6 +806,20 @@ fn a_hook_requiring_a_retired_hook_is_withheld() {
                 assert_eq!(files, Vec::<PathBuf>::new(), "{row}: {after:?} {name}");
             }
             apply::execute(&f.env, &done.plan).unwrap();
+            // Where the judge goes, nothing the plan leaves runs beside
+            // none, the person's edits included: no copy, no registration.
+            let settings =
+                fs::read_to_string(f.project.join(".claude/settings.json")).unwrap_or_default();
+            for name in over.hooks().iter().filter(|name| !stays.contains(name)) {
+                for copy in f.installed_copies(ItemKind::Hook, name) {
+                    assert!(!copy.exists(), "{row}: {after:?} leaves {}", copy.display());
+                }
+                let registered = format!("hooks/{name}.sh");
+                assert!(
+                    !settings.contains(&registered),
+                    "{row}: {after:?} registers {name}"
+                );
+            }
         }
 
         let plain = plan_apply(&f.env, &f.scope, &refresh_options()).unwrap();
@@ -727,18 +848,46 @@ fn a_hook_requiring_a_retired_hook_is_withheld() {
             let files = written_files(&plain, name);
             assert_eq!(files, Vec::<PathBuf>::new(), "{row}: {name}");
         }
-        apply::execute(&f.env, &plain.plan).unwrap();
-        for name in over.hooks() {
-            assert_eq!(
-                recorded_of(&f, name),
-                Vec::new(),
-                "{row}: {name} is recorded"
-            );
+        // The judge is withheld, and so held, only in the knot; kept, it
+        // has no row.
+        let withheld = |name: &&&str| over.hooks().contains(*name) || over == Over::Knot;
+        for name in edited
+            .iter()
+            .filter(|name| stays.contains(name))
+            .filter(withheld)
+        {
+            let held = plain.drift.iter().any(|drift| {
+                drift.name == *name
+                    && drift.state == DriftState::Conflict
+                    && drift.cause == Some(DriftCause::LocalEdit)
+            });
+            assert!(held, "{row}: {name}'s edit is not held");
         }
-        let kept = (before, after) == (Before::Installed, After::Nothing);
+        // The judge's notice, keyed by its name as the CLI prints it
+        // (`engine_common::keyed_by_target`), stands exactly where the
+        // record the plan writes still holds it.
+        let noticed = plain
+            .warnings
+            .iter()
+            .any(|w| w.name == "judge" && w.message.starts_with("judge: "));
+        let held = |entry: &lock::LockEntry| entry.name == "judge";
+        assert_eq!(
+            noticed,
+            plain.record.entries.values().any(held),
+            "{row}: the judge's notice"
+        );
+        apply::execute(&f.env, &plain.plan).unwrap();
+        // A judge switched off is kept parked, as recorded, under a name
+        // no installed copy here carries.
         for name in over.hooks().iter().chain(&["judge"]) {
+            let parked = before == Before::SwitchedOff && *name == "judge";
+            let stays = stays.contains(name);
+            assert_eq!(
+                !recorded_of(&f, name).is_empty(),
+                stays || parked,
+                "{row}: {name}'s record"
+            );
             for copy in f.installed_copies(ItemKind::Hook, name) {
-                let stays = kept && *name == "judge";
                 assert_eq!(copy.exists(), stays, "{row}: {}", copy.display());
             }
         }
@@ -853,7 +1002,8 @@ fn a_declaration_rebound_to_a_catalog_that_retires_it_keeps_the_conflict() {
 /// A declaration deleted from kendex.toml by hand leaves a record nothing
 /// declares or derives. Refresh takes its copies, a hook's script or a Pi
 /// package; one the person edited stays, as the edit conflict. Without the
-/// sweep the leftover's row carries the removal that takes it.
+/// sweep the leftover's row carries the removal that takes it. A derived
+/// companion going with a deleted hook changes nothing said of the hook.
 #[test]
 #[allow(clippy::unwrap_used)]
 fn refresh_takes_what_a_deleted_declaration_left_except_an_edited_copy() {
@@ -914,6 +1064,54 @@ fn refresh_takes_what_a_deleted_declaration_left_except_an_edited_copy() {
         apply::execute(&f.env, &report.plan).unwrap();
         assert_eq!(copy.exists(), edited, "{case}");
     }
+    // What the plan says of a deleted hook is the same whether or not a
+    // derived companion goes with it: the companion going does not change
+    // why the hook goes.
+    let mut said = Vec::new();
+    for with_helper in [false, true] {
+        let f = installed(ItemKind::Hook, "other-check");
+        if with_helper {
+            write_item(&f, ItemKind::Hook, "helper");
+            require(&f, "other-check", "helper");
+            let report = plan_apply(&f.env, &f.scope, &refresh_options()).unwrap();
+            apply::execute(&f.env, &report.plan).unwrap();
+            assert_ne!(recorded_of(&f, "helper"), Vec::new(), "no helper record");
+        }
+        let manifest = f.project.join("kendex.toml");
+        let text = fs::read_to_string(&manifest).unwrap();
+        let undeclared = text.replace("[hooks.other-check]\nsource = \"cat\"\n", "");
+        assert_ne!(undeclared, text, "with_helper={with_helper}: not deleted");
+        fs::write(&manifest, undeclared).unwrap();
+
+        let report = plan_apply(&f.env, &f.scope, &refresh_options()).unwrap();
+
+        let rows: Vec<(HarnessId, String)> = report
+            .drift
+            .iter()
+            .filter(|row| row.name == "other-check")
+            .map(|row| (row.harness, row.detail.clone()))
+            .collect();
+        let changes: Vec<(HarnessId, String)> = report
+            .set_changes
+            .iter()
+            .filter(|change| change.name == "other-check")
+            .map(|change| (change.harness, change.reason.clone()))
+            .collect();
+        if with_helper {
+            let helper = report
+                .set_changes
+                .iter()
+                .any(|change| change.name == "helper");
+            assert!(helper, "the helper does not go with it");
+        }
+        said.push((rows, changes));
+    }
+    let (rows, changes) = &said[0];
+    assert!(
+        !rows.is_empty() && !changes.is_empty(),
+        "nothing is said of the hook"
+    );
+    assert_eq!(said[0], said[1], "a companion going changes what is said");
 }
 
 /// What the person did to a kept retired item's copy on one tool.
@@ -981,6 +1179,143 @@ fn a_kept_retired_copy_gone_or_edited_is_a_conflict() {
                 pruned.record.entries.contains_key(&key),
                 by_hand == ByHand::Edited,
                 "{case}"
+            );
+        }
+    }
+}
+
+/// A retired judge kept as recorded that requires a live boss, both
+/// declared: refreshes that keep the judge carry its recorded requirement
+/// onto boss's record, so when a later refresh withholds boss for a
+/// companion switched off, the judge goes with it rather than running
+/// alone.
+#[test]
+#[allow(clippy::unwrap_used)]
+fn a_kept_retired_hook_goes_with_a_requirement_withheld_refreshes_later() {
+    let f = installed(ItemKind::Hook, "boss");
+    for name in ["judge", "steward"] {
+        write_item(&f, ItemKind::Hook, name);
+    }
+    require(&f, "judge", "boss");
+    require(&f, "boss", "steward");
+    let manifest = f.project.join("kendex.toml");
+    let declared = fs::read_to_string(&manifest).unwrap();
+    fs::write(
+        &manifest,
+        format!("{declared}\n[hooks.judge]\nsource = \"cat\"\n"),
+    )
+    .unwrap();
+    let installed = plan_apply(&f.env, &f.scope, &refresh_options()).unwrap();
+    apply::execute(&f.env, &installed.plan).unwrap();
+    f.retire(ItemKind::Hook, "judge", "");
+
+    // Kept, the judge derives nothing, while boss is written again.
+    for _ in 0..2 {
+        let kept = plan_apply(&f.env, &f.scope, &refresh_options()).unwrap();
+        apply::execute(&f.env, &kept.plan).unwrap();
+        for name in ["judge", "boss"] {
+            assert_ne!(recorded_of(&f, name), Vec::new(), "{name} is not kept");
+        }
+    }
+    let text = fs::read_to_string(&manifest).unwrap();
+    fs::write(
+        &manifest,
+        format!("{text}\n[hooks.steward]\nsource = \"cat\"\nenabled = false\n"),
+    )
+    .unwrap();
+
+    let withheld = plan_apply(&f.env, &f.scope, &refresh_options()).unwrap();
+    apply::execute(&f.env, &withheld.plan).unwrap();
+
+    for name in ["judge", "boss"] {
+        assert_eq!(recorded_of(&f, name), Vec::new(), "{name} is recorded");
+        for copy in f.installed_copies(ItemKind::Hook, name) {
+            assert!(!copy.exists(), "{} stays", copy.display());
+        }
+    }
+}
+
+/// What the report says of a hook requiring a retired judge, the one
+/// answer verify's gap row reads: the withholding only where the plan
+/// writes the hook on no tool. Its own harnesses line leaving Claude Code
+/// out, the hook is written nowhere and withheld on Copilot alone; its
+/// requires-on line naming only Copilot, it is written on Claude Code, so
+/// apply records it there.
+#[test]
+#[allow(clippy::unwrap_used)]
+fn a_withholding_is_said_only_where_the_plan_writes_the_hook_nowhere() {
+    for (row, line, said) in [
+        ("withheld on every tool", "", Withholding::Retired.said()),
+        (
+            "its own line leaves Claude Code out",
+            "# harnesses: [copilot]\n",
+            Withholding::Retired.said(),
+        ),
+        (
+            "required only on Copilot",
+            "# requires-on: [copilot]\n",
+            None,
+        ),
+    ] {
+        let f = installed(ItemKind::Hook, "boss");
+        write_item(&f, ItemKind::Hook, "judge");
+        require(&f, "boss", "judge");
+        if !line.is_empty() {
+            let copy = f.catalog_copy(ItemKind::Hook, "boss");
+            let header = fs::read_to_string(&copy).unwrap();
+            let lined = header.replacen("# ---\nexit", &format!("{line}# ---\nexit"), 1);
+            assert_ne!(lined, header, "{row}: no header to add to");
+            fs::write(&copy, lined).unwrap();
+        }
+        f.retire(ItemKind::Hook, "judge", "");
+
+        let report = plan_apply(&f.env, &f.scope, &refresh_options()).unwrap();
+
+        assert_eq!(report.withheld_said(ItemKind::Hook, "boss"), said, "{row}");
+    }
+}
+
+/// The knot, boss and the retired judge requiring each other, both
+/// installed: removing either member by name takes the other in the same
+/// plan, files and registrations, so neither is left armed alone
+/// whichever one the person names.
+#[test]
+#[allow(clippy::unwrap_used)]
+fn removing_either_member_of_a_knot_by_name_takes_both() {
+    for named in ["judge", "boss"] {
+        let f = installed(ItemKind::Hook, "boss");
+        write_item(&f, ItemKind::Hook, "judge");
+        require(&f, "boss", "judge");
+        require(&f, "judge", "boss");
+        let report = plan_apply(&f.env, &f.scope, &refresh_options()).unwrap();
+        apply::execute(&f.env, &report.plan).unwrap();
+        for name in ["boss", "judge"] {
+            assert_ne!(
+                recorded_of(&f, name),
+                Vec::new(),
+                "{named}: no {name} record"
+            );
+        }
+        f.retire(ItemKind::Hook, "judge", "");
+
+        let removed = ops::remove(&f.env, &f.scope, &[named.to_owned()], None, false).unwrap();
+        apply::execute(&f.env, &removed.plan).unwrap();
+
+        let settings =
+            fs::read_to_string(f.project.join(".claude/settings.json")).unwrap_or_default();
+        for name in ["boss", "judge"] {
+            assert_eq!(
+                recorded_of(&f, name),
+                Vec::new(),
+                "{named}: {name} is recorded"
+            );
+            for copy in f.installed_copies(ItemKind::Hook, name) {
+                assert!(!copy.exists(), "{named}: {} stays", copy.display());
+            }
+            let registered = format!("hooks/{name}.sh");
+            assert!(
+                !settings.contains(&registered),
+                "{named}: {name} is registered"
             );
         }
     }

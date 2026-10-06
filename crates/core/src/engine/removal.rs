@@ -15,15 +15,17 @@ use crate::pi_ext::PackageState;
 
 use super::item_plan::KeptAsIs;
 use super::origin::Origins;
+use super::set_change::Said;
 
 /// Whether the user's hands are (or may be) on this installation's bytes.
 /// Automatic removals — refusals, sweeps, orphan cleanup nobody named —
 /// only take content they can prove is ours: every content path must hash
 /// to what apply last wrote. A record that cannot prove that holds
 /// whatever content is present, hooks included. Explicitly asked-for
-/// removals and a hook withheld for a companion that will not run
-/// (`Withholding::Requires`) are not gated here: the trash keeps what they
-/// take.
+/// removals, a hook withheld for a companion that will not run
+/// (`Withholding::Requires`), and a hook whose recorded or retired
+/// companion goes on its tool (`settle_lacking`) are not gated here: the
+/// trash keeps what they take.
 pub fn edit_holds(env: &Env, scope: &Scope, entry: &LockEntry) -> bool {
     if entry
         .output_style
@@ -190,17 +192,20 @@ impl TrashGuard {
 /// What the orphan pass decided for one record, before any row or op is
 /// written: every verdict is known before the first is acted on, so a
 /// record a held one requires can be kept with it.
+#[derive(Clone)]
 enum Verdict {
     /// Kept with no row, for want of an answer: its declaration's source
     /// is unreachable, or its origin will not read. What it requires stays
     /// with it, except a copy withheld for a companion that will not run,
     /// which is an answer, and what is known outranks what is not.
     Retained,
-    /// Kept as recorded because its catalog retired it and no prune takes
-    /// it (`Retirement::kept`). Nothing renders it again, so its record is
-    /// what its installed copy is held to: a copy gone or edited is a
-    /// conflict row with the [`DriftCause::Retired`] cause. What it
-    /// requires stays with it as for [`Retained`].
+    /// Kept as recorded because its catalog retired it, and this pass
+    /// neither prunes it, names it nor withholds it (`Retirement::kept`).
+    /// Nothing renders it again, so its record is what its installed copy
+    /// is held to: a copy gone or edited is a conflict row with the
+    /// [`DriftCause::Retired`] cause. What it requires stays with it as for
+    /// [`Retained`]; unlike that, it goes where a companion it requires
+    /// goes ([`settle_lacking`]).
     ///
     /// [`DriftCause::Retired`]: super::DriftCause::Retired
     ///
@@ -223,9 +228,6 @@ enum Verdict {
     /// left armed refuses every call it guards: the row says why.
     Removed { named: bool, withheld: bool },
 }
-
-/// The row a withheld hook's installed copy leaves as it goes.
-const WITHHELD: &str = "withheld: a hook it requires will not run here — will be removed";
 
 /// The conflict a held orphan leaves, naming the remedy that takes it.
 const EDITED: &str =
@@ -281,7 +283,7 @@ pub(super) fn orphans(
     config_edits: &mut super::config_edits::ConfigEditPlan,
     new_lock: &mut Lock,
     notes: &mut Vec<String>,
-) -> Result<Vec<super::SetChange>> {
+) -> Result<(Vec<super::SetChange>, Said)> {
     let mut sweepable = Vec::new();
     let mut origins = Origins::default();
     let mut verdicts = verdicts(
@@ -295,9 +297,16 @@ pub(super) fn orphans(
         guard,
         &mut origins,
     );
-    keep_what_kept_records_require(lock, kept, &mut verdicts);
+    let lacking = settle_lacking(lock, kept, state, &mut verdicts);
+    let said = said_of(lock, state, &verdicts, &lacking);
+    let going = |said: Option<&str>| match said {
+        Some(said) => format!("{said} — will be removed"),
+        None => "no longer wanted — will be removed".to_owned(),
+    };
     for (key, verdict) in verdicts {
         let entry = &lock.entries[key];
+        let withheld = said.get(key).copied();
+        let orphan = |detail: String| row(scope, entry, DriftState::Orphaned, detail, None);
         match verdict {
             Verdict::Retained => {
                 new_lock.entries.insert(key.clone(), entry.clone());
@@ -313,23 +322,19 @@ pub(super) fn orphans(
                         scope,
                         entry,
                         DriftState::Orphaned,
-                        "left over from an earlier setup; nothing needs it anymore".into(),
+                        withheld
+                            .unwrap_or("left over from an earlier setup; nothing needs it anymore")
+                            .into(),
                         None,
                     )
                 });
                 if unneeded {
-                    sweepable.push(super::SetChange::dropped(entry));
+                    sweepable.push(super::SetChange::dropped(entry, withheld));
                 }
                 new_lock.entries.insert(key.clone(), entry.clone());
             }
             Verdict::Held => {
-                drift.push(row(
-                    scope,
-                    entry,
-                    DriftState::Orphaned,
-                    "no longer wanted — will be removed".into(),
-                    None,
-                ));
+                drift.push(orphan(going(withheld)));
                 drift.push(row(
                     scope,
                     entry,
@@ -349,12 +354,8 @@ pub(super) fn orphans(
                 ));
                 new_lock.entries.insert(key.clone(), entry.clone());
             }
-            Verdict::Removed { withheld, .. } => {
-                let detail = match withheld {
-                    true => WITHHELD,
-                    false => "no longer wanted — will be removed",
-                };
-                drift.push(row(scope, entry, DriftState::Orphaned, detail.into(), None));
+            Verdict::Removed { .. } => {
+                drift.push(orphan(going(withheld)));
                 if entry.kind == ItemKind::PiExtension {
                     match pi_removal(env, scope, entry, config_edits) {
                         Ok(planned) => guard.extend(ops, planned),
@@ -381,7 +382,30 @@ pub(super) fn orphans(
         }
     }
     origins.notes(notes);
-    Ok(sweepable)
+    Ok((sweepable, said))
+}
+
+/// What each record's row and set change say of a withholding or a
+/// missing companion that takes it ([`settle_lacking`]), in place of the
+/// words for an orphan; a copy lacking a companion the walk did not
+/// withhold it for says what a missing companion does.
+fn said_of(
+    lock: &Lock,
+    state: &desired::DesiredState,
+    verdicts: &[(&String, Verdict)],
+    lacking: &BTreeSet<&String>,
+) -> Said {
+    verdicts
+        .iter()
+        .filter_map(|(key, _)| {
+            let withheld = withheld_said(state, &lock.entries[*key]);
+            let said = match lacking.contains(key) {
+                true => withheld.or(Withholding::Requires.said()),
+                false => withheld,
+            };
+            said.map(|said| ((*key).clone(), said))
+        })
+        .collect()
 }
 
 /// One row the orphan pass says about `entry`.
@@ -404,6 +428,13 @@ fn row(
         also_in_the_way: Vec::new(),
         remedy: None,
     }
+}
+
+/// What a withholding that takes this copy says of it, in place of the
+/// words for an orphan nothing withholds.
+fn withheld_said(state: &desired::DesiredState, entry: &LockEntry) -> Option<&'static str> {
+    let key = (entry.kind, entry.name.clone(), entry.harness);
+    state.withheld.get(&key).and_then(|because| because.said())
 }
 
 /// The verdict on every record no pass has planned for, in key order,
@@ -448,10 +479,16 @@ fn verdicts<'a>(
             continue;
         }
         // An item its catalog retired stays where it is kept
-        // (`Retirement::kept`) unless the person names it; anywhere else it
-        // goes as a departed declaration does.
+        // (`Retirement::kept`, which a removal by name leaves out) and the
+        // walk does not withhold it; anywhere else it goes as a departed
+        // declaration does.
         let retirement = state.retired.get(&(entry.kind, entry.name.clone()));
-        if retirement.is_some_and(|retired| retired.kept.contains(&entry.harness)) && !named {
+        let held = (entry.kind, entry.name.clone(), entry.harness);
+        let withheld = state
+            .withheld
+            .get(&held)
+            .is_some_and(|because| because.takes());
+        if retirement.is_some_and(|retired| retired.kept.contains(&entry.harness)) && !withheld {
             verdicts.push((key, Verdict::Retired));
             continue;
         }
@@ -519,6 +556,89 @@ fn verdicts<'a>(
     verdicts
 }
 
+/// Every verdict settled together with what the copies run with, the one
+/// answer to whether a hook still has its companions: a switched-on hook
+/// whose companion goes on its tool lacks it, and goes as one withheld
+/// for a companion that will not run does, whatever the options and its
+/// edits, so no hook is left armed beside nothing. Its companions are what
+/// its record required there (each companion record's `RequiredBy`) and,
+/// for a copy withheld for a retirement, the companions the walk took that
+/// reason from (`DesiredState::retired_companions`), one with no record
+/// there gone already. A companion goes where its own verdict takes it:
+/// pruned, named, never recorded or itself lacking, whichever member of a
+/// pair the person names. A copy that lacks a companion is never kept by
+/// what requires it ([`keep_what_kept_records_require`]), and keeps
+/// nothing it required, so every verdict is read again from the first ones
+/// until no more copies lack one. Only a copy that would otherwise stay
+/// is asked: one retained for want of an answer has nothing decided on
+/// it, and one already taken goes for its own reason. Returns the copies
+/// that lack a companion.
+fn settle_lacking<'a>(
+    lock: &Lock,
+    carried: &KeptAsIs,
+    state: &desired::DesiredState,
+    verdicts: &mut Vec<(&'a String, Verdict)>,
+) -> BTreeSet<&'a String> {
+    let mut requires: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (key, entry) in &lock.entries {
+        for reason in &entry.reasons {
+            if let Reason::RequiredBy { by } = reason {
+                let requirer = entry_key(by.kind, &by.name, by.harness);
+                requires.entry(requirer).or_default().push(key.clone());
+            }
+        }
+    }
+    for ((kind, name, harness), companions) in &state.retired_companions {
+        let companions = companions
+            .iter()
+            .map(|(dep_kind, dep)| entry_key(*dep_kind, dep, *harness));
+        requires
+            .entry(entry_key(*kind, name, *harness))
+            .or_default()
+            .extend(companions);
+    }
+    let first = verdicts.clone();
+    let mut lacking: BTreeSet<&'a String> = BTreeSet::new();
+    loop {
+        *verdicts = first.clone();
+        for (key, verdict) in verdicts.iter_mut() {
+            if lacking.contains(key) {
+                let named = matches!(verdict, Verdict::Removed { named: true, .. });
+                *verdict = Verdict::Removed {
+                    named,
+                    withheld: true,
+                };
+            }
+        }
+        keep_what_kept_records_require(lock, carried, &lacking, verdicts);
+        let going: BTreeSet<&str> = verdicts
+            .iter()
+            .filter(|(_, verdict)| matches!(verdict, Verdict::Removed { .. }))
+            .map(|(key, _)| key.as_str())
+            .collect();
+        let before = lacking.len();
+        for (key, verdict) in verdicts.iter() {
+            let entry = &lock.entries[*key];
+            // A copy already going for its own reason is not changed by
+            // what it lacks, and keeps the words for that reason.
+            let asked = entry.kind == ItemKind::Hook
+                && entry.enabled
+                && !matches!(verdict, Verdict::Retained | Verdict::Removed { .. });
+            let lacks = requires.get(key.as_str()).is_some_and(|companions| {
+                companions.iter().any(|companion| {
+                    !lock.entries.contains_key(companion) || going.contains(companion.as_str())
+                })
+            });
+            if asked && lacks {
+                lacking.insert(*key);
+            }
+        }
+        if lacking.len() == before {
+            return lacking;
+        }
+    }
+}
+
 /// A record that stays installed with its recorded bytes, whichever pass
 /// kept it, keeps what it requires on its tool: every record an automatic
 /// removal would take whose own recorded `RequiredBy` reason names a kept
@@ -535,6 +655,7 @@ fn verdicts<'a>(
 fn keep_what_kept_records_require(
     lock: &Lock,
     carried: &KeptAsIs,
+    lacking: &BTreeSet<&String>,
     verdicts: &mut [(&String, Verdict)],
 ) {
     loop {
@@ -558,6 +679,9 @@ fn keep_what_kept_records_require(
             else {
                 continue;
             };
+            if lacking.contains(key) {
+                continue;
+            }
             let requirer = lock.entries[*key]
                 .reasons
                 .iter()
