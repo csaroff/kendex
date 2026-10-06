@@ -1,0 +1,1 @@
+- The Mutation-Stability Pairing runs only on tests the diff, or a re-review's fix diff, adds or changes, and mutation-stability's summary line reports the call's elapsed seconds.
