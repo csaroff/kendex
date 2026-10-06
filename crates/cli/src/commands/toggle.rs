@@ -1,6 +1,5 @@
 use clap::Args;
 use kendex_core::env::Env;
-use kendex_core::model::ItemKind;
 
 use super::advisory::Listing;
 use super::engine_common::{confirm_and_execute, print_report};
@@ -11,8 +10,7 @@ use crate::scope::ScopeFilter;
 pub struct ToggleArgs {
     #[arg(required = true)]
     names: Vec<String>,
-    /// Narrow to agent | skill | hook | command | mcp-server | plugin | pi-extension
-    #[arg(long)]
+    #[arg(long, help = format!("Narrow to {}", super::pin::kind_or_plugin_choices()))]
     kind: Option<String>,
     #[arg(short = 'g', long)]
     global: bool,
@@ -30,13 +28,7 @@ pub fn run(env: &Env, args: ToggleArgs, enabled: bool) -> CliResult {
     let kind = args
         .kind
         .as_deref()
-        .map(|kind| {
-            if kind == "plugin" {
-                Ok(ItemKind::Plugin)
-            } else {
-                super::pin::parse_kind(kind)
-            }
-        })
+        .map(super::pin::parse_kind_or_plugin)
         .transpose()?;
     let filter = ScopeFilter::resolve(args.scope.as_deref(), args.global, ScopeFilter::Project)?;
     for scope in resolve_scopes(env, filter)? {

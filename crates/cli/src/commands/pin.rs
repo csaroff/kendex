@@ -62,6 +62,22 @@ pub fn parse_kind(value: &str) -> Result<ItemKind, String> {
     }
 }
 
+/// [`kind_choices`], plus `plugin`: the help of a `--kind` that
+/// [`parse_kind_or_plugin`] reads, and its unknown-kind error.
+pub(crate) fn kind_or_plugin_choices() -> String {
+    format!("{} | {}", kind_choices(), ItemKind::Plugin.name())
+}
+
+/// [`parse_kind`], plus `plugin`: the kinds a verb acting on an installed
+/// package by name (enable, disable, remove) narrows to.
+pub fn parse_kind_or_plugin(value: &str) -> Result<ItemKind, String> {
+    match value {
+        "plugin" => Ok(ItemKind::Plugin),
+        other => parse_kind(other)
+            .map_err(|_| format!("unknown kind '{other}' ({})", kind_or_plugin_choices())),
+    }
+}
+
 pub fn run(env: &Env, args: PinArgs) -> CliResult {
     let kind = parse_kind(&args.kind)?;
     if args.version.is_none() && !args.follow {

@@ -925,7 +925,7 @@ fn declared_packages(
         .filter(|declared| {
             !report
                 .retired
-                .contains(&(declared.kind, declared.name.clone()))
+                .contains_key(&(declared.kind, declared.name.clone()))
         })
         .partition(|declared| {
             report.left_out_by_own_line(declared.kind, &declared.name, &declared.harnesses)
@@ -1170,8 +1170,24 @@ fn say_row(
                 .unwrap_or_else(|| row.detail.clone()),
         ),
         Some(row) => Some(match row.remedy {
-            Some(RowRemedy::Remove) => {
-                format!("{} — refresh takes it, or remove {name}", row.detail)
+            Some(remedy) => {
+                // The kind rides along: a bare name also removes a live
+                // item of another kind that shares it. A personal-setup
+                // row is out of reach of a removal at the project.
+                let global = match row.scope {
+                    Scope::Global => " and --global",
+                    _ => "",
+                };
+                let removal = format!("remove {name} with --kind {kind}{global}");
+                match remedy {
+                    RowRemedy::Remove => {
+                        format!("{} — refresh takes it, or {removal}", row.detail)
+                    }
+                    RowRemedy::RemoveEdited => format!(
+                        "{}; its files were edited, which refresh holds — {removal}",
+                        row.detail
+                    ),
+                }
             }
             None => row.detail.clone(),
         }),

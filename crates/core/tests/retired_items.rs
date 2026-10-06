@@ -5,12 +5,15 @@
 //! item's name that carries the catalog's migration, and a kept copy
 //! deleted or edited by hand is a conflict. A prune takes the
 //! copies, an emptied Copilot registry and a Pi package's registration with
-//! them, the records and the item's own declaration. Where nothing of it is
-//! kept, pruned or never installed, it is owed nothing. An armed hook
-//! requiring it is withheld, kept or not, and a kept retired hook whose
-//! record requires a withheld hook goes with it. A rebound declaration keeps the
-//! source conflict. Every other name the catalog does not carry keeps the
-//! refusal that fails a refresh, so a retirement cannot hide a typo.
+//! them, the records and the item's own declaration, and says so in the
+//! same keyed line, the retirement its removals' reason; a copy the person
+//! edited stays, its record with it, and the line says it is held. Where
+//! nothing of it is kept, pruned or never installed, it is owed nothing. An
+//! armed hook requiring it is withheld, kept or not, and a kept retired
+//! hook whose record requires a withheld hook goes with it. A rebound
+//! declaration keeps the source conflict. Every other name the catalog does
+//! not carry keeps the refusal that fails a refresh, so a retirement cannot
+//! hide a typo.
 //! Refresh also takes what a declaration deleted by hand left, except a
 //! copy the person edited.
 #![cfg(unix)]
@@ -26,7 +29,8 @@ use kendex_core::engine::desired::Withholding;
 use kendex_core::engine::ops;
 use kendex_core::engine::{
     AgentModelRequest, DeclarationStatus, DriftCause, DriftState, EngineReport, PlanOptions,
-    RowRemedy, agent_model_request, audit, plan_apply, planned_closure,
+    RetiredStanding, RowRemedy, SetDirection, agent_model_request, audit, plan_apply,
+    planned_closure,
 };
 use kendex_core::env::{Env, FakeOs};
 use kendex_core::error::CoreError;
@@ -398,6 +402,11 @@ fn a_retired_item_is_kept_with_one_notice_until_a_prune() {
         );
         assert_eq!(not_found_keys(&report), Vec::<String>::new(), "{row}");
         assert_eq!(warned(&report), [(kind, name.to_owned())], "{row}");
+        assert_eq!(
+            report.retired.get(&(kind, name.to_owned())),
+            Some(&RetiredStanding::Kept),
+            "{row}"
+        );
         let notice = &report.warnings[0];
         assert_eq!(notice.harness, None, "{row}");
         // The key the CLI prints the notice bare under
@@ -456,7 +465,32 @@ fn a_retired_item_is_kept_with_one_notice_until_a_prune() {
         let pruned = plan_apply(&f.env, &f.scope, &prune_options()).unwrap();
 
         assert_eq!(not_found_keys(&pruned), Vec::<String>::new(), "{row}");
-        assert_eq!(warned(&pruned), Vec::<(ItemKind, String)>::new(), "{row}");
+        // The prune says what it took, keyed as the kept notice is and
+        // carrying the catalog and its migration: the review-gate consumer
+        // refresh (`refresh-consumer.sh`) forwards that line into its pull
+        // request body.
+        assert_eq!(warned(&pruned), [(kind, name.to_owned())], "{row}");
+        assert_eq!(
+            pruned.retired.get(&(kind, name.to_owned())),
+            Some(&RetiredStanding::Pruned),
+            "{row}"
+        );
+        let notice = &pruned.warnings[0].message;
+        assert!(
+            notice.starts_with(&format!("{name}: retired by cat; ")),
+            "{row}: {notice}"
+        );
+        if !migration.is_empty() {
+            assert!(
+                notice.ends_with(&format!("; {migration}")),
+                "{row}: {notice}"
+            );
+        }
+        let drops = pruned
+            .set_changes
+            .iter()
+            .any(|change| change.name == name && change.direction == SetDirection::Remove);
+        assert!(drops, "{row}: the preview drops nothing");
         for written in [name, COMPANION] {
             let files = written_files(&pruned, written);
             assert_eq!(files, Vec::<PathBuf>::new(), "{row}: {written}");
@@ -495,6 +529,68 @@ fn a_retired_item_is_kept_with_one_notice_until_a_prune() {
             let files = written_files(&after, written);
             assert_eq!(files, Vec::<PathBuf>::new(), "{row}: {written}");
         }
+    }
+}
+
+/// A prune meets a retired item whose installed copy the person edited:
+/// the copy stays, its record with it, while its declaration goes, and the
+/// plan says it holds the item rather than that it pruned it. The notice
+/// keeps the keyed shape the review-gate consumer refresh
+/// (`refresh-consumer.sh`) forwards, the migration last.
+#[test]
+#[allow(clippy::unwrap_used)]
+fn a_prune_holds_an_edited_retired_copy() {
+    for (kind, name, edited, migration) in [
+        (ItemKind::Skill, "deploy", "SKILL.md", "declare deploy-next"),
+        (ItemKind::Hook, "doc-drift-check", "", ""),
+        (
+            ItemKind::PiExtension,
+            "old-ext",
+            "index.js",
+            "declare new-ext",
+        ),
+    ] {
+        let f = installed(kind, name);
+        let copy = f.installed_copies(kind, name).remove(0);
+        let edited = match edited.is_empty() {
+            true => copy.clone(),
+            false => copy.join(edited),
+        };
+        let mut bytes = fs::read_to_string(&edited).unwrap();
+        bytes.push_str("// the person's line\n");
+        fs::write(&edited, bytes).unwrap();
+        f.retire(kind, name, migration);
+
+        let pruned = plan_apply(&f.env, &f.scope, &prune_options()).unwrap();
+
+        assert_eq!(
+            pruned.retired.get(&(kind, name.to_owned())),
+            Some(&RetiredStanding::Held),
+            "{kind:?}"
+        );
+        assert_eq!(warned(&pruned), [(kind, name.to_owned())], "{kind:?}");
+        let notice = &pruned.warnings[0].message;
+        assert!(
+            notice.starts_with(&format!("{name}: retired by cat; ")),
+            "{kind:?}: {notice}"
+        );
+        if !migration.is_empty() {
+            assert!(
+                notice.ends_with(&format!("; {migration}")),
+                "{kind:?}: {notice}"
+            );
+        }
+        apply::execute(&f.env, &pruned.plan).unwrap();
+        assert!(edited.exists(), "{kind:?}: the edited copy went");
+        assert!(
+            !recorded_of(&f, name).is_empty(),
+            "{kind:?}: the record dropped the held copy"
+        );
+        let manifest = kendex_core::engine::ops::manifest_for_reading(&f.env, &f.scope).unwrap();
+        assert!(
+            !manifest.declared(kind).contains_key(name),
+            "{kind:?}: the declaration stays"
+        );
     }
 }
 
@@ -1002,8 +1098,9 @@ fn a_declaration_rebound_to_a_catalog_that_retires_it_keeps_the_conflict() {
 /// A declaration deleted from kendex.toml by hand leaves a record nothing
 /// declares or derives. Refresh takes its copies, a hook's script or a Pi
 /// package; one the person edited stays, as the edit conflict. Without the
-/// sweep the leftover's row carries the removal that takes it. A derived
-/// companion going with a deleted hook changes nothing said of the hook.
+/// sweep the leftover's row carries the removal that takes it, and says
+/// where refresh would hold an edited copy. A derived companion going with
+/// a deleted hook changes nothing said of the hook.
 #[test]
 #[allow(clippy::unwrap_used)]
 fn refresh_takes_what_a_deleted_declaration_left_except_an_edited_copy() {
@@ -1034,13 +1131,15 @@ fn refresh_takes_what_a_deleted_declaration_left_except_an_edited_copy() {
             fs::write(&edited_file, bytes).unwrap();
         }
 
-        let audited = audit(&f.env, &f.scope).unwrap();
-        let left = audited
-            .drift
-            .iter()
-            .find(|row| row.name == name && row.state == DriftState::Orphaned)
-            .unwrap();
-        assert_eq!(left.remedy, Some(RowRemedy::Remove), "{case}");
+        // The edited copy's row names the removal alone: refresh holds it.
+        let remedies = left_over_remedies(&f, name);
+        assert!(!remedies.is_empty(), "{case}: no left-over row");
+        assert!(remedies.iter().all(Option::is_some), "{case}: {remedies:?}");
+        assert_eq!(
+            remedies.contains(&Some(RowRemedy::RemoveEdited)),
+            edited,
+            "{case}: {remedies:?}"
+        );
 
         let report = plan_apply(&f.env, &f.scope, &refresh_options()).unwrap();
         let trashed = trash_paths(&report);
@@ -1112,6 +1211,18 @@ fn refresh_takes_what_a_deleted_declaration_left_except_an_edited_copy() {
         "nothing is said of the hook"
     );
     assert_eq!(said[0], said[1], "a companion going changes what is said");
+}
+
+/// The remedy each left-over row an audit says of `name` carries.
+#[allow(clippy::unwrap_used)]
+fn left_over_remedies(f: &Fixture, name: &str) -> Vec<Option<RowRemedy>> {
+    audit(&f.env, &f.scope)
+        .unwrap()
+        .drift
+        .iter()
+        .filter(|row| row.name == name && row.state == DriftState::Orphaned)
+        .map(|row| row.remedy)
+        .collect()
 }
 
 /// What the person did to a kept retired item's copy on one tool.

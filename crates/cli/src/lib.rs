@@ -73,6 +73,12 @@ enum Command {
     /// Remove installed packages
     Remove {
         names: Vec<String>,
+        #[arg(
+            long,
+            conflicts_with = "keep_declaration",
+            help = format!("Narrow to {}", commands::pin::kind_or_plugin_choices())
+        )]
+        kind: Option<String>,
         #[arg(short = 'g', long)]
         global: bool,
         /// project | global | all (default project)
@@ -517,6 +523,7 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         Command::Disable(args) => commands::toggle::run(&env, args, false)?,
         Command::Remove {
             names,
+            kind,
             global,
             scope,
             sweep,
@@ -526,6 +533,7 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         } => remove(
             &env,
             names,
+            kind,
             global,
             scope,
             sweep,

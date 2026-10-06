@@ -122,7 +122,10 @@ pub enum Remedy {
         to: std::path::PathBuf,
         windows: bool,
     },
+    /// Remove one item by kind and name: a bare name also removes a live
+    /// item of another kind that shares it.
     Remove {
+        kind: ItemKind,
         name: String,
         global: bool,
     },
@@ -324,7 +327,9 @@ impl Remedy {
                     command_word(to, false)?
                 ),
             },
-            Remedy::Remove { name, .. } => format!("kendex remove {name}{place}"),
+            Remedy::Remove { kind, name, .. } => {
+                format!("kendex remove --kind {} {name}{place}", kind.name())
+            }
             Remedy::Add { kind, name, .. } => {
                 format!("kendex add --{} {name}{place}", kind.name())
             }

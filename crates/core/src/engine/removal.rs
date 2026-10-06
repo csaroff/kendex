@@ -211,9 +211,13 @@ enum Verdict {
     ///
     /// [`Retained`]: Verdict::Retained
     Retired,
-    /// Not removable under the options: the left-over row, and offered to
-    /// a sweep where nothing needs it.
-    Left { unneeded: bool },
+    /// Not removable under the options: the left-over row, carrying the
+    /// removal that takes it, and offered to a sweep where nothing needs
+    /// it.
+    Left {
+        unneeded: bool,
+        remedy: super::RowRemedy,
+    },
     /// Removable, but the person's edits are in it: the removed row, the
     /// edit conflict, and the record kept.
     Held,
@@ -266,7 +270,8 @@ fn edited(state: &desired::DesiredState, entry: &LockEntry) -> &'static str {
 /// `decided_keys` are the records the refusal and withheld passes already
 /// planned for; nothing here asks about them again. `kept`
 /// is every record an earlier pass kept as it was in place of writing it,
-/// whose requirements this pass keeps with it.
+/// whose requirements this pass keeps with it. Returns what a sweep could
+/// take, and where the plan leaves each retired item.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn orphans(
     env: &Env,
@@ -283,7 +288,7 @@ pub(super) fn orphans(
     config_edits: &mut super::config_edits::ConfigEditPlan,
     new_lock: &mut Lock,
     notes: &mut Vec<String>,
-) -> Result<(Vec<super::SetChange>, Said)> {
+) -> Result<(Vec<super::SetChange>, Said, Retired)> {
     let mut sweepable = Vec::new();
     let mut origins = Origins::default();
     let mut verdicts = verdicts(
@@ -303,7 +308,7 @@ pub(super) fn orphans(
         Some(said) => format!("{said} — will be removed"),
         None => "no longer wanted — will be removed".to_owned(),
     };
-    for (key, verdict) in verdicts {
+    for &(key, ref verdict) in &verdicts {
         let entry = &lock.entries[key];
         let withheld = said.get(key).copied();
         let orphan = |detail: String| row(scope, entry, DriftState::Orphaned, detail, None);
@@ -315,9 +320,9 @@ pub(super) fn orphans(
                 drift.extend(retired_copy(env, scope, entry));
                 new_lock.entries.insert(key.clone(), entry.clone());
             }
-            Verdict::Left { unneeded } => {
+            Verdict::Left { unneeded, remedy } => {
                 drift.push(DriftRow {
-                    remedy: Some(super::RowRemedy::Remove),
+                    remedy: Some(*remedy),
                     ..row(
                         scope,
                         entry,
@@ -328,8 +333,8 @@ pub(super) fn orphans(
                         None,
                     )
                 });
-                if unneeded {
-                    sweepable.push(super::SetChange::dropped(entry, withheld));
+                if *unneeded {
+                    sweepable.push(super::SetChange::dropped(entry, withheld, &state.retired));
                 }
                 new_lock.entries.insert(key.clone(), entry.clone());
             }
@@ -382,7 +387,8 @@ pub(super) fn orphans(
         }
     }
     origins.notes(notes);
-    Ok((sweepable, said))
+    let retired = standings(lock, state, new_lock, &verdicts);
+    Ok((sweepable, said, retired))
 }
 
 /// What each record's row and set change say of a withholding or a
@@ -404,6 +410,61 @@ fn said_of(
                 false => withheld,
             };
             said.map(|said| ((*key).clone(), said))
+        })
+        .collect()
+}
+
+/// Where the plan leaves each item its catalog retired.
+pub(super) type Retired = BTreeMap<(ItemKind, String), super::RetiredStanding>;
+
+/// Where the plan leaves each retired item, read off the record it writes
+/// rather than off the verdicts alone, since a planned removal can still
+/// keep its record (a Pi package whose carrier cleanup will not read). Not
+/// pruned, one that record still holds is kept, and one it holds nowhere is
+/// uninstalled: never installed, named for removal, or taken with a
+/// companion it requires ([`settle_lacking`]). A pruned one with no
+/// recorded copy left is pruned; one keeping a copy the person edited
+/// ([`Verdict::Held`]) is held, which names the removal that takes it; one
+/// keeping a copy for any other reason has the row that copy's verdict
+/// wrote.
+fn standings(
+    lock: &Lock,
+    state: &desired::DesiredState,
+    new_lock: &Lock,
+    verdicts: &[(&String, Verdict)],
+) -> Retired {
+    use super::RetiredStanding;
+    let held: BTreeSet<&String> = verdicts
+        .iter()
+        .filter(|(_, verdict)| matches!(verdict, Verdict::Held))
+        .map(|(key, _)| *key)
+        .collect();
+    state
+        .retired
+        .keys()
+        .map(|(kind, name)| {
+            let staying: Vec<&String> = lock
+                .entries
+                .iter()
+                .filter(|(key, entry)| {
+                    entry.kind == *kind
+                        && entry.name == *name
+                        && new_lock.entries.contains_key(*key)
+                })
+                .map(|(key, _)| key)
+                .collect();
+            let standing = match (
+                state.prune_retired,
+                staying.is_empty(),
+                staying.iter().any(|key| held.contains(*key)),
+            ) {
+                (false, true, _) => RetiredStanding::Uninstalled,
+                (false, false, _) => RetiredStanding::Kept,
+                (true, true, _) => RetiredStanding::Pruned,
+                (true, false, true) => RetiredStanding::Held,
+                (true, false, false) => RetiredStanding::Stays,
+            };
+            ((*kind, name.clone()), standing)
         })
         .collect()
 }
@@ -527,10 +588,6 @@ fn verdicts<'a>(
         let unfiltered = options.removal_filter.is_none();
         let removable = (options.remove_orphans && (named || unfiltered))
             || (options.sweep_unneeded && (unneeded || departed_harness || unfiltered));
-        if !removable {
-            verdicts.push((key, Verdict::Left { unneeded }));
-            continue;
-        }
         // An automatic removal (a sweep, an unfiltered orphan cleanup)
         // never takes bytes a record could vouch for and does not —
         // `edit_holds`' doc draws that line. Naming the item or discarding
@@ -539,11 +596,21 @@ fn verdicts<'a>(
         if let Some(emitted) = &mut removable_entry.emitted {
             emitted.paths.retain(|path| !guard.keep.contains(path));
         }
-        let takes_edits = named || options.overwrite_edited;
         let edited = match entry.kind {
             ItemKind::PiExtension => pi_edit_holds(env, scope, entry),
             _ => edit_holds(env, scope, &removable_entry),
         };
+        if !removable {
+            // An automatic removal would hold an edited copy, so only
+            // removing it by name takes it.
+            let remedy = match edited {
+                true => super::RowRemedy::RemoveEdited,
+                false => super::RowRemedy::Remove,
+            };
+            verdicts.push((key, Verdict::Left { unneeded, remedy }));
+            continue;
+        }
+        let takes_edits = named || options.overwrite_edited;
         let verdict = match !takes_edits && edited {
             true => Verdict::Held,
             false => Verdict::Removed {

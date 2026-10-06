@@ -160,6 +160,29 @@ pub struct DriftRow {
 pub enum RowRemedy {
     /// Removing the item by name takes it, as refresh's sweep does.
     Remove,
+    /// Only removing the item by name takes it: its files were edited on
+    /// disk, which refresh's sweep holds.
+    RemoveEdited,
+}
+
+/// Where a plan leaves an item its catalog retired, read off what the
+/// removal pass decided for each copy the record holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetiredStanding {
+    /// Not pruned, and a copy stays as recorded.
+    Kept,
+    /// Not pruned, and the record the plan writes holds no copy: never
+    /// installed, named for removal, or taken with a companion it requires.
+    Uninstalled,
+    /// Pruned: no recorded copy stays, and its declaration goes.
+    Pruned,
+    /// Pruned, but a copy whose files were edited stays with its record,
+    /// which only removing the item by name takes; its declaration goes.
+    Held,
+    /// Pruned, but a copy stays for another reason its drift row gives,
+    /// such as something still installed that requires it; its
+    /// declaration goes.
+    Stays,
 }
 
 impl DriftRow {
@@ -354,10 +377,11 @@ pub struct EngineReport {
     /// name. `verify` holds them against the project's ignore rules
     /// (`tracked_output`).
     pub tracked_outputs: BTreeMap<String, Vec<String>>,
-    /// Items their catalog retired (`PlanOptions::prune_retired`): the plan
-    /// writes nothing for them, so the record owes a declaration of one no
-    /// entry.
-    pub retired: BTreeSet<(ItemKind, String)>,
+    /// Items their catalog retired (`PlanOptions::prune_retired`), and
+    /// where this plan leaves each: the plan writes nothing for them, so
+    /// the record owes a declaration of one no entry. Each one's notice
+    /// is said from its standing.
+    pub retired: BTreeMap<(ItemKind, String), RetiredStanding>,
     /// Each hook the plan writes nowhere on a tool because a hook it runs
     /// with will not run there, and why (`DesiredState::withheld`).
     pub withheld: BTreeMap<(ItemKind, String, HarnessId), super::desired::Withholding>,
@@ -463,7 +487,7 @@ impl EngineReport {
             record: Lock::default(),
             held: Vec::new(),
             tracked_outputs: BTreeMap::new(),
-            retired: BTreeSet::new(),
+            retired: BTreeMap::new(),
             withheld: BTreeMap::new(),
         }
     }
