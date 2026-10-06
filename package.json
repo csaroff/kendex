@@ -1,0 +1,17 @@
+{
+  "name": "@csaroff/kendex-pi",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Skills manager for Pi, installed from this repository.",
+  "pi": {
+    "extensions": ["./pi-extensions/pi-skills-manager/extensions/skills-manager.ts"],
+    "skills": [],
+    "prompts": [],
+    "themes": []
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  }
+}
