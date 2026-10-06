@@ -24,7 +24,8 @@ mkdir -p "$LAYOUT/orch/scripts/lib" "$LAYOUT/orch/references" \
   "$LAYOUT/harness-ci/scripts/lib"
 cp "$ORCH_DIR/../harness-ci/scripts/lib/change-class.sh" "$LAYOUT/harness-ci/scripts/lib/"
 cp "$ORCH_DIR/scripts/item-tier" "$LAYOUT/orch/scripts/"
-cp "$ORCH_DIR/scripts/lib/change-class.sh" "$ORCH_DIR/scripts/lib/branch-growth.sh" "$LAYOUT/orch/scripts/lib/"
+cp "$ORCH_DIR/scripts/lib/change-class.sh" "$ORCH_DIR/scripts/lib/branch-growth.sh" \
+  "$LAYOUT/orch/scripts/lib/"
 cp "$ORCH_DIR/references/narrow-change.conf" "$LAYOUT/orch/references/"
 TIER="$LAYOUT/orch/scripts/item-tier"
 
@@ -77,6 +78,7 @@ ROWS=(
   "-|--production 1 --path .pi/settings.json|tier=standard brief=start cause=configuration-source rc=0|a registry Location proves no render"
   "-|--production 1 --path CLAUDE.md|tier=standard brief=start cause=instruction-pointer rc=0|an instruction pointer Location proves no render"
   "-|--production 1 --path $PR_MERGE|tier=standard brief=start cause=excluded-path rc=0|a merge-gate Location is never micro whatever the estimate"
+  "-|--production 1 --path skills/orch/scripts/lib/change-class.sh|tier=standard brief=start cause=excluded-path rc=0|the classifier and version reader item-tier sources is never micro"
   "-|--production 1 --path skills/orch/workflows/review-pr.md|tier=micro brief=micro cause=estimate-within-micro rc=0|a Location off the list leaves the estimate's class"
   "-|--production 1 --path hooks/block-bare-cd.sh|tier=standard brief=start cause=excluded-path rc=0|a hook body Location is never micro"
   "-|--production 1 --path hooks/tests/block-bare-cd.test.sh|tier=micro brief=micro cause=estimate-within-micro rc=0|a hook suite Location leaves the estimate's class"
@@ -278,6 +280,13 @@ closer_skill() { # NAME CLOSER BODY_VERSION
 # body that repeats the metadata map.
 closer_skill dots '...' 1.0.0
 closer_skill spaced '--- ' 1.0.0
+commented_skill() { # VERSION
+  mkdir -p "$SKILLS/skills/commented"
+  printf -- '---\nname: commented\nmetadata:\n# pinned by release\n  version: "%s"\n---\n\n# Commented\n' \
+    "$1" >"$SKILLS/skills/commented/SKILL.md"
+}
+# A column-0 comment inside the metadata map, which YAML reads as no key.
+commented_skill 1.0.0
 git -C "$SKILLS" add -A
 git -C "$SKILLS" commit -qm seed-closers
 SKILLS_BASE="$(git -C "$SKILLS" rev-parse HEAD)"
@@ -293,6 +302,9 @@ closer_commit() { # BRANCH NAME CLOSER
 }
 closer_commit dots-body dots '...'
 closer_commit spaced-body spaced '--- '
+git -C "$SKILLS" checkout -q -b commented-raise "$SKILLS_BASE"
+commented_skill 1.0.1
+git -C "$SKILLS" commit -qam commented-raise
 # branch|expected|row
 SKILL_ROWS=(
   "version-raise|tier=micro brief=micro cause=estimate-within-micro rc=0|a metadata.version raise in a SKILL.md and its render stays micro"
@@ -300,6 +312,7 @@ SKILL_ROWS=(
   "version-and-agents|tier=small brief=small cause=instruction-file rc=0|an exempt raise leaves later paths in the range classified"
   "dots-body|tier=small brief=small cause=instruction-file rc=0|a body version line after a ... closer selects small"
   "spaced-body|tier=small brief=small cause=instruction-file rc=0|a body version line after a closer with trailing space selects small"
+  "commented-raise|tier=micro brief=micro cause=estimate-within-micro rc=0|a raise below a comment line inside metadata stays micro"
 )
 for row in "${SKILL_ROWS[@]}"; do
   IFS='|' read -r branch want name <<<"$row"
@@ -308,13 +321,15 @@ done
 # Each control edits one line of a private copy and must turn exactly its rows
 # red: without the exemption the raise selects small, and a reader that drops
 # every version-shaped line misses the changed body line, and one that ends
-# the frontmatter only at an exact --- reads the body as metadata.
+# the frontmatter only at an exact --- reads the body as metadata, and one
+# that takes a comment line for a key closes the metadata map above the raise.
 # control@file under orch/scripts@needle@replacement@rows it reddens: the
 # needle holds '|'
 SKILL_CONTROLS=(
-  'no-version-exemption@item-tier@        instruction-file\ *) ! version_raise_only "$path" || continue ;;@        instruction-file\ *) ;;@version-raise'
+  'no-version-exemption@item-tier@        instruction-file\ *) ! version_raise_only "$path" || continue ;;@        instruction-file\ *) ;;@version-raise commented-raise'
   'any-version-line@lib/change-class.sh@    front && metadata && /^[[:space:]]+version:/ { next }@    /^[[:space:]]+version:/ { next }@version-and-body dots-body spaced-body'
   'exact-closer@lib/change-class.sh@    front && /^(---|\.\.\.)[[:space:]]*$/ { front = 0 }@    front && $0 == "---" { front = 0 }@dots-body spaced-body'
+  'comment-key@lib/change-class.sh@    front && /^[^[:space:]#]/ {@    front && /^[^[:space:]]/ {@commented-raise'
 )
 for control in "${SKILL_CONTROLS[@]}"; do
   IFS='@' read -r control_name control_file needle replacement red <<<"$control"

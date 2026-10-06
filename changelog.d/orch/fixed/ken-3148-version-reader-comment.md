@@ -1,0 +1,1 @@
+- item-tier and restack-skip read a SKILL.md metadata.version raise as version-only when a column-0 comment sits inside the frontmatter metadata map.
