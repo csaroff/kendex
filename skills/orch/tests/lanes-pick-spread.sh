@@ -32,6 +32,7 @@ source "$TEST_DIR/lib/growth-state.sh"
 source "$TEST_DIR/lib/virtual-clock.sh"
 source "$TEST_DIR/lib/open-terminal-stubs.sh"
 source "$TEST_DIR/lib/question-off.sh"
+source "$TEST_DIR/lib/shared-skill-libs.sh"
 
 FETCHER="$TMP_ROOT/fetch"
 make_fetcher "$FETCHER"
@@ -68,7 +69,10 @@ claude_usage 10 86 5 Opus > "$FIXTURE_DIR/.wclaude.json"
 make_lane "$H" mclaude 3600
 claude_usage 10 20 84 Opus > "$FIXTURE_DIR/.mclaude.json"
 make_codex_token_lane "$H/.1codex" 3600
-jq -n '{rate_limit: {primary_window: {used_percent: 22, reset_at: 1900000000,
+# Its reset is ten hours past the suite clock, beyond the five-hour bound on
+# the session charge, so every row charges the full five hours.
+CODEX_RESET="$("$BIN/date" +%s)" || exit 1
+jq -n --argjson reset "$((CODEX_RESET + 36000))" '{rate_limit: {primary_window: {used_percent: 22, reset_at: $reset,
   limit_window_seconds: 18000}}}' > "$FIXTURE_DIR/.1codex.json"
 ALL_DIRS="ORCH_LANE_DIRS=$H/.aclaude:$H/.bclaude:$H/.cclaude"
 
@@ -151,7 +155,10 @@ stage_rate() {
 # line is the pick-overseer-seats refusal naming the seat step and this run's
 # own fleet state, else that line), keyed.KEY (the first keyed stderr line
 # carrying KEY, in the form key takes, or none), key (the first keyed stderr line as
-# `key,field=value,...`), out (stdout whole), or a field of the JSON record.
+# `key,field=value,...`), out (stdout whole), record.PATH (that path of the
+# fleet state's first lane record), score_hundredths (its pick's
+# selection_score), or a field of the JSON record. args `launch-fleet LANE` is
+# a fleet launch of one claude lane on LANE, `auto` or a config dir.
 RUN_SEQ=0
 table() {
   local row label env stage_spec rate args expect env_args command got token name value rate_lane rate_now rate_prior rate_claims rate_elapsed rate_age rate_bucket
@@ -170,6 +177,10 @@ table() {
     command=("${LANES_UNDER_TEST:-$LANES}" $args)
     if [[ "$args" == launch ]]; then
       command=("${command[0]%/*}/open-terminal" --ghostty --harness codex --lane "$H/.1codex" --cmd "true -m gpt-6.1-sol -c model_reasoning_effort=high $QUESTION_OFF_ALL $COMPACTION_OFF_ALL" SPREAD-1)
+    elif [[ "$args" == "launch-fleet "* ]]; then
+      ot_fleet_state "${command[0]%/*}/workflow-state" "$FLEET" "$NOSETTINGS" || exit 1
+      command=("${command[0]%/*}/open-terminal" --ghostty --harness claude --lane "${args#launch-fleet }" --state-dir "$FLEET" \
+        --cmd "true --model opus --effort high $QUESTION_OFF_ALL $COMPACTION_OFF_ALL" SPREAD-6)
     fi
     # The launcher reads settings from its source checkout. An empty team
     # keeps this projection test independent of tracker authentication.
@@ -191,6 +202,8 @@ table() {
         sample_claims) value="$(jq -r --arg dir "$H/.1codex" 'select(.config_dir == $dir) | .sample_claims' "$STORE"/usage/*.json)" || exit 1 ;;
         fetched) value="$(cat "$RUN/fetch.log")" || exit 1 ;;
         headroom_hundredths) value="$(jq -r '.projected_headroom_pct * 100 | round' <<<"$OUT")" ;;
+        record.*) value="$(jq -r ".lanes[0].${name#record.}" "$FLEET/workflow-state-oversee.json" 2>/dev/null || echo UNREADABLE)" ;;
+        score_hundredths) value="$(jq -r '.lanes[0].pick.selection_score * 100 | round' "$FLEET/workflow-state-oversee.json" 2>/dev/null || echo UNREADABLE)" ;;
         seatrefusal)
           value="$(awk '$1 == "lanes:" { $1 = ""; sub(/^ +/, ""); gsub(/ +/, ","); print; exit }' "$RUN/err")"
           [[ "$value" != "pick-overseer-seats,step=seat,state=$FLEET/workflow-state-oversee.json" ]] || value=named
@@ -241,15 +254,18 @@ table \
   "the named projection charges the added measured claim too|ORCH_LANE_DIRS=$H/.aclaude|claim:a:2|a:20:19|pick --lane $H/.aclaude --harness claude --projected --json|rc=0 claims=2 burn_pct_per_lane_hour=6 projected_headroom_pct=68" \
   "enough claims wall the named measured projection|ORCH_LANE_DIRS=$H/.aclaude|claim:a:13|a:20:19|pick --lane $H/.aclaude --harness claude --projected --json|rc=3 projected_headroom_pct=2"
 
+# The Codex window resets beyond five hours, so each claim is charged the
+# shared burn for the five-hour session horizon: 78 room less 12 claims at 0.9554 for 5
+# hours leaves 20.68.
 ACCOUNT_HARNESS=codex table \
-  "twelve sampled claims share the account burn in the chooser|ORCH_LANE_DIRS=$H/.1codex|claim:1:12|1:22:20:12:628|pick --harness codex --model gpt-6.1-sol --json|rc=0 config_dir=$H/.1codex claims=12 headroom_hundredths=6654" \
-  "the named projection shares the same twelve-claim burn|ORCH_LANE_DIRS=$H/.1codex|claim:1:12|1:22:20:12:628|pick --lane $H/.1codex --harness codex --model gpt-6.1-sol --projected --json|rc=0 claims=12 headroom_hundredths=6654" \
+  "twelve sampled claims share the account burn in the chooser|ORCH_LANE_DIRS=$H/.1codex|claim:1:12|1:22:20:12:628|pick --harness codex --model gpt-6.1-sol --json|rc=0 config_dir=$H/.1codex claims=12 headroom_hundredths=2068" \
+  "the named projection shares the same twelve-claim burn|ORCH_LANE_DIRS=$H/.1codex|claim:1:12|1:22:20:12:628|pick --lane $H/.1codex --harness codex --model gpt-6.1-sol --projected --json|rc=0 claims=12 headroom_hundredths=2068" \
   "open-terminal launches on the sampled twelve-claim account|ORCH_LANE_DIRS=$H/.1codex|claim:1:12|1:22:20:12:628|launch|rc=0 launched=yes" \
   "a fresh sample records its live claim count|ORCH_LANE_DIRS=$H/.1codex|claim:1:12||list --harness codex --json|rc=0 sample_claims=12"
 # The usage endpoint returns 22 after an expired sample of 20. The fixed clock
 # keeps the 628-second interval exact, including on a loaded runner.
 ACCOUNT_HARNESS=codex table \
-  "the first projection after a fetch shares the newly sampled account burn|ORCH_LANE_DIRS=$H/.1codex|claim:1:12|1:20:19:12:628:628|pick --harness codex --model gpt-6.1-sol --json|rc=0 claims=12 usage_rate_state=measured usage_age_s=0 headroom_hundredths=6654 sample_claims=12 fetched=.1codex"
+  "the first projection after a fetch shares the newly sampled account burn|ORCH_LANE_DIRS=$H/.1codex|claim:1:12|1:20:19:12:628:628|pick --harness codex --model gpt-6.1-sol --json|rc=0 claims=12 usage_rate_state=measured usage_age_s=0 headroom_hundredths=2068 sample_claims=12 fetched=.1codex"
 table \
   "one sampled claim keeps its measured charge|ORCH_LANE_DIRS=$H/.aclaude|claim:a:1|a:20:19:1|$PICK|rc=0 burn_pct_per_lane_hour=6 projected_headroom_pct=74" \
   "an older cache record keeps the one-claim charge|ORCH_LANE_DIRS=$H/.aclaude|claim:a:2|a:20:19:missing|$PICK|rc=0 burn_pct_per_lane_hour=6 projected_headroom_pct=68" \
@@ -311,6 +327,103 @@ CTRL="$(mutant_scripts mutant-weekly-whole lib/lane-model.sh)" || exit 1
 mutate_file "$CTRL/lib/lane-model.sh" 'else $burn_default * 5 / 168 end' 'else $burn_default end'
 LANES_UNDER_TEST="$CTRL/lanes" table \
   "control: charged whole, the weekly-bound account is dropped|ORCH_LANE_DIRS=$H/.wclaude|claim:w:2||$PICK|rc=3 walled=1"
+
+echo "=== the session window is charged to its reset whatever bucket binds ==="
+# r is weekly-bound at 46 used with its session at 2, resetting in 4 hours; q
+# is weekly-bound at 83 with its session at 5. Five claims on r charge its
+# weekly window 0.74 and its session 5 x 5 x 4 = 100, so r projects past the
+# threshold and the sixth lane goes to q. The resets are written against the
+# suite clock just before the rows that read them.
+NOW="$("$BIN/date" +%s)" || exit 1
+make_lane "$H" rclaude 3600
+jq -n --argjson now "$NOW" '{five_hour: {utilization: 2, resets_at: ($now + 14400 | todate)},
+  seven_day: {utilization: 46, resets_at: ($now + 543600 | todate)}, limits: []}' > "$FIXTURE_DIR/.rclaude.json"
+make_lane "$H" qclaude 3600
+jq -n --argjson now "$NOW" '{five_hour: {utilization: 5, resets_at: ($now + 16200 | todate)},
+  seven_day: {utilization: 83, resets_at: ($now + 288000 | todate)}, limits: []}' > "$FIXTURE_DIR/.qclaude.json"
+RQ_DIRS="ORCH_LANE_DIRS=$H/.rclaude:$H/.qclaude"
+table \
+  "the sixth lane is not stacked on a weekly-bound account whose session the five on it spend before its reset|$RQ_DIRS|claim:r:5||$PICK|rc=0 config_dir=$H/.qclaude binding_bucket=weekly" \
+  "the named projection refuses the stacked account on its session window|ORCH_LANE_DIRS=$H/.rclaude|claim:r:5||pick --lane $H/.rclaude --harness claude --projected --json|rc=3 binding_bucket=weekly projected_headroom_pct=-2 projected_window.bucket=session key=pick-lane-walled,lane=$H/.rclaude,wall=2,bucket=session,max-pct=95,projected-headroom=-2" \
+  "the same account with no claims keeps its room and is picked|$RQ_DIRS|||$PICK|rc=0 config_dir=$H/.rclaude"
+
+# The deciding window as the real output names it: the listing and the
+# chooser's refusal date r's wall to its session reset, four hours out, not
+# its weekly one. o is walled on its Opus window at 97, resetting in two days,
+# and on its Sonnet window at 96, resetting in one, with no lanes on it and
+# room on its session and weekly windows: a pick on Sonnet dates its wall to
+# the Sonnet reset, where a pick naming no model judges the most-consumed
+# Opus window and dates it a day later.
+R_SESSION_RESET="$(jq -nr --argjson now "$NOW" '$now + 14400 | todate')" || exit 1
+O_OPUS_RESET="$(jq -nr --argjson now "$NOW" '$now + 172800 | todate')" || exit 1
+O_SONNET_RESET="$(jq -nr --argjson now "$NOW" '$now + 86400 | todate')" || exit 1
+make_lane "$H" oclaude 3600
+jq -n --argjson now "$NOW" '{five_hour: {utilization: 10, resets_at: ($now + 10800 | todate)},
+  seven_day: {utilization: 20, resets_at: ($now + 432000 | todate)},
+  limits: [{kind: "weekly_scoped", percent: 97, resets_at: ($now + 172800 | todate), scope: {model: {display_name: "Opus"}}},
+    {kind: "weekly_scoped", percent: 96, resets_at: ($now + 86400 | todate), scope: {model: {display_name: "Sonnet"}}}]}' \
+  > "$FIXTURE_DIR/.oclaude.json"
+table \
+  "the listing names the session window that decided r and its reset|ORCH_LANE_DIRS=$H/.rclaude|claim:r:5||list --harness claude --json|rc=0 [0].projected_window.bucket=session [0].projected_window.resets_at=$R_SESSION_RESET" \
+  "the chooser's refusal dates r's wall to its session reset|ORCH_LANE_DIRS=$H/.rclaude|claim:r:5||$PICK|rc=3 walled=1 walled_resets_at=$R_SESSION_RESET" \
+  "a pick on Sonnet dates o's wall to the Sonnet window's reset|ORCH_LANE_DIRS=$H/.oclaude|||$PICK --model sonnet|rc=3 walled=1 walled_resets_at=$O_SONNET_RESET" \
+  "a pick naming no model dates o's wall to the most-consumed Opus window's reset|ORCH_LANE_DIRS=$H/.oclaude|||$PICK|rc=3 walled=1 walled_resets_at=$O_OPUS_RESET"
+# u is weekly-bound at 90 with its session at 80 and no session reset: five
+# lanes wall it on the session window, charged one hour each, and a wall
+# whose deciding reset nobody stated is undated rather than dated to the
+# weekly reset. Its control lets the weekly reset stand in.
+make_lane "$H" uclaude 3600
+jq -n --argjson now "$NOW" '{five_hour: {utilization: 80, resets_at: null},
+  seven_day: {utilization: 90, resets_at: ($now + 288000 | todate)}, limits: []}' > "$FIXTURE_DIR/.uclaude.json"
+table \
+  "a session wall with no stated reset is undated, not dated to the weekly reset|ORCH_LANE_DIRS=$H/.uclaude|claim:u:5||$PICK|rc=3 walled=1 walled_resets_at=null"
+CTRL="$(mutant_scripts mutant-reset-stand-in lib/lane-model.sh)" || exit 1
+mutate_file "$CTRL/lib/lane-model.sh" 'if .projected_window == null then .binding_resets_at else .projected_window.resets_at end' '.projected_window.resets_at // .binding_resets_at'
+LANES_UNDER_TEST="$CTRL/lanes" table \
+  "control: the binding reset standing in dates an unknown session wall to the weekly reset|ORCH_LANE_DIRS=$H/.uclaude|claim:u:5||$PICK|rc=3 walled=1 walled_resets_at=$(jq -nr --argjson now "$NOW" '$now + 288000 | todate')"
+# Control: with no deciding window in the output, r's wall dates to the
+# weekly reset days away.
+CTRL="$(mutant_scripts mutant-window-unnamed lib/lane-model.sh)" || exit 1
+mutate_file "$CTRL/lib/lane-model.sh" '         projected_window:
+           (if $binding_room == null then null' '         projected_window:
+           (if true then null'
+LANES_UNDER_TEST="$CTRL/lanes" table \
+  "control: without the deciding window the refusal dates r's wall to its weekly reset|ORCH_LANE_DIRS=$H/.rclaude|claim:r:5||$PICK|rc=3 walled=1 walled_resets_at=$(jq -nr --argjson now "$NOW" '$now + 543600 | todate')"
+
+# Control: a refusal read from the binding bucket names the weekly window the
+# lanes did not wall.
+CTRL="$(mutant_scripts mutant-walled-binding lanes)" || exit 1
+mutate_file "$CTRL/lanes" "'if \$p and .projected_window != null then .projected_window.bucket else .binding_bucket end'" "'.binding_bucket'"
+LANES_UNDER_TEST="$CTRL/lanes" table \
+  "control: the named refusal read from the binding bucket names the weekly window|ORCH_LANE_DIRS=$H/.rclaude|claim:r:5||pick --lane $H/.rclaude --harness claude --projected --json|rc=3 key=pick-lane-walled,lane=$H/.rclaude,wall=2,bucket=weekly,max-pct=95,projected-headroom=-2"
+# Control: projected on the binding bucket alone, the stacked account keeps
+# its weekly room and takes the sixth lane.
+CTRL="$(mutant_scripts mutant-session-unprojected lib/lane-model.sh)" || exit 1
+mutate_file "$CTRL/lib/lane-model.sh" 'else 100 - .session_5h_pct - .claims * $session_burn * $session_hours end) as $session_room' 'else null end) as $session_room'
+LANES_UNDER_TEST="$CTRL/lanes" table \
+  "control: with no session projection the sixth lane stacks on the weekly-bound account|$RQ_DIRS|claim:r:5||$PICK|rc=0 config_dir=$H/.rclaude"
+# Control: the session charged one hour per claim projects 73, above the
+# weekly room, so the account still takes the sixth lane.
+CTRL="$(mutant_scripts mutant-session-one-hour lib/lane-model.sh)" || exit 1
+mutate_file "$CTRL/lib/lane-model.sh" 'else [1, ([5, ($session_reset - $now) / 3600] | min)] | max end) as $session_hours' 'else 1 end) as $session_hours'
+LANES_UNDER_TEST="$CTRL/lanes" table \
+  "control: a session charged one hour per claim still stacks the sixth lane|$RQ_DIRS|claim:r:5||$PICK|rc=0 config_dir=$H/.rclaude"
+
+# The launch keeps the reading it was judged on in the lane record. q has no
+# claims, so its rooms are its readings, 17 weekly and 95 session, and its
+# session charge runs the 4.5 hours to its reset; the score is 17 weighted by
+# the 80 hours to the weekly reset. A named lane keeps its judge's reading,
+# which no score ranks: two claims on r charge its session 2 x 5 x 4.
+SIXTH_RECORD="rc=0 record.account=$H/.qclaude record.pick.account=$H/.qclaude record.pick.binding_bucket=weekly record.pick.claims=0 record.pick.binding_projected_headroom_pct=17 record.pick.session_projected_headroom_pct=95 record.pick.session_burn_pct_per_lane_hour=5 record.pick.session_charge_hours=4.5 record.pick.projected_headroom_pct=17 score_hundredths=1721"
+table \
+  "the sixth lane's launch records the pick reading it was launched on|$RQ_DIRS|claim:r:5||launch-fleet auto|$SIXTH_RECORD" \
+  "a named lane's launch records the reading its judge took|ORCH_LANE_DIRS=$H/.rclaude|claim:r:2||launch-fleet $H/.rclaude|rc=0 record.account=$H/.rclaude record.pick.account=$H/.rclaude record.pick.claims=2 record.pick.session_projected_headroom_pct=58 record.pick.selection_score=null"
+# Control: a lane record that drops the pick turns the sixth-lane row red.
+CTRL="$(mutant_scripts mutant-pick-unrecorded open-terminal)" || exit 1
+orch_fixture_shared_libs "$TMP_ROOT/mutant-pick-unrecorded"
+mutate_file "$CTRL/open-terminal" '+ (if $pick == null then {} else {pick:' '+ (if true then {} else {pick:'
+LANES_UNDER_TEST="$CTRL/lanes" table \
+  "control: a record without the pick reading names no pick|$RQ_DIRS|claim:r:5||launch-fleet auto|rc=0 record.account=$H/.qclaude record.pick.account=null"
 
 echo "=== an unread claim store is a notice for the reading and a refusal for the projection ==="
 table \

@@ -37,18 +37,20 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/growth-state.sh"
 BIN="$TMP_ROOT/bin"
 mkdir -p "$BIN"
 # lanes: a named lane's judge answers walled once the row's wall file exists,
-# and `--lane auto` picks whatever the row's pick file names, recording the
-# ORCH_STATE_DIR it ran under, `unset` for none, beside that file.
+# with the record that file holds or a five_hour wall where it is empty, and `--lane auto` picks the account the row's pick file names, printing the
+# record open-terminal asks for and recording the ORCH_STATE_DIR it ran under,
+# `unset` for none, beside that file.
 cat > "$BIN/lanes" <<'EOF'
 #!/usr/bin/env bash
 case "${1:-}" in
   list) echo "[]" ;;
   pick)
     if [[ " $* " == *" --lane "* ]]; then
+      if [[ -s "$STUB_WALL" ]]; then cat -- "$STUB_WALL"; exit 3; fi
       [[ ! -e "$STUB_WALL" ]] || { echo '{"wall":97,"binding_bucket":"five_hour","projected_headroom_pct":3}'; exit 3; }
     else
       printf '%s\n' "${ORCH_STATE_DIR-unset}" > "$STUB_PICK.state"
-      cat -- "$STUB_PICK"
+      jq -cn --rawfile d "$STUB_PICK" '{config_dir: ($d | rtrimstr("\n"))}'
     fi ;;
 esac
 exit 0
@@ -537,13 +539,33 @@ await_exit "$WAITER"
 assert_eq "rc=$(rc one) $(key one | tail -n 1) opened=$([[ -e "$ROW/opened.one" ]] && echo yes || echo no)" \
   "rc=1 open-terminal: lane-model-walled lane=$LANE_A model=opus pct=97 bucket=five_hour projected-headroom=3 opened=no" \
   "a named lane whose window walled during the wait is refused rather than launched"
+# A weekly-bound account the lanes on it wall on their session window: the
+# refusal names that window and its reading, not the weekly bucket that binds.
+# Its control reads the binding bucket and names the weekly window instead.
+SESSION_WALL='{"wall":46,"binding_bucket":"weekly","projected_headroom_pct":-2,"projected_window":{"bucket":"session","pct":2,"resets_at":"2026-10-06T08:00:00Z"}}'
+row wall-session
+printf '%s\n' "$SESSION_WALL" > "$ROW/wall"
+launch one 10 --lane "$LANE_A" CC-1
+assert_eq "rc=$(rc one) $(key one | tail -n 1)" \
+  "rc=1 open-terminal: lane-model-walled lane=$LANE_A model=opus pct=2 bucket=session projected-headroom=-2" \
+  "a named lane walled on its session projection names the session window"
+WALL_OT="$(mutant_scripts session-wall-control open-terminal)/open-terminal" || exit 1
+orch_fixture_shared_libs "$TMP_ROOT/session-wall-control"
+mutate_file "$WALL_OT" 'if .projected_window != null then .projected_window.pct else .wall end' '.wall'
+mutate_file "$WALL_OT" 'if .projected_window != null then .projected_window.bucket else .binding_bucket end' '.binding_bucket'
+row wall-session-control
+printf '%s\n' "$SESSION_WALL" > "$ROW/wall"
+OT="$WALL_OT" launch one 10 --lane "$LANE_A" CC-1
+assert_eq "rc=$(rc one) $(key one | tail -n 1)" \
+  "rc=1 open-terminal: lane-model-walled lane=$LANE_A model=opus pct=46 bucket=weekly projected-headroom=-2" \
+  "control: read from the binding bucket the refusal names the weekly window the lanes did not wall"
 row wait-repick
-printf 'CLAUDE_CONFIG_DIR=%s\n' "$LANE_A" > "$ROW/pick"
+printf '%s\n' "$LANE_A" > "$ROW/pick"
 seed_running CC-9
 launch one 1 --lane auto --wait-slot CC-1 &
 WAITER=$!
 await_line one '^open-terminal: slot-waiting item=CC-1 '
-printf 'CLAUDE_CONFIG_DIR=%s\n' "$LANE_B" > "$ROW/pick"
+printf '%s\n' "$LANE_B" > "$ROW/pick"
 "$WS" --state-dir "$STATE" update oversee '.lanes |= map(.status = "done")' >/dev/null
 await_exit "$WAITER"
 assert_eq "rc=$(rc one) account=$(account_of CC-1)" "rc=0 account=$LANE_B" \
@@ -555,12 +577,12 @@ echo "=== a fleet's auto pick reads that fleet's state for its overseer seat ===
 # runs from; a launch naming no fleet hands none and the pick reads the
 # checkout's own.
 row seat-state
-printf 'CLAUDE_CONFIG_DIR=%s\n' "$LANE_A" > "$ROW/pick"
+printf '%s\n' "$LANE_A" > "$ROW/pick"
 launch one 10 --lane auto CC-1
 assert_eq "rc=$(rc one) state=$(cat "$ROW/pick.state")" "rc=0 state=$STATE" \
   "a fleet's auto pick runs under that fleet's state directory"
 row seat-state-none
-printf 'CLAUDE_CONFIG_DIR=%s\n' "$LANE_A" > "$ROW/pick"
+printf '%s\n' "$LANE_A" > "$ROW/pick"
 STATE="" launch one 10 --lane auto CC-1
 assert_eq "rc=$(rc one) state=$(cat "$ROW/pick.state")" "rc=0 state=unset" \
   "an auto pick naming no fleet hands no state directory"
@@ -572,7 +594,7 @@ perl -i -pe 'BEGIN { $o = shift } s/\Q$o\E//g' '[[ "$FLEET" != true ]] || state_
 assert_eq "$(grep -cF 'state_env=("ORCH_STATE_DIR=$STATE_DIR")' "$STATELESS" || true)" "0" \
   "control removed the state hand-off from the copy"
 row seat-state-control
-printf 'CLAUDE_CONFIG_DIR=%s\n' "$LANE_A" > "$ROW/pick"
+printf '%s\n' "$LANE_A" > "$ROW/pick"
 OT="$STATELESS" launch one 10 --lane auto CC-1
 assert_eq "rc=$(rc one) state=$(cat "$ROW/pick.state")" "rc=0 state=unset" \
   "control: without the hand-off the fleet's auto pick reads no fleet state"
@@ -619,7 +641,7 @@ else
   # Under --lane auto the re-pick reads claims alone, so a batch whose claim
   # went unwritten stops rather than picking an account it cannot see.
   row claim-spread
-  printf 'CLAUDE_CONFIG_DIR=%s\n' "$LANE_A" > "$ROW/pick"
+  printf '%s\n' "$LANE_A" > "$ROW/pick"
   mkdir -p "$CLAIMS/claims"
   chmod 555 "$CLAIMS/claims"
   STATE="" launch one 10 --lane auto CC-1 CC-2
