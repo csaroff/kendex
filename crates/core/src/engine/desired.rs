@@ -313,6 +313,20 @@ pub struct DesiredState {
     /// What this pass removes by name (`PlanOptions::removal_filter`): a
     /// retired item named there is not kept ([`DesiredState::kept_as_recorded`]).
     pub(super) removal_filter: Option<Vec<super::report_types::RemovalName>>,
+    /// Declared sets this pass could not expand whose installed members it
+    /// keeps as recorded, each with why.
+    pub(super) kept_bundles: BTreeMap<crate::lock::BundleRef, KeptBundle>,
+    /// The records a set in `kept_bundles` keeps, its members and what
+    /// they require, by entry key, each with the edges tying it to them it
+    /// was recorded under (`bundles::kept_members`). The item pass adds
+    /// those edges to what it writes for one of them, `plan_pass::plan_kept_members` keeps
+    /// every other one before anything is taken, `removal::orphans` takes
+    /// a hook among them whose companion goes, and the inventory keeps the
+    /// rows of what stays (`generated_paths::Unrendered`).
+    pub(super) kept_members: BTreeMap<String, BTreeSet<crate::lock::Reason>>,
+    /// Declared sets their catalog retired, under a prune:
+    /// `settle_retired` drops each declaration.
+    pub(super) pruned_bundles: BTreeSet<String>,
     /// The entry keys of the record this pass read: where a retired item
     /// is kept ([`Retirement::kept`]).
     pub(super) recorded: BTreeSet<String>,
@@ -390,6 +404,16 @@ pub struct DesiredState {
     /// harness declares as tracked output, by agent name;
     /// `EngineReport::tracked_outputs`.
     pub tracked_outputs: BTreeMap<String, Vec<String>>,
+}
+
+/// Why a declared set's installed members stay as recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum KeptBundle {
+    /// Its catalog no longer offers it, which fails the refresh.
+    NotOffered,
+    /// Its catalog retired it, short of a prune: the one notice keyed by
+    /// the set, which `EngineReport::retired_bundles` carries to verify.
+    Retired { notice: String },
 }
 
 /// Why a hook is withheld from a tool, and so what becomes of a copy
@@ -520,6 +544,45 @@ impl DesiredState {
             .is_some_and(|retirement| retirement.kept.is_empty())
     }
 
+    /// Whether a set its catalog retired keeps the record under `key`
+    /// (`kept_members`): as its member, or as what a record it keeps
+    /// requires.
+    pub(super) fn kept_by_retired_bundle(&self, key: &str) -> bool {
+        let mut seen = BTreeSet::new();
+        let mut next = vec![key.to_owned()];
+        while let Some(key) = next.pop() {
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            for edge in self.kept_members.get(&key).into_iter().flatten() {
+                match edge {
+                    crate::lock::Reason::MemberOf { bundle } => {
+                        if let Some(KeptBundle::Retired { .. }) = self.kept_bundles.get(bundle) {
+                            return true;
+                        }
+                    }
+                    crate::lock::Reason::RequiredBy { by } => {
+                        next.push(crate::lock::entry_key(by.kind, &by.name, by.harness));
+                    }
+                    crate::lock::Reason::Requested => {}
+                }
+            }
+        }
+        false
+    }
+
+    /// The notice each declared set its catalog retired gets, by name,
+    /// short of a prune.
+    pub(super) fn retired_bundles(&self) -> BTreeMap<String, String> {
+        self.kept_bundles
+            .iter()
+            .filter_map(|(bundle, kept)| match kept {
+                KeptBundle::Retired { notice } => Some((bundle.name.clone(), notice.clone())),
+                KeptBundle::NotOffered => None,
+            })
+            .collect()
+    }
+
     /// A declaration whose source item cannot be parsed. Un-marking it keeps
     /// what it already installed out of the orphan sweep: a source file
     /// someone broke this morning must never uninstall a working artifact.
@@ -638,6 +701,8 @@ fn compute(
     // installed bundles carry, and what those skills require — while the
     // manifest keeps holding only what was chosen.
     let expansion = super::expansion::expand(env, scope, manifest, held, &mut state);
+    state.kept_members =
+        super::bundles::kept_members(lock, manifest, &state.kept_bundles, &expansion);
     let model_classes = if expansion.of(ItemKind::Agent).is_empty() {
         BTreeMap::new()
     } else {
@@ -692,7 +757,7 @@ fn compute(
                 no_harness_note(kind, name, decl, manifest, &mut state);
             }
             harnesses.retain(|harness| collisions.allows(kind, name, *harness));
-            let reasons = reasons_for(kind, name, &harnesses, &expansion);
+            let reasons = reasons_for(kind, name, &harnesses, &expansion, &state.kept_members);
             let ctx = ItemCtx {
                 model_classes: &model_classes,
                 env,
@@ -790,16 +855,25 @@ fn item_path(
     }
 }
 
-/// Why each of an item's installations is wanted, as the closure derived it.
+/// Why each of an item's installations is wanted, as the closure derived
+/// it, with each edge to a set kept as recorded that the record holds: a
+/// member another set also carries keeps the kept set's edge, so it stays
+/// once the other set lets it go.
 fn reasons_for(
     kind: ItemKind,
     name: &str,
     harnesses: &[HarnessId],
     expansion: &super::expansion::Expansion,
+    kept_members: &BTreeMap<String, BTreeSet<crate::lock::Reason>>,
 ) -> BTreeMap<HarnessId, BTreeSet<crate::lock::Reason>> {
     harnesses
         .iter()
-        .map(|harness| (*harness, expansion.reasons(kind, name, *harness)))
+        .map(|harness| {
+            let mut reasons = expansion.reasons(kind, name, *harness);
+            let key = crate::lock::entry_key(kind, name, *harness);
+            reasons.extend(kept_members.get(&key).into_iter().flatten().cloned());
+            (*harness, reasons)
+        })
         .collect()
 }
 
@@ -1024,12 +1098,13 @@ fn settle_retired(
             changed = true;
         }
     }
+    for name in &state.pruned_bundles {
+        changed |= updated.bundles.remove(name).is_some();
+    }
     changed
 }
 
-/// The note for a declaration the catalog does not carry. It names what the
-/// source does offer of that kind, so a declaration left on a name the
-/// catalog retired reads its remedy in the line that refuses it.
+/// The note for a declaration the catalog does not carry.
 fn not_offered_note(
     sealed: &SealedSource,
     config: &SourceConfig,
@@ -1037,18 +1112,23 @@ fn not_offered_note(
     name: &str,
     source: &str,
 ) -> String {
-    let mut offered = list_items(sealed, config, kind);
+    let offered = list_items(sealed, config, kind);
+    not_offered(name, source, kind.name(), offered)
+}
+
+/// The note for a declaration of a `noun` its catalog does not carry,
+/// keyed by `key`. It names what the source does offer of that noun, so a
+/// declaration left on a name the catalog renamed reads its remedy in the
+/// line that refuses it. `kendex refresh` fails on its "not found in
+/// source" (`refresh_failures` in the CLI's `engine_common.rs`).
+pub(super) fn not_offered(key: &str, source: &str, noun: &str, mut offered: Vec<String>) -> String {
     offered.sort();
     offered.dedup();
     if offered.is_empty() {
-        return format!(
-            "{name}: not found in source '{source}', which offers no {}",
-            kind.name()
-        );
+        return format!("{key}: not found in source '{source}', which offers no {noun}");
     }
     format!(
-        "{name}: not found in source '{source}' — its {}s are {}; declare one of those",
-        kind.name(),
+        "{key}: not found in source '{source}' — its {noun}s are {}; declare one of those",
         offered.join(", ")
     )
 }

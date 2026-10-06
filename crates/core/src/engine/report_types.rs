@@ -65,8 +65,9 @@ pub enum DriftCause {
     /// exit is on offer: the read is fixed first, and the detail says
     /// where.
     Uncompared,
-    /// A copy its catalog retired, kept as recorded because no prune took
-    /// it, whose files are gone or edited against that record. Nothing
+    /// A copy its catalog retired, or one a set its catalog retired keeps,
+    /// kept as recorded because no prune took it, whose files are gone or
+    /// edited against that record. Nothing
     /// renders it again, so no refresh writes it and none fails on it: a
     /// prune takes the record, or removing it by name takes the copy.
     Retired,
@@ -385,6 +386,10 @@ pub struct EngineReport {
     /// Each hook the plan writes nowhere on a tool because a hook it runs
     /// with will not run there, and why (`DesiredState::withheld`).
     pub withheld: BTreeMap<(ItemKind, String, HarnessId), super::desired::Withholding>,
+    /// Declared sets their catalog retired, kept short of a prune, by name,
+    /// each with the one notice keyed by the set that `notes` also holds;
+    /// verify shows it, where it shows no note.
+    pub retired_bundles: BTreeMap<String, String>,
 }
 
 /// One declaration a held plan read at the commit the record names
@@ -489,6 +494,7 @@ impl EngineReport {
             tracked_outputs: BTreeMap::new(),
             retired: BTreeMap::new(),
             withheld: BTreeMap::new(),
+            retired_bundles: BTreeMap::new(),
         }
     }
 

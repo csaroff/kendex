@@ -1,0 +1,1 @@
+- `kendex refresh` fails on a declared bundle its catalog no longer offers and keeps its members and what they require; a catalog can retire a bundle under `[retired.bundles]`.

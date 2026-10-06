@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::apply::PlannedOp;
 use crate::env::Env;
 use crate::error::Result;
-use crate::lock::{Lock, entry_key};
+use crate::lock::{Lock, Reason, entry_key};
 use crate::manifest::Manifest;
 use crate::model::Scope;
 
@@ -205,6 +205,55 @@ fn plan_refusals(
         ops.append(&mut removals);
     }
     Ok(refused_keys)
+}
+
+/// Every record a declared set this pass could not expand keeps
+/// (`DesiredState::kept_members`) where nothing else plans it, written to
+/// the new record ahead of the trash guard, which keeps every path that
+/// record holds: kept as recorded, whatever the options and whoever is
+/// named for removal, since the set is still declared and this pass cannot
+/// say what it holds. Of its edges to sets, the record keeps only those to
+/// the sets that keep it. A record the item pass writes or refuses is that
+/// pass's, and a copy withheld for a companion that will not run goes as
+/// `removal::orphans` takes it. Returns the keys of the records this pass
+/// kept, which `removal::orphans` gives their verdict: it holds a copy a
+/// retired set keeps to its record and takes a hook whose companion goes.
+pub(super) fn plan_kept_members(
+    lock: &Lock,
+    state: &desired::DesiredState,
+    new_lock: &mut Lock,
+) -> BTreeSet<String> {
+    let lacking = state
+        .withheld
+        .iter()
+        .filter(|(_, because)| **because == desired::Withholding::Requires)
+        .map(|((kind, name, harness), _)| entry_key(*kind, name, *harness));
+    let planned: BTreeSet<String> = state
+        .items
+        .iter()
+        .map(|item| item.key.clone())
+        .chain(
+            state
+                .refused
+                .iter()
+                .map(|r| entry_key(r.kind, &r.name, r.harness)),
+        )
+        .chain(lacking)
+        .collect();
+    let mut decided = BTreeSet::new();
+    for (key, edges) in &state.kept_members {
+        let Some(entry) = lock.entries.get(key).filter(|_| !planned.contains(key)) else {
+            continue;
+        };
+        let mut entry = entry.clone();
+        entry.reasons.retain(|reason| match reason {
+            Reason::MemberOf { .. } => edges.contains(reason),
+            Reason::Requested | Reason::RequiredBy { .. } => true,
+        });
+        new_lock.entries.insert(key.clone(), entry);
+        decided.insert(key.clone());
+    }
+    decided
 }
 
 /// The records planned for outside the item pass, because no item is

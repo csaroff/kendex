@@ -19,16 +19,16 @@
 //! disagreement, so it is reported rather than settled by whichever set the
 //! manifest happens to name first.
 
-use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, BTreeSet};
 
-use crate::lock::{BundleRef, Reason};
+use crate::lock::{BundleRef, Reason, entry_key};
 use crate::manifest::{ItemDecl, Manifest};
 use crate::model::{HarnessId, ItemKind, Scope};
 
 use super::ItemWarning;
 use super::desired::hold::HeldPins;
-use super::desired::{DesiredState, target_harnesses};
+use super::desired::{DesiredState, KeptBundle, target_harnesses};
 use super::expansion::{Catalogs, Expansion, Offer, OpenCatalog};
 
 /// One member, as every set that carries it asked for it.
@@ -58,10 +58,7 @@ pub(super) fn expand(
         {
             let edge = (
                 Reason::MemberOf {
-                    bundle: BundleRef {
-                        source: decl.source.clone(),
-                        name: name.clone(),
-                    },
+                    bundle: bundle_ref(name, &decl.source),
                 },
                 harnesses,
             );
@@ -193,6 +190,13 @@ fn installable(
     // reached through here and never through the item pass, so without this
     // a bundle-only manifest is told nothing its catalog reported.
     super::catalog::notes(config, &decl.source, state);
+    // `[retired]` answers before the set is looked for, as it does for an
+    // item, so a catalog that retired a set and deleted it answers as one
+    // still carrying it.
+    if let Some(migration) = config.retired_bundle(name) {
+        retire(name, &decl.source, migration, state);
+        return Vec::new();
+    }
     let offered = match crate::source::bundles::find(sealed, config, name) {
         Ok(offered) => offered,
         // The set is installed and this pass cannot say what it holds. The
@@ -214,12 +218,17 @@ fn installable(
             return Vec::new();
         }
     };
+    // Refused as a declared item the catalog does not carry is: a set
+    // renamed in its catalog would otherwise uninstall what it brought in
+    // from every consumer that declared it, and say so only in passing.
     let Some(bundle) = offered else {
         state.mark_incomplete();
-        state.notes.push(format!(
-            "bundle {name}: the catalog '{}' offers no set by that name",
-            decl.source
-        ));
+        let kept = bundle_ref(name, &decl.source);
+        state.kept_bundles.insert(kept, KeptBundle::NotOffered);
+        let offered = crate::source::bundles::names(config);
+        let key = format!("bundle {name}");
+        let note = super::desired::not_offered(&key, &decl.source, "bundle", offered);
+        state.notes.push(note);
         return Vec::new();
     };
     let mut installable = Vec::new();
@@ -282,6 +291,81 @@ fn installable(
         ));
     }
     installable
+}
+
+/// A declared set its catalog retired. Short of a prune, what it installed
+/// stays as recorded, with one notice keyed by the set that ends with the
+/// catalog's migration; its command is engine rule 18's exception for a
+/// retired bundle's notice. A prune drops the declaration
+/// (`desired::settle_retired`), and what only the set carried then goes as
+/// any leftover does.
+fn retire(name: &str, source: &str, migration: &str, state: &mut DesiredState) {
+    if state.prune_retired {
+        state.pruned_bundles.insert(name.to_owned());
+        return;
+    }
+    let line =
+        format!("bundle {name}: retired by {source}; kept; remove it with kendex refresh --prune");
+    let notice = match migration.is_empty() {
+        true => line,
+        false => format!("{line}; {migration}"),
+    };
+    state.notes.push(notice.clone());
+    let kept = KeptBundle::Retired { notice };
+    state.kept_bundles.insert(bundle_ref(name, source), kept);
+}
+
+/// The records the sets in `kept` keep, by entry key, each with the edges
+/// it was recorded under that tie it to them: what the record says such a
+/// set brought in, since this pass cannot read what it holds, and what
+/// those records require, until nothing changes. A member keeps its edges
+/// to those sets, and a record kept for what it requires its
+/// `RequiredBy` edges to records kept here. A record the expansion derives
+/// on its tool requires afresh, so a stale reason naming it keeps nothing.
+/// A record the person took away (`Manifest::is_held_back`) is not kept,
+/// as a set this pass expands does not install it.
+pub(super) fn kept_members(
+    lock: &crate::lock::Lock,
+    manifest: &Manifest,
+    kept: &BTreeMap<BundleRef, KeptBundle>,
+    expansion: &Expansion,
+) -> BTreeMap<String, BTreeSet<Reason>> {
+    let mut members: BTreeMap<String, BTreeSet<Reason>> = BTreeMap::new();
+    loop {
+        let mut changed = false;
+        for (key, entry) in &lock.entries {
+            if manifest.is_held_back(entry.kind, &entry.name) {
+                continue;
+            }
+            let edges: BTreeSet<Reason> = entry
+                .reasons
+                .iter()
+                .filter(|reason| match reason {
+                    Reason::MemberOf { bundle } => kept.contains_key(bundle),
+                    Reason::RequiredBy { by } => {
+                        members.contains_key(&entry_key(by.kind, &by.name, by.harness))
+                            && expansion.reasons(by.kind, &by.name, by.harness).is_empty()
+                    }
+                    Reason::Requested => false,
+                })
+                .cloned()
+                .collect();
+            if !edges.is_empty() && members.get(key) != Some(&edges) {
+                members.insert(key.clone(), edges);
+                changed = true;
+            }
+        }
+        if !changed {
+            return members;
+        }
+    }
+}
+
+fn bundle_ref(name: &str, source: &str) -> BundleRef {
+    BundleRef {
+        source: source.to_owned(),
+        name: name.to_owned(),
+    }
 }
 
 /// What two sets carrying one member cannot agree on, once the tools and the

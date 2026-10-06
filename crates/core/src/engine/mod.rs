@@ -176,12 +176,7 @@ pub fn plan_scope(
 ) -> Result<EngineReport> {
     // Identity first: derived paths and the scope lock key off canonical.
     let scope = &scope.canonical();
-    if let Some(finding) = manifest::output_style_count(declared.output_styles.len()) {
-        return Err(crate::error::CoreError::ManifestInvalid {
-            path: manifest::manifest_path(env, scope),
-            findings: vec![finding],
-        });
-    }
+    manifest::refuse_output_styles(env, scope, declared.output_styles.len())?;
     // `declared` is what the person declared, as this build reads it: the
     // manifest any write this plan carries is built from. A single-package
     // update reads from a copy with every other follower pinned at its
@@ -245,7 +240,7 @@ pub fn plan_scope(
     state.warnings.extend(notices);
     let kept = kept_members(lock, &new_lock, &options.uninstalled_bundles);
     let repo_effects_leaving = repo_effects::leaving(env, scope, lock, &new_lock)?;
-    let trees = generated_paths::TemplateTrees::of(env, scope, &state, lock, &new_lock);
+    let trees = generated_paths::Unrendered::of(env, scope, &state, lock, &new_lock)?;
     // Read off before the record moves into its write: a pass that
     // writes no record still says which commit each revision resolved to.
     let resolved_sources = resolved_revisions(&new_lock, &state);
@@ -255,6 +250,7 @@ pub fn plan_scope(
         generated_paths::plan(scope, &state, &instruction_shims, &drift, &trees, &mut ops)?;
 
     state.warnings.extend(state.agent_names.warnings());
+    let retired_bundles = state.retired_bundles();
     let report = EngineReport {
         declaration_status: DeclarationStatus::of(&state),
         // Ahead of the moves out of `state` below, and read before `drift`
@@ -271,6 +267,7 @@ pub fn plan_scope(
         excluded_hooks: state.excluded_hooks,
         pinned_hooks: state.pinned_hooks,
         tracked_outputs: state.tracked_outputs,
+        retired_bundles,
         retired,
         withheld: state.withheld,
         set_changes,
@@ -328,10 +325,11 @@ fn plan_pi_switches(
     Ok(drift)
 }
 
-/// Everything a plan takes away, after every write is planned: stale
-/// emitted files, what a refusal or a withholding takes or keeps, then
-/// the orphans, and the Pi records they keep finalized. Returns what a
-/// sweep could still take, and where the plan leaves each retired item.
+/// Everything a plan takes away, after every write is planned: what a
+/// declared set this pass could not expand keeps, stale emitted files,
+/// what a refusal or a withholding takes or keeps, then the orphans, and
+/// the Pi records they keep finalized. Returns what a sweep could still
+/// take, and where the plan leaves each retired item.
 #[allow(clippy::too_many_arguments)]
 fn plan_removals(
     env: &Env,
@@ -347,6 +345,8 @@ fn plan_removals(
     kept: &mut item_plan::KeptAsIs,
     scope_notes: &mut Vec<String>,
 ) -> Result<(Vec<SetChange>, set_change::Said, removal::Retired)> {
+    // Ahead of the guard, which keeps every path the new record holds.
+    let kept_by_sets = plan_pass::plan_kept_members(lock, state, new_lock);
     // Trash ops all pass one guard: writes for this pass are already
     // planned, so anything still wanted is known, and no path goes to the
     // trash twice.
@@ -373,6 +373,7 @@ fn plan_removals(
         state,
         options,
         &decided_keys,
+        &kept_by_sets,
         kept,
         &mut guard,
         drift,
