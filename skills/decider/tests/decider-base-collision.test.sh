@@ -2,7 +2,8 @@
 # Decision IDs judged against the base branch: next-id skips a number the base
 # holds, a removed record's row included, check refuses an ID two records
 # share and passes a row whose document is gone and whose Link cell became the
-# backticked filename, and get refuses an ID on more than one INDEX row. Every row builds its own repositories, so a fetch one run
+# backticked filename, passes a rename inherited from the shared history, and
+# get refuses an ID on more than one INDEX row. Every row builds its own repositories, so a fetch one run
 # makes never answers for the next.
 set -euo pipefail
 unset GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE GIT_INDEX_FILE
@@ -15,8 +16,10 @@ source "$TEST_DIR/lib/mutate-script.sh"
 
 PASS=0
 FAIL=0
-TMP_ROOT="$(mktemp -d)"
-trap 'rm -rf "$TMP_ROOT"' EXIT
+TMP_ROOT="$(mktemp -d)" || { echo "decider-base-collision: scratch=mktemp-failed" >&2; exit 1; }
+[[ -d $TMP_ROOT && ! -L $TMP_ROOT ]] || { echo "decider-base-collision: scratch=not-a-directory value=[$TMP_ROOT]" >&2; exit 1; }
+TMP_ROOT="$(cd -- "$TMP_ROOT" && pwd -P)" || { echo "decider-base-collision: scratch=resolve-failed" >&2; exit 1; }
+trap 'rm -rf -- "${TMP_ROOT:?}"' EXIT
 ERR_FILE="$TMP_ROOT/stderr"
 
 pass() { PASS=$((PASS + 1)); printf '  ok    %s\n' "$1"; }
@@ -160,6 +163,115 @@ build_collision() { # the lane and the base each record their own D035
   write_index "$1/work" D034:D034-first.md D035:D035-lane.md
 }
 
+build_rename() { # DIR [remove]: the lane renames D035; main can remove its inherited document
+  build_ahead "$1"
+  git -C "$1/work" pull -q --ff-only origin main
+  mv "$1/work/docs/decisions/D035-main.md" "$1/work/docs/decisions/D035-renamed.md"
+  write_index "$1/work" D034:D034-first.md D035:D035-renamed.md
+  if [[ "${2:-}" == remove ]]; then
+    write_index "$1/up" D034:D034-first.md D035:D035-main.md:Removed:unlinked
+    rm "$1/up/docs/decisions/D035-main.md"
+    commit_all "$1/up" "main removes D035's document"
+  fi
+}
+
+build_rename_committed() { # a committed rename also keeps the inherited ID
+  build_rename "$1"
+  commit_all "$1/work" rename
+}
+
+build_base_rename() { # DIR [remove]: main renames D035; the lane can remove its inherited document
+  build_ahead "$1"
+  git -C "$1/work" pull -q --ff-only origin main
+  mv "$1/up/docs/decisions/D035-main.md" "$1/up/docs/decisions/D035-base-renamed.md"
+  write_index "$1/up" D034:D034-first.md D035:D035-base-renamed.md
+  commit_all "$1/up" "main renames D035"
+  if [[ "${2:-}" == remove ]]; then
+    write_index "$1/work" D034:D034-first.md D035:D035-main.md:Removed:unlinked
+    rm "$1/work/docs/decisions/D035-main.md"
+    commit_all "$1/work" "lane removes D035's document"
+  fi
+}
+
+build_both_rename() { # both sides rename the same inherited D035 to different filenames
+  build_base_rename "$1"
+  mv "$1/work/docs/decisions/D035-main.md" "$1/work/docs/decisions/D035-lane-renamed.md"
+  write_index "$1/work" D034:D034-first.md D035:D035-lane-renamed.md
+  commit_all "$1/work" "lane renames D035"
+}
+
+build_base_rename_old_present() { # main retains the original file beside the new indexed file
+  build_base_rename "$1"
+  printf '# D035: Decision\n' >"$1/up/docs/decisions/D035-main.md"
+  commit_all "$1/up" "main retains D035's original file"
+}
+
+build_base_rename_new_absent() { # main changes the index without retaining the replacement document
+  build_base_rename "$1"
+  rm "$1/up/docs/decisions/D035-base-renamed.md"
+  commit_all "$1/up" "main loses D035's replacement file"
+}
+
+build_both_rename_old_present() { # a branch cannot keep the ancestor's file after both sides rename
+  build_both_rename "$1"
+  printf '# D035: Decision\n' >"$1/work/docs/decisions/D035-main.md"
+}
+
+build_rename_edited() { # changed row text does not change a renamed decision's ID
+  local text
+  build_rename "$1"
+  write_index "$1/work" D034:D034-first.md "D035:D035-renamed.md:Superseded by D036"
+  text="$(<"$1/work/docs/decisions/INDEX.md")"
+  text="${text//PROJ-1/PROJ-2}"
+  text="${text//Decision D035/Reworded decision}"
+  text="${text//Reason/New reason}"
+  printf '%s\n' "$text" >"$1/work/docs/decisions/INDEX.md"
+  printf '# D035: Reworded decision\n' >"$1/work/docs/decisions/D035-renamed.md"
+}
+
+build_rename_old_present() { # retaining the old document is a copy, not a rename
+  build_rename "$1"
+  printf '# D035: Decision\n' >"$1/work/docs/decisions/D035-main.md"
+}
+
+build_rename_new_absent() { # an INDEX edit without a replacement document is not a rename
+  build_rename "$1"
+  rm "$1/work/docs/decisions/D035-renamed.md"
+}
+
+build_rename_no_history() { # a shallow committed rename cannot establish its shared history
+  build_rename_committed "$1"
+  git -C "$1/work" rev-parse HEAD >"$1/work/.git/shallow"
+}
+
+build_removed_id_reused() { # DIR [SIDE STATUS]: retained pointers permit only Removed renames
+  local side="${2:-}" status="${3:-Active}" repo
+  if [[ -z "$side" ]]; then
+    build_removed "$1"
+    write_index "$1/work" D034:D034-first.md D035:D035-renamed.md
+    return
+  fi
+  # update-decision retains a Removed document when outside citations need its path.
+  build_ahead "$1"
+  write_index "$1/up" D034:D034-first.md D035:D035-main.md:Removed
+  commit_all "$1/up" "main retains removed D035's pointer"
+  git -C "$1/work" pull -q --ff-only origin main
+  repo="$1/work"
+  [[ "$side" != base ]] || repo="$1/up"
+  mv "$repo/docs/decisions/D035-main.md" "$repo/docs/decisions/D035-renamed.md"
+  write_index "$repo" D034:D034-first.md "D035:D035-renamed.md:$status"
+  if [[ "$side" == base ]]; then
+    commit_all "$repo" "main renames retained D035"
+  fi
+}
+
+build_removed_id_revived() { # the shared ancestor reserves a removed ID even if main recreates its file
+  build_removed "$1"
+  write_index "$1/up" D034:D034-first.md D035:D035-main.md:Removed
+  commit_all "$1/up" "main recreates removed D035"
+  write_index "$1/work" D034:D034-first.md D035:D035-renamed.md:Removed
+}
+
 build_edited() { # the lane changes the status of the base's own D035
   build_ahead "$1"
   git -C "$1/work" pull -q --ff-only origin main
@@ -281,8 +393,10 @@ build_dup_files() { # one D035 row, two D035 documents, no remote; local main is
   commit_all "$1/work" base
 }
 
-run_row() { # SCRIPT FIXTURE ENV ACTION [ARG] — ENV is VAR=VALUE words or empty
+run_row() { # SCRIPT FIXTURE[:SIDE:STATUS] ENV ACTION [ARG]: ENV is VAR=VALUE words or empty
   local script="$1" fixture="$2" row_env="$3" action="$4" arg="${5:-}" world build_rc
+  local fixture_side fixture_status
+  IFS=: read -r fixture fixture_side fixture_status <<<"$fixture"
   local env_args=()
   if [[ -n "$row_env" ]]; then
     read -r -a env_args <<<"$row_env"
@@ -299,7 +413,7 @@ run_row() { # SCRIPT FIXTURE ENV ACTION [ARG] — ENV is VAR=VALUE words or empt
   # itself: behind || or if, errexit is off inside it and a failed step would
   # hand the row a half-built world.
   set +e
-  ( set -e; "build_$fixture" "$world" ) >/dev/null 2>&1
+  ( set -e; "build_$fixture" "$world" "$fixture_side" "$fixture_status" ) >/dev/null 2>&1
   build_rc=$?
   set -e
   if [[ "$build_rc" -ne 0 ]]; then
@@ -373,6 +487,27 @@ next-id-empty-index-base-scheme~empty_base_scheme~~next-id~~0~ADR-0036~
 next-id-configured-prefix-base-width~prefix_base_width~DECISION_ID_PREFIX=ADR-~next-id~~0~ADR-0036~
 next-id-index-absent~index_absent~~next-id~~0~D002~notice=base-unverified ref=origin/main reason=index-absent
 check-collision~collision~~check~~1~~error=id-collision id=D035 path=docs/decisions/D035-lane.md base=origin/main:docs/decisions/D035-main.md
+check-renamed-record~rename~~check~~0~~
+check-committed-rename~rename_committed~~check~~0~~
+check-base-renamed-record~base_rename~~check~~0~~
+check-branch-rename-base-removed~rename:remove~~check~~0~~
+check-base-rename-branch-removed~base_rename:remove~~check~~0~~
+check-both-renamed-record~both_rename~~check~~0~~
+check-base-rename-old-present~base_rename_old_present~~check~~1~~error=id-collision id=D035 path=docs/decisions/D035-main.md base=origin/main:docs/decisions/D035-base-renamed.md
+check-base-rename-new-absent~base_rename_new_absent~~check~~1~~error=id-collision id=D035 path=docs/decisions/D035-main.md base=origin/main:docs/decisions/D035-base-renamed.md
+check-both-rename-old-present~both_rename_old_present~~check~~1~~error=id-duplicate-file id=D035 paths=docs/decisions/D035-lane-renamed.md,docs/decisions/D035-main.md;error=id-collision id=D035 path=docs/decisions/D035-lane-renamed.md base=origin/main:docs/decisions/D035-base-renamed.md
+check-renamed-edited-record~rename_edited~~check~~0~~
+check-rename-old-present~rename_old_present~~check~~1~~error=id-duplicate-file id=D035 paths=docs/decisions/D035-main.md,docs/decisions/D035-renamed.md;error=id-collision id=D035 path=docs/decisions/D035-renamed.md base=origin/main:docs/decisions/D035-main.md
+check-rename-new-absent~rename_new_absent~~check~~1~~error=id-collision id=D035 path=docs/decisions/D035-renamed.md base=origin/main:docs/decisions/D035-main.md
+check-rename-no-history~rename_no_history~~check~~1~~error=rename-unverified ref=origin/main reason=ancestor-unresolved
+check-removed-id-reused~removed_id_reused~~check~~1~~error=id-collision id=D035 path=docs/decisions/D035-renamed.md base=origin/main:docs/decisions/D035-main.md
+check-removed-id-revived~removed_id_revived~~check~~1~~error=id-collision id=D035 path=docs/decisions/D035-renamed.md base=origin/main:docs/decisions/D035-main.md
+check-removed-retained-active~removed_id_reused:branch:Active~~check~~1~~error=id-collision id=D035 path=docs/decisions/D035-renamed.md base=origin/main:docs/decisions/D035-main.md
+check-removed-retained-superseded~removed_id_reused:branch:Superseded by D036~~check~~1~~error=id-collision id=D035 path=docs/decisions/D035-renamed.md base=origin/main:docs/decisions/D035-main.md
+check-removed-retained-removed~removed_id_reused:branch:Removed~~check~~0~~
+check-removed-retained-base-active~removed_id_reused:base:Active~~check~~1~~error=id-collision id=D035 path=docs/decisions/D035-main.md base=origin/main:docs/decisions/D035-renamed.md
+check-removed-retained-base-superseded~removed_id_reused:base:Superseded by D036~~check~~1~~error=id-collision id=D035 path=docs/decisions/D035-main.md base=origin/main:docs/decisions/D035-renamed.md
+check-removed-retained-base-removed~removed_id_reused:base:Removed~~check~~0~~
 check-edited-record~edited~~check~~0~~
 check-removed-record~removing~~check~~0~~
 next-id-past-removed~removed~~next-id~~0~D036~
@@ -446,7 +581,22 @@ next-id-empty-index-base-scheme~    elif [[ "${#base_ids[@]}" -gt 0 ]]; then~   
 next-id-configured-prefix-base-width~    for id in ${base_ids[@]+"${base_ids[@]}"} ${ids[@]+"${ids[@]}"}; do~    for id in ${ids[@]+"${ids[@]}"}; do~a configured prefix whose width ignores the base
 next-id-index-absent~    BASE_REASON=index-absent~    BASE_REASON=""~a base without INDEX.md reported as read
 check-collision~select(($held | length) > 0 and~select(($held | length) > 99 and~a collision rule that never fires
-check-edited-record~($held | map(.link) | index($row.link)) == null~true~a collision rule blind to record identity
+check-renamed-record~if [[ -n "$old_link"\n~if [[ -z "$old_link"\n~a rename rule that rejects inherited records
+check-base-rename-branch-removed~if [[ -n "$old_link"\n~if [[ -n "$old_link" && -f "$path"\n~an unchanged branch required to retain its removed document
+check-branch-rename-base-removed~[[ "$base_link" == "$old_link" ]]~[[ "$base_link" == "$old_link" ]] && git -C "$DECISIONS_DIR" rev-parse --verify --quiet "$BASE_REF:${BASE_PATH%INDEX.md}$base_link" >/dev/null~an unchanged base required to retain its removed document
+check-base-renamed-record~then $history[0] else null end~then (if $history[0].link == $row.base_links[0] then $history[0] else null end) else null end~an identity rule that rejects base-side renames
+check-both-renamed-record~then $history[0] else null end~then (if $history[0].link == $row.base_links[0] or $history[0].link == $row.link then $history[0] else null end) else null end~an identity rule that rejects both-side renames
+check-collision~then $history[0] else null end~then $history[0] else {link: .base_links[0], path: .base} end~a rename rule that accepts independently allocated IDs
+check-rename-old-present~! -e "$DECISIONS_DIR/$old_link" && ! -L "$DECISIONS_DIR/$old_link"~true~a rename rule that accepts a retained old document
+check-both-rename-old-present~! -e "$DECISIONS_DIR/$old_link" && ! -L "$DECISIONS_DIR/$old_link"~true~a both-side rename that retains the ancestor's file
+check-base-rename-old-present~[[ -z "$base_old_path" ]]~true~a rename rule that accepts a retained old base document
+check-rename-new-absent~-f "$path" && ! -e~true && ! -e~a rename rule that accepts a missing new document
+check-base-rename-new-absent~&& git -C "$DECISIONS_DIR" rev-parse --verify --quiet "$BASE_REF:${BASE_PATH%INDEX.md}$base_link" >/dev/null~&& true~a rename rule that accepts a missing new base document
+check-removed-id-revived~&& git -C "$DECISIONS_DIR" rev-parse --verify --quiet "$old_path" >/dev/null~&& true~a rename rule that accepts a removed ancestor ID
+check-removed-retained-active~.link != .ancestor.link and .status != "Removed"~.link != .ancestor.link and false~a retained Removed pointer that permits active branch ID reuse
+check-removed-retained-base-active~.base_links[0] != .ancestor.link and .base_statuses[0] != "Removed"~.base_links[0] != .ancestor.link and false~a retained Removed pointer that permits active base ID reuse
+check-removed-retained-removed~.link != .ancestor.link and .status != "Removed"~.link != .ancestor.link and .status == "Removed"~a status rule that rejects a retained Removed pointer rename
+check-rename-no-history~ancestor_rows="$(shared_index)" || return 1~ancestor_rows="$(shared_index)" || ancestor_rows='[]'~an unread shared history that becomes an empty INDEX
 check-removed-record~    if [[ "$file_count" -gt 1 ]]; then~    if [[ "$file_count" -ne 1 ]]; then~a check that demands a document for every row
 check-removed-record~          status: .[6], link: (.[7] | cell_path), line: $line }~          status: .[6], link: .[7], line: $line }~an identity read from the Link cell as written
 next-id-past-removed~      | { id: .[1], research: .[2],~      | { id: (if .[6] == "Removed" then "" else .[1] end), research: .[2],~a next-id that skips a removed row
