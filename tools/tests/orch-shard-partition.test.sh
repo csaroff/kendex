@@ -50,9 +50,11 @@
 #      one exclude row, plant a Linux-only queue shard and drop one from
 #      QUEUE_MACOS_SHARDS.
 #   5. the cargo legs' partition — the macOS kendex-cli lane splits by
-#      `--test` target, the legs are the combinations the matrix expands
-#      rather than its raw list, every test target `cargo metadata` reports
-#      for that crate is claimed by exactly one of them, and exactly one asks
+#      target and integration test name. The legs are the combinations the
+#      matrix expands rather than its raw list. Each target other than the
+#      shared integration harness is claimed once. The compiled harness's
+#      --list runs through the workflow's own test step and filters, so each
+#      integration test is claimed once, and exactly one leg asks
 #      for the crate's doc tests, which no `--test` roster can account for.
 #      Two contracts ride beside that partition: the bounded leg selects the
 #      library and binary unit tests, and the leg the seam exists for claims
@@ -61,20 +63,28 @@
 #      the `--lib --bins` requests, merge the expensive target back into the
 #      bounded leg, and delete each of the two workflow shapes read here.
 #
-# The roster is real and the suites are not: every run below happens in a
+# The shell roster is real and the suites are not: every shell run happens in a
 # sandbox holding a copy of run-all.sh and one empty file per suite name, or a
 # copy of the workflow and a `bash` that does nothing, so the real filter and
-# roster logic runs over the real names without running the battery.
+# roster logic runs over the real names without running the battery. Cargo's
+# integration harness is compiled and listed, but its tests do not run.
 set -euo pipefail
 
-# --shell-only selects the workflow's shell partition and CI selection checks
-# without the independent Cargo-target partition or its metadata command.
-shell_only=false
-case "$#:${1-}" in
-  0:) ;;
-  1:--shell-only) shell_only=true ;;
-  *) printf 'orch-shard-partition: argument=%s\n' "$*" >&2; exit 2 ;;
-esac
+# CI separates shell checks from Cargo name checks so the latter reuse the
+# macOS rest leg's compiled harness. Local validation runs both by default.
+partition_mode() {
+  case "$#:${1-}" in
+    0:) printf 'combined' ;;
+    1:--shell-only) printf 'shell' ;;
+    1:--cargo-only) printf 'cargo' ;;
+    *) return 2 ;;
+  esac
+}
+mode="$(partition_mode "$@")" || {
+  printf 'orch-shard-partition: argument=%s\n' "$*" >&2
+  exit 2
+}
+PARTITION_SUITE=tools/tests/orch-shard-partition.test.sh
 
 # A suite running from inside a git hook inherits GIT_DIR, GIT_COMMON_DIR,
 # GIT_WORK_TREE and GIT_INDEX_FILE, which would resolve ROOT to the hook's
@@ -86,8 +96,10 @@ TEST_DIR="$ROOT/skills/orch/tests"
 WORKFLOW="$ROOT/.github/workflows/skill-tests.yml"
 
 mkdir -p "$ROOT/tmp"
-TMP="$(mktemp -d "$ROOT/tmp/orch-shard-partition.XXXXXX")"
-trap 'rm -rf -- "$TMP"' EXIT
+TMP="$(mktemp -d "$ROOT/tmp/orch-shard-partition.XXXXXX")" || { echo "orch-shard-partition: scratch=mktemp-failed" >&2; exit 1; }
+[[ -d "$TMP" && ! -L "$TMP" ]] || { echo "orch-shard-partition: scratch=not-a-directory value=[$TMP]" >&2; exit 1; }
+TMP="$(cd -- "$TMP" && pwd -P)" || { echo "orch-shard-partition: scratch=resolve-failed" >&2; exit 1; }
+trap 'rm -rf -- "${TMP:?}"' EXIT
 
 PASS=0
 FAIL=0
@@ -96,6 +108,65 @@ bad() { FAIL=$((FAIL + 1)); printf '  FAIL  %s\n' "$1"; }
 check() { # check <desc> <expected> <actual>
   if [[ "$2" == "$3" ]]; then ok "$1"; else bad "$1 (expected '$2', got '$3')"; fi
 }
+
+# One record per step carrying a `run: |` block: the step's `if:` text on the
+# `@@` line, its dedented body on the `>` lines. Every body line is prefixed,
+# so a body opening with `@` or `>` is not read as a boundary. Indent work is
+# substr and not a regex interval — the macOS leg's awk is not GNU's.
+BLOCK_AWK="$TMP/run-blocks.awk"
+cat > "$BLOCK_AWK" <<'AWK'
+substr($0, 1, 8)  == "      - "       { inrun = 0; cond = "" }
+substr($0, 1, 12) == "        if: "   { cond = substr($0, 13); next }
+substr($0, 1, 14) == "        run: |" { inrun = 1; printf "@@%s\n", cond; next }
+inrun == 1 {
+  if (substr($0, 1, 10) == "          ") { printf ">%s\n", substr($0, 11); next }
+  if ($0 ~ /^[ 	]*$/) { print ">"; next }
+  inrun = 0
+}
+AWK
+
+split_run_blocks() { # split_run_blocks <workflow> <dir> ; <dir>/N.sh and its `if:` text in <dir>/N.cond per block
+  local wf="$1" dir="$2" n=0 line
+  rm -rf -- "${dir:?}"
+  mkdir -p "$dir"
+  while IFS= read -r line; do
+    case "$line" in
+      '@@'*) n=$((n + 1)); : > "$dir/$n.sh"; printf '%s\n' "${line#@@}" > "$dir/$n.cond" ;;
+      *)
+        if [[ "$n" -gt 0 ]]; then printf '%s\n' "${line#>}" >> "$dir/$n.sh"; fi ;;
+    esac
+  done < <(awk -f "$BLOCK_AWK" "$wf")
+}
+
+# One record per one-line `run:` step: its job, its `if:` text, its working
+# directory and its command, parted on the unit separator, which no step text
+# holds: a tab IFS would fold an empty field away. A job opens at the
+# two-space key under `jobs:`.
+one_line_steps() { # one_line_steps <workflow> ; `job\037if\037wd\037run` per step
+  awk '
+    function flush() { if (wd != "" || run != "") printf "%s\037%s\037%s\037%s\n", job, cond, wd, run; cond = wd = run = "" }
+    substr($0, 1, 2) == "  " && substr($0, 3, 1) != " " && substr($0, 3, 1) != "#" && $0 ~ /:$/ { flush(); job = $0; sub(/^ */, "", job); sub(/:$/, "", job) }
+    substr($0, 1, 8) == "      - " { flush() }
+    substr($0, 1, 12) == "        if: " { cond = substr($0, 13) }
+    substr($0, 1, 27) == "        working-directory: " { wd = substr($0, 28) }
+    substr($0, 1, 13) == "        run: " && substr($0, 14, 1) != "|" && substr($0, 14, 1) != ">" { run = substr($0, 14) }
+    END { flush() }
+  ' "$1"
+}
+
+partition_cargo_steps() { # <workflow> ; mode, compile order and condition of direct partition checks
+  local job cond wd run compiled=false
+  one_line_steps "$1" | while IFS=$'\037' read -r job cond wd run; do
+    [[ "$job" == cargo-macos ]] || continue
+    case "$run" in
+      'cargo test '*--no-run*) compiled=true ;;
+      "bash $PARTITION_SUITE"*)
+        printf '%s:%s:%s:%s\n' "${run#"bash $PARTITION_SUITE"}" "$compiled" "$wd" "$cond" ;;
+    esac
+  done
+}
+
+if [[ "$mode" != cargo ]]; then
 
 # --- The sandbox: the real roster, none of the real work --------------------
 SANDBOX="$TMP/battery"
@@ -247,22 +318,6 @@ fi
 # The file keeps its name: the orch filters above are still the seam most
 # likely to be edited, and this section is the same invariant one level out.
 
-# One record per step carrying a `run: |` block: the step's `if:` text on the
-# `@@` line, its dedented body on the `>` lines. Every body line is prefixed,
-# so a body opening with `@` or `>` is not read as a boundary. Indent work is
-# substr and not a regex interval — the macOS leg's awk is not GNU's.
-BLOCK_AWK="$TMP/run-blocks.awk"
-cat > "$BLOCK_AWK" <<'AWK'
-substr($0, 1, 8)  == "      - "       { inrun = 0; cond = "" }
-substr($0, 1, 12) == "        if: "   { cond = substr($0, 13); next }
-substr($0, 1, 14) == "        run: |" { inrun = 1; printf "@@%s\n", cond; next }
-inrun == 1 {
-  if (substr($0, 1, 10) == "          ") { printf ">%s\n", substr($0, 11); next }
-  if ($0 ~ /^[ 	]*$/) { print ">"; next }
-  inrun = 0
-}
-AWK
-
 # The sandbox: the workflow under test at the path a step's `$wf` spells, and
 # the real trees its globs expand over.
 PART="$TMP/partition"
@@ -275,7 +330,14 @@ ln -s "$ROOT/hooks"  "$PART/hooks"
 # and printf stay the host's.
 SHIM="$TMP/shim"
 mkdir -p "$SHIM"
-printf '#!/bin/sh\nexit 0\n' > "$SHIM/bash"
+cat > "$SHIM/bash" <<'SH'
+#!/bin/sh
+if [ "$1" = tools/tests/orch-shard-partition.test.sh ]; then
+  shift
+  printf 'partition-arguments: %s\n' "$*"
+fi
+exit 0
+SH
 chmod +x "$SHIM/bash"
 
 # A roster step is one that reports its suites as `=== <path>`. That marker is
@@ -284,46 +346,34 @@ chmod +x "$SHIM/bash"
 # and the node steps run no shell suite at all.
 ROSTER_MARK='=== $t'
 
-split_run_blocks() { # split_run_blocks <workflow> <dir> ; <dir>/N.sh and its `if:` text in <dir>/N.cond per block
-  local wf="$1" dir="$2" n=0 line
-  rm -rf -- "${dir:?}"
-  mkdir -p "$dir"
-  while IFS= read -r line; do
-    case "$line" in
-      '@@'*) n=$((n + 1)); : > "$dir/$n.sh"; printf '%s\n' "${line#@@}" > "$dir/$n.cond" ;;
-      *)
-        if [[ "$n" -gt 0 ]]; then printf '%s\n' "${line#>}" >> "$dir/$n.sh"; fi ;;
-    esac
-  done < <(awk -f "$BLOCK_AWK" "$wf")
-}
-
-# One record per one-line `run:` step: its job, its `if:` text, its working
-# directory and its command, parted on the unit separator, which no step text
-# holds: a tab IFS would fold an empty field away. A job opens at the
-# two-space key under `jobs:`.
-one_line_steps() { # one_line_steps <workflow> ; `job\037if\037wd\037run` per step
-  awk '
-    function flush() { if (wd != "" || run != "") printf "%s\037%s\037%s\037%s\n", job, cond, wd, run; cond = wd = run = "" }
-    substr($0, 1, 2) == "  " && substr($0, 3, 1) != " " && substr($0, 3, 1) != "#" && $0 ~ /:$/ { flush(); job = $0; sub(/^ */, "", job); sub(/:$/, "", job) }
-    substr($0, 1, 8) == "      - " { flush() }
-    substr($0, 1, 12) == "        if: " { cond = substr($0, 13) }
-    substr($0, 1, 27) == "        working-directory: " { wd = substr($0, 28) }
-    substr($0, 1, 13) == "        run: " && substr($0, 14, 1) != "|" && substr($0, 14, 1) != ">" { run = substr($0, 14) }
-    END { flush() }
-  ' "$1"
-}
-
 # A job outside the shell matrix may run a suite by path. Each job claims
 # a path once, and only a path in the suite universe counts.
-direct_claims() { # direct_claims <workflow> ; one path per job that runs it by path
+run_paths() { # <run command> ; existing paths whose invocation owns shell work
+  local word invocation_mode
+  set -f
+  # Workflow one-line commands name unquoted paths and mode switches.
+  # shellcheck disable=SC2086
+  set -- $1
+  set +f
+  while [[ "$#" -gt 0 ]]; do
+    word="$1"
+    shift
+    [[ "$word" == */* && -f "$ROOT/$word" ]] || continue
+    if [[ "$word" == "$PARTITION_SUITE" ]]; then
+      invocation_mode="$(partition_mode "$@")" || return
+      [[ "$invocation_mode" != cargo ]] || continue
+    fi
+    printf '%s\n' "$word"
+  done
+}
+
+direct_claims() { # direct_claims <workflow> ; one path per job that runs its shell work
   local job cond wd run word
   one_line_steps "$1" | while IFS=$'\037' read -r job cond wd run; do
     [[ -z "$wd" ]] || continue
-    set -f
-    for word in $run; do
+    while IFS= read -r word; do
       if grep -qxF -- "$word" "$UNIV"; then printf '%s\t%s\n' "$job" "$word"; fi
-    done
-    set +f
+    done < <(run_paths "$run")
   done | sort -u | cut -f2
 }
 
@@ -380,6 +430,17 @@ claims_file() { # claims_file <workflow> <out> ; the sorted claim list
   claims_of "$1" | grep -v "^$LINEAR_PREFIX" | sort > "$2" || true
 }
 
+shell_partition_args() { # <workflow> ; actual arguments from the shell roster invocation
+  local wf="$1" dir="$TMP/partition-mode-blocks" f
+  cp "$wf" "$PART/.github/workflows/skill-tests.yml"
+  split_run_blocks "$wf" "$dir"
+  for f in "$dir"/*.sh; do
+    grep -qF "$ROSTER_MARK" "$f" || continue
+    ( cd "$PART" && PATH="$SHIM:$PATH" "$BASH" "$f" ) 2>/dev/null |
+      sed -n 's/^partition-arguments: //p'
+  done
+}
+
 # The universe: the three globs the roster steps loop over, less the runner
 # the orch steps invoke by path. That runner drives the battery and is not a
 # suite, the same exclusion section 2's roster makes by name. A file here that
@@ -404,6 +465,40 @@ check "every claim names a file that exists, so no roster carries a phantom" \
   "" "$(comm -13 "$UNIV" <(sort -u "$HEAD_CLAIMS"))"
 check "exactly one run block claims the linear package by glob" \
   "1" "$(grep -lF "${LINEAR_PREFIX}*.sh" "$TMP/blocks"/*.sh | wc -l | tr -d ' ')"
+
+check "the shell roster invokes only the shell partition" \
+  "--shell-only" "$(shell_partition_args "$WORKFLOW")"
+check "a Cargo-only one-line call owns no shell suite" \
+  "" "$(direct_claims "$WORKFLOW" | grep -xF "$PARTITION_SUITE" || true)"
+
+# The actual Cargo step is a one-line producer. Replacing only its mode must
+# restore shell ownership for a full or shell-only call, including duplicates.
+for args in '' --shell-only --cargo-only; do
+  mutant="$TMP/wf-partition-direct-${args:-combined}.yml"
+  sed "s%run: bash $PARTITION_SUITE --cargo-only%run: bash $PARTITION_SUITE $args%" \
+    "$WORKFLOW" > "$mutant"
+  claims_file "$mutant" "$TMP/mode-claims"
+  expected="$PARTITION_SUITE"
+  [[ "$args" != --cargo-only ]] || expected=''
+  check "direct mode ${args:-combined} has the required shell ownership" \
+    "$expected" "$(uniq -d "$TMP/mode-claims")"
+done
+
+wf_no_shell_partition="$TMP/wf-shell-partition-dropped.yml"
+sed "s%$PARTITION_SUITE; do%; do%" "$WORKFLOW" > "$wf_no_shell_partition"
+claims_file "$wf_no_shell_partition" "$TMP/no-shell-partition-claims"
+check "must-fail: a Cargo-only call cannot cover an omitted shell suite" \
+  "$PARTITION_SUITE" "$(comm -23 "$UNIV" <(sort -u "$TMP/no-shell-partition-claims"))"
+
+for args in '' --cargo-only; do
+  mutant="$TMP/wf-partition-shell-${args:-combined}.yml"
+  sed "s/set -- --shell-only/set -- $args/" "$WORKFLOW" > "$mutant"
+  if [[ "$(shell_partition_args "$mutant")" != --shell-only ]]; then
+    ok "must-fail: shell mode ${args:-combined} violates the actual invocation contract"
+  else
+    bad "must-fail: shell mode ${args:-combined} is accepted"
+  fi
+done
 
 # --- 3b. Must-fail: the ways this partition breaks --------------------------
 # Each arm mutates a copy of the workflow, and the section above must name the
@@ -633,12 +728,10 @@ suite_owners() { # <workflow> [files [bash-major]] ; `shard<tab>path`, by direct
         printf '%s\t%s/package.json\n' "$shard" "$wd"
         continue
       fi
-      for word in $run; do
-        if [[ "$word" == */* && -f "$ROOT/$word" ]]; then
-          printf '%s\t%s\n' "$shard" "$word"
-          break
-        fi
-      done
+      while IFS= read -r word; do
+        printf '%s\t%s\n' "$shard" "$word"
+        break
+      done < <(run_paths "$run")
     done
   } | awk -F '\t' -v mode="$mode" 'mode == "files" { print; next } { d = $2; sub(/\/[^\/]*$/, "", d) } !seen[$1 "\t" d]++'
 }
@@ -829,20 +922,34 @@ for os in ubuntu-latest macos-latest; do
     ok "must-fail: a duplicated roster repeats suites on $os" || bad "duplication control named no suite on $os"
 done
 
-if [[ "$shell_only" == true ]]; then
-  printf 'pass: %d   fail: %d\n' "$PASS" "$FAIL"
-  [[ "$FAIL" -eq 0 ]]
-  exit
 fi
+
+if [[ "$mode" != shell ]]; then
+
+check "Cargo name checks run only after the macOS CLI rest compile" \
+  " --cargo-only:true::matrix.crate == 'kendex-cli' && matrix.leg == 'rest'" \
+  "$(partition_cargo_steps "$WORKFLOW")"
+for defect in mode order; do
+  mutant="$TMP/wf-partition-cargo-$defect.yml"
+  case "$defect" in
+    mode) sed "s%run: bash $PARTITION_SUITE --cargo-only%run: bash $PARTITION_SUITE --shell-only%" "$WORKFLOW" > "$mutant" ;;
+    order) sed 's/--no-run \$CARGO_TARGETS \$CARGO_INTEGRATION/\$CARGO_TARGETS \$CARGO_INTEGRATION/' "$WORKFLOW" > "$mutant" ;;
+  esac
+  if [[ "$(partition_cargo_steps "$mutant")" != "$(partition_cargo_steps "$WORKFLOW")" ]]; then
+    ok "must-fail: Cargo $defect breaks the compile-owner invocation"
+  else
+    bad "must-fail: Cargo $defect is accepted"
+  fi
+done
 
 # --- 5. The cargo legs' partition over the CLI's test targets --------------
 # A cargo leg is a roster of `--test` names, and the seam it cuts is inside
 # one package rather than across the workspace, so the crate guard in that job
 # cannot see it. The universe comes from `cargo metadata`, the one reader of a
 # crate's target list; the claims come from RUNNING the workflow's own roster
-# step once per leg, so what a leg claims is what that step's case arm prints
-# rather than a second reading of it here, and each claim is recorded WITH the
-# leg that printed it.
+# step once per leg. Claims use its GITHUB_ENV exports, the inputs GitHub
+# gives the consumer step. Diagnostic lines remain independent declarations
+# for the checks that compare intended selections with executed selections.
 #
 # The legs are the combinations GitHub expands — the matrix `leg:` list minus
 # the `exclude:` entries naming this crate — so a leg the matrix prunes is
@@ -861,11 +968,14 @@ fi
 # counter bumped in the subshell would be discarded.
 CARGO_TARGET_MARK='cargo-targets: $flags'
 CARGO_CRATE=kendex-cli
-CARGO_LEGS='render-lint rest'
+CARGO_LEGS='render-lint rest verify-lock'
 LANE_LEG=render-lint
 LANE_TARGET=catalog_render_lint
 UNIT_LEG=rest
 UNIT_FLAGS='--lib --bins'
+INTEGRATION_TARGET=integration
+INTEGRATION_LEGS=$'rest\nverify-lock'
+CARGO_TEST_MARK='cargo test -p ${{ matrix.crate }} --locked --no-fail-fast'
 
 cli_targets() { # cli_targets ; CARGO_CRATE's test target names, one per line
   ( cd "$ROOT" && cargo metadata --format-version 1 --no-deps --locked ) |
@@ -904,14 +1014,19 @@ cargo_legs_of() { # cargo_legs_of <workflow> ; the CARGO_CRATE legs it expands
     tr ',' '\n' | sort -u)
 }
 
-roster_of() { # roster_of <workflow> <leg> ; that leg's echoed roster lines
-  local dir="$TMP/cargo-blocks" f
+roster_of() { # <workflow> <leg> [declarations] ; exports, or diagnostic declarations
+  local dir="$TMP/cargo-blocks" f env_file log_file
   split_run_blocks "$1" "$dir"
   for f in "$dir"/*.sh; do
     grep -qF "$CARGO_TARGET_MARK" "$f" || continue
-    # The step writes its roster to GITHUB_ENV for the steps after it and
-    # echoes it for the log; the echo is what is read here.
-    LEG="$2" GITHUB_ENV="$TMP/github-env" "$BASH" "$f" 2>/dev/null
+    env_file="$(mktemp "$TMP/github-env.XXXXXX")" || return
+    log_file="$env_file.log"
+    LEG="$2" GITHUB_ENV="$env_file" "$BASH" "$f" > "$log_file" 2>/dev/null || return
+    if [[ "${3-}" == declarations ]]; then
+      cat "$log_file"
+    else
+      cat "$env_file"
+    fi
   done
 }
 
@@ -920,7 +1035,7 @@ leg_claims() { # leg_claims <workflow> ; "<--test name> <leg>" per claim, per le
   while IFS= read -r leg; do
     [[ -n "$leg" ]] || continue
     roster_of "$wf" "$leg" |
-      sed -n 's/^cargo-targets: //p' |
+      sed -n -e 's/^CARGO_TARGETS=//p' -e 's/^CARGO_INTEGRATION=//p' |
       awk -v leg="$leg" \
         '{ for (i = 1; i <= NF; i++) if ($i == "--test") print $(i + 1), leg }'
   done < <(cargo_legs_of "$wf")
@@ -929,7 +1044,7 @@ leg_claims() { # leg_claims <workflow> ; "<--test name> <leg>" per claim, per le
 # What a leg selects BESIDE its `--test` names: `--lib` and `--bins` are the
 # crate's library and binary unit tests, which no target claim can show.
 unit_flags_of() { # unit_flags_of <workflow> <leg> ; that leg's other selections
-  roster_of "$1" "$2" | sed -n 's/^cargo-targets: //p' |
+  roster_of "$1" "$2" | sed -n 's/^CARGO_TARGETS=//p' |
     awk '{ out = ""
            for (i = 1; i <= NF; i++) {
              if ($i == "--test") { i++; continue }
@@ -949,7 +1064,7 @@ doc_legs() { # doc_legs <workflow> ; the legs whose roster carries `--doc`
     # A here-string and not a pipe: `grep -q` stops at the first match, and a
     # shell writer it SIGPIPEs returns 141 under pipefail, which in condition
     # position reads as a leg that asked for no doc tests.
-    if grep -qx 'cargo-doc: --doc' <<< "$(roster_of "$wf" "$leg")"; then
+    if grep -qx 'CARGO_DOC=--doc' <<< "$(roster_of "$wf" "$leg")"; then
       printf '%s\n' "$leg"
     fi
   done < <(cargo_legs_of "$wf")
@@ -964,6 +1079,90 @@ roster_steps_of() { # roster_steps_of <workflow> <dir> ; run blocks echoing a ro
   { grep -lF "$CARGO_TARGET_MARK" "$2"/*.sh || true; } | wc -l | tr -d ' '
 }
 
+# The executable comes from Cargo's build record, not a guessed target path.
+# --list is libtest's machine-read list and applies its real substring/skip
+# rules without running the CLI's integration tests.
+integration_binary() {
+  ( cd "$ROOT" && cargo test -p "$CARGO_CRATE" --locked --no-run \
+      --test "$INTEGRATION_TARGET" --message-format=json ) > "$TMP/integration-build.jsonl" \
+      2> "$TMP/integration-build.err" || return
+  cat "$TMP/integration-build.err" >&2
+  jq -r --arg target "$INTEGRATION_TARGET" '
+    select(.reason == "compiler-artifact" and .profile.test and .target.name == $target)
+    | .executable // empty' "$TMP/integration-build.jsonl"
+}
+
+# Only Cargo's launch is replaced: its --test selection chooses whether the
+# real integration binary gets listed. The workflow still owns argument
+# forwarding. Omitting its -- or CARGO_FILTERS therefore breaks these claims.
+CARGO_SHIM="$TMP/cargo-shim"
+mkdir -p "$CARGO_SHIM"
+cat > "$CARGO_SHIM/cargo" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "${1-}" == test ]] || exit 2
+shift
+integration=false
+other=false
+selections=''
+doc=false
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    --test)
+      if [[ "$2" == integration ]]; then integration=true; else other=true; fi
+      selections="$selections --test $2"
+      shift 2 ;;
+    --lib|--bins) other=true; selections="$selections $1"; shift ;;
+    --doc) doc=true; shift ;;
+    --) shift; break ;;
+    *) shift ;;
+  esac
+done
+[[ "$other" != true || "$#" -eq 0 ]] || exit 1
+if [[ "$doc" == true ]]; then
+  echo 'cargo-executed-doc: --doc'
+else
+  echo "cargo-executed: $selections"
+fi
+if [[ "$integration" == true ]]; then
+  "$INTEGRATION_EXE" --list "$@"
+fi
+SH
+chmod +x "$CARGO_SHIM/cargo"
+
+integration_claims() { # <workflow> ; "<integration test name> <leg>" per claim
+  local wf="$1" leg dir="$TMP/cargo-test-blocks" f block roster output
+  split_run_blocks "$wf" "$dir"
+  for f in "$dir"/*.sh; do
+    grep -qF "$CARGO_TEST_MARK" "$f" || continue
+    block="$TMP/cargo-test-step.sh"
+    sed 's/${{ matrix.crate }}/kendex-cli/g' "$f" > "$block"
+    while IFS= read -r leg; do
+      [[ -n "$leg" ]] || continue
+      roster="$(roster_of "$wf" "$leg")" || return
+      output="$(CARGO_TARGETS="$(sed -n 's/^CARGO_TARGETS=//p' <<< "$roster")" \
+      CARGO_DOC="$(sed -n 's/^CARGO_DOC=//p' <<< "$roster")" \
+      CARGO_FILTERS="$(sed -n 's/^CARGO_FILTERS=//p' <<< "$roster")" \
+      CARGO_INTEGRATION="$(sed -n 's/^CARGO_INTEGRATION=//p' <<< "$roster")" \
+      INTEGRATION_EXE="$INTEGRATION_EXE" PATH="$CARGO_SHIM:$PATH" "$BASH" "$block")" || return
+      printf '%s\n' "$output" > "$TMP/cargo-executed-$leg"
+      sed -n 's/: test$//p' <<< "$output" | awk -v leg="$leg" '{ print $0, leg }'
+    done < <(cargo_legs_of "$wf")
+  done
+}
+
+target_selections() { # normalized target switches, independent of invocation order
+  awk '{ for (i = 1; i <= NF; i++) {
+           if ($i == "--test") { print $i " " $(i + 1); i++ }
+           else if ($i == "--lib" || $i == "--bins") print $i
+         } }' | sort
+}
+
+integration_test_steps_of() { # <workflow> ; run blocks launching Cargo tests
+  split_run_blocks "$1" "$TMP/cargo-step-count"
+  { grep -lF "$CARGO_TEST_MARK" "$TMP/cargo-step-count"/*.sh || true; } | wc -l | tr -d ' '
+}
+
 CLI_TARGETS="$TMP/cli-targets"
 CARGO_ERR="$TMP/cargo-metadata.err"
 if ! cli_targets > "$CLI_TARGETS" 2> "$CARGO_ERR"; then
@@ -973,12 +1172,30 @@ elif [[ ! -s "$CLI_TARGETS" ]]; then
   bad "cargo metadata reported no test target for $CARGO_CRATE, so the extractor is broken, not the crate sparse"
 fi
 
+INTEGRATION_EXE="$(integration_binary)" || {
+  cat "$TMP/integration-build.err" >&2
+  bad "the integration harness did not compile, so no name partition can be judged"
+  exit 1
+}
+[[ -x "$INTEGRATION_EXE" ]] || { bad "Cargo reported no single executable integration harness"; exit 1; }
+INTEGRATION_TESTS="$TMP/integration-tests"
+"$INTEGRATION_EXE" --list > "$TMP/integration-list"
+sed -n 's/: test$//p' "$TMP/integration-list" | sort > "$INTEGRATION_TESTS"
+for module in cli verify_records lock_record toggle_locked; do
+  grep -q "^$module::" "$INTEGRATION_TESTS" || {
+    bad "the integration test list has no $module member, so discovery is incomplete"
+    exit 1
+  }
+done
+
 [[ "$(leg_count_of "$WORKFLOW")" -gt 0 ]] ||
   bad "no leg matrix in $WORKFLOW, so no cargo leg roster can be judged"
 check "exactly one run block echoes a cargo target roster" "1" \
   "$(roster_steps_of "$WORKFLOW" "$TMP/cargo-blocks-head")"
+check "exactly one run block launches the macOS Cargo test targets" "1" \
+  "$(integration_test_steps_of "$WORKFLOW")"
 
-# The expansion itself, pinned to the two legs the split cut. This is what
+# The expansion itself, pinned to the legs the splits cut. This is what
 # gives the checks below their teeth: an exclude reader that stopped reading
 # would put the pruned `whole` leg back, and `whole` selects every target the
 # crate has, so every check below would pass over a leg GitHub never creates.
@@ -992,12 +1209,51 @@ cut -d' ' -f1 "$LEG_CLAIMS" | sort > "$CLAIMED"
 
 check "every $CARGO_CRATE test target is claimed by one of the workflow's cargo legs" \
   "" "$(comm -23 "$CLI_TARGETS" <(sort -u "$CLAIMED"))"
-check "no $CARGO_CRATE test target is claimed by two of them" \
-  "" "$(uniq -d "$CLAIMED")"
+check "no $CARGO_CRATE target other than the shared integration harness is claimed twice" \
+  "$INTEGRATION_TARGET" "$(uniq -d "$CLAIMED")"
+check "only the two name-partitioned legs share the integration target" \
+  "$INTEGRATION_LEGS" "$(awk -v target="$INTEGRATION_TARGET" '$1 == target { print $2 }' "$LEG_CLAIMS" | sort)"
 check "the $UNIT_LEG leg selects the crate's library and binary unit tests" \
   "$UNIT_FLAGS" "$(unit_flags_of "$WORKFLOW" "$UNIT_LEG")"
 check "the $LANE_LEG leg claims $LANE_TARGET and nothing else" \
   "$LANE_TARGET" "$(lane_claims_of "$LEG_CLAIMS")"
+
+INTEGRATION_CLAIMS="$TMP/integration-claims"
+integration_claims "$WORKFLOW" | sort > "$INTEGRATION_CLAIMS"
+# Named tests keep a valid but incomplete --list extractor from proving only
+# a module prefix. They also exercise each selector family and rest.
+while IFS='|' read -r name leg; do
+  if grep -qxF "$name $leg" "$INTEGRATION_CLAIMS"; then
+    ok "the named integration test $name belongs to $leg"
+  else
+    bad "the named integration test $name is missing from $leg"
+  fi
+done <<'TESTS'
+cli::list_sees_global_and_current_project_scopes|rest
+cli::verify_names_an_installation_that_cannot_act|verify-lock
+lock_record::two_branches_on_one_package_merge_in_sequence_and_main_records_after_each|verify-lock
+TESTS
+check "every locked-record toggle test belongs to verify-lock" \
+  "$(sed -n '/^toggle_locked::/p' "$INTEGRATION_TESTS")" \
+  "$(awk '$1 ~ /^toggle_locked::/ && $2 == "verify-lock" { print $1 }' "$INTEGRATION_CLAIMS")"
+while IFS= read -r leg; do
+  check "the $leg test command runs every declared target and unit selection" \
+    "$(roster_of "$WORKFLOW" "$leg" declarations | sed -n 's/^cargo-targets: //p' | target_selections)" \
+    "$(sed -n 's/^cargo-executed: //p' "$TMP/cargo-executed-$leg" | target_selections)"
+  check "the $leg test command runs its declared doc tests" \
+    "$(roster_of "$WORKFLOW" "$leg" declarations | sed -n 's/^cargo-doc: //p')" \
+    "$(sed -n 's/^cargo-executed-doc: //p' "$TMP/cargo-executed-$leg")"
+done < <(cargo_legs_of "$WORKFLOW")
+cut -d' ' -f1 "$INTEGRATION_CLAIMS" | sort > "$TMP/integration-claimed"
+check "every integration test is claimed by one workflow leg" \
+  "" "$(comm -23 "$INTEGRATION_TESTS" <(sort -u "$TMP/integration-claimed"))"
+check "no integration test is claimed by two workflow legs" \
+  "" "$(uniq -d "$TMP/integration-claimed")"
+for leg in rest verify-lock; do
+  [[ -n "$(awk -v leg="$leg" '$2 == leg { print $1 }' "$INTEGRATION_CLAIMS")" ]] &&
+    ok "the $leg leg claims integration tests" || bad "the $leg leg claims no integration test"
+done
+printf 'coverage: cargo-integration tests=%s\n' "$(wc -l < "$INTEGRATION_TESTS" | tr -d ' ')"
 
 # Doc tests are the one thing a `--test` roster cannot account for. cargo runs
 # them only where nothing selects targets, and `--doc` cannot be mixed with a
@@ -1024,7 +1280,7 @@ fi
 wf_leg_twice="$TMP/wf-cargo-leg-repeated.yml"
 awk "{ sub(/$UNIT_FLAGS/, \"$UNIT_FLAGS --test $LANE_TARGET\"); print }" \
   "$WORKFLOW" > "$wf_leg_twice"
-if [[ -n "$(leg_claims "$wf_leg_twice" | cut -d' ' -f1 | sort | uniq -d)" ]]; then
+if grep -qxF "$LANE_TARGET" <<< "$(leg_claims "$wf_leg_twice" | cut -d' ' -f1 | sort | uniq -d)"; then
   ok "must-fail: a target added to a second cargo leg is named as claimed twice"
 else
   bad "must-fail: a repeated cargo target produced no duplicate, so the overlap check proves nothing"
@@ -1056,7 +1312,7 @@ check "must-fail: with $UNIT_FLAGS dropped, the $UNIT_LEG leg selects no unit te
 # on, and it holds before the mutation as well, which is the point.
 wf_lane_merged="$TMP/wf-cargo-lane-merged.yml"
 awk "{
-       sub(/leg: \[whole, $LANE_LEG, $UNIT_LEG\]/, \"leg: [whole, $UNIT_LEG]\")
+       sub(/leg: \[whole, $LANE_LEG, $UNIT_LEG, verify-lock\]/, \"leg: [whole, $UNIT_LEG, verify-lock]\")
        sub(/flags='$UNIT_FLAGS'/, \"flags='$UNIT_FLAGS --test $LANE_TARGET'\")
        print
      }" "$WORKFLOW" > "$wf_lane_merged"
@@ -1064,8 +1320,58 @@ merged="$TMP/leg-claims-lane-merged"
 leg_claims "$wf_lane_merged" | sort > "$merged"
 check "must-fail: with $LANE_TARGET merged into the $UNIT_LEG leg, the $LANE_LEG leg claims nothing" \
   "" "$(lane_claims_of "$merged")"
-check "must-fail: that merge leaves the target partition whole, so only the leg contract shows it" \
-  ":" "$(comm -23 "$CLI_TARGETS" <(cut -d' ' -f1 "$merged" | sort -u)):$(cut -d' ' -f1 "$merged" | sort | uniq -d)"
+check "must-fail: that merge retains every target and only the integration overlap" \
+  ":$INTEGRATION_TARGET" "$(comm -23 "$CLI_TARGETS" <(cut -d' ' -f1 "$merged" | sort -u)):$(cut -d' ' -f1 "$merged" | sort | uniq -d)"
+
+# Omission and overlap controls remove one side of the same name seam.
+# A third control drops forwarding in the actual test command: declarations
+# alone must not claim protection for arguments the harness never receives.
+for defect in selector skip toggle-selector toggle-skip forwarding export unit-filter; do
+  mutant="$TMP/wf-cargo-filter-$defect.yml"
+  case "$defect" in
+    selector) sed "s/filters='verify_ lock_record:: toggle_locked::'/filters='lock_record:: toggle_locked::'/" "$WORKFLOW" > "$mutant" ;;
+    skip) sed 's/--skip verify_ //' "$WORKFLOW" > "$mutant" ;;
+    toggle-selector) sed "s/filters='verify_ lock_record:: toggle_locked::'/filters='verify_ lock_record::'/" "$WORKFLOW" > "$mutant" ;;
+    toggle-skip) sed 's/ --skip toggle_locked:://' "$WORKFLOW" > "$mutant" ;;
+    forwarding) sed 's/ -- \$CARGO_FILTERS//' "$WORKFLOW" > "$mutant" ;;
+    export) sed 's/echo "CARGO_FILTERS=\$filters"/echo "CARGO_FILTERS="/' "$WORKFLOW" > "$mutant" ;;
+    unit-filter) sed 's/\$CARGO_TARGETS ||/\$CARGO_TARGETS -- \$CARGO_FILTERS ||/' "$WORKFLOW" > "$mutant" ;;
+  esac
+  cmp -s "$WORKFLOW" "$mutant" && { bad "must-fail: the $defect mutation changed nothing"; continue; }
+  if [[ "$defect" == export ]]; then
+    check "the export control preserves the roster declarations" \
+      "$(roster_of "$WORKFLOW" "$UNIT_LEG" declarations)" \
+      "$(roster_of "$mutant" "$UNIT_LEG" declarations)"
+  fi
+  if [[ "$defect" == unit-filter ]]; then
+    if integration_claims "$mutant" > "$TMP/integration-$defect"; then
+      bad "must-fail: integration filters on unit tests are accepted"
+    else
+      ok "must-fail: integration filters on unit tests are rejected"
+    fi
+    continue
+  fi
+  integration_claims "$mutant" | cut -d' ' -f1 | sort > "$TMP/integration-$defect"
+  if [[ "$defect" == selector || "$defect" == toggle-selector ]]; then
+    lost="$(comm -23 "$INTEGRATION_TESTS" <(sort -u "$TMP/integration-$defect"))"
+    if [[ "$defect" == toggle-selector ]]; then
+      check "must-fail: a dropped toggle selector leaves every toggle test unclaimed" \
+        "$(sed -n '/^toggle_locked::/p' "$INTEGRATION_TESTS")" "$lost"
+    else
+      [[ -n "$lost" ]] && ok "must-fail: a dropped selector names unclaimed integration tests" ||
+        bad "must-fail: a dropped selector leaves no unclaimed integration test"
+    fi
+  else
+    repeated="$(uniq -d "$TMP/integration-$defect")"
+    if [[ "$defect" == toggle-skip ]]; then
+      check "must-fail: a dropped toggle skip repeats every toggle test" \
+        "$(sed -n '/^toggle_locked::/p' "$INTEGRATION_TESTS")" "$repeated"
+    else
+      [[ -n "$repeated" ]] && ok "must-fail: dropped $defect names repeated integration tests" ||
+        bad "must-fail: dropped $defect leaves no repeated integration test"
+    fi
+  fi
+done
 
 # The two shapes this section reads, each deleted. Neither loss shows in a
 # claim: with no leg matrix no leg is read at all, and with no roster step no
@@ -1085,6 +1391,8 @@ awk '
 ' "$WORKFLOW" > "$wf_no_roster"
 check "must-fail: with the roster step deleted, no run block echoes a cargo target roster" \
   "0" "$(roster_steps_of "$wf_no_roster" "$TMP/cargo-blocks-no-roster")"
+
+fi
 
 printf 'pass: %d   fail: %d\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
