@@ -28,7 +28,7 @@ mock.module("../../extensions/skills-manager/creation.js", () => {
 });
 mock.module("../../extensions/skills-manager/dialog.js", () => {
   loaded.push("dialog");
-  return { showSkillsManager: async () => undefined };
+  return { showSkillsManager: async () => ({ name: "sample" }) };
 });
 mock.module("../../extensions/skills-manager/registry.js", () => {
   loaded.push("registry");
@@ -62,7 +62,8 @@ if (mode === "disabled") {
   assert(commands.has("skill:enable"));
 } else {
   // Non-UI calls and command arguments must not load a menu the user cannot open.
-  const ctx = { cwd: process.cwd(), hasUI: false, ui: { notify() {}, pasteToEditor() {} } } as unknown as ExtensionCommandContext;
+  const inserted: string[] = [];
+  const ctx = { cwd: process.cwd(), hasUI: false, ui: { notify() {}, pasteToEditor: (text: string) => inserted.push(text) } } as unknown as ExtensionCommandContext;
   await handler("", ctx);
   await handler("invalid-argument", { ...ctx, hasUI: true });
   assert.deepEqual(loaded, needsStartupPatch ? ["host-sdk"] : []);
@@ -70,6 +71,7 @@ if (mode === "disabled") {
   // The first interactive command still opens the manager; later commands reuse the modules.
   await handler("", { ...ctx, hasUI: true });
   assert.deepEqual(new Set(loaded.filter((name) => name !== "host-sdk")), new Set(["creation", "dialog", "registry", "toggle"]));
+  assert.deepEqual(inserted, ["/skill:sample\n"]);
   const count = loaded.length;
   await handler("", { ...ctx, hasUI: true });
   assert.equal(loaded.length, count);
