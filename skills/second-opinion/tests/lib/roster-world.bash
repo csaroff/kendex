@@ -117,6 +117,39 @@ unpad() { local v="${1//_/ }"; printf '%s' "${v//TAB/$'\t'}"; }
 # them. `mixed` is 33c's shape: .env.local supplies the value while the
 # settings file only mentions the key, commented under [env] and under a table
 # the loader never reads.
+# A target's command behind PREFIX, for a NAME=<lane stub | missing | none>.
+prefixed_cmd() {
+  local prog
+  case "${2##*=}" in
+    missing) prog=" $ROW/no-such-cli" ;;
+    none) prog="" ;;
+    *) prog=" $ROW/bin/lane-${2##*=}" ;;
+  esac
+  W_ENV+=("$(so_var "$2" CMD)=$1$prog")
+}
+
+# A target's command whose env prefix decides where its program resolves:
+# PATH= naming the private directory or one without the program, -i or -u PATH
+# leaving the system default, or -C into the directory holding a relative
+# program or away from it, or the last of two -C naming the directory; or an
+# option outside those the check reads.
+lookup_cmd() {
+  local name="${1%%=*}" cmd
+  case "${1##*=}" in
+    path-private) cmd="env PATH=$ROW/private:/usr/bin:/bin so-private-$name" ;;
+    path-away) cmd="env PATH=$ROW/private lane-$name" ;;
+    clear) cmd="env -i lane-$name" ;;
+    unset-path) cmd="env -u PATH lane-$name" ;;
+    chdir-private) cmd="env -C $ROW/private ./so-private-$name" ;;
+    chdir-away) cmd="env -C $ROW/bin ./so-private-$name" ;;
+    chdir-last) cmd="env -C $ROW/private -C . ./so-private-$name" ;;
+    bsd-path) cmd="env -P $ROW/private so-private-$name" ;;
+    signal) cmd="env --default-signal=PIPE lane-$name" ;;
+    *) echo "UNKNOWN-LOOKUP: $1" >&2; exit 2 ;;
+  esac
+  W_ENV+=("$(so_var "$name" CMD)=$cmd")
+}
+
 project_file() {
   case "$1" in
     settings:*) printf '[env]\nSECOND_OPINION_CURRENT_MODEL = "%s"\n' "${1#settings:}" >"$PROJ/kendex.settings.toml" ;;
@@ -149,6 +182,16 @@ word() {
     # a target's command: cmd:<name>=<lane stub | missing>
     cmd:*=missing) W_ENV+=("$(so_var "${1#cmd:}" CMD)=$ROW/no-such-cli") ;;
     cmd:*) W_ENV+=("$(so_var "${1#cmd:}" CMD)=$ROW/bin/lane-${1##*=}") ;;
+    # the same behind a launch prefix, cmd-<prefix>:<name>=<lane stub | missing |
+    # none>, none being the prefix with no program word after it: env and its
+    # assignment, env with an option ahead of it, or exec ahead of env
+    cmd-env:*) prefixed_cmd "env SO_TEST_PREFIX=1" "${1#cmd-env:}" ;;
+    cmd-envopt:*) prefixed_cmd "env -u SO_TEST_UNSET SO_TEST_PREFIX=1" "${1#cmd-envopt:}" ;;
+    cmd-exec:*) prefixed_cmd "exec env SO_TEST_PREFIX=1" "${1#cmd-exec:}" ;;
+    # an env prefix that moves where the program is looked up,
+    # cmd-lookup:<name>=<form>; the program is the name's stub, by a name only
+    # $ROW/private holds or by its own name only $ROW/bin holds
+    cmd-lookup:*) lookup_cmd "${1#cmd-lookup:}" ;;
     # a target's declared identity: model:<name>=<id>
     model:*) W_ENV+=("$(so_var "${1#model:}" MODEL)=$(unpad "${1##*=}")") ;;
     # a target's room check: room:<name>=<kind> runs a stub judging its
@@ -301,6 +344,8 @@ build() {
   make_stub claude
   make_stub codex
   make_stub extra
+  mkdir -p "$ROW/private"
+  for w in claude codex extra; do ln -s "$ROW/bin/lane-$w" "$ROW/private/so-private-$w"; done
   make_ps
   response "$W_RESP_CLAUDE" claude >"$ROW/resp-claude"
   response "$W_RESP_CODEX" codex >"$ROW/resp-codex"
