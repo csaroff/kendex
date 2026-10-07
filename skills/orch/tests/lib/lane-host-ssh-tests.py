@@ -861,6 +861,99 @@ touch node_modules/dep
         self.assertEqual(second.stdout, first.stdout)
         self.assertEqual(self.call("close", "--item", "TEST-1").returncode, 0)
 
+    def test_relaunch_opens_origin_only_landing_branch(self):
+        """A cloud handoff pushes its branch before a static host has a tree."""
+        scripts = self.source / ".agents/skills/worktree/scripts"
+        shutil.copytree(PACKAGE.parent / "worktree/scripts", scripts, dirs_exist_ok=True)
+        shutil.copytree(PACKAGE.parent / "github/scripts", self.source / ".agents/skills/github/scripts",
+                        dirs_exist_ok=True)
+        # The installed helper must admit each GitHub network operation. The
+        # Git stub supplies a local transport only after its HTTPS auth config.
+        self.executable(self.bin / "git", '''#!/usr/bin/env bash
+set -euo pipefail
+network=false
+credential=false
+rewrite=false
+for arg in "$@"; do
+  case "$arg" in
+    fetch|ls-remote) network=true ;;
+    'credential.helper=!gh auth git-credential') credential=true ;;
+    'url.https://github.com/.insteadOf=git@github.com:') rewrite=true ;;
+  esac
+done
+if [[ "$network" == true ]]; then
+  [[ "$credential" == true && "$rewrite" == true ]] || exit 19
+  printf 'authenticated-git %s\\n' "$*" >> "$SSH_TEST_LOG"
+  exec "$REAL_GIT" -c "url.$SSH_TEST_SOURCE.insteadOf=git@github.com:owner/repo" "$@"
+fi
+exec "$REAL_GIT" "$@"
+''')
+        self.executable(self.bin / "gh", '''#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$1" == auth && "$2" == status ]]; then exit 0; fi
+if [[ "$1" == repo && "$2" == view ]]; then printf 'owner/repo\\n'; exit 0; fi
+if [[ "$1" == pr && "$2" == list ]]; then exit 0; fi
+exit 9
+''')
+        self.seed_source("kendex.settings.toml", '[env]\nWORKTREE_DEFAULT_BRANCH = "main"\nWORKTREE_SYMLINKS = ".env.local .agents"\n')
+        git = [self.env["REAL_GIT"], "-C", str(self.source)]
+        for args in (("config", "gc.auto", "0"), ("config", "maintenance.auto", "false"),
+                     ("branch", "-M", "main"), ("add", ".agents"),
+                     ("-c", "user.name=Test", "-c", "user.email=test@example.org", "commit", "-qm", "real worktree fixture"),
+                     ("checkout", "-qb", "test-1")):
+            subprocess.run([*git, *args], check=True, capture_output=True)
+        self.seed_source("cloud-change", "cloud landing\n")
+        head = subprocess.run([*git, "rev-parse", "HEAD"], check=True, capture_output=True).stdout
+        subprocess.run([*git, "checkout", "-q", "main"], check=True, capture_output=True)
+        clone = Path(self.row["clone"])
+        subprocess.run([self.env["REAL_GIT"], "clone", "-q", str(self.source), str(clone)],
+                       check=True, capture_output=True)
+        clone_git = [self.env["REAL_GIT"], "-C", str(clone)]
+        for key, value in (("gc.auto", "0"), ("maintenance.auto", "false")):
+            subprocess.run([*clone_git, "config", key, value], check=True, capture_output=True)
+        subprocess.run([*clone_git, "remote", "set-url", "origin", "git@github.com:owner/repo"],
+                       check=True, capture_output=True)
+        self.assertEqual(subprocess.run([*clone_git, "show-ref", "--verify", "--quiet", "refs/heads/test-1"],
+                                        capture_output=True).returncode, 1)
+        self.assertEqual(subprocess.run([*clone_git, "rev-parse", "refs/remotes/origin/test-1"],
+                                        check=True, capture_output=True).stdout, head)
+        self.assertFalse((clone / ".git/lane-host-item").exists())
+        self.assertEqual(subprocess.run([*clone_git, "worktree", "list", "--porcelain"],
+                                        check=True, capture_output=True).stdout.count(b"worktree "), 1)
+
+        original = self.script.read_text()
+        admission = 'return ["--base", branch] if existing.returncode == 0 else []'
+        self.assertEqual(original.count(admission), 1)
+        self.script.write_text(original.replace(admission, "return []"))
+        self.assertNotEqual(self.script.read_text(), original)
+        refused = self.create("--relaunch")
+        self.assertEqual((refused.returncode, refused.stdout), (75, b""), refused.stderr)
+        self.assertFalse((clone / ".git/lane-host-item").exists())
+        self.script.write_text(original)
+
+        probe = '\"$1/.agents/skills/github/scripts/git-https-auth\" -C \"$1\" ls-remote'
+        self.assertEqual(original.count(probe), 1)
+        self.script.write_text(original.replace(probe, 'git -C "$1" ls-remote'))
+        self.assertNotEqual(self.script.read_text(), original)
+        unauthenticated = self.create("--relaunch")
+        self.assertEqual((unauthenticated.returncode, unauthenticated.stdout), (19, b""),
+                         unauthenticated.stderr)
+        self.assertFalse((clone / ".git/lane-host-item").exists())
+        self.script.write_text(original)
+
+        result = self.create("--relaunch")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        path = Path(dict(field.split("=", 1) for field in result.stdout.decode().strip().split("\t"))["path"])
+        for args, expected in ((("branch", "--show-current"), b"test-1\n"), (("rev-parse", "HEAD"), head)):
+            self.assertEqual(subprocess.run([self.env["REAL_GIT"], "-C", str(path), *args],
+                                            check=True, capture_output=True).stdout, expected)
+        self.assertEqual((path / "cloud-change").read_text(), "cloud landing\n")
+        authenticated = [line.split() for line in self.log_since(0) if line.startswith("authenticated-git ")]
+        self.assertTrue(any("ls-remote" in words and "--exit-code" in words and "refs/heads/test-1" in words
+                            for words in authenticated), authenticated)
+        self.assertEqual(subprocess.run([*clone_git, "config", "--get", "remote.origin.url"],
+                                        check=True, capture_output=True).stdout, b"git@github.com:owner/repo\n")
+
     def test_clone_without_committed_render_refuses_create(self):
         """A render script absent from the checkout, or present but not
         committed at HEAD, is named before create makes a worktree."""
