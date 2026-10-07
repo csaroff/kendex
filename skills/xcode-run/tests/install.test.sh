@@ -71,4 +71,35 @@ for rule, old, new, failure_assertion in (
         assertions.assertEqual(len(result.errors), 0)
         assertions.assertIn(failure_assertion, result.failures[0][1])
         print(f"must-fail control: {rule} behavior removed, assertion turned red: {failure_assertion}")
+
+
+# Install, launch and capture name one device; `booted` can pick another booted simulator.
+class DeviceTest(unittest.TestCase):
+    workflow = template.decode()
+
+    def test_device(self):
+        calls = [line.split()[2:4] for line in self.workflow.splitlines()
+                 if line.split()[:2] == ["xcrun", "simctl"]]
+        operations = {operation for operation, _ in calls}
+        for required in ("bootstatus", "install", "launch", "io"):
+            self.assertIn(required, operations, f"simctl {required} missing")
+        for operation, device in calls:
+            self.assertEqual(device, '"$simulator"', f"simctl {operation} device differs")
+
+
+result = runner.run(unittest.defaultTestLoader.loadTestsFromTestCase(DeviceTest))
+if not result.wasSuccessful():
+    sys.exit(1)
+workflow = DeviceTest.workflow
+capture = 'xcrun simctl io "$simulator" screenshot'
+for rule, new, failure_assertion in (
+    ("capture device", "xcrun simctl io booted screenshot", "simctl io device differs"),
+    ("capture presence", ": " + capture, "simctl io missing"),
+):
+    assertions.assertEqual(workflow.count(capture), 1)
+    DeviceTest.workflow = workflow.replace(capture, new)
+    result = runner.run(unittest.defaultTestLoader.loadTestsFromTestCase(DeviceTest))
+    assertions.assertEqual(len(result.failures), 1)
+    assertions.assertIn(failure_assertion, result.failures[0][1])
+    print(f"must-fail control: {rule} removed, assertion turned red: {failure_assertion}")
 PY
