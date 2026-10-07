@@ -154,15 +154,14 @@ pub enum Remedy {
 pub enum Fix {
     /// Runnable where the report was read.
     Here(String),
-    /// Runnable, but not where it was read: the line is about a project
-    /// the command has to name and this verb has no `--project-path`
-    /// form, so a session running the catalog's `block-worktree-refresh`
-    /// hook is refused it inside that linked git worktree — every such
-    /// verb where the project is the main checkout's, and `update-pi`
-    /// alone where it is the worktree's own. The command is still the
-    /// fix, and the renderer marks it with why it will not run here — a
-    /// reader handed no remedy at all is left with the drift and no way
-    /// out of it.
+    /// Runnable, but not where it was read: the line is about the main
+    /// checkout's project, the shared base its refresh owner writes from
+    /// there, so a session running the catalog's `block-worktree-refresh`
+    /// hook is refused every write to it from a linked worktree, named by
+    /// `--project-path` or typed bare. The command is still the fix, and
+    /// the renderer marks it with why it will not run here — a reader
+    /// handed no remedy at all is left with the drift and no way out of
+    /// it.
     Elsewhere(String),
 }
 
@@ -181,7 +180,7 @@ pub enum ProjectTarget {
     /// The checked project in a linked worktree, which holds a manifest of
     /// its own, readable or not, whether it is the worktree's root or a
     /// folder below it. A bare verb typed there writes it and nothing
-    /// else, so every remedy but `update-pi` runs there as it is, with no
+    /// else, so every remedy runs there as it is, with no
     /// path in the command: the path reaches no command and is carried
     /// for `kendex check --json`, which prints the target as its path
     /// alone, and for the serialization guard that path shares with the
@@ -252,13 +251,14 @@ impl Remedy {
     /// reach the place the line is about, set by [`CheckReport`] where the
     /// checked directory is a linked worktree. Only the main checkout's
     /// project is named: a verb that takes `--project-path` carries it,
-    /// and one with no such form renders its bare command as
-    /// [`Fix::Elsewhere`]. The worktree's own project is reached by every
-    /// bare verb typed there, so the command carries no path and only
-    /// `update-pi`, which the catalog's `block-worktree-refresh` hook runs
-    /// in a linked worktree at global scope alone, is [`Fix::Elsewhere`] —
-    /// the command is still the fix, and the marker the renderer adds
-    /// says why it will not run where the report was read.
+    /// and one with no such form is spelled bare. Every write to it is
+    /// [`Fix::Elsewhere`], its refresh owner's to run from the main
+    /// checkout: the command is still the fix, and the marker the renderer
+    /// adds says why it will not run where the report was read. The plan
+    /// and `updates`, which writes only the snapshot outside the checkout,
+    /// run here.
+    /// The worktree's own project is reached by every bare verb typed
+    /// there, so its command carries no path and runs here.
     pub fn render(&self, target: Option<&ProjectTarget>) -> Option<Fix> {
         self.render_with_scope(target, false)
     }
@@ -339,9 +339,12 @@ impl Remedy {
             Remedy::Plan { .. } => format!("kendex apply --plan{place}"),
         };
         let elsewhere = match named {
-            None => false,
-            Some(ProjectTarget::Worktree(_)) => matches!(self, Remedy::UpdatePi { .. }),
-            Some(ProjectTarget::MainCheckout(_)) => !self.takes_project_path(),
+            None | Some(ProjectTarget::Worktree(_)) => false,
+            // `updates` without `--apply` and the plan write nothing in the
+            // checkout, so the hook passes them from the worktree.
+            Some(ProjectTarget::MainCheckout(_)) => {
+                !matches!(self, Remedy::Plan { .. } | Remedy::Updates { .. })
+            }
         };
         Some(match elsewhere {
             true => Fix::Elsewhere(command),
