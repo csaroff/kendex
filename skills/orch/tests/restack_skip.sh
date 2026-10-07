@@ -31,7 +31,7 @@ g() { git -C "$1" -c user.name=t -c user.email=t@example.com "${@:2}"; }
 # DEV_VALIDATE_* or COMMIT_GUARDS_* settings, so the fixture's own file decides.
 clean_env() {
   env -u DEV_VALIDATE_CMD -u DEV_VALIDATE_RANGE_CMD -u DEV_VALIDATE_TIMEOUT_SECS -u DEV_VALIDATE_BASE \
-    -u DEV_VALIDATE_CLASS -u DEV_VALIDATE_DOCS_ONLY -u DEV_VALIDATE_PATHS -u DEV_VALIDATE_CI_CONTEXT \
+    -u DEV_VALIDATE_CLASS -u DEV_VALIDATE_DOCS_ONLY -u DEV_VALIDATE_PATHS -u DEV_VALIDATE_CI_CONTEXT -u DEV_VALIDATE_FINDING_PREFIX \
     -u WORKTREE_DEFAULT_BRANCH -u COMMIT_GUARDS_CHANGELOG_PATHS -u COMMIT_GUARDS_CHANGELOG_RECORD \
     -u COMMIT_GUARDS_CHANGELOG_VERSION_PATHS -u COMMIT_GUARDS_CHANGELOG_PACKAGE_PATHS -u COMMIT_GUARDS_SETTINGS_FILE "$@"
 }
@@ -235,6 +235,38 @@ clean_env "$SCRIPTS_DIR/dev-validate-run" --worktree "$TMP_ROOT/newer-red" --pol
   >/dev/null 2>&1 && fixture_failed newer-red-passed
 assert_eq "$(ask "$SCRIPTS_DIR/restack-skip" "$TMP_ROOT/newer-red")" "restack=retest cause=newer-red rc=1" \
   "a range run that failed on the restacked head re-tests when asked again"
+
+# A range run on the restacked head that the bound ended, planted the way the
+# runner leaves one under a name that sorts after the seed's pass: with no
+# finding line of its command it refuted nothing, and the version-only restack
+# still skips; with one it re-tests.
+cp -a -- "$TMP_ROOT/package" "$TMP_ROOT/no-verdict"
+nv_dir="$TMP_ROOT/no-verdict/tmp/dev-validate-29990101T000000Z-1"
+mkdir -p "$nv_dir"
+printf 'validate-mode=range\ntimeout-secs=3600\nhead=%s\nfinding-prefix=guard: \n' "$(git -C "$TMP_ROOT/no-verdict" rev-parse HEAD)" > "$nv_dir/start"
+printf 'tools/guard --range $DEV_VALIDATE_BASE' > "$nv_dir/cmd"
+printf 'runner=setsid\nguard-note: suites=all\n' > "$nv_dir/log"
+printf 'guard-exit=124 at=2026-01-01T00:00:00Z verdict=no-verdict\n' > "$nv_dir/exit"
+assert_eq "$(ask "$SCRIPTS_DIR/restack-skip" "$TMP_ROOT/no-verdict")" \
+  "$(skip_line "$TMP_ROOT/no-verdict" version-only pkg/CHANGELOG.md,pkg/package.json)" \
+  "a version-only restack after a range run the bound ended with no finding still skips"
+nv_control_dir="$(mutant_scripts no-verdict-red dev-validate-run)" || exit 1
+mutate_file "$nv_control_dir/dev-validate-run" \
+  $'    if [[ "$verdict" == no-verdict ]] && ! run_has_finding "$run_dir"; then\n      continue\n    fi\n' ''
+assert_eq "$(ask "$nv_control_dir/restack-skip" "$TMP_ROOT/no-verdict")" "restack=retest cause=newer-red rc=1" \
+  "control: with every no-verdict run read as red the restack re-tests"
+nv_control_dir="$(mutant_scripts no-verdict-prefix dev-validate-run)" || exit 1
+mutate_file "$nv_control_dir/dev-validate-run" '  [[ -n "$prefix" ]] || return 0' '  [[ -n "$prefix" ]] || return 1'
+sed -i.bak '/^finding-prefix=/d' "$nv_dir/start"
+assert_eq "$(ask "$SCRIPTS_DIR/restack-skip" "$TMP_ROOT/no-verdict")" "restack=retest cause=newer-red rc=1" \
+  "a range run the bound ended that recorded no finding prefix re-tests"
+nv_answer="$(ask "$nv_control_dir/restack-skip" "$TMP_ROOT/no-verdict")"
+assert_eq "${nv_answer%% *}" "restack=skip" \
+  "control: with a missing prefix read as none the restack skips"
+printf 'finding-prefix=guard: \n' >> "$nv_dir/start"
+printf 'guard: suite=skills/p/tests/a.sh\n' >> "$nv_dir/log"
+assert_eq "$(ask "$SCRIPTS_DIR/restack-skip" "$TMP_ROOT/no-verdict")" "restack=retest cause=newer-red rc=1" \
+  "a range run the bound ended whose log holds a finding line re-tests"
 
 echo "=== controls: each rule, removed, lets its row skip ==="
 # control NAME FILE OLD NEW ROW — ROW's answer under copies of the scripts with

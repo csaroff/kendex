@@ -87,7 +87,7 @@ run_script() { # SCRIPT ARG...
   # suite also runs under dev-validate-run itself, which sets one. A row that
   # means to hand one in names it in INHERITED_CLASS.
   OUT="$(env -u DEV_VALIDATE_CMD -u DEV_VALIDATE_TIMEOUT_SECS -u DEV_VALIDATE_RANGE_CMD -u DEV_VALIDATE_BASE \
-    -u DEV_VALIDATE_CLASS -u DEV_VALIDATE_DOCS_ONLY -u DEV_VALIDATE_PATHS -u WORKTREE_DEFAULT_BRANCH -u DEV_VALIDATE_CI_CONTEXT \
+    -u DEV_VALIDATE_CLASS -u DEV_VALIDATE_DOCS_ONLY -u DEV_VALIDATE_PATHS -u WORKTREE_DEFAULT_BRANCH -u DEV_VALIDATE_CI_CONTEXT -u DEV_VALIDATE_FINDING_PREFIX \
     ${INHERITED_CLASS:+DEV_VALIDATE_CLASS=$INHERITED_CLASS} \
     PATH="${RUN_PATH:-$PATH}" "$script" "$@" 2>"$err")"
   RC=$?
@@ -699,7 +699,7 @@ cat > "$LAYOUT/harness-ci/scripts/harness-only" <<'SH'
 #!/usr/bin/env bash
 prev=""
 for a in "$@"; do
-  [[ "$prev" != --paths-output ]] || printf 'docs/a.md\n' > "$a"
+  [[ "$prev" != --paths-output ]] || tr , '\n' <<<"${STUB_PATHS:-docs/a.md}" > "$a"
   prev="$a"
 done
 case "$STUB_DOCS" in
@@ -989,7 +989,7 @@ assert_eq "$RC $(sed -n 1p <<<"$OUT" | cut -d' ' -f1) $(verdict_of "$OUT")" \
   "0 state=started state=done guard-exit=0 validate=pass" \
   "an attached ci run prints its started line, then its done line" "$ERR"
 cp -p -- "$CI_SCRIPT" "$CI_SCRIPT.mutant"
-mutate_file "$CI_SCRIPT.mutant" '[[ "$attached" == true && "$validate_mode" != ci ]]' '[[ "$attached" == true ]]'
+mutate_file "$CI_SCRIPT.mutant" '[[ "$attached" == true && "$validate_mode" != ci && "$bound_ended" == false ]]' '[[ "$attached" == true ]]'
 ci_run "$CI_SCRIPT.mutant" --attached
 assert_eq "$(sed -n 1p <<<"$OUT" | cut -d' ' -f1)" "state=done" \
   "control: an attached ci run that skips its started line opens on the done line" "$ERR"
@@ -1737,6 +1737,202 @@ mutant mutant-last-pass-ci $'      *) continue ;;\n    esac\n    verdict=unfinis
 run_script "$MUTANT" --last-pass --worktree "$proj_last_ci"
 assert_eq "$([[ "${OUT%% *} rc=$RC" == "run-dir=$last_full_dir rc=0" ]] && echo full || echo other)" "other" \
   "control: a read that takes any mode names the ci run"
+
+# --- A run the bound already ended answers a later run over no fewer paths ----
+# plant_run plants a finished run directory the way the runner leaves one: the
+# command its mode runs in these projects, a log whose first line names the
+# runner, the paths it read and a sentinel the bound wrote. Planted under a
+# name that sorts before or after the real runs, as each row needs.
+# Its class and docs verdict are the micro, non-docs ones the bound rows'
+# classifier stub answers, unless START_LINE names its own, and it records the
+# finding prefix `echo: ` unless START_LINE is no-finding-prefix.
+plant_run() { # WORKTREE NAME MODE PATHS TIMEOUT_SECS [LOG_LINE] [START_LINE]
+  local dir="$1/tmp/dev-validate-$2"
+  mkdir -p "$dir"
+  printf 'validate-mode=%s\ntimeout-secs=%s\nhead=\n' "$3" "$5" > "$dir/start"
+  # A range run validated from the project's HEAD, the base the rows' range
+  # and ci requests name; a full run from none.
+  case "$3:${7:-}" in
+    *validate-base=*) ;;
+    range:*) printf 'validate-base=%s\n' "$(git -C "$1" rev-parse HEAD)" >> "$dir/start" ;;
+    *) printf 'validate-base=\n' >> "$dir/start" ;;
+  esac
+  case "${7:-}" in
+    class=*) ;;
+    *) printf 'class=micro\n' >> "$dir/start" ;;
+  esac
+  case "${7:-}" in
+    *docs-only=*) ;;
+    *) printf 'docs-only=false\n' >> "$dir/start" ;;
+  esac
+  if [[ "${7:-}" == no-finding-prefix ]]; then
+    :
+  else
+    printf 'finding-prefix=echo: \n' >> "$dir/start"
+    printf '%s\n' "${7:-}" | tr ' ' '\n' >> "$dir/start"
+  fi
+  printf 'echo %s' "$3" > "$dir/cmd"
+  printf 'runner=setsid\n%s\n' "${6:-echo-note: suites=all}" > "$dir/log"
+  tr , '\n' <<<"$4" > "$dir/paths"
+  printf 'guard-exit=124 at=2026-01-01T00:00:00Z verdict=no-verdict\n' > "$dir/exit"
+}
+# bound_row SCRIPT PATHS PLANT_MODE PLANT_PATHS PLANT_SECS PLANT_LOG PLANT_START ARG... —
+# a fresh project holding one planted run, then one start in it under the
+# micro class: the mode recorded, the verdict, what the command printed and
+# the bound-run= line. A ci request's rules read fails, so it falls back to
+# range.
+# The count of projects made lives in a file: bound_rows runs in a subshell.
+bound_row() {
+  local script="$1" paths="$2" proj dir n
+  n=$(( $(cat "$TMP_ROOT/bound-n" 2>/dev/null || echo 0) + 1 ))
+  printf '%s\n' "$n" > "$TMP_ROOT/bound-n"
+  proj="$(ci_proj "proj-bound-$n" CI)"
+  plant_run "$proj" 20000101T000000Z-1 "$3" "$4" "$5" "$6" "$7"
+  shift 7
+  ci_world unrequired
+  RUN_PATH="$GH_STUB_BIN:$PATH" STUB_ANSWER=change_class=micro STUB_DOCS=false STUB_MEASURED=true STUB_PATHS="$paths" \
+    run_script "$script" --worktree "$proj" --poll 1 "$@"
+  dir="$(run_dir_of "$OUT")"
+  printf '%s|%s|%s|%s\n' "$(start_line "$dir" validate-mode 2>/dev/null)" "$(verdict_of "$OUT")" \
+    "$(output_of "$OUT" 2>/dev/null)" "$(start_line "$dir" bound-run 2>/dev/null | sed 's|.*/||')"
+}
+PLANTED=dev-validate-20000101T000000Z-1
+NV="state=done guard-exit=124 validate=no-verdict"
+OK="state=done guard-exit=0 validate=pass"
+# label|paths this run reads|planted mode|planted paths|planted bound|planted log line|planted start line|arguments|want
+BOUND_ROWS=(
+  "a range request over every path a bound-ended range run read ends at once with no verdict|docs/a.md,docs/b.md|range|docs/a.md|20|||--validate-mode range --base HEAD|range|$NV||$PLANTED"
+  "a range request short of a path that run read keeps its local run|docs/b.md|range|docs/a.md|20|||--validate-mode range --base HEAD|range|$OK|range|"
+  "a full request over every path a bound-ended full run read ends at once with no verdict|docs/a.md|full|docs/a.md|20|||--|full|$NV||$PLANTED"
+  "a full request short of a path that run read keeps its local run|docs/b.md|full|docs/a.md|20|||--|full|$OK|full|"
+  "a ci request that falls back to range ends at once after a range run's bound|docs/a.md|range|docs/a.md|20|||--validate-mode ci --base HEAD|range|$NV||$PLANTED"
+  "a full request after only a range run's bound, another command, keeps its local run|docs/a.md|range|docs/a.md|20||validate-base=|--|full|$OK|full|"
+  "a bound-ended run whose log holds a finding line is no evidence|docs/a.md|full|docs/a.md|20|echo: suite=tests/a.sh||--|full|$OK|full|"
+  "a bound-ended run under a lower bound is no evidence|docs/a.md|full|docs/a.md|10|||--|full|$OK|full|"
+  "a run an earlier run's bound answered, which ran nothing, is no evidence|docs/a.md|full|docs/a.md|20||bound-run=/elsewhere|--|full|$OK|full|"
+  "a fresh request runs its command whatever the evidence|docs/a.md|full|docs/a.md|20|||--fresh|full|$OK|full|"
+  "a bound-ended run that recorded no finding prefix is no evidence|docs/a.md|full|docs/a.md|20||no-finding-prefix|--|full|$OK|full|"
+  "a ci request that falls back to range keeps its local run after a range run from another base|docs/a.md|range|docs/a.md|20||validate-base=0000000000000000000000000000000000000000|--validate-mode ci --base HEAD|range|$OK|range|"
+  "a bound-ended run handed another class is no evidence|docs/a.md|full|docs/a.md|20||class=standard|--|full|$OK|full|"
+  "a bound-ended run handed another docs verdict is no evidence|docs/a.md|full|docs/a.md|20||docs-only=true|--|full|$OK|full|"
+)
+bound_rows() { # SCRIPT [LABEL]
+  local row label paths pmode ppaths psecs plog pstart args
+  for row in "${BOUND_ROWS[@]}"; do
+    IFS='|' read -r label paths pmode ppaths psecs plog pstart args _ <<<"$row"
+    [[ -z "${2:-}" || "$label" == "$2" ]] || continue
+    [[ "$args" != -- ]] || args=""
+    # shellcheck disable=SC2086 # the row's arguments are space-separated words
+    printf '%s\t%s\n' "$label" "$(bound_row "$1" "$paths" "$pmode" "$ppaths" "$psecs" "$plog" "$pstart" $args)"
+  done
+}
+BOUND_GOT="$(bound_rows "$CI_SCRIPT")"
+for row in "${BOUND_ROWS[@]}"; do
+  IFS='|' read -r label _ _ _ _ _ _ _ want <<<"$row"
+  assert_eq "$(awk -F'\t' -v want="$label" '$1 == want { print $2 }' <<<"$BOUND_GOT")" "$want" "$label"
+done
+# bound_control LABEL ANCHOR REPLACEMENT ROW — ROW under a copy with one rule
+# removed must answer otherwise than it does with the rule.
+bound_control() {
+  local want got
+  cp -p -- "$CI_SCRIPT" "$CI_SCRIPT.mutant"
+  mutate_file "$CI_SCRIPT.mutant" "$2" "$3"
+  want="$(awk -F'\t' -v want="$4" '$1 == want { print $2 }' <<<"$BOUND_GOT")"
+  got="$(bound_rows "$CI_SCRIPT.mutant" "$4" | cut -f2)"
+  assert_eq "$([[ "$got" != "$want" ]] && echo turned || echo "held:$got")" "turned" "control: with $1, '$4' turns"
+}
+# shellcheck disable=SC2016 # the script's own text, not expansions
+{
+bound_control 'no path rule' $'    (( rc == 1 )) || continue\n' '' \
+  'a range request short of a path that run read keeps its local run'
+bound_control 'no path rule' $'    (( rc == 1 )) || continue\n' '' \
+  'a full request short of a path that run read keeps its local run'
+bound_control 'no command rule' ' && [[ "$ran" == "$4" ]] || continue' ' || continue' \
+  "a full request after only a range run's bound, another command, keeps its local run"
+bound_control 'no finding rule' $'    ! run_has_finding "$dir" || continue\n' '' \
+  'a bound-ended run whose log holds a finding line is no evidence'
+bound_control 'no bound rule' ' && (( 10#$secs >= 10#$2 ))' '' \
+  'a bound-ended run under a lower bound is no evidence'
+bound_control 'answered runs taken as evidence' $'    [[ -z "$(start_field "$start_file" bound-run)" ]] || continue\n' '' \
+  "a run an earlier run's bound answered, which ran nothing, is no evidence"
+bound_control '--fresh unread' ' && "$fresh" == false' '' \
+  'a fresh request runs its command whatever the evidence'
+bound_control 'a missing finding prefix read as none' '  [[ -n "$prefix" ]] || return 0' '  [[ -n "$prefix" ]] || return 1' \
+  'a bound-ended run that recorded no finding prefix is no evidence'
+bound_control 'no base rule' $'    [[ "$(start_field "$start_file" validate-base)" == "$7" ]] || continue\n' '' \
+  'a ci request that falls back to range keeps its local run after a range run from another base'
+bound_control 'no class rule' $'    [[ "$(start_field "$start_file" class)" == "$5" ]] || continue\n' '' \
+  'a bound-ended run handed another class is no evidence'
+bound_control 'no docs rule' $'    [[ "$(start_field "$start_file" docs-only)" == "$6" ]] || continue\n' '' \
+  'a bound-ended run handed another docs verdict is no evidence'
+}
+# The range timeout, then a full request (another command, so it runs), then
+# a range request: the range request is answered by the range run, never
+# blocked by the newer full record.
+proj_bound_seq="$(ci_proj proj-bound-seq CI)"
+plant_run "$proj_bound_seq" 20000101T000000Z-1 range docs/a.md 20
+plant_run "$proj_bound_seq" 20000101T000001Z-1 full docs/a.md 20 '' 'bound-run=/elsewhere'
+RUN_PATH="$GH_STUB_BIN:$PATH" STUB_ANSWER=change_class=micro STUB_DOCS=false STUB_MEASURED=true \
+  run_script "$CI_SCRIPT" --worktree "$proj_bound_seq" --poll 1 --validate-mode range --base HEAD
+assert_eq "$(verdict_of "$OUT") $(start_line "$(run_dir_of "$OUT")" bound-run | sed 's|.*/||')" "$NV $PLANTED" \
+  "a range request after a range timeout and a newer full record is answered by the range run" "$ERR"
+# --fresh belongs to the start path alone.
+run_script "$RUN" --last-pass --worktree "$proj_bound_seq" --fresh
+assert_eq "$RC $(sed -n 1p <"$ERR")" "2 dev-validate-run: option-unused option=--fresh mode=last-pass" \
+  "--fresh outside a start is refused, never dropped" "$ERR"
+# A run the evidence ended records a zero wall time, and --record reads it as
+# no-verdict, which a receipt's no-verdict needs.
+proj_bound_rec="$(ci_proj proj-bound-rec CI)"
+plant_run "$proj_bound_rec" 20000101T000000Z-1 full docs/a.md 20
+RUN_PATH="$GH_STUB_BIN:$PATH" STUB_ANSWER=change_class=micro STUB_DOCS=false STUB_MEASURED=true \
+  run_script "$CI_SCRIPT" --worktree "$proj_bound_rec" --poll 1
+bound_rec_dir="$(run_dir_of "$OUT")"
+run_script "$CI_SCRIPT" --record --run-dir "$bound_rec_dir"
+assert_eq "$(sed -E 's/ head=[^ ]* start=[0-9]+ / /; s/started-at=[^ ]+ ended-at=[^ ]+$/T/' <<<"$OUT")" \
+  "validate-mode=full selection=unreported verdict=no-verdict seconds=0 T" \
+  "a run an earlier run's bound ended records no verdict and no wall time" "$ERR"
+
+# --- A no-verdict run with no finding leaves the last pass standing ----------
+# A run the bound ended after the pass, planted under a name that sorts after
+# it: with no finding line it refuted nothing; with one it is red.
+proj_last_nv="$(make_mode_proj proj-last-nv "")"
+run_script "$RUN" --worktree "$proj_last_nv" --poll 1
+last_nv_pass="$(run_dir_of "$OUT")"
+plant_run "$proj_last_nv" 29990101T000000Z-1 full docs/a.md 20
+run_script "$RUN" --last-pass --worktree "$proj_last_nv"
+assert_eq "${OUT%% *} rc=$RC" "run-dir=$last_nv_pass rc=0" \
+  "--last-pass passes over a later no-verdict run whose log holds no finding line" "$ERR"
+mutant mutant-last-pass-nv $'    if [[ "$verdict" == no-verdict ]] && ! run_has_finding "$run_dir"; then\n      continue\n    fi\n' ''
+run_script "$MUTANT" --last-pass --worktree "$proj_last_nv"
+assert_eq "$OUT rc=$RC" "last-pass=red run-dir=$proj_last_nv/tmp/dev-validate-29990101T000000Z-1 rc=1" \
+  "control: a read that counts every no-verdict run as red names it"
+printf 'echo: suite=tests/a.sh\n' >> "$proj_last_nv/tmp/dev-validate-29990101T000000Z-1/log"
+run_script "$RUN" --last-pass --worktree "$proj_last_nv"
+assert_eq "$OUT rc=$RC" "last-pass=red run-dir=$proj_last_nv/tmp/dev-validate-29990101T000000Z-1 rc=1" \
+  "a later no-verdict run whose log holds a finding line is red" "$ERR"
+mutant mutant-last-pass-finding '  (( rc != 1 ))' '  false'
+run_script "$MUTANT" --last-pass --worktree "$proj_last_nv"
+assert_eq "${OUT%% *} rc=$RC" "run-dir=$last_nv_pass rc=0" \
+  "control: a finding reader that finds nothing passes over the red run"
+# A run that recorded no finding prefix declared no way to tell a finding, so
+# --last-pass names it red.
+proj_last_np="$(make_mode_proj proj-last-np "")"
+run_script "$RUN" --worktree "$proj_last_np" --poll 1
+last_np_pass="$(run_dir_of "$OUT")"
+plant_run "$proj_last_np" 29990101T000000Z-1 full docs/a.md 20 '' no-finding-prefix
+run_script "$RUN" --last-pass --worktree "$proj_last_np"
+assert_eq "$OUT rc=$RC" "last-pass=red run-dir=$proj_last_np/tmp/dev-validate-29990101T000000Z-1 rc=1" \
+  "a later no-verdict run that recorded no finding prefix is red" "$ERR"
+mutant mutant-last-pass-prefix '  [[ -n "$prefix" ]] || return 0' '  [[ -n "$prefix" ]] || return 1'
+run_script "$MUTANT" --last-pass --worktree "$proj_last_np"
+assert_eq "${OUT%% *} rc=$RC" "run-dir=$last_np_pass rc=0" \
+  "control: a reader that takes a missing prefix as none passes over it"
+# A start records the prefix the project declares, and none where it declares
+# none.
+printf 'DEV_VALIDATE_FINDING_PREFIX = "echo: "\n' >> "$proj_last_np/kendex.settings.toml"
+run_script "$RUN" --worktree "$proj_last_np" --poll 1
+assert_eq "$(start_line "$(run_dir_of "$OUT")" finding-prefix)|$(start_line "$last_np_pass" finding-prefix)" "echo: |" \
+  "a start records the declared finding prefix, and none where none is declared" "$ERR"
 
 # --- A value option given twice is refused, never half-read ---------------------
 # option|the arguments that repeat it
