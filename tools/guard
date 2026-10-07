@@ -1238,8 +1238,8 @@ pi_suite_failed() { # DIR
 #   doc          a file under references/ and any other .md file: a
 #                skill's SKILL.md, README.md, workflows/ and schemas/
 # A module is scanned as a lib is, and a test module as a helper is, but a
-# changed one maps to no suite: a Python module is reached by an import that
-# spells no path. Status 1, printing nothing, is a path of no role:
+# changed module seeds its enclosing folder and file name. A changed test
+# module maps to no suite: an import can spell no path. Status 1 is a path of no role:
 # run-all.sh, any other file under tests/<dir>/, a file of hooks/ that is no
 # hook, and anything else.
 path_role() { # DIR REL
@@ -1255,6 +1255,7 @@ path_role() { # DIR REL
       if [ -f "$1/tests/run-all.sh" ]; then return 1; fi
       echo suite
       ;;
+    hooks:*.md) echo doc ;;
     hooks:*/*) return 1 ;;
     hooks:*.sh) echo script ;;
     hooks:*) return 1 ;;
@@ -1287,28 +1288,67 @@ skill_files() { # DIR
 # What the scan holds of each file skill_files lists for the tree SCAN_DIR,
 # loaded once for all of the tree's changed paths, one index per file:
 # SCAN_PATH, SCAN_ROLE, SCAN_CODE, its lines that are no `#` comment,
+# SCAN_READ_CODE, those lines filtered to document reads for scripts/libs,
 # SCAN_NAMES, each `/<name>` that code spells, and SCAN_SOURCED, each
 # `/<name>` its `source` and `.` lines spell, one per line between newlines.
 # A name is the whole run of letters, digits, `.`, `_` and `-` after a slash,
 # less any trailing dots, so `/lane-state` is no name in `/lane-state.sh` and
 # `/oversee` none in `/oversee-watch`. Status 2 is a file it could not read.
 scan_load() { # DIR
-  local role f code names lines sourced
+  local role f code read_code names lines sourced
   SCAN_DIR=""
   SCAN_PATH=()
   SCAN_ROLE=()
   SCAN_CODE=()
+  SCAN_READ_CODE=()
   SCAN_NAMES=()
   SCAN_SOURCED=()
   while IFS=' ' read -r role f; do
     [ -n "$f" ] || continue
     code=$(grep -v '^[[:space:]]*#' -- "$f") || [ $? -eq 1 ] || return 2
+    read_code=$code
+    case "$role" in
+      script | lib)
+        # Read commands and the path assignments they use share one checked
+        # extraction. A failed process cannot publish a valid empty scan.
+        read_code=$(awk '
+          {
+            lines[NR] = $0
+            if ($0 ~ /(^|[;&|({[:space:]])(cat|grep|sed|awk|head|tail|read|find)[[:space:]]|\/[^[:space:]]*["}]*[[:space:]]*\/?\*/) {
+              keep[NR] = 1
+              rest = $0
+              while (match(rest, /\$\{?[[:alpha:]_][[:alnum:]_]*/)) {
+                name = substr(rest, RSTART, RLENGTH)
+                sub(/^\$\{?/, "", name)
+                read_names[name] = 1
+                rest = substr(rest, RSTART + RLENGTH)
+              }
+            }
+            rest = $0
+            while (match(rest, /(^|[;&|({[:space:]])[[:alpha:]_][[:alnum:]_]*=["'\'']?(\$|[.\/])/)) {
+              name = substr(rest, RSTART, RLENGTH)
+              sub(/^[;&|({[:space:]]*/, "", name)
+              sub(/=.*/, "", name)
+              assignment_names[++assignments] = name
+              assignment_lines[assignments] = NR
+              rest = substr(rest, RSTART + RLENGTH)
+            }
+          }
+          END {
+            for (i = 1; i <= assignments; i++)
+              if (read_names[assignment_names[i]]) keep[assignment_lines[i]] = 1
+            for (i = 1; i <= NR; i++) if (keep[i]) print lines[i]
+          }
+        ' <<<"$code") || return 2
+        ;;
+    esac
     names=$(grep -oE '/[[:alnum:]._-]*[[:alnum:]_-]' <<<"$code") || [ $? -eq 1 ] || return 2
     lines=$(grep -E '(^|[;&|({[:space:]])(source|\.)[[:space:]]' <<<"$code") || [ $? -eq 1 ] || return 2
     sourced=$(grep -oE '/[[:alnum:]._-]*[[:alnum:]_-]' <<<"$lines") || [ $? -eq 1 ] || return 2
     SCAN_PATH+=("$f")
     SCAN_ROLE+=("$role")
     SCAN_CODE+=("$code")
+    SCAN_READ_CODE+=("$read_code")
     SCAN_NAMES+=($'\n'"$names"$'\n')
     SCAN_SOURCED+=($'\n'"$sourced"$'\n')
   done <<<"$(skill_files "$1")"
@@ -1328,19 +1368,22 @@ scan_load() { # DIR
 #     as `"$SKILL_DIR"/*.md` or `"$SKILL_DIR/$doc"`;
 #   - or a skill-root variable or a path ending in /skills among the start
 #     paths of a find, a walk that meets every doc.
-# A comment citing a doc reads nothing, nor does a find from any other start
-# or a walk in another language.
+# Scripts and libraries join only on a read command, a directory glob or a
+# path assignment whose variable those lines use. This text scan does not
+# resolve shell scope or control flow.
+# A comment, printed brief or API path reads nothing, nor does a find from
+# any other start or a walk in another language.
 doc_readers() { # REL
   local rel="$1" i code dir token
   token="(^|[^[:alnum:]._/-])$(sed 's/[][\\.*^$+?(){}|]/\\&/g' <<<"$rel")([^[:alnum:]_/-]|\$)"
   case "$rel" in
     */*)
-      dir="/${rel%%/*}(/?\$|/[^[:alnum:]._-]|[^/[:alnum:]._-])"
+      dir="/${rel%%/*}(/?\$|/[^[:alnum:]._-]|[\"}]*[[:space:]]*/?[*\$])|[\"'](\\\$|[./])[^\"']*/${rel%%/*}[\"']([[:space:]]|\\)|\$)"
       ;;
     *) dir='\$\{?[A-Z_]*SKILL[A-Z_]*\}?"?/[^[:alnum:]._-]' ;;
   esac
   for ((i = 0; i < ${#SCAN_PATH[@]}; i++)); do
-    code=${SCAN_CODE[i]}
+    code=${SCAN_READ_CODE[i]}
     if grep -qF -e "/$rel" <<<"$code" ||
       grep -qE -e "$token" <<<"$code" ||
       grep -qE -e "$dir" <<<"$code" ||
@@ -1382,14 +1425,16 @@ reach_join() { # ROLE PATH
 #     doc_readers names, each adding its needle by its role. A doc no file
 #     reads runs nothing.
 #   - A deleted suite whose reach holds no suite runs nothing.
-#   - A path of no role, a changed module or test module, and a path whose
+#   - A changed module seeds its scripts/<dir> folder and its file name.
+#     A module no suite names runs nothing.
+#   - A path of no role, a changed test module, and a path whose
 #     reach holds no suite map to no suite.
 # The reach is what the scan can see, not every caller: a script run through
 # a variable path is missed, and so is a suite that runs a changed script
 # only through another script that runs it. CI's full run owns completeness.
 # The suites land in MAPPED, one per line, rather than on stdout, so the
 # scan stays loaded for the tree's next path. None with status 0 is a
-# deleted suite or a doc no file reads; status 1 is a path mapped to no
+# deleted suite, a module no suite names or a doc no file reads; status 1 is a path mapped to no
 # suite, status 2 a file the scan could not read, and status 3 a role
 # reach_join does not know, a broken guard.
 mapped_suites() { # DIR REL
@@ -1397,13 +1442,13 @@ mapped_suites() { # DIR REL
   MAPPED=""
   local reached=() next_any=() next_script=() any=() scripts=() reach_scripts=()
   role=$(path_role "$dir" "$rel") || return 1
-  case "$role" in module | test-module) return 1 ;; esac
+  case "$role" in test-module) return 1 ;; esac
   [ "${SCAN_DIR-}" = "$dir" ] || scan_load "$dir" || return 2
   for ((i = 0; i < ${#SCAN_PATH[@]}; i++)); do
     [ "${SCAN_PATH[i]}" != "$dir/$rel" ] || reached[i]=1
   done
   if [ "$role" = doc ]; then
-    readers=$(doc_readers "$rel")
+    readers=$(doc_readers "$rel") || return 2
     [ -n "$readers" ] || return 0
     while IFS= read -r i; do
       reached[i]=1
@@ -1411,6 +1456,10 @@ mapped_suites() { # DIR REL
     done <<<"$readers"
   else
     reach_join "$role" "$dir/$rel" || return 3
+    if [ "$role" = module ]; then
+      name=${rel#scripts/}
+      next_any+=("${name%%/*}")
+    fi
   fi
   # Each pass offers the files still outside the reach only the needles the
   # last pass added: every older needle has already missed them.
@@ -1472,6 +1521,7 @@ mapped_suites() { # DIR REL
     done
   done
   if [ -z "$out" ]; then
+    [ "$role" != module ] || return 0
     case "$rel" in
       tests/*/*) ;;
       tests/*) [ -e "$dir/$rel" ] || return 0 ;;
@@ -1480,6 +1530,9 @@ mapped_suites() { # DIR REL
   fi
   MAPPED=$out
 }
+# The final report uses the runner's subset vocabulary only for a smaller
+# mapped set. Empty means no tree was selected; any whole set makes it all.
+suite_selection=""
 if [ "$MODE" != default ] && lane_on shell_shards; then
   # Each touched path of a tree with suites, as `<tree> TAB <path inside
   # it> TAB <path>`: a render reads as the source it renders.
@@ -1515,6 +1568,7 @@ if [ "$MODE" != default ] && lane_on shell_shards; then
     case "$d" in
       pi-extensions/*)
         [ -f "$d/package.json" ] || continue
+        suite_selection=all
         if ! command -v jq >/dev/null 2>&1; then
           say missing-tool jq
           continue
@@ -1548,9 +1602,17 @@ if [ "$MODE" != default ] && lane_on shell_shards; then
         fi
         filters=()
         if [ "$run" = all ]; then
+          suite_selection=all
           run=$(skill_suites "$d")
         else
-          note suites "$(count_lines "$run")/$(count_lines "$(skill_suites "$d")") reason=mapped tree=$d"
+          selected_count=$(count_lines "$run")
+          total_count=$(count_lines "$(skill_suites "$d")")
+          if [ "$selected_count" -lt "$total_count" ]; then
+            [ "$suite_selection" = all ] || suite_selection=subset
+          else
+            suite_selection=all
+          fi
+          note suites "$selected_count/$total_count reason=mapped tree=$d"
           [ -n "$run" ] || continue
           while IFS= read -r t; do
             [ -n "$t" ] || continue
@@ -1577,6 +1639,7 @@ if [ "$MODE" != default ] && lane_on shell_shards; then
     esac
   done
 fi
+[ -n "$suite_selection" ] || suite_selection=all
 
 if [ "$MODE" = full ] && [ -f Cargo.toml ]; then
   # The cross-target checks and cargo doc each write a target tree of their
@@ -1680,5 +1743,5 @@ if [ "$ui_changed" -eq 1 ] && [ -f ui/package.json ]; then
   fi
 fi
 
-printf 'validate: lanes=%s selection=all\n' "$reported_lanes"
+printf 'validate: lanes=%s selection=%s\n' "$reported_lanes" "$suite_selection"
 exit $fail

@@ -423,6 +423,23 @@ printf 'import subprocess\nsubprocess.run([HERE + "/../../scripts/driven"])\n' >
 printf -- '---\nname: mapped\n---\n\n# Mapped\n' >"$M/SKILL.md"
 printf '# Flow\n' >"$M/workflows/flow.md"
 printf '# Record\n' >"$M/schemas/rec.md"
+mkdir -p "$M/scripts/plugin/hooks" "$M/scripts/plugin/.claude-plugin" "$M/scripts/unused"
+printf 'export {};\n' >"$M/scripts/plugin/hooks/x.js"
+printf '{}\n' >"$M/scripts/plugin/.claude-plugin/plugin.json"
+printf '{}\n' >"$M/scripts/unused/data.json"
+printf '#!/usr/bin/env bash\ngh api repos/demo/actions/workflows\n' >"$M/scripts/api"
+# open-terminal prints these launch prompts; their workflow prose reads no doc.
+cat >"$M/scripts/brief" <<'SH'
+#!/usr/bin/env bash
+case "$TRACKER:$HARNESS" in
+linear:codex)    printf "codex %s'Read .agents/skills/orch/SKILL.md and execute the orch start workflow for %s.%s'\n" "$flags" "$item" "$unattended" ;;
+linear:copilot)  printf "copilot %s-i 'Read .agents/skills/orch/SKILL.md and execute the orch start workflow for %s.%s'\n" "$flags" "$item" "$unattended" ;;
+github:codex)    printf "codex %s'Read .agents/skills/orch/SKILL.md and execute the orch start workflow for github %s#%s.%s'\n" "$flags" "$repo" "$item" "$unattended" ;;
+github:copilot)  printf "copilot %s-i 'Read .agents/skills/orch/SKILL.md and execute the orch start workflow for github %s#%s.%s'\n" "$flags" "$repo" "$item" "$unattended" ;;
+esac
+SH
+printf 'brief="Read .agents/skills/mapped/SKILL.md"\n' >"$M/scripts/lib/brief.sh"
+printf '#!/usr/bin/env bash\ncat "$(dirname "$0")/../workflows/flow.md"\n' >"$M/scripts/readflow"
 printf 'key=1\n' >"$M/settings.example"
 suite_naming() { # NAME [TEXT] — a passing suite whose code holds TEXT
   printf '#!/usr/bin/env bash\n: "%s"\necho "pass: 1   fail: 0"\n' "${2:-}" >"$M/tests/$1.sh"
@@ -447,6 +464,10 @@ suite_naming wrapped 'names ../scripts/lib/wrap.sh'
 suite_naming deep 'names ../scripts/lib/alpha.sh'
 suite_naming drives 'runs ../scripts/runner'
 suite_naming pyuse 'reads ../scripts/lib/mod.py'
+suite_naming plugin 'reads ../scripts/plugin'
+suite_naming api 'runs ../scripts/api; calls repos/demo/actions/workflows'
+suite_naming brief 'runs ../scripts/brief; reads ../scripts/lib/brief.sh'
+suite_naming readflow
 suite_naming helped 'sources lib/helper.sh'
 suite_naming probed 'runs lib/probe.py'
 suite_naming wrap 'runs ../scripts/driven'
@@ -460,7 +481,7 @@ printf '# Note\n' >"$P/references/note.md"
 printf '# Lone\n' >"$P/references/lone.md"
 printf '# Plain\n' >"$P/README.md"
 printf '#!/usr/bin/env bash\ncat "$(dirname "$0")/../references/lone.md"\n' >"$P/scripts/lonely.sh"
-printf '#!/usr/bin/env bash\n# see ../references/note.md\necho a\n' >"$P/scripts/alpha.sh"
+printf '#!/usr/bin/env bash\n# cat ../references/note.md\necho a\n' >"$P/scripts/alpha.sh"
 printf '#!/usr/bin/env bash\necho b\n' >"$P/scripts/beta.sh"
 : >"$P/scripts/empty.sh"
 for s in alpha beta; do printf '#!/usr/bin/env bash\necho ok\n' >"$P/tests/$s.test.sh"; done
@@ -480,7 +501,50 @@ hook_suite() { # NAME LINE — a passing hook suite that runs LINE first
 hook_suite alpha ': ../alpha.sh'
 hook_suite alpha-copilot ':'
 hook_suite via-world '. "$(dirname "$0")/lib/world.sh"'
-hook_suite beta ': ../beta.sh'
+hook_suite beta 'cat "$(dirname "$0")/../README.md"; : ../beta.sh'
+# Shipped directory reads: workflow_helpers.sh's quoted find operands,
+# workflow-state-init-guard-lint's W assignment and iced-rs's SOURCES array.
+# second-opinion reads each assigned schema_file through sed. Keep these
+# apart from the other mapping rows so a reader case changes no older set.
+D="$R/skills/doc-readers"
+mkdir -p "$D/scripts/lib" "$D/tests" "$D/workflows" "$D/references" "$D/schemas"
+printf '# Flow\n' >"$D/workflows/flow.md"
+printf '# Reference\n' >"$D/references/guide.md"
+printf '# Prompt\n' >"$D/schemas/review-finding-prompt.md"
+M_SAVED=$M
+M=$D
+suite_running quoted-find 'SKILL_DIR="$(dirname "$0")/.."; find "$SKILL_DIR/workflows" "$SKILL_DIR/references" "$SKILL_DIR/schemas" -type f -name "*.md" >/dev/null'
+suite_running assigned-dir 'SKILL_DIR="$(dirname "$0")/.."
+W="$SKILL_DIR/workflows"
+grep -r Flow "$W" >/dev/null'
+suite_running array-dir 'SKILL_DIR="$(dirname "$0")/.."
+SOURCES=("$SKILL_DIR/references")
+grep -r Reference "${SOURCES[@]}" >/dev/null'
+suite_naming assigned-script 'runs ../scripts/schema'
+suite_naming assigned-lib 'sources ../scripts/lib/schema.sh'
+suite_naming api 'calls "repos/demo/actions/workflows"'
+suite_naming brief 'runs ../scripts/brief; sources ../scripts/lib/brief.sh'
+suite_naming unused 'runs ../scripts/unused'
+suite_naming printed-path 'runs ../scripts/printed-path'
+M=$M_SAVED
+for f in "$D/scripts/schema" "$D/scripts/lib/schema.sh"; do
+  cat >"$f" <<'SH'
+#!/usr/bin/env bash
+read_schema() {
+  local schema_file="$SCRIPT_DIR/../schemas/review-finding-prompt.md"
+  schema=$(sed 's/Prompt/Fixture/g' "$schema_file")
+}
+read_other_schema() {
+  local schema_file="$SCRIPT_DIR/../schemas/review-finding-prompt.md"
+  schema=$(sed 's/Prompt/Fixture/g' "${schema_file}")
+}
+SH
+done
+printf '#!/usr/bin/env bash\nprintf "Read .agents/skills/doc-readers/workflows and schemas/review-finding-prompt.md"\n' >"$D/scripts/brief"
+printf '%s\n' 'printf "Read references/guide.md for details"' >>"$D/scripts/brief"
+printf 'brief="Read .agents/skills/doc-readers/schemas/review-finding-prompt.md"\n' >"$D/scripts/lib/brief.sh"
+printf '#!/usr/bin/env bash\nschema_file="$SCRIPT_DIR/../schemas/review-finding-prompt.md"\n' >"$D/scripts/unused"
+printf '#!/usr/bin/env bash\nschema_file="$SCRIPT_DIR/../schemas/review-finding-prompt.md"\nprintf "%%s\\n" "$schema_file"\n' >"$D/scripts/printed-path"
 git -C "$R" add -A
 git -C "$R" commit -q -m "chore: two skills and hooks with suites named for their files"
 mapped_base="$(git -C "$R" rev-parse HEAD)"
@@ -514,7 +578,7 @@ mapped_note() { printf 'guard-note: suites=%s reason=mapped tree=%s' "$1" "$2"; 
 # guard prints for a tree with no runner, or for the mapped skill once its
 # runner is deleted.
 started() {
-  printf '%s\n' "$OUT" | sed -n 's/^start suite=//p; s#^=== skills/plain/tests/##p; s#^=== hooks/tests/##p; /run-all\.sh/!s#^=== skills/mapped/tests/\(.*\)\.sh$#\1#p' | sort | tr '\n' ' ' | sed 's/ $//'
+  printf '%s\n' "$OUT" | sed -n 's/^start suite=//p; s#^=== skills/plain/tests/##p; s#^=== hooks/tests/##p; s#^=== skills/doc-readers/tests/\(.*\)\.sh$#\1#p; /run-all\.sh/!s#^=== skills/mapped/tests/\(.*\)\.sh$#\1#p' | sort | tr '\n' ' ' | sed 's/ $//'
 }
 back_to_mapped() {
   git -C "$R" reset -q --hard "$mapped_base"
@@ -545,13 +609,15 @@ MAP_ROWS=(
   "a deleted suite nothing names runs nothing|delete|skills/mapped/tests/other.sh||$(mapped_note 0/$((MAPPED_N - 1)) skills/mapped)"
   "a deleted tests/lib helper nothing names runs the whole set and says so|delete|skills/mapped/tests/lib/lonely.sh|$MAPPED_ALL|$(note_for unmapped skills/mapped/tests/lib/lonely.sh)"
   "a changed script no suite names whole, though one names a longer name it begins, runs the whole set and says so|append|skills/mapped/scripts/orphan|$MAPPED_ALL|$(note_for unmapped skills/mapped/scripts/orphan)"
-  "a Python module under lib runs the whole set and says so|append|skills/mapped/scripts/lib/mod.py|$MAPPED_ALL|$(note_for unmapped skills/mapped/scripts/lib/mod.py)"
+  "a Python module under lib runs its file reader and folder readers|append|skills/mapped/scripts/lib/mod.py|brief deep drives pid_direct pyuse refsuse runner wrapped|$(mapped_note 8/$MAPPED_N skills/mapped)"
+  "plugin modules run suites naming their enclosing folder|append|skills/mapped/scripts/plugin/hooks/x.js skills/mapped/scripts/plugin/.claude-plugin/plugin.json|plugin|$(mapped_note 1/$MAPPED_N skills/mapped)"
+  "a module no suite names runs nothing|append|skills/mapped/scripts/unused/data.json||$(mapped_note 0/$MAPPED_N skills/mapped)"
   "a changed file of no role at the skill root runs the whole set and says so|append|skills/mapped/settings.example|$MAPPED_ALL|$(note_for unmapped skills/mapped/settings.example)"
   "a deleted fixture under tests runs the whole set and says so|delete|skills/mapped/tests/fixtures/x.sh|$MAPPED_ALL|$(note_for unmapped skills/mapped/tests/fixtures/x.sh)"
   "a changed runner runs the whole set and says so|append|skills/mapped/tests/run-all.sh|$MAPPED_ALL|$(note_for unmapped skills/mapped/tests/run-all.sh)"
   "a deleted runner runs the whole set by file and says so|delete|skills/mapped/tests/run-all.sh|$MAPPED_ALL|$(note_for unmapped skills/mapped/tests/run-all.sh)"
-  "a changed SKILL.md runs the suites naming it, globbing the skill root or walking it|append|skills/mapped/SKILL.md|$SKILL_READERS|$(mapped_note 4/$MAPPED_N skills/mapped)"
-  "a changed workflow doc runs the suites naming it or globbing its directory and the walkers|append|skills/mapped/workflows/flow.md|catalogscan flowdir flowread walker|$(mapped_note 4/$MAPPED_N skills/mapped)"
+  "a changed SKILL.md runs its readers without the shipped workflow for launch briefs|append|skills/mapped/SKILL.md|$SKILL_READERS|$(mapped_note 4/$MAPPED_N skills/mapped)"
+  "a changed workflow doc reaches its file and glob readers and its script reader but no API reader|append|skills/mapped/workflows/flow.md|catalogscan flowdir flowread readflow walker|$(mapped_note 5/$MAPPED_N skills/mapped)"
   "a changed schema doc runs the walkers and the suite naming it in a table it joins onto the skill root|append|skills/mapped/schemas/rec.md|catalogscan tablecheck walker|$(mapped_note 3/$MAPPED_N skills/mapped)"
   "a root doc no file reads runs nothing|append|skills/plain/README.md||$(mapped_note 0/3 skills/plain)"
   "a changed reference runs the suites of its path readers, the directory's readers and the walkers of the skill root and the skills directory|append|skills/mapped/references/table.conf|catalogscan docscan refsuse tool tool_extra walker|$(mapped_note 6/$MAPPED_N skills/mapped)"
@@ -564,8 +630,13 @@ MAP_ROWS=(
   "a changed hook runs its namesake suites and the suite whose helper names it|append|hooks/alpha.sh|alpha-copilot.test.sh alpha.test.sh via-world.test.sh|$(mapped_note 3/5 hooks)"
   "a changed render of a hook runs that hook's suite|append|.codex/hooks/demo.sh|demo.test.sh|$(mapped_note 1/5 hooks)"
   "a changed hooks helper runs the suite sourcing it|append|hooks/tests/lib/world.sh|via-world.test.sh|$(mapped_note 1/5 hooks)"
+  "quoted find operands and an assigned workflow directory select their readers without API or brief readers|append|skills/doc-readers/workflows/flow.md|assigned-dir quoted-find|$(mapped_note 2/9 skills/doc-readers)"
+  "a quoted reference directory in an array selects its reader beside find without a printed for details brief|append|skills/doc-readers/references/guide.md|array-dir quoted-find|$(mapped_note 2/9 skills/doc-readers)"
+  "assigned schema paths used by sed select script and lib readers without briefs or unread assignments|append|skills/doc-readers/schemas/review-finding-prompt.md|assigned-lib assigned-script quoted-find|$(mapped_note 3/9 skills/doc-readers)"
   "a changed hook no suite reaches runs the whole hooks set and says so|append|hooks/lone.sh|$HOOKS_ALL|$(note_for unmapped hooks/lone.sh)"
-  "a hooks file that is no hook runs the whole hooks set and says so|append|hooks/README.md|$HOOKS_ALL|$(note_for unmapped hooks/README.md)"
+  "a hooks doc runs its reader alone|append|hooks/README.md|beta.test.sh|$(mapped_note 1/5 hooks)"
+  "a hooks doc no file reads runs nothing|append|hooks/unused.md||$(mapped_note 0/5 hooks)"
+  "a hooks file of no role runs the whole hooks set|append|hooks/settings.example|$HOOKS_ALL|$(note_for unmapped hooks/settings.example)"
 )
 map_row() { # HOW PATHS NOTE[;;NOTE...] [GUARD] — sets VERDICT
   local noted
@@ -596,6 +667,37 @@ for row in "${MAP_ROWS[@]}"; do
     || bad "$label" "$VERDICT out=$OUT"
 done
 [ "$((PASS + FAIL))" -eq "$((before + ${#MAP_ROWS[@]}))" ] || { echo "a suite-map row asserted nothing" >&2; exit 2; }
+# dev-validate-run consumes this machine-readable final line.
+for row in \
+  'skills/mapped/tests/tool.sh|subset' \
+  'skills/mapped/settings.example|all' \
+  'hooks/README.md|subset' \
+  'hooks/settings.example|all' \
+  'docs/guide.md|all' \
+  'skills/demo/scripts/demo.sh .agents/skills/demo/scripts/demo.sh|all' \
+  'skills/mapped/tests/tool.sh hooks/settings.example|all' \
+  'skills/mapped/settings.example hooks/README.md|all'; do
+  IFS='|' read -r path selection <<<"$row"
+  map_row append "$path" none
+  [ "$RC" -eq 0 ] && [ "$(sed -n '$p' <<<"$OUT")" = "validate: lanes=guard-scans selection=$selection" ] \
+    && ok "the final report records $selection for $path" \
+    || bad "the final report records $selection for $path" "$OUT"
+done
+for row in \
+  'skills/mapped/tests/tool.sh|subset|s/^            \[ "\$suite_selection" = all \] || suite_selection=subset$/            [ "$suite_selection" = all ] || suite_selection=all/' \
+  'skills/mapped/settings.example|all|s/^          suite_selection=all$/          suite_selection=subset/' \
+  'docs/guide.md|all|s/^suite_selection=""$/suite_selection=subset/' \
+  'skills/demo/scripts/demo.sh .agents/skills/demo/scripts/demo.sh|all|s/^          if \[ "\$selected_count" -lt "\$total_count" \]; then$/          if true; then/'; do
+  IFS='|' read -r path selection expr <<<"$row"
+  if mutant_guard "$expr"; then
+    map_row append "$path" none "$MUTANT_TOOLS/guard"
+    [ "$RC" -eq 0 ] && [ "$(sed -n '$p' <<<"$OUT")" != "validate: lanes=guard-scans selection=$selection" ] \
+      && ok "control: the changed report decision fails the $selection assertion" \
+      || bad "control: the changed report decision fails the $selection assertion" "$OUT"
+  else
+    bad "control: the report decision could not be changed"
+  fi
+done
 # Each rule is what its row stands on: with it broken, the row's diff runs
 # another set.
 # label~how~paths~sed expression breaking the rule~suites that start, sorted
@@ -619,13 +721,23 @@ MAP_CONTROLS=(
   "control: with skill_files missing scripts subdirectories the lib chain stands down~append~skills/mapped/scripts/lib/pid.sh~s| \"\$1\"/scripts/\*/\* \"\$1\"/tests/lib/\*| \"\$1\"/tests/lib/*|~drives pid_direct runner"
   "control: with skill_files missing tests/lib the helper's suite goes unreached~append~skills/mapped/scripts/driven~s| \"\$1\"/tests/lib/\* \"\$1\"/tests/\*.sh| \"\$1\"/tests/*.sh|~wrap"
   "control: without tests/lib in the scanned-path arm a changed helper runs the whole set~append~skills/mapped/tests/lib/helper.sh~/^    \*:tests\/lib\/\*.sh | \*:tests\/lib\/\*.bash) echo helper ;;$/d~$MAPPED_ALL"
-  "control: with a changed module taken as a seed the Python module runs only its namer~append~skills/mapped/scripts/lib/mod.py~/^  case \"\$role\" in module | test-module) return 1 ;; esac$/d~pyuse"
+  "control: without a module's folder seed only its file readers run~append~skills/mapped/scripts/plugin/hooks/x.js~/^      next_any+=(\"\${name%%\/\*}\")$/d~"
+  "control: with module rejection restored a module runs the whole set~append~skills/mapped/scripts/unused/data.json~s/in test-module) return 1/in module | test-module) return 1/~$MAPPED_ALL"
+  "control: without the hook doc role README runs the whole hooks set~append~hooks/README.md~/^    hooks:\*.md) echo doc ;;$/d~$HOOKS_ALL"
+  "control: without the script read filter a printed brief reaches its suites~append~skills/mapped/SKILL.md~/^      script | lib)$/,/^        ;;$/d~brief catalogscan rootglob skillmd walker"
+  "control: with bare for recognized as a read command the shipped launch briefs reach their suite~append~skills/mapped/SKILL.md~s/(cat|grep|sed|awk|head|tail|read|find)/(cat|grep|sed|awk|head|tail|read|find|for)/~brief catalogscan rootglob skillmd walker"
+  "control: without cat as a read command the workflow script reader stands down~append~skills/mapped/workflows/flow.md~s/(cat|grep|sed|awk|head|tail|read|find)/(grep|sed|awk|head|tail|read|find)/~catalogscan flowdir flowread walker"
+  'control: without quoted directory paths the find and assigned directory readers stand down~append~skills/doc-readers/workflows/flow.md~s/|\[\\"'"'"'\](.*$/"/~'
+  'control: without quoted directory paths the array and find readers stand down~append~skills/doc-readers/references/guide.md~s/|\[\\"'"'"'\](.*$/"/~'
+  'control: without path assignments the sed readers stand down~append~skills/doc-readers/schemas/review-finding-prompt.md~s/assignment_names\[++assignments\] = name/assignment_names[++assignments] = "NEVER"/~quoted-find'
+  'control: without variable reads unread and printed assignments select their suites~append~skills/doc-readers/schemas/review-finding-prompt.md~s/if (read_names\[assignment_names\[i\]\])/if (1)/~assigned-lib assigned-script printed-path quoted-find unused'
+  'control: with any directory mention counted the API suite joins~append~skills/mapped/workflows/flow.md~s#^      dir=.*#      dir="/${rel%%/*}(/?\\$|/[^[:alnum:]._-]|[^/[:alnum:]._-])"#~api catalogscan flowdir flowread readflow walker'
   "control: with a test module matching a script only on a source line the suite using it stands down~append~skills/mapped/scripts/driven~s/^          suite | helper | test-module) ;;$/          suite | helper) ;;/~helped wrap"
   "control: without the runner arm a deleted runner runs nothing~delete~skills/mapped/tests/run-all.sh~/^    \*:tests\/run-all.sh) return 1 ;;$/d~"
   "control: without the references arm a changed reference runs the whole set~append~skills/mapped/references/table.conf~s/^    \*:references\/\* | \*.md) echo doc ;;$/    *.md) echo doc ;;/~$MAPPED_ALL"
   "control: without the .md arm a changed SKILL.md runs the whole set~append~skills/mapped/SKILL.md~s/^    \*:references\/\* | \*.md) echo doc ;;$/    *:references\/*) echo doc ;;/~$MAPPED_ALL"
   "control: with no skill-root pattern for a root doc the root's globber stands down~append~skills/mapped/SKILL.md~s/^    \*) dir='.*' ;;$/    *) dir=NEVER ;;/~catalogscan skillmd walker"
-  "control: with every doc's directory read as references the workflow directory's globber stands down~append~skills/mapped/workflows/flow.md~s|dir=\"/\\\${rel%%/\\*}(|dir=\"/references(|~catalogscan docscan flowread refsuse walker"
+  "control: with every doc's directory read as references the workflow directory's globber stands down~append~skills/mapped/workflows/flow.md~s|dir=\"/\\\${rel%%/\\*}(|dir=\"/references(|~catalogscan docscan flowread readflow refsuse walker"
   "control: with the reference matched by its bare name the suite naming another directory's table.conf runs~append~skills/mapped/references/table.conf~s|grep -qF -e \"/\$rel\"|grep -qF -e \"/\${rel:11}\"|~catalogscan docscan refsuse tool tool_extra toolbox walker"
   "control: with comment lines read as code the script citing a reference in a comment runs its suite~append~skills/plain/references/note.md~s/'^\[\[:space:\]\]\*/'^NEVER/~alpha.test.sh"
   "control: without the whole-token match the suite reading the schema doc through a table stands down~append~skills/mapped/schemas/rec.md~s/grep -qE -e \"\\\$token\"/false/~catalogscan walker"
@@ -657,7 +769,7 @@ for row in "${MAP_CONTROLS[@]}"; do
   fi
 done
 # The narrowed run's note is the reader's one sign that the set was cut.
-if mutant_guard '/note suites "\$(count_lines/d'; then
+if mutant_guard '/^          note suites "\$selected_count\/\$total_count reason=mapped tree=\$d"$/d'; then
   map_row append skills/mapped/tests/tool.sh "$(mapped_note 1/$MAPPED_N skills/mapped)" "$MUTANT_TOOLS/guard"
   [[ "$VERDICT" == *" started=tool note=missing" ]] \
     && ok "control: without the narrowed-run note the one-suite run says nothing of the cut" \
@@ -737,6 +849,86 @@ for row in "${UNREAD_ROWS[@]}"; do
   back_to_mapped
 done
 rm -f -- "${R:?}/fake-bin/grep"
+
+# second-opinion reads assigned schema paths with sed. Its extraction must
+# finish before the tree can be reused for another changed document.
+ln -s "$REAL_AWK" "$R/fake-bin/real-awk"
+cat >"$R/fake-bin/awk" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  *read_names*)
+    printf 'extract\n' >>"$0.log"
+    if [ -f "$0.fail" ]; then
+      # Partial output from a failed dependency is still unreadable.
+      printf 'sed "$schema_file"\n'
+      exit 2
+    fi
+    ;;
+esac
+exec "${0%/*}/real-awk" "$@"
+SH
+chmod +x "$R/fake-bin/awk"
+READ_LOG="$R/fake-bin/awk.log"
+DOC_ALL="$(printf '%s\n' "$D"/tests/*.sh | sed 's#.*/##; s/\.sh$//' | sort | tr '\n' ' ' | sed 's/ $//')"
+SCHEMA_PATH=skills/doc-readers/schemas/review-finding-prompt.md
+READ_ROWS=(
+  "one document|$SCHEMA_PATH|assigned-lib assigned-script quoted-find"
+  "repeated document queries|$SCHEMA_PATH skills/doc-readers/workflows/flow.md|assigned-dir assigned-lib assigned-script quoted-find"
+  "another tree before the document|hooks/README.md $SCHEMA_PATH|assigned-lib assigned-script beta.test.sh quoted-find"
+)
+single_extractions=""
+for row in "${READ_ROWS[@]}"; do
+  IFS='|' read -r label paths want <<<"$row"
+  : >"$READ_LOG"
+  map_row append "$paths" none
+  extractions="$(wc -l <"$READ_LOG" | tr -d ' ')"
+  [ "$RC" -eq 0 ] && [ "$(started)" = "$want" ] \
+    && ok "checked read metadata selects readers for $label" \
+    || bad "checked read metadata selects readers for $label" "$VERDICT out=$OUT"
+  case "$label" in
+    'one document') single_extractions=$extractions ;;
+    'repeated document queries')
+      [ "$extractions" -gt 0 ] && [ "$extractions" = "$single_extractions" ] \
+        && ok "another document reuses the completed extraction" \
+        || bad "another document reuses the completed extraction" "single=$single_extractions repeated=$extractions"
+      ;;
+  esac
+done
+# Breaking the tree reset must redden the cross-tree reader assertion.
+if mutant_guard '/^  SCAN_READ_CODE=()$/d'; then
+  map_row append "hooks/README.md $SCHEMA_PATH" none "$MUTANT_TOOLS/guard"
+  [ "$RC" -eq 0 ] && [ "$(started)" != 'assigned-lib assigned-script beta.test.sh quoted-find' ] \
+    && ok "control: retained read metadata fails the next tree's reader assertion" \
+    || bad "control: retained read metadata fails the next tree's reader assertion" "$VERDICT out=$OUT"
+else
+  bad "control: the read metadata reset could not be removed"
+fi
+# Reloading for every document breaks the extraction reuse assertion.
+if mutant_guard 's/\[ "${SCAN_DIR-}" = "$dir" \] || scan_load/scan_load/'; then
+  : >"$READ_LOG"
+  map_row append "$SCHEMA_PATH skills/doc-readers/workflows/flow.md" none "$MUTANT_TOOLS/guard"
+  extractions="$(wc -l <"$READ_LOG" | tr -d ' ')"
+  [ "$RC" -eq 0 ] && [ "$extractions" -gt "$single_extractions" ] \
+    && ok "control: repeated extraction fails the reuse assertion" \
+    || bad "control: repeated extraction fails the reuse assertion" "single=$single_extractions repeated=$extractions $VERDICT"
+else
+  bad "control: extraction reuse could not be removed"
+fi
+touch "$R/fake-bin/awk.fail"
+map_row append "$SCHEMA_PATH" "$(note_for unreadable "$SCHEMA_PATH")"
+[ "$VERDICT" = "rc=0 started=$DOC_ALL note=$(note_for unreadable "$SCHEMA_PATH")" ] \
+  && [ "$(sed -n '$p' <<<"$OUT")" = 'validate: lanes=guard-scans selection=all' ] \
+  && ok "a failed reader extraction runs the whole tree" \
+  || bad "a failed reader extraction runs the whole tree" "$VERDICT out=$OUT"
+if mutant_guard '/<<<"\$code") || return 2$/s/|| return 2/|| true/'; then
+  map_row append "$SCHEMA_PATH" none "$MUTANT_TOOLS/guard"
+  [ "$RC" -eq 0 ] && [ "$(started)" != "$DOC_ALL" ] \
+    && ok "control: ignoring the extraction failure skips the whole-tree fallback" \
+    || bad "control: ignoring the extraction failure skips the whole-tree fallback" "$VERDICT out=$OUT"
+else
+  bad "control: reader extraction failure could not be ignored"
+fi
+rm -f -- "${R:?}/fake-bin/awk" "$R/fake-bin/real-awk" "$READ_LOG" "$R/fake-bin/awk.fail"
 back_to_base
 
 echo "=== a range with no usable base is refused before anything runs ==="
