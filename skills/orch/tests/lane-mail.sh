@@ -118,6 +118,46 @@ assert_eq "$RC=$ERR=$SLEPT" "124=lane-mail: timeout=$MINE=1" "wait ignores an an
 lm send --item KEN-1 --root "$LANE" --re "$MINE" --file "$(text a 'Merge it.')"
 lm wait --item KEN-1 --id "$MINE" --timeout 5 --interval 1
 assert_eq "$RC=$OUT" "0=Merge it." "wait returns the answer that names its own ask"
+assert_eq "$(jq -r '.re' < "$TMP_ROOT/err")" "$OTHER" "wait hands over the earlier unread answer on stderr"
+lm send --item KEN-1 --root "$LANE" --directive --file "$(text d 'After the answer.')"
+lm inbox --item KEN-1
+assert_eq "$RC=$(jq -rs 'map(.kind + " " + .text) | join(",")' <<<"$OUT")" "0=directive After the answer." \
+  "inbox does not repeat a waited answer and still hands over the next directive"
+
+# The wait's cursor crosses earlier mail only after handing it over, and
+# leaves later mail unread. Compaction keeps these positions logical.
+for row in answer:plain directive:plain halt:plain answer:compacted directive:compacted halt:compacted; do
+  new_lane "wait_${row/:/_}"
+  printf '946684800\n' >"$STUB_CLOCK"
+  clock_lm send --item KEN-1 --root "$LANE" --directive --file "$(text old 'Already read.')"
+  lm inbox --item KEN-1
+  printf '1790870400\n' >"$STUB_CLOCK"
+  clock_lm ask --item KEN-1 --file "$(text q 'Selected ask.')"
+  WAIT_SELECTED="${OUT#id=}"
+  case "${row%%:*}" in
+    answer) clock_lm send --item KEN-1 --root "$LANE" --re earlier-ask --file "$(text earlier 'Earlier mail.')" ;;
+    directive) clock_lm send --item KEN-1 --root "$LANE" --directive --file "$(text earlier 'Earlier mail.')" ;;
+    halt) clock_lm send --item KEN-1 --root "$LANE" --halt --file "$(text earlier 'Earlier mail.')" ;;
+  esac
+  WAIT_EARLIER="$(jq -rs 'last.id' < "$LANE/tmp/lane-mail/KEN-1/to-lane.jsonl")"
+  clock_lm send --item KEN-1 --root "$LANE" --re "$WAIT_SELECTED" --file "$(text selected 'Selected answer.')"
+  clock_lm send --item KEN-1 --root "$LANE" --directive --file "$(text later 'Later mail.')"
+  WAIT_LATER="$(jq -rs 'last.id' < "$LANE/tmp/lane-mail/KEN-1/to-lane.jsonl")"
+  if [ "${row#*:}" = compacted ]; then
+    FLEET_DIR="$TMP_ROOT/fleet" ORCH_RECORD_RETENTION_DAYS=5 SLACK_THREAD_DAYS=5 \
+      clock_lm compact --item KEN-1 --root "$LANE"
+    assert_eq "$RC" "0" "$row: compaction completes"
+    assert_eq "$(wc -l < "$LANE/tmp/lane-mail/KEN-1/to-lane.jsonl" | tr -d ' ')" "3" "$row: compaction removes the earlier read line"
+  fi
+  lm wait --item KEN-1 --id "$WAIT_SELECTED" --timeout 5 --interval 1
+  assert_eq "$RC=$OUT" "0=Selected answer." "$row: stdout holds only the selected answer"
+  assert_eq "$(jq -rs 'map(.id) | join(",")' < "$TMP_ROOT/err")" "$WAIT_EARLIER" "$row: stderr holds only the earlier unread envelope"
+  assert_eq "$(cat "$LANE/tmp/lane-mail/KEN-1/to-lane.cursor")" "3" "$row: wait advances to the answer's logical line"
+  lm wait --item KEN-1 --id "$WAIT_SELECTED" --timeout 5 --interval 1
+  assert_eq "$RC=$OUT=$ERR" "0=Selected answer.=" "$row: a restarted wait finds its answer without repeating earlier mail"
+  lm inbox --item KEN-1
+  assert_eq "$RC=$(jq -rs 'map(.id) | join(",")' <<<"$OUT")" "0=$WAIT_LATER" "$row: later mail stays unread until inbox delivers it"
+done
 
 # --timeout is a deadline, not a count of intervals: one shorter than the
 # interval must not wait the whole interval out, so the naps sum to the timeout.
@@ -137,12 +177,10 @@ assert_eq "$RC=$OUT" "0=" "a second inbox re-reads nothing"
 lm ask --item KEN-1 --file "$(text q 'Merge now?')"
 lm send --item KEN-1 --root "$LANE" --re "${OUT#id=}" --file "$(text a 'Answered.')"
 lm inbox --item KEN-1
-assert_eq "$RC=$OUT" "0=" "an answer belongs to the wait that asked for it, never to the inbox"
-assert_eq "$(cat "$LANE/tmp/lane-mail/KEN-1/to-lane.cursor")" "2" "the cursor still passes the answer it did not hand over"
+assert_eq "$RC=$(jq -r '.kind + " " + .text' <<<"$OUT")" "0=answer Answered." "inbox hands over an answer no wait read"
+assert_eq "$(cat "$LANE/tmp/lane-mail/KEN-1/to-lane.cursor")" "2" "the cursor passes the answer it handed over"
 
-# Since only an ask's `wait` reads an answer, a send --re to a lane names an
-# ask that lane sent: an answer to its notice, or to an id nothing carries,
-# would land where no reader looks, so it is refused before any append.
+# A lane inbox reads answers even when no ask's wait runs.
 new_lane re_names_ask
 lm ask --item KEN-1 --file "$(text q 'Land it?')"
 RE_ASK="${OUT#id=}"
@@ -160,8 +198,8 @@ while IFS='|' read -r name id want; do
   re_send "$id"
   assert_eq "$RE_SENT" "$want" "send --re to a lane: $name"
 done <<ROWS
-a lane notice's id is refused and appends nothing|$RE_NOTICE|2=lane-mail: ask-unknown=$RE_NOTICE answers=0
-an id no envelope carries is refused and appends nothing|1790000000-1-1|2=lane-mail: ask-unknown=1790000000-1-1 answers=0
+a lane notice's id receives an answer|$RE_NOTICE|0= answers=1
+an unrecorded id receives an answer|1790000000-1-1|0= answers=1
 the lane's own ask is answered|$RE_ASK|0= answers=1
 ROWS
 
@@ -592,21 +630,19 @@ assert_eq "${OUT%% id=*}" "lane-mail: sent item=overseer" "peer send prints the 
 LANE="$PEER_A"
 lm pending --item overseer
 assert_eq "$RC=$(jq -c 'select(.kind == "ask")' <<<"$OUT")" "0=" "the answered peer ask is no longer pending"
-lm wait --item overseer --id "$PEER_ASK" --timeout 5 --interval 1
-assert_eq "$RC=$OUT" "0=It is ours." "the asker's wait on the overseer mailbox returns the peer's answer"
-
-# An answer in the overseer mailbox has no `wait` to go to: the overseer runs
-# its watch, which reads this mailbox with `inbox`.
+# The overseer's watch reads its peer answer through inbox.
 lm inbox --item overseer
 assert_eq "$(jq -rs 'map(.kind) | join(",")' <<<"$OUT")" "directive,answer" \
   "inbox hands the overseer its own note and the peer's answer"
+lm wait --item overseer --id "$PEER_ASK" --timeout 5 --interval 1
+assert_eq "$RC=$OUT" "0=It is ours." "a restarted wait still finds an answer the inbox read"
 lm pending --item overseer
 assert_eq "$RC=$OUT" "0=" "a directive the inbox has read is no longer pending"
 lm ask --item KEN-1 --file "$(text q 'Lane question.')"
 lm send --item KEN-1 --root "$PEER_A" --re "${OUT#id=}" --file "$(text a 'Lane answer.')"
 lm inbox --item KEN-1
-assert_eq "$RC=$(jq -rs 'map(.kind) | unique | join(",")' <<<"$OUT")" "0=directive" \
-  "a lane item's answer still belongs to the wait that asked for it"
+assert_eq "$RC=$(jq -rs 'map(.kind) | unique | join(",")' <<<"$OUT")" "0=answer,directive" \
+  "a lane inbox includes its unread answer"
 
 lm send --item KEN-1 --root "$PEER_B" --directive --file "$(text d 'Not yours.')"
 assert_eq "$RC=$ERR" "2=lane-mail: lane-foreign=$PEER_B" \
@@ -827,14 +863,14 @@ else
   printf '  skip  the one-spelling rule: this filesystem is case-insensitive, so the second name is the first mailbox\n'
 fi
 
-# A write leaves no work directory behind on a host with no flock, which is
+# A command leaves no work directory behind on a host with no flock, which is
 # every stock macOS. There file-lock.sh takes a mkdir mutex, and the mutex arm
-# arms its own EXIT trap over lane-mail's; the trap the writer re-arms after
+# arms its own EXIT trap over lane-mail's; the trap the caller re-arms after
 # the lock is what still removes the work directory. The PATH below is the
 # commands lane-mail names, minus flock, so the mutex arm is the one that runs.
 FLOCKLESS_BIN="$TMP_ROOT/no-flock-bin"
 mkdir -p "$FLOCKLESS_BIN"
-for command_name in bash sh cat tail printf mkdir mv rm rmdir date jq awk sed git \
+for command_name in bash sh python3 cat tail printf mkdir mv rm rmdir date jq awk sed git \
   tr head sleep cp ln wc sort grep dirname basename touch chmod id uname getent; do
   command_path="$(command -v "$command_name" 2>/dev/null)" || continue
   ln -sfn "$command_path" "$FLOCKLESS_BIN/$command_name"
@@ -859,19 +895,98 @@ mkdir -p "$FLOCKLESS_PROBE_DIR"
 FLOCKLESS_PROBE="$(env TMPDIR="$FLOCKLESS_PROBE_DIR" PATH="$FLOCKLESS_BIN" mktemp -d)"
 assert_eq "${FLOCKLESS_PROBE#$FLOCKLESS_PROBE_DIR/}" "${FLOCKLESS_PROBE##*/}" \
   "a work directory lands under the TMPDIR this case counts"
-# What one local write on that PATH exits with, and how many work directories
+# What one command on that PATH exits with, and how many work directories
 # it leaves under a TMPDIR of its own.
-flockless_leftovers() { # NAME
+flockless_leftovers() { # NAME SCRIPT ARGS...
   local rc=0 dir="$TMP_ROOT/no-flock-tmp-$1"
+  shift
   mkdir -p "$dir"
-  (cd "$LANE" && env TMPDIR="$dir" PATH="$FLOCKLESS_BIN" \
-    "$LANE_MAIL" notice --item KEN-1 --file "$(text n 'no flock on this host')") || rc=$?
+  FLOCKLESS_OUT="$(cd "$LANE" && env TMPDIR="$dir" PATH="$FLOCKLESS_BIN" \
+    "$@" 2>"$TMP_ROOT/flockless.err")" || rc=$?
   FLOCKLESS="$rc=$(ls "$dir" | wc -l | tr -d ' ')"
 }
 new_lane flockless_cleanup
-flockless_leftovers real
+flockless_leftovers real "$LANE_MAIL" notice --item KEN-1 --file "$(text n 'no flock on this host')"
 assert_eq "$(env PATH="$FLOCKLESS_BIN" sh -c 'command -v flock >/dev/null 2>&1 && echo present || echo absent')=$FLOCKLESS" \
   "absent=0=0" "a local write where flock is absent leaves no work directory behind"
+
+# A held cursor mutex drives the real lock retry loop to failure. Its naps
+# have no bearing on cleanup, so the fixture removes only those naps.
+FLOCKLESS_SLEEP="$(command -v sleep)"
+rm -- "$FLOCKLESS_BIN/sleep"
+cat > "$FLOCKLESS_BIN/sleep" <<STUB
+#!/bin/sh
+if [ "\$#" -eq 1 ] && [ "\$1" = 0.1 ]; then
+  exit 0
+fi
+exec "$FLOCKLESS_SLEEP" "\$@"
+STUB
+chmod +x "$FLOCKLESS_BIN/sleep"
+
+for row in wait:success inbox:success wait:failure inbox:failure; do
+  CLEANUP_VERB="${row%%:*}"
+  CLEANUP_RESULT="${row#*:}"
+  CLEANUP_EXPECT=0
+  [ "$CLEANUP_RESULT" != failure ] || CLEANUP_EXPECT=2
+  for variant in real control; do
+    # Successful inbox cleanup already existed; only changed paths mutate.
+    [ "$row:$variant" != inbox:success:control ] || continue
+    CLEANUP_SCRIPT="$LANE_MAIL"
+    if [ "$variant" = control ]; then
+      CLEANUP_SCRIPT="$(mutant_scripts "mutants/cleanup-${row/:/-}" lane-mail)/lane-mail" || exit 1
+      if [ "$CLEANUP_RESULT" = success ]; then
+        mutate_file "$CLEANUP_SCRIPT" $'\n        trap lm_cleanup EXIT\n        lm_cursor_read' \
+          $'\n        if false; then trap lm_cleanup EXIT; fi\n        lm_cursor_read'
+      else
+        CLEANUP_INDENT='    '
+        [ "$CLEANUP_VERB" != wait ] || CLEANUP_INDENT='        '
+        CLEANUP_OLD=$'\n'"${CLEANUP_INDENT}"'orch_take_lock 9 "$CURSOR.lock" 30 || { trap lm_cleanup EXIT; refuse lock-failed "$CURSOR.lock"; }'
+        CLEANUP_NEW=$'\n'"${CLEANUP_INDENT}"'orch_take_lock 9 "$CURSOR.lock" 30 || { if false; then trap lm_cleanup EXIT; fi; refuse lock-failed "$CURSOR.lock"; }'
+        mutate_file "$CLEANUP_SCRIPT" "$CLEANUP_OLD" "$CLEANUP_NEW"
+      fi
+    fi
+    new_lane "cleanup_${row/:/_}_$variant"
+    lm ask --item KEN-1 --file "$(text cleanup-ask 'Cleanup question')"
+    assert_eq "$RC" 0 "$row $variant: the shipped ask succeeds"
+    CLEANUP_ASK="${OUT#id=}"
+    lm send --item KEN-1 --root "$LANE" --re "$CLEANUP_ASK" --file "$(text cleanup-answer 'Cleanup answer')"
+    assert_eq "$RC" 0 "$row $variant: the shipped send answers the ask"
+    CLEANUP_MUTEX="$LANE/tmp/lane-mail/KEN-1/to-lane.cursor.lock.d"
+    [ "$CLEANUP_RESULT" != failure ] || mkdir "$CLEANUP_MUTEX"
+    CLEANUP_ARGS=("$CLEANUP_VERB" --item KEN-1)
+    [ "$CLEANUP_VERB" != wait ] || CLEANUP_ARGS+=(--id "$CLEANUP_ASK" --timeout 1 --interval 1)
+    flockless_leftovers "${row/:/-}-$variant" "$CLEANUP_SCRIPT" "${CLEANUP_ARGS[@]}"
+    if [ "$variant" = real ]; then
+      assert_eq "$FLOCKLESS" "$CLEANUP_EXPECT=0" "$row: no-flock cursor locking leaves no work directory" "$TMP_ROOT/flockless.err"
+    else
+      CLEANUP_ASSERT_RC=0
+      (FAIL=0; assert_eq "$FLOCKLESS" "$CLEANUP_EXPECT=0" "$row: no-flock cursor locking leaves no work directory"; \
+        [ "$FAIL" -eq 0 ]) >"$TMP_ROOT/cleanup-control.out" || CLEANUP_ASSERT_RC=$?
+      assert_eq "$CLEANUP_ASSERT_RC" 1 "$row: removing cleanup makes the leak assertion fail"
+      assert_eq "$FLOCKLESS" "$CLEANUP_EXPECT=1" "$row: the control retains a work directory with the same command status"
+    fi
+    if [ "$CLEANUP_RESULT" = failure ]; then
+      assert_file_contains "$TMP_ROOT/flockless.err" "lane-mail: lock-failed=${CLEANUP_MUTEX%.d}" \
+        "$row $variant: refusal names the cursor lock"
+      if [ -d "$CLEANUP_MUTEX" ]; then
+        pass "$row $variant: cleanup preserves another holder's mutex"
+      else
+        fail "$row $variant: cleanup removed another holder's mutex"
+      fi
+    else
+      if [ "$CLEANUP_VERB" = wait ]; then
+        assert_eq "$FLOCKLESS_OUT" 'Cleanup answer' "$row $variant: wait returns the shipped answer"
+      else
+        assert_eq "$(jq -r '.text' <<<"$FLOCKLESS_OUT")" 'Cleanup answer' "$row: inbox returns the shipped answer"
+      fi
+      if [ -d "$CLEANUP_MUTEX" ]; then
+        fail "$row $variant: the command retained its cursor mutex"
+      else
+        pass "$row $variant: the command releases its cursor mutex"
+      fi
+    fi
+  done
+done
 
 # The remote root exists nowhere on this disk, so a case that silently fell
 # back to the local root would read an empty mailbox instead.
@@ -1165,7 +1280,7 @@ mutant_lib() {
   MUTANT_LIB_BIN="$dir/lane-mail"
 }
 
-# The overseer exception through the cursor-backed read the watch makes, from
+# The overseer answer through the cursor-backed read the watch makes, from
 # the start of PEER_A's mailbox: its peek hands the peer's answer over.
 overseer_peek_answers() {
   rm -f -- "${PEER_A:?}/tmp/lane-mail/overseer/to-lane.cursor"
@@ -1226,6 +1341,17 @@ done
 # above call directly. Each mutant is a private copy of one file beside links
 # to the shipped rest (lane-mail resolves its lock library, the transport and
 # the checkout judge beside itself), and removes one behaviour.
+
+new_lane control_wait_cursor
+LANE_MAIL_BIN="$LANE_MAIL" lm ask --item KEN-1 --file "$(text q 'Read once?')"
+WAIT_ID="${OUT#id=}"
+LANE_MAIL_BIN="$LANE_MAIL" lm send --item KEN-1 --root "$LANE" --re "$WAIT_ID" --file "$(text a 'Once.')"
+mutant wait-cursor-frozen '        [ "$SEEN" -ge "$ANSWER_AT" ] || lm_cursor_write "$ANSWER_AT"' '        :'
+lm wait --item KEN-1 --id "$WAIT_ID" --timeout 5 --interval 1
+assert_eq "$RC=$OUT" "0=Once." "control: the wait still returns its answer with its cursor frozen"
+LANE_MAIL_BIN="$LANE_MAIL" lm inbox --item KEN-1
+assert_eq "$RC=$(jq -r '.text' <<<"$OUT")" "0=Once." \
+  "control: without wait advancing the cursor the inbox repeats its answer"
 
 new_lane control_partial
 LANE_MAIL_BIN="$LANE_MAIL" lm notice --item KEN-1 --file "$(text n 'whole')"
@@ -1303,13 +1429,14 @@ lm send --item KEN-1 --root "$PEER_B" --directive --file "$(text d 'Not yours.')
 assert_eq "$RC=$(jq -r '.text' < "$PEER_B/tmp/lane-mail/KEN-1/to-lane.jsonl")" "0=Not yours." \
   "control: without the ownership rule the same send writes the foreign lane"
 
-new_lane control_re_notice
+new_lane control_inbox_answer
 LANE_MAIL_BIN="$LANE_MAIL" lm notice --item KEN-1 --file "$(text n 'ready: KEN-1')"
 RE_NOTICE="$(jq -r '.id' < "$LANE/tmp/lane-mail/KEN-1/to-overseer.jsonl")"
-mutant re-unjudged '      lm_ask "$MSGID"' '      [ "$ITEM" != overseer ] || lm_ask "$MSGID"'
-re_send "$RE_NOTICE"
-assert_eq "$RE_SENT" "0= answers=1" \
-  "control: without the ask check a lane answer to a notice lands where no reader looks"
+LANE_MAIL_BIN="$LANE_MAIL" lm send --item KEN-1 --root "$LANE" --re "$RE_NOTICE" --file "$(text a 'GO.')"
+mutant inbox-drops-answer '  lm_objects "$1"' '  lm_objects "$1" | jq -c '\''select(.kind != "answer")'\'''
+lm inbox --item KEN-1
+assert_eq "$RC=$OUT" "0=" \
+  "control: excluding answers from inbox loses the answer to a notice"
 
 mutant self-allowed '[ "$ROOT" != "$OWN_ROOT" ] || refuse repo-self "$ROOT"' ':'
 new_lane control_self_target
