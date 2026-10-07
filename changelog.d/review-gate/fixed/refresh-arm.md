@@ -1,0 +1,1 @@
+- Consumer refresh waits for the pushed commit before auto-merge and confirms its merge state. Pull request text explains when refresh leaves auto-merge unarmed.

@@ -65,6 +65,12 @@ FIXTURES="$TMP/github"
 mkdir -p "$BIN" "$FIXTURES"
 cp "$TEST_DIR/lib/gh-shim.sh" "$BIN/gh"
 chmod +x "$BIN/gh"
+cat >"$BIN/sleep" <<'SLEEP'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'sleep %s\n' "$*" >>"$TEST_STATE/calls"
+SLEEP
+chmod +x "$BIN/sleep"
 printf '{"full_name":"acme/widgets","default_branch":"main"}\n' >"$FIXTURES/repository.json"
 printf '{"environments":[{"name":"kendex","deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}]}\n' >"$FIXTURES/environments.json"
 printf '{"branch_policies":[{"name":"main","type":"branch"}]}\n' >"$FIXTURES/branch-policies.json"
@@ -85,9 +91,11 @@ run_refresh_command() {
 # RUNNER_ARGS, an array, holds the runner's own arguments.
 run_refresh() { # CONTENT VERIFY CLASS
   local result=0
-  rm -f -- "${TMP:?}/state/auth" "$TMP/state/push-refused" "$TMP/state/refreshed"
+  rm -f -- "${TMP:?}/state/auth" "$TMP/state/push-refused" "$TMP/state/refreshed" \
+    "$TMP/state/head-reads" "$TMP/state/shown-head" "$TMP/state/arm-attempted" \
+    "$TMP/state/armed" "$TMP/state/queued" "$TMP/state/merged" "$TMP/state/arm-state.json"
   : >"$TMP/state/summary"
-  OUT="$(cd "$repo" && env -i PATH="$TMP/bin:$PATH" HOME="$TMP/home" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GH_TOKEN=test-token GITHUB_TOKEN=other-test-token GITHUB_STEP_SUMMARY="$TMP/state/summary" TEST_VERSION_EXIT="${VERSION_EXIT:-0}" TEST_SECRET=private-test-value GH_REPO=acme/test REFRESH_APP_SLUG=lanes TEST_STATE="$TMP/state" TEST_REAL_GIT="$REAL_GIT" TEST_CONTENT="$1" TEST_VERIFY="$2" TEST_CLASS="$3" TEST_MEASURED="${MEASURED:-true}" TEST_REASON="${CLASS_REASON:-cause=renders-match-their-sources}" TEST_CLASS_EXIT="${CLASS_EXIT:-0}" TEST_CLASS_NOTES="${CLASS_NOTES:-}" TEST_APPLY_EXIT="${APPLY_EXIT:-0}" TEST_LISTS_PRUNE="${LISTS_PRUNE:-}" TEST_LEASE_RACE="${LEASE_RACE:-}" TEST_PUSH_MODE="${PUSH_MODE:-normal}" TEST_PUSH_QUERY="${PUSH_QUERY:-pass}" TEST_START_QUERY="${START_QUERY:-pass}" TEST_LEASE_REMOTE="$TMP/remote" TEST_HOSTILE="${HOSTILE:-}" TEST_FRESH_ORCH="${FRESH_ORCH:-}" TEST_ORCH_MODE="${ORCH_MODE:-keep}" TEST_REFRESH_SKILL="${REFRESH_SKILL:-}" TEST_REFRESH_BOT="${REFRESH_BOT:-}" TEST_REFRESH_ADDS="${REFRESH_ADDS:-}" TEST_REFRESH_SAID="${REFRESH_SAID:-}" TEST_FRESH_TEMPLATES="$TMP/fresh-templates" TEST_GH_SHIM="$TMP/standard-gh" GH_SHIM_FIXTURES="$FIXTURES" bash "$runner" ${RUNNER_ARGS[@]+"${RUNNER_ARGS[@]}"} 2>&1)" || result=$?
+  OUT="$(cd "$repo" && env -i PATH="$TMP/bin:$PATH" HOME="$TMP/home" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GH_TOKEN=test-token GITHUB_TOKEN=other-test-token GITHUB_STEP_SUMMARY="$TMP/state/summary" TEST_VERSION_EXIT="${VERSION_EXIT:-0}" TEST_SECRET=private-test-value GH_REPO=acme/test REFRESH_APP_SLUG=lanes TEST_STATE="$TMP/state" TEST_REAL_GIT="$REAL_GIT" TEST_CONTENT="$1" TEST_VERIFY="$2" TEST_CLASS="$3" TEST_MEASURED="${MEASURED:-true}" TEST_REASON="${CLASS_REASON:-cause=renders-match-their-sources}" TEST_CLASS_EXIT="${CLASS_EXIT:-0}" TEST_CLASS_NOTES="${CLASS_NOTES:-}" TEST_APPLY_EXIT="${APPLY_EXIT:-0}" TEST_LISTS_PRUNE="${LISTS_PRUNE:-}" TEST_LEASE_RACE="${LEASE_RACE:-}" TEST_PUSH_MODE="${PUSH_MODE:-normal}" TEST_PUSH_QUERY="${PUSH_QUERY:-pass}" TEST_START_QUERY="${START_QUERY:-pass}" TEST_HEAD_MODE="${HEAD_MODE:-matched}" TEST_ARM_MODE="${ARM_MODE:-armed}" TEST_ARM_QUERY="${ARM_QUERY:-pass}" TEST_LEASE_REMOTE="$TMP/remote" TEST_HOSTILE="${HOSTILE:-}" TEST_FRESH_ORCH="${FRESH_ORCH:-}" TEST_ORCH_MODE="${ORCH_MODE:-keep}" TEST_REFRESH_SKILL="${REFRESH_SKILL:-}" TEST_REFRESH_BOT="${REFRESH_BOT:-}" TEST_REFRESH_ADDS="${REFRESH_ADDS:-}" TEST_REFRESH_SAID="${REFRESH_SAID:-}" TEST_FRESH_TEMPLATES="$TMP/fresh-templates" TEST_GH_SHIM="$TMP/standard-gh" GH_SHIM_FIXTURES="$FIXTURES" bash "$runner" ${RUNNER_ARGS[@]+"${RUNNER_ARGS[@]}"} 2>&1)" || result=$?
   RC="$result"
 }
 
@@ -144,19 +152,67 @@ reset_default() {
 }
 
 # Assert the runner's publication record, body data and arm together. The arm
-# names the rolling head the remote holds, no disable follows it, and the body
-# states that arm for every class.
+# names the rolling head the remote holds and no disable follows it.
 refresh_class_matches() { # CLASS STATE REASON METHOD
   local head
   head="$(git --git-dir="$TMP/remote" rev-parse refs/heads/kendex/refresh)" || return 1
   [ "$RC" -eq 0 ] &&
     grep -qxF -- "refresh-state=$2 pr=1 class=$1" <<<"$OUT" &&
     grep -qxF -- "class: class=$1 measured=true $3" "$TMP/state/body" &&
-    grep -qxF -- 'The refresh workflow arms auto-merge. The merge queue merges this pull request once the required approval, thread resolution and checks pass.' "$TMP/state/body" &&
     grep -qF -- "api --method $4 repos/acme/test/pulls" "$TMP/state/calls" &&
     grep -qxF -- "pr merge 1 --repo acme/test --auto --squash --match-head-commit $head" "$TMP/state/calls" &&
     ! grep -qF -- '--disable-auto' "$TMP/state/calls" &&
     [ -f "$TMP/state/armed" ]
+}
+
+# The service records an actual arm, queue entry or completed merge separately
+# from the command's exit code. A successful command alone is not acceptance.
+refresh_arm_matches() { # EXIT OUTCOME READS
+  local head old_head reads=0
+  head="$(git --git-dir="$TMP/remote" rev-parse refs/heads/kendex/refresh)" || return 1
+  old_head="$(cat "$TMP/state/old-head")" || return 1
+  if [ -f "$TMP/state/head-reads" ]; then reads="$(cat "$TMP/state/head-reads")"; fi
+  [ "$RC" -eq "$1" ] && [ "$reads" -eq "$3" ] || return 1
+  # Each stale read owes one pause before the next request. Matching and
+  # final stale reads owe no pause. The injected command records requests.
+  awk -v expected="$((reads > 0 ? reads - 1 : 0))" '
+    /^pr view 1 --repo acme\/test --json headRefOid --jq .headRefOid$/ {
+      if (requests && pending != 1) exit 1
+      requests++; pending = 0
+    }
+    /^sleep / {
+      if (!requests || $0 != "sleep 2" || pending) exit 1
+      pauses++; pending++
+    }
+    END { if (pending || pauses != expected) exit 1 }
+  ' "$TMP/state/calls" || return 1
+  case "$2" in
+    armed | queued | merged)
+      grep -qxF 'refresh-state=pushed pr=1 class=render' <<<"$OUT" &&
+        grep -qxF "pr merge 1 --repo acme/test --auto --squash --match-head-commit $head" "$TMP/state/calls" &&
+        [ -f "$TMP/state/$2" ] &&
+        awk '/^pr merge / { merged = 1 } /^api graphql / { if (merged) confirmed++ } END { if (confirmed != 1) exit 1 }' "$TMP/state/calls" ;;
+    unseen)
+      grep -qxF "refresh-state=unarmed pr=1 pushed=$head head=$old_head" <<<"$OUT" &&
+        grep -q '^::warning title=refresh unarmed::' <<<"$OUT" &&
+        ! grep -q '^pr merge ' "$TMP/state/calls" &&
+        [ ! -f "$TMP/state/armed" ] ;;
+    read-failed)
+      grep -qxF "pr-arm-error=head-read pr=1 pushed=$head" <<<"$OUT" &&
+        ! grep -q '^pr merge ' "$TMP/state/calls" ;;
+    refused)
+      grep -qxF "refresh-error=arm pr=1 pushed=$head head=$head value=73" <<<"$OUT" &&
+        grep -qxF "pr merge 1 --repo acme/test --auto --squash --match-head-commit $head" "$TMP/state/calls" &&
+        ! grep -q '^refresh-state=' <<<"$OUT" ;;
+    active | closed)
+      grep -qxF "refresh-error=arm-state pr=1 pushed=$head value=$2" <<<"$OUT" &&
+        [ ! -f "$TMP/state/armed" ] && [ ! -f "$TMP/state/queued" ] &&
+        ! grep -q '^refresh-state=' <<<"$OUT" ;;
+    query | output)
+      grep -qxF "refresh-error=push-state value=$2" <<<"$OUT" &&
+        ! grep -q '^refresh-state=' <<<"$OUT" ;;
+    *) return 1 ;;
+  esac
 }
 
 refresh_stopped_at_class() { # REMOTE_HEAD
