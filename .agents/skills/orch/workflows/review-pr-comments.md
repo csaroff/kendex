@@ -318,6 +318,8 @@ Before every push, run `env -u GH_REPO -u GITHUB_REPOSITORY .agents/skills/orch/
 git -C "[WORKTREE_PATH]" push origin HEAD
 ```
 
+With workflow state `pr_order` reading `open-first-returned`, publish through `.agents/skills/orch/scripts/worktree-push --worktree "[WORKTREE_PATH]" --issue [ISSUE_ID]` in place of that command, routing its exit code and `sha-reconcile:` line by `worktree-push --help`, so [submit-pr.md](submit-pr.md) § 2 step 1 pushes next and GitHub receives one combined head. That push may rebase this round's fix commits, whose SHAs come from the dev return and sit in no record it rewrites: resolve each through workflow state's `.rebase_map`, following the chain until no key matches, before § 6.3's `Fixed in` reply and § 8's `pr_comment_review.fixes` entry use it, and a chain ending in `dropped` puts no SHA in the reply and the `dropped:[COMMIT_SHA]` marker in the entry.
+
 **A round ends with the description matching its head.** The PR body describes the commits actually on the PR head and names every issue § 6.2 filed this round; nothing else regenerates it after round one, so rebuild it per [`submit-pr.md` § 2](submit-pr.md) step 3 and post it with `pr-edit-body` until both hold.
 
 ### 6.2 Create Issues
@@ -388,7 +390,7 @@ Auto-resolve every thread where a reply was posted; keep open only threads await
 
 ### 7.2 Copilot Head Route
 
-**Skip if** no thread this triage answered is Copilot's and the body check below, run now, exits `0`; any other exit runs this step. Copilot's review overview opens with one of three labels. It submits `Approved` as an `APPROVED` review. It submits `Changes recommended` and `Needs a closer look` as `COMMENTED`. It re-reads a head only on a review request, so a head its review left `COMMENTED` stays unapproved after the answers until one of the two routes below runs. Bind `[REVIEW_BASE_CHECKOUT]` per [Gate-mode routing](../references/gates.md#gate-mode-routing). Resolve through that consumer base:
+**Skip if** no thread this triage answered is Copilot's and the body check below, run now, exits `0`; any other exit runs this step. **Skip if** workflow state `pr_order` reads `open-first-returned`, with no notice and no request: on a PR [start-worktree.md](start-worktree.md) § 2.1 opened, the lane's `Review:` line still reads pending, and [submit-pr.md](submit-pr.md) § 2 step 1 routes the head once its push lands. Copilot's review overview opens with one of three labels. It submits `Approved` as an `APPROVED` review. It submits `Changes recommended` and `Needs a closer look` as `COMMENTED`. It re-reads a head only on a review request, so a head its review left `COMMENTED` stays unapproved after the answers until one of the two routes below runs. Bind `[REVIEW_BASE_CHECKOUT]` per [Gate-mode routing](../references/gates.md#gate-mode-routing). Resolve through that consumer base:
 
 ```bash
 env -u GH_REPO -u GITHUB_REPOSITORY .agents/skills/orch/scripts/approval-wait [PR_NUMBER] --resolve-mode --base-checkout [REVIEW_BASE_CHECKOUT]

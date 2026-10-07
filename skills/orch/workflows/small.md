@@ -26,13 +26,13 @@ Run [start-worktree.md](start-worktree.md) § 1, which records the tier as `stan
 
 ## 2. Implement
 
-Run [start-worktree.md](start-worktree.md) § 2. Then check the branch against its class:
+Run [start-worktree.md](start-worktree.md) § 2 through its step 4. Then check the branch against its class:
 
 ```bash
 .agents/skills/orch/scripts/item-tier --floor small --base origin/[BASE_BRANCH] --head HEAD --repo [WORKTREE_PATH]
 ```
 
-`[BASE_BRANCH]` is `resolve-base-branch [WORKTREE_PATH]`. `tier=small` continues. Any other answer, or a non-zero exit, escapes (§ Escape).
+`[BASE_BRANCH]` is `resolve-base-branch [WORKTREE_PATH]`. `tier=small` runs [start-worktree.md](start-worktree.md) § 2.1, which opens a private repository's pull request before review under this tier too, then continues at § 3 below. Any other answer, or a non-zero exit, escapes (§ Escape).
 
 ## 3. Review
 
