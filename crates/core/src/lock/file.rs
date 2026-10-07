@@ -195,12 +195,17 @@ fn parse_versioned<T: DeserializeOwned>(path: &Path, text: &str) -> Result<T> {
         }
         return Err(CoreError::LockCorrupt {
             path: path.to_path_buf(),
-            message: match version {
-                Some(version) => format!(
-                    "it is a version {version} record, and this kendex writes version {LOCK_VERSION}"
-                ),
-                None => "it names no version, so nothing here can say what shape it is".to_owned(),
-            },
+            message: format!(
+                "{}; {}",
+                crate::error::lock_version_refused(path, version),
+                match version {
+                    Some(version) => format!(
+                        "it is a version {version} record, and this kendex writes version {LOCK_VERSION}"
+                    ),
+                    None =>
+                        "it names no version, so nothing here can say what shape it is".to_owned(),
+                }
+            ),
         });
     }
     serde_json::from_value(value).map_err(|e| CoreError::LockCorrupt {
