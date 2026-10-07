@@ -1,0 +1,1 @@
+- The frontend agent builds each changed view to code-quality's polish bar and captures its screenshot set by code-quality's UI reference when the dev workflow calls for it.
