@@ -153,10 +153,33 @@ case "${1:-}" in
       echo '{"workflow_runs":[]}'
       exit 0
     fi
+    # The base branch's required contexts (github required_contexts), named
+    # by STUB_REQUIRED as a space-separated list; unset, the reads fail and every check
+    # counts.
+    if [[ -n "${STUB_REQUIRED:-}" && "${2:-}" == repos/*/rules/branches/* ]]; then
+      _stub_auth_ok || { echo "HTTP 401: Bad credentials" >&2; exit 1; }
+      tr ' ' '\n' <<<"$STUB_REQUIRED" | sed 's/^/ctx:/'
+      exit 0
+    fi
+    if [[ -n "${STUB_REQUIRED:-}" && "${2:-}" == repos/*/branches/* ]]; then
+      _stub_auth_ok || { echo "HTTP 401: Bad credentials" >&2; exit 1; }
+      echo '{"protection":{"required_status_checks":{"contexts":[]}}}'
+      exit 0
+    fi
     # queue-wait's progress read of the merge-queue head commit.
     if [[ "${2:-}" == repos/*/commits/*/check-runs* ]]; then
       _stub_auth_ok || { echo "HTTP 401: Bad credentials" >&2; exit 1; }
       _emit_fixture checkruns "$(_next checkruns)"
+    fi
+    ;;
+  run)
+    # ci-wait's transient-failure retry: a failed run whose log reads as a
+    # network timeout is re-run once.
+    _stub_auth_ok || { echo "HTTP 401: Bad credentials" >&2; exit 1; }
+    [[ "${2:-}" == "view" ]] && { echo "network timeout"; exit 0; }
+    if [[ "${2:-}" == "rerun" ]]; then
+      printf '%s\n' "${3:-}" >> "$STUB_SEQ_DIR/reruns.log"
+      exit 0
     fi
     ;;
   repo)
@@ -182,9 +205,17 @@ case "${1:-}" in
     fi
     if [[ "${2:-}" == "checks" ]]; then
       _stub_auth_ok || { echo "HTTP 401: Bad credentials" >&2; exit 1; }
+      # A staged rollup sequence, one fixture per call, wins over the mode.
+      if [[ -f "$STUB_SEQ_DIR/prchecks-last.json" ]]; then
+        _emit_fixture prchecks "$(_next prchecks)"
+      fi
       if [[ "${STUB_PR_CHECKS_MODE:-}" == "failure" ]]; then
         echo '[{"name":"build","state":"FAILURE"}]'
         exit 1
+      fi
+      if [[ "${STUB_PR_CHECKS_MODE:-}" == "pending" ]]; then
+        echo '[{"name":"build","state":"SUCCESS","bucket":"pass"},{"name":"macos","state":"IN_PROGRESS","bucket":"pending"}]'
+        exit 8
       fi
       echo '[{"name":"build","state":"SUCCESS"}]'
       exit 0
@@ -351,6 +382,18 @@ stage() {
       dequeue:dq_ok) write_fixture dequeue "$n" "$dq_ok" ;;
       dequeue:dq_err) write_fixture dequeue "$n" "$dq_err" 1 ;;
       dequeue:am_errs_on_200) write_fixture dequeue "$n" "$am_errs_on_200" ;;
+      prchecks:running) write_fixture prchecks "$n" '[{"name":"macos","state":"IN_PROGRESS","bucket":"pending"}]' 8 ;;
+      prchecks:green) write_fixture prchecks "$n" '[{"name":"macos","state":"SUCCESS","bucket":"pass"}]' ;;
+      prchecks:failed_run) write_fixture prchecks "$n" '[{"name":"build","state":"FAILURE","bucket":"fail","link":"https://github.com/owner/repo/actions/runs/123/job/4"}]' 1 ;;
+      prchecks:optional_red) write_fixture prchecks "$n" '[{"name":"build","state":"SUCCESS","bucket":"pass"},{"name":"lint","state":"FAILURE","bucket":"fail"}]' 1 ;;
+      prchecks:optional_running) write_fixture prchecks "$n" '[{"name":"build","state":"SUCCESS","bucket":"pass"},{"name":"lint","state":"IN_PROGRESS","bucket":"pending"}]' 8 ;;
+      prchecks:none) write_fixture prchecks "$n" '[]' ;;
+      prchecks:all_skipped) write_fixture prchecks "$n" '[{"name":"build","state":"SKIPPED","bucket":"skipping"}]' ;;
+      prchecks:optional_done) write_fixture prchecks "$n" '[{"name":"build","state":"SUCCESS","bucket":"pass"},{"name":"lint","state":"SUCCESS","bucket":"pass"}]' ;;
+      prchecks:required_skipped) write_fixture prchecks "$n" '[{"name":"build","state":"SKIPPED","bucket":"skipping"},{"name":"lint","state":"IN_PROGRESS","bucket":"pending"}]' 8 ;;
+      prchecks:both_red) write_fixture prchecks "$n" '[{"name":"lint","state":"FAILURE","bucket":"fail","workflow":"aaa-wf","link":"https://github.com/owner/repo/actions/runs/111/job/1"},{"name":"build","state":"FAILURE","bucket":"fail","workflow":"zzz-wf","link":"https://github.com/owner/repo/actions/runs/222/job/2"}]' 1 ;;
+      prchecks:green_skipped) write_fixture prchecks "$n" '[{"name":"macos","state":"SUCCESS","bucket":"pass"},{"name":"lint","state":"SKIPPED","bucket":"skipping"}]' ;;
+      prchecks:green_more) write_fixture prchecks "$n" '[{"name":"macos","state":"SUCCESS","bucket":"pass"},{"name":"linux","state":"SUCCESS","bucket":"pass"}]' ;;
       checkruns:queued_run) write_fixture checkruns "$n" '{"total_count":2,"check_runs":[{"name":"c1","status":"completed","conclusion":"success"},{"name":"q1","status":"queued","conclusion":null}]}' ;;
       checkruns:c*.*)
         [[ "$name" =~ ^c([0-9]+)\.([0-9]+)$ ]] || { echo "stage: unknown fixture $item" >&2; exit 1; }
@@ -405,12 +448,14 @@ json() { jq -r "$1" <<<"$OUT" 2>/dev/null || echo UNPARSEABLE; }
 #   mutations         the GraphQL mutations issued, in order: `disable`,
 #                     `dequeue`, or `none`
 #   mutation_ids      the ids those mutations named, or `none`
+#   reruns            run ids `gh run rerun` received, or none
 #   thread_reads      reviewThreads reads the stub served
 #   checkruns_read    whether any check-runs read reached the stub
 #   guard_warned      the guard's consecutive-failure warning on stderr
 #   checkrun_warned   the progress read's consecutive-failure warning
 #   mail              the count on a `queue-wait: mail=` stdout line
 #   stderr_line       stderr's first line, spaces encoded as +
+#   pending_names     the result's pending_checks, comma-joined, spaces as +
 observe() {
   local got="" token name value
   for token in $1; do
@@ -423,6 +468,7 @@ observe() {
       text_verdict) value="$(sed -n '1s/^queue-wait: result status=[^ ]* verdict=\([^ ]*\).*$/\1/p' <<<"$OUT")" ;;
       text_repo) value="$(sed -n '1s/^queue-wait: result .* repo=\([^ ]*\).*$/\1/p' <<<"$OUT")" ;;
       stderr_line) value="$(sed -n '1p' "$ERR")"; value="${value// /+}" ;;
+      pending_names) value="$(json '.pending_checks | join(",")')"; value="${value// /+}" ;;
       mail) value="$(sed -n '1s/^queue-wait: mail=\([0-9]*\)$/\1/p' <<<"$OUT")" ;;
       help_record) value="${OUT%%$'\n'*}"; value="${value// /+}" ;;
       mutations)
@@ -433,6 +479,7 @@ observe() {
         value="$(grep -o 'PR_[A-Za-z0-9]*\|MQE_[A-Za-z0-9]*' "$SEQ_DIR/mutations.log" 2>/dev/null | sort -u | paste -sd, - || true)"
         [[ -n "$value" ]] || value=none
         ;;
+      reruns) value="$(paste -sd, - <"$SEQ_DIR/reruns.log" 2>/dev/null || true)"; [[ -n "$value" ]] || value=none ;;
       thread_reads) value="$(cat "$SEQ_DIR/threads.count" 2>/dev/null || echo 0)" ;;
       checkruns_read) value="$([[ -f "$SEQ_DIR/checkruns.count" ]] && echo true || echo false)" ;;
       guard_warned) value="$(grep -qF 'queue-wait: guard-blind failures=3 pr=1' "$ERR" && echo true || echo false)" ;;
@@ -482,8 +529,8 @@ table "$QW" \
   'still queued at the deadline is a timeout, never a silent success|open_queued|1 1 3 --json --no-check-probe||rc=1 status=timeout verdict=queued in_merge_queue=true merge_queue_state=QUEUED' \
   'closed without merging|state:last=closed,queue:last=in|1 1 10 --json --no-check-probe||rc=1 verdict=closed' \
   'a transient error is absorbed and counted|state:1=open,state:last=merged,queue:1=fail502,queue:last=in|||rc=0 verdict=merged transient_api_errors=1' \
-  'a failed required check on an armed PR disarms through the probe|open_armed|1 1 20 --json|STUB_PR_CHECKS_MODE=failure|rc=1 verdict=disarmed cause=check_failed' \
-  '--no-check-probe leaves the same PR queued|open_armed|1 1 3 --json --no-check-probe|STUB_PR_CHECKS_MODE=failure|verdict=queued' \
+  'a failed required check on an armed PR is armed_blocked through the probe|open_armed|1 1 20 --json|STUB_PR_CHECKS_MODE=failure|rc=1 status=complete verdict=armed_blocked cause=check_failed' \
+  '--no-check-probe reads no rollup: the same PR awaits checks unread|open_armed|1 1 3 --json --no-check-probe|STUB_PR_CHECKS_MODE=failure|verdict=armed_awaiting_checks cause=checks_unread' \
   'a one-poll queued verdict exposes the age of its sample|open_queued|1 1 1 --json --no-check-probe||verdict=queued polls=1 has_last_poll_age_seconds=true' \
   'the last sleep is clamped to the remaining budget|open_queued|1 3 4 --json --no-check-probe||elapsed_seconds=4'
 
@@ -548,6 +595,39 @@ table '1 1 8 --json --no-check-probe' \
   'every check-run read failing is unknown, never zero, and warns|open_queued_head,checkruns:last=fail502|1 1 5 --json --no-check-probe||verdict=queued has_progressing=true progressing=null cause=progress_unobservable checkrun_warned=true progress_head_polls=5 progress_check_reads=0 last_running_count=null' \
   'a failed read between two reads does not erase the movement|open_queued_head,checkruns:1=c1.0,checkruns:2=fail502,checkruns:last=c2.0|1 1 4 --json --no-check-probe||verdict=queued progressing=true cause=still_progressing' \
   'a merged verdict carries progressing and no cause|state:last=merged,queue:last=in_head|1 1 10 --json --no-check-probe||verdict=merged has_progressing=true has_cause=false'
+
+echo "=== an armed PR GitHub has not enqueued reads the PR's own check rollup ==="
+# No queue entry means no merge-group head, so progress is never the verdict
+# there: a running check is armed_awaiting_checks, which merge-pr § 5 waits
+# out with no recovery cycle; a failed check, or every check green with still
+# no entry, is armed_blocked. progress_unobservable stays the enqueued-entry
+# reading (the progress table above).
+table '1 1 20 --json' \
+  'pending required checks await, never progress_unobservable|open_armed||STUB_PR_CHECKS_MODE=pending|rc=1 status=timeout verdict=armed_awaiting_checks cause=checks_pending pending_names=macos progress_head_polls=0' \
+  'a rollup already green that no probe could confirm in the budget still awaits|open_armed||STUB_PR_CHECKS_MODE=pass|rc=1 status=timeout verdict=armed_awaiting_checks cause=checks_pending' \
+  'a rollup green before any probe is confirmed by a wider probe, then armed_blocked|open_armed|1 20 300 --json|STUB_PR_CHECKS_MODE=pass|rc=1 status=timeout verdict=armed_blocked cause=not_mergeable' \
+  'a changed green rollup after a confirmed pass is unconfirmed again and awaits|open_armed,prchecks:1=running,prchecks:2=running,prchecks:3=running,prchecks:4=green,prchecks:5=green,prchecks:6=green,prchecks:7=green,prchecks:8=green,prchecks:9=green,prchecks:10=green,prchecks:last=green_more|1 20 300 --json||rc=1 status=timeout verdict=armed_awaiting_checks cause=checks_pending' \
+  'a skipped check registering after a confirmed pass is a changed rollup and awaits|open_armed,prchecks:1=running,prchecks:2=running,prchecks:3=running,prchecks:4=green,prchecks:5=green,prchecks:6=green,prchecks:7=green,prchecks:8=green,prchecks:9=green,prchecks:10=green,prchecks:last=green_skipped|1 20 300 --json||rc=1 status=timeout verdict=armed_awaiting_checks cause=checks_pending' \
+  'an optional check failing beside green required ones is never check_failed|open_armed,prchecks:last=optional_red|1 1 20 --json|STUB_REQUIRED=build|rc=1 verdict=armed_awaiting_checks cause=checks_pending' \
+  'an optional check still running beside green required ones awaits nothing|open_armed,prchecks:last=optional_running|1 20 300 --json|STUB_REQUIRED=build|rc=1 verdict=armed_blocked cause=not_mergeable' \
+  'a required context with no check yet is pending as missing|open_armed,prchecks:last=green|1 20 300 --json|STUB_REQUIRED=macos linux|rc=1 verdict=armed_awaiting_checks cause=checks_pending pending_names=linux+(missing)' \
+  'no check registered yet names every required context as missing|open_armed,prchecks:last=none|1 1 20 --json|STUB_REQUIRED=build|rc=1 verdict=armed_awaiting_checks cause=checks_pending pending_names=build+(missing)' \
+  'a transient retry re-runs the required failure, never the optional one|open_armed,prchecks:1=both_red,prchecks:2=both_red,prchecks:last=fail502|1 1 40 --json|STUB_REQUIRED=build|reruns=222' \
+  'an optional check settling inside the confirmation window does not restart it|open_armed,prchecks:1=optional_running,prchecks:2=optional_running,prchecks:3=optional_running,prchecks:4=optional_running,prchecks:5=optional_running,prchecks:6=optional_running,prchecks:last=optional_done|1 20 300 --json|STUB_REQUIRED=build|rc=1 verdict=armed_blocked cause=not_mergeable' \
+  'a skipped required check is satisfied, whatever optional checks still run|open_armed,prchecks:last=required_skipped|1 20 300 --json|STUB_REQUIRED=build|rc=1 verdict=armed_blocked cause=not_mergeable' \
+  'an all-skipped rollup with the required set unreadable is satisfied|open_armed,prchecks:last=all_skipped|1 20 300 --json||rc=1 verdict=armed_blocked cause=not_mergeable' \
+  'a probe fits inside the budget with a poll after it, which reads the merge|state:1=open,state:last=merged,queue:last=armed|1 1 20 --json|STUB_PR_CHECKS_MODE=pass|rc=0 verdict=merged polls=2' \
+  'a probe never carries the wait past max_wait|open_armed|1 1 20 --json|STUB_PR_CHECKS_MODE=pass|rc=1 elapsed_seconds=20' \
+  'checks turning green between probes are confirmed by a wider probe, then armed_blocked|open_armed,prchecks:1=running,prchecks:2=running,prchecks:3=running,prchecks:last=green|1 20 300 --json||rc=1 status=timeout verdict=armed_blocked cause=not_mergeable' \
+  'checks seen running then green, and still no entry, is armed_blocked|open_armed,prchecks:1=running,prchecks:last=green|1 1 40 --json||rc=1 status=timeout verdict=armed_blocked cause=not_mergeable has_pending_checks=false' \
+  'an errored probe that carries a failed check is no reading, never check_failed|open_armed,prchecks:1=running,prchecks:2=failed_run,prchecks:3=failed_run,prchecks:last=fail502|1 1 40 --json||rc=1 verdict=armed_awaiting_checks cause=checks_unread' \
+  'an errored probe keeps the readable answer before it|open_armed,prchecks:1=running,prchecks:2=green,prchecks:last=fail502|1 20 120 --json||rc=1 verdict=armed_blocked cause=not_mergeable' \
+  'an enqueued entry keeps its progress reading|open_queued_head,checkruns:last=c1.1||STUB_PR_CHECKS_MODE=pending|rc=1 verdict=queued cause=still_progressing'
+
+echo "=== text mode names the armed verdicts on stdout ==="
+table '1 1 20' \
+  'armed_awaiting_checks|open_armed||STUB_PR_CHECKS_MODE=pending|rc=1 text_verdict=armed_awaiting_checks' \
+  'armed_blocked|open_armed||STUB_PR_CHECKS_MODE=failure|rc=1 text_verdict=armed_blocked'
 
 echo "=== the verdict names the repository it read ==="
 # The resolution ladder is lib/gh-repo.sh's, and gh-repo-resolve.test.sh holds
