@@ -112,7 +112,7 @@ pub fn planned_closure(
 /// declaration's `decl` carries that commit as its revision. Without a
 /// hold this is [`planned_closure`].
 ///
-/// The pins come from [`desired::hold::planning_manifest`], the one rule
+/// The pins come from [`desired::hold::held_planning`], the one rule
 /// `plan_scope` holds a scope still by, so a caller that rendered a scope
 /// with `options` asks the closure the same question it rendered.
 pub fn planned_closure_held(
@@ -121,28 +121,24 @@ pub fn planned_closure_held(
     manifest: &Manifest,
     lock: &crate::lock::Lock,
     options: &super::PlanOptions,
-) -> (Vec<PlannedDeclaration>, super::DeclarationStatus) {
-    let (planning, held) = desired::hold::planning_manifest(manifest, lock, options);
-    closure(env, scope, planning.as_ref(), held.as_ref())
+) -> crate::error::Result<(Vec<PlannedDeclaration>, super::DeclarationStatus)> {
+    let (planning, held) = desired::hold::held_planning(env, manifest, lock, options)?;
+    Ok(closure(env, scope, planning.as_ref(), held.as_ref()))
 }
 
-/// The declarations a plan run with `options` against `lock` reads: under
-/// a hold, each follower the record can place carries the commit `lock`
-/// records as its revision, released where that commit is gone as the
-/// plan releases it. A step outside the plan that resolves a declaration
-/// itself, the Pi settle, reads it here so it reads the commit the plan
-/// read. Without a hold this is `manifest`.
+/// The declarations a plan run with `options` against `lock` reads, by
+/// [`desired::hold::held_planning`]: under a hold, each follower the record
+/// can place carries the commit `lock` records as its revision. A step
+/// outside the plan that resolves a declaration itself, the Pi settle,
+/// reads it here so it reads the commit the plan read. Without a hold this
+/// is `manifest`.
 pub fn held_declarations<'a>(
     env: &Env,
     manifest: &'a Manifest,
     lock: &crate::lock::Lock,
     options: &super::PlanOptions,
 ) -> crate::error::Result<std::borrow::Cow<'a, Manifest>> {
-    let (mut planning, pins) = desired::hold::planning_manifest(manifest, lock, options);
-    if let Some(mut pins) = pins {
-        desired::hold::release_unserved(env, options, planning.to_mut(), &mut pins)?;
-    }
-    Ok(planning)
+    Ok(desired::hold::held_planning(env, manifest, lock, options)?.0)
 }
 
 /// The closure `manifest` expands to, `held` naming the declarations a
