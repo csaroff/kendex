@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use kendex_core::attest::{Document, Foreign, Row, State};
+use kendex_core::drift::report::Remedy;
 use kendex_core::engine::Owns;
 use kendex_core::env::Env;
 use kendex_core::lock::LOCK_VERSION;
@@ -262,15 +263,38 @@ pub(crate) fn verify_scope(world: &World, scope: &str, base: Option<&str>) -> (O
 }
 
 /// One verify run of `scope` from `cwd`, with the document it printed.
-#[allow(clippy::unwrap_used)]
 fn verify_from(home: &Path, cwd: &Path, scope: &str, base: Option<&str>) -> (Output, Document) {
     let mut args = vec!["verify", "--scope", scope, "--json"];
     if let Some(base) = base {
         args.extend(["--base", base]);
     }
-    let output = kendex(home, cwd, &args);
+    verify_output(kendex(home, cwd, &args))
+}
+
+/// The CLI's plain remedy data must carry every action in its document,
+/// including duplicates, and no action for rows without a remedy.
+#[allow(clippy::unwrap_used)]
+pub(crate) fn verify_output(output: Output) -> (Output, Document) {
     let document: Document = serde_json::from_slice(&output.stdout)
         .unwrap_or_else(|error| panic!("the document does not parse: {error}\n{}", said(&output)));
+    let stderr = std::str::from_utf8(&output.stderr).unwrap();
+    let remedies: Vec<Remedy> = stderr
+        .lines()
+        .filter_map(|line| line.trim_start().strip_prefix("remedy: "))
+        .map(|data| {
+            serde_json::from_str(data)
+                .unwrap_or_else(|error| panic!("the remedy data does not parse: {error}"))
+        })
+        .collect();
+    let expected: Vec<Remedy> = document
+        .rows
+        .iter()
+        .filter_map(|row| row.remedy.clone())
+        .collect();
+    assert_eq!(
+        remedies, expected,
+        "human action data differs from the document"
+    );
     (output, document)
 }
 
@@ -740,7 +764,7 @@ fn provenance_edits(catalog: &Path) -> Vec<(&'static str, Edit, Vec<Failing>)> {
                     "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".into();
             }),
             vec![record(&format!(
-                "source spare: commit deadbeefdeadbeefdeadbeefdeadbeefdeadbeef cannot be placed: the mirror of {catalog} does not hold it; fix=\"kendex source refresh\"",
+                "source spare: commit deadbeefdeadbeefdeadbeefdeadbeefdeadbeef cannot be placed: the mirror of {catalog} does not hold it",
             ))],
         ),
         (
@@ -797,7 +821,7 @@ fn provenance_edits(catalog: &Path) -> Vec<(&'static str, Edit, Vec<Failing>)> {
                     "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".into();
             }),
             vec![record(&format!(
-                "set starter: commit deadbeefdeadbeefdeadbeefdeadbeefdeadbeef cannot be placed: the mirror of {catalog} does not hold it; fix=\"kendex source refresh\"",
+                "set starter: commit deadbeefdeadbeefdeadbeefdeadbeefdeadbeef cannot be placed: the mirror of {catalog} does not hold it",
             ))],
         ),
         (
@@ -900,7 +924,7 @@ fn narrowing_edits(catalog: &Path) -> Vec<(&'static str, Edit, Vec<Failing>)> {
                     "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".into();
             }),
             vec![record(&format!(
-                "source cat: commit deadbeefdeadbeefdeadbeefdeadbeefdeadbeef cannot be placed: the mirror of {catalog} does not hold it; fix=\"kendex source refresh\"",
+                "source cat: commit deadbeefdeadbeefdeadbeefdeadbeefdeadbeef cannot be placed: the mirror of {catalog} does not hold it",
             ))],
         ),
         (
@@ -910,7 +934,7 @@ fn narrowing_edits(catalog: &Path) -> Vec<(&'static str, Edit, Vec<Failing>)> {
                     "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".into();
             }),
             vec![record(&format!(
-                "skill:second:claude: sourceCommit deadbeefdeadbeefdeadbeefdeadbeefdeadbeef cannot be placed: the mirror of {catalog} does not hold it; fix=\"kendex source refresh\"",
+                "skill:second:claude: sourceCommit deadbeefdeadbeefdeadbeefdeadbeefdeadbeef cannot be placed: the mirror of {catalog} does not hold it",
             ))],
         ),
         (
@@ -1371,7 +1395,7 @@ fn a_record_with_no_entries_is_held_to_the_sources_the_pass_reads() {
     assert_eq!(record.state, State::Failed, "{record:?}");
     assert!(
         record.detail.as_deref().unwrap_or_default().contains(&format!(
-            "source spare: commit deadbeefdeadbeefdeadbeefdeadbeefdeadbeef cannot be placed: the mirror of file://{} does not hold it; fix=\"kendex source refresh\"",
+            "source spare: commit deadbeefdeadbeefdeadbeefdeadbeefdeadbeef cannot be placed: the mirror of file://{} does not hold it",
             world.catalog.display()
         )),
         "{record:?}"
@@ -1406,7 +1430,7 @@ fn a_commit_a_cold_mirror_cannot_place_is_named_as_one_to_fetch() {
     assert_eq!(record.state, State::Failed, "{record:?}");
     let detail = record.detail.as_deref().unwrap_or_default();
     let named = format!(
-        "{SECOND}: sourceCommit deadbeefdeadbeefdeadbeefdeadbeefdeadbeef cannot be placed: the mirror of file://{} does not hold it; fix=\"kendex source refresh\"",
+        "{SECOND}: sourceCommit deadbeefdeadbeefdeadbeefdeadbeefdeadbeef cannot be placed: the mirror of file://{} does not hold it",
         world.catalog.display()
     );
     assert!(detail.contains(&named), "{record:?} does not say {named:?}");
@@ -1447,7 +1471,7 @@ fn a_mirror_behind_the_record_names_source_refresh_and_recovers() {
     fs::remove_dir_all(&mirror).unwrap();
     fs::rename(saved, &mirror).unwrap();
     let keyed = format!(
-        "sourceCommit {newer} cannot be placed: the mirror of file://{} does not hold it; fix=\"kendex source refresh\"",
+        "sourceCommit {newer} cannot be placed: the mirror of file://{} does not hold it",
         world.catalog.display()
     );
     let (output, document) = verify(&world, None);
