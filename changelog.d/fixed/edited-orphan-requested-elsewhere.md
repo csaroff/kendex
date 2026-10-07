@@ -1,0 +1,1 @@
+- Edited hook removal advice names the discard-edits option and preserves copies still requested or required on other coding tools.
