@@ -551,6 +551,53 @@ assert_eq "must-fail: always from the fork point, the follow-up is refused for t
   "rc=1 pre-push: step=against:<oid>:history:<oid>;byte-ceiling: result=0:1:1:against:<oid>;changelog-entries: major-breaking=lib.json:1.0.0:2.0.0;changelog-entries: violations=1:1;pre-push: result=1" \
   "$(push_ref "$FORK_POINT" topic)"
 
+# With no recorded default branch the remote head stays the baseline: another
+# tracking ref names no base. A topic restacked onto a side branch that
+# carries a major, while the destination still holds the old version, lands
+# that major there, and it is refused.
+side_stacked() { # VAR NAME [SKILL-SOURCE] — VAR gets a repo whose topic sits on a side branch's major
+  local __v="$1" side_repo=""
+  new_repo side_repo "$2" "${3:-}"
+  printf '[env]\nCOMMIT_GUARDS_CHECKS = "byte-ceiling changelog-entries"\nCOMMIT_GUARDS_BYTE_CEILING_KB = "1"\nCOMMIT_GUARDS_CHANGELOG_VERSION_PATHS = "app.json"\n' \
+    >"$side_repo/kendex.settings.toml"
+  printf '{"version":"1.0.0"}\n' >"$side_repo/app.json"
+  q git -C "$side_repo" add kendex.settings.toml app.json
+  q git -C "$side_repo" commit -q -m "feat: seed"
+  q git -C "$side_repo" push -q origin main
+  q git -C "$side_repo" checkout -q -b topic
+  mkdir -p "$side_repo/changelog.d/fixed"
+  printf -- '- A fix.\n' >"$side_repo/changelog.d/fixed/topic.md"
+  q git -C "$side_repo" add changelog.d/fixed/topic.md
+  q git -C "$side_repo" commit -q -m "fix: the branch's own change"
+  q git -C "$side_repo" -c core.hooksPath=/dev/null push -q origin topic
+  q git -C "$side_repo" checkout -q -b side main
+  printf '{"version":"2.0.0"}\n' >"$side_repo/app.json"
+  q git -C "$side_repo" add app.json
+  q git -C "$side_repo" -c core.hooksPath=/dev/null commit -q -m "feat: the side branch's major"
+  q git -C "$side_repo" -c core.hooksPath=/dev/null push -q origin side
+  q git -C "$side_repo" checkout -q topic
+  q git -C "$side_repo" rebase -q side
+  eval "$__v=\$side_repo"
+}
+SIDE_LINE="rc=1 pre-push: step=against:<oid>;byte-ceiling: result=0:1:1:against:<oid>;changelog-entries: major-breaking=app.json:1.0.0:2.0.0;changelog-entries: violations=1:1;pre-push: result=1"
+SIDE=""
+side_stacked SIDE side
+assert_eq "with no recorded default branch, a topic stacked on a side branch's major is refused" \
+  "$SIDE_LINE" "$(push_ref "$SIDE" topic --force-with-lease)"
+
+# The must-fail control: a copy that falls back to the newest commit any
+# tracking ref holds takes the side branch's tip as the baseline and lets the
+# major onto the destination unjudged.
+cp -- "$RANGES_KEPT" "$RANGES_LANE"
+sed -i.bak 's#^  default="$(git symbolic-ref --quiet "refs/remotes/$REMOTE/HEAD" 2>/dev/null)" || return 1$#  default="$(git symbolic-ref --quiet "refs/remotes/$REMOTE/HEAD" 2>/dev/null)" || { local_boundary pushed HEAD \&\& eval "$__v=\\$pushed"; return; }#' "$RANGES_LANE"
+rm -f -- "$RANGES_LANE.bak"
+assert_eq "the any-ref edit matches one line" "1" "$(diff -- "$RANGES_KEPT" "$RANGES_LANE" | grep -c '^>')"
+ANY_REF=""
+side_stacked ANY_REF any-ref "$RANGES"
+assert_eq "must-fail: a baseline from any tracking ref lets the side branch's major through" \
+  "rc=0 pre-push: step=against:<oid>:history:<oid>;byte-ceiling: result=0:1:1:against:<oid>;changelog-entries: checked=1;pre-push: result=0" \
+  "$(push_ref "$ANY_REF" topic --force-with-lease)"
+
 # The same restack pushed through a pushurl the tracking refs were not fetched
 # from: refs/remotes/origin/HEAD describes another spelling, so it sets no
 # baseline and the changelog check keeps the remote head, refusing the base's
