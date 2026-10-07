@@ -969,6 +969,7 @@ impl ScopeCheck<'_> {
         };
         let age = self.now.saturating_sub(snapshot.taken_at);
         *oldest_age = Some(oldest_age.map_or(age, |oldest| oldest.max(age)));
+        let mut changed = BTreeSet::new();
         for package in &snapshot.packages {
             // A hold or an ignore is a decision already made; re-announcing
             // it every session teaches agents to skim.
@@ -983,14 +984,18 @@ impl ScopeCheck<'_> {
                 (Some(current), Some(evaluated)) if current == evaluated => {
                     self.package_line(package, sections);
                 }
-                (Some(_), Some(_)) => sections.unevaluated.push(unevaluated(
-                    format!(
-                        "{prefix}{kind} '{name}': source changed since evaluation; not yet re-evaluated"
-                    ),
-                    Remedy::Refresh {
-                        global: self.global,
-                    },
-                )),
+                (Some(_), Some(_)) => {
+                    if changed.insert((package.kind, package.name.as_str(), package.repo.as_str())) {
+                        sections.unevaluated.push(unevaluated(
+                            format!(
+                                "{prefix}{kind} '{name}': source changed since evaluation; not yet re-evaluated"
+                            ),
+                            Remedy::Refresh {
+                                global: self.global,
+                            },
+                        ));
+                    }
+                }
                 _ => sections.unevaluated.push(unevaluated(
                     format!(
                         "{prefix}{kind} '{name}': could not compare source versions; comparison data is missing"
@@ -1002,9 +1007,25 @@ impl ScopeCheck<'_> {
             }
         }
         for note in &snapshot.unreadable {
-            sections
-                .unknown
-                .push(unknown(format!("{prefix}{}", shown(note))));
+            let kind = note.kind.name();
+            let name = shown(&note.name);
+            if crate::drift::snapshot::source_changed(
+                self.env,
+                &note.repo,
+                note.refs_state.as_deref(),
+            ) {
+                if changed.insert((note.kind, note.name.as_str(), note.repo.as_str())) {
+                    sections.unevaluated.push(unevaluated(
+                        format!("{prefix}{kind} '{name}': source changed since evaluation; not yet re-evaluated"),
+                        Remedy::Refresh { global: self.global },
+                    ));
+                }
+            } else {
+                sections.unknown.push(unknown(format!(
+                    "{prefix}{kind} {name}: {}",
+                    shown(&note.message)
+                )));
+            }
         }
     }
 

@@ -336,6 +336,173 @@ fn an_unreadable_history_is_a_warning_never_current() {
     );
 }
 
+/// A lock received from another lane can name a commit this mirror has not
+/// fetched. A foreground fetch must retire that warning despite its fresh TTL.
+#[test]
+#[allow(clippy::unwrap_used)]
+fn a_foreground_fetch_retires_missing_commit_evidence() {
+    use drift::copies::CheckMode;
+    use drift::report::{CheckStatus, Class, Remedy};
+
+    let cases = [
+        ("package and warning", false, false, false, false),
+        ("held package", true, false, false, false),
+        ("ignored package", false, true, false, false),
+        ("warning only", false, false, true, false),
+        ("repeated warnings with package", false, false, false, true),
+        ("repeated warnings only", false, false, true, true),
+    ];
+    for (case, held, ignored, notes_only, repeated) in cases {
+        for fetch in [false, true] {
+            let w = world();
+            write_skill(&w.upstream, "gh", "One.");
+            let first = commit(&w.upstream, "one");
+            let pin = format!("rev = \"{first}\"\n");
+            let source_extra = if held { pin } else { String::new() };
+            declare(&w, &source_extra, "[skills.gh]\nsource = \"cat\"\n");
+            sync_and_apply(&w);
+            updates::set_ignored(
+                &w.env,
+                &w.scope,
+                kendex_core::model::ItemKind::Skill,
+                "gh",
+                REPO,
+                ignored,
+            )
+            .unwrap();
+
+            fs::write(w.upstream.join("README.md"), "Another lane's commit.\n").unwrap();
+            let missing = commit(&w.upstream, "another lane");
+            let lock_path = kendex_core::lock::lock_path(&w.env, &w.scope);
+            let mut lock = kendex_core::lock::load(&lock_path).unwrap();
+            for entry in lock.entries.values_mut() {
+                entry.source_commit = Some(missing.clone());
+            }
+            kendex_core::lock::save(&lock_path, &lock).unwrap();
+            let mut evaluated = updates::updates(&w.env, &w.scope).unwrap();
+            assert_eq!(row(&evaluated.rows, "gh").pinned, held, "{case}");
+            assert_eq!(row(&evaluated.rows, "gh").ignored, ignored, "{case}");
+            if notes_only {
+                evaluated.rows.clear();
+            }
+            if repeated {
+                evaluated.warnings.extend(evaluated.warnings.clone());
+            }
+            let snapshot = drift::snapshot::record_with(&w.env, &w.scope, &evaluated).unwrap();
+            assert!(!snapshot.unreadable.is_empty());
+            let note = &snapshot.unreadable[0];
+            assert_eq!(note.repo, REPO);
+            assert_eq!(
+                note.refs_state,
+                drift::stamps::load(&w.env, &remote::cache_key(&w.env, REPO)).refs_state
+            );
+
+            if fetch {
+                remote::sync(&w.env, REPO, None).unwrap();
+            }
+            let scopes = std::slice::from_ref(&w.scope);
+            let checked = drift::report::check(&w.env, scopes, CheckMode::ReportOnly);
+            let key = remote::cache_key(&w.env, REPO);
+            assert!(!drift::stamps::load(&w.env, &key).is_stale(kendex_core::clock::unix_now()));
+            let lines: Vec<_> = checked
+                .sections
+                .iter()
+                .flat_map(|section| &section.lines)
+                .collect();
+            let count = |class| lines.iter().filter(|line| line.class == class).count();
+            assert_eq!(count(Class::Unknown) > 0, !fetch, "{case}, fetch={fetch}");
+            assert_eq!(
+                count(Class::Unevaluated),
+                usize::from(fetch),
+                "{case}, fetch={fetch}"
+            );
+            let remedies = lines
+                .iter()
+                .filter(|line| line.remedy == Some(Remedy::Refresh { global: false }))
+                .count();
+            assert_eq!(remedies, usize::from(fetch), "{case}, fetch={fetch}");
+            assert_eq!(
+                drift::report::wants_background_refresh(&w.env, scopes, &checked),
+                fetch
+            );
+            if fetch {
+                assert!(drift::refresh::refresh_stale(&w.env, scopes).is_empty());
+                let settled = drift::snapshot::load(&w.env, &w.scope);
+                let drift::snapshot::SnapshotFile::Current(settled) = settled else {
+                    panic!("snapshot was not derived");
+                };
+                assert!(settled.unreadable.is_empty());
+                let report = updates::updates(&w.env, &w.scope).unwrap();
+                assert!(row(&report.rows, "gh").current.is_some());
+                assert_eq!(
+                    drift::report::check(&w.env, scopes, CheckMode::ReportOnly).status,
+                    CheckStatus::Clean
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[allow(clippy::unwrap_used)]
+fn a_foreground_fetch_rederives_package_verdicts() {
+    let w = world();
+    write_skill(&w.upstream, "gh", "One.");
+    commit(&w.upstream, "one");
+    declare(&w, "", "[skills.gh]\nsource = \"cat\"\n");
+    sync_and_apply(&w);
+    drift::snapshot::record(&w.env, &w.scope).unwrap();
+    write_skill(&w.upstream, "gh", "Two.");
+    commit(&w.upstream, "two");
+    remote::sync(&w.env, REPO, None).unwrap();
+    let scopes = std::slice::from_ref(&w.scope);
+    let checked = drift::report::check(&w.env, scopes, drift::copies::CheckMode::ReportOnly);
+    assert!(drift::report::wants_background_refresh(
+        &w.env, scopes, &checked
+    ));
+    assert!(drift::refresh::refresh_stale(&w.env, scopes).is_empty());
+    let drift::snapshot::SnapshotFile::Current(snapshot) = drift::snapshot::load(&w.env, &w.scope)
+    else {
+        panic!("snapshot was not derived");
+    };
+    assert!(
+        snapshot
+            .packages
+            .iter()
+            .any(|package| package.name == "gh" && package.update_available)
+    );
+}
+
+#[test]
+#[allow(clippy::unwrap_used)]
+fn an_old_snapshot_is_rederived_despite_a_fresh_mirror() {
+    let w = world();
+    write_skill(&w.upstream, "gh", "One.");
+    commit(&w.upstream, "one");
+    declare(&w, "", "[skills.gh]\nsource = \"cat\"\n");
+    sync_and_apply(&w);
+    drift::snapshot::record(&w.env, &w.scope).unwrap();
+    fs::write(
+        drift::snapshot::snapshot_path(&w.env, &w.scope),
+        r#"{"schema":2,"taken-at":0,"scope":"project","packages":[],"unreadable":[]}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        drift::snapshot::load(&w.env, &w.scope),
+        drift::snapshot::SnapshotFile::Absent
+    ));
+    let scopes = std::slice::from_ref(&w.scope);
+    let checked = drift::report::check(&w.env, scopes, drift::copies::CheckMode::ReportOnly);
+    assert!(drift::report::wants_background_refresh(
+        &w.env, scopes, &checked
+    ));
+    assert!(drift::refresh::refresh_stale(&w.env, scopes).is_empty());
+    assert_eq!(
+        drift::report::check(&w.env, scopes, drift::copies::CheckMode::ReportOnly).status,
+        drift::report::CheckStatus::Clean
+    );
+}
+
 #[test]
 #[allow(clippy::unwrap_used)]
 fn the_snapshot_carries_stale_and_holding_silences_it() {
