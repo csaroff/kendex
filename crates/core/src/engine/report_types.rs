@@ -415,6 +415,39 @@ pub struct EngineReport {
     pub wanted: BTreeMap<(ItemKind, String), BTreeSet<crate::lock::Reason>>,
     /// What the request behind this pass asked for.
     pub asked: Asked,
+    /// What a disowning removal changes in kendex.toml: `Some` exactly
+    /// where the manifest it saves differs from the file it read. `None` on
+    /// every other pass: a manifest save the planner makes of its own
+    /// accord (an agent alias renamed, a retired item pruned) is no
+    /// removal, and a removal that keeps declarations writes nothing.
+    pub disowned: Option<Disowned>,
+}
+
+/// A disowning removal's own change to kendex.toml, by what it names. Its
+/// other edits (an optional choice taken back, the named items'
+/// instructions and fork records) change the file without a name of
+/// their own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Disowned {
+    /// The named items' declarations it takes out.
+    pub dropped: Vec<DroppedDeclaration>,
+    /// What it writes into `[suppressed]`, so nothing that stays brings
+    /// it back.
+    pub suppressed: Vec<(ItemKind, String)>,
+}
+
+/// One declaration a removal takes out of kendex.toml, by the table it
+/// leaves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DroppedDeclaration {
+    /// An item's own table, `[plugins]` included.
+    Item {
+        kind: ItemKind,
+        name: String,
+    },
+    Bundle {
+        name: String,
+    },
 }
 
 /// One declaration a held plan read at the commit the record names
@@ -523,6 +556,7 @@ impl EngineReport {
             withheld: BTreeMap::new(),
             retired_bundles: BTreeMap::new(),
             asked: Asked::Declared,
+            disowned: None,
         }
     }
 

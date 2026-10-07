@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use crate::apply::{Op, PlannedOp, Pre};
 
-use super::{EngineReport, PlanOptions, plan_scope};
+use super::{Disowned, DroppedDeclaration, EngineReport, PlanOptions, plan_scope};
 use crate::env::Env;
 use crate::error::Result;
 use crate::lock::{Lock, Reason, lock_path};
@@ -144,8 +144,9 @@ pub fn uninstall(env: &Env, scope: &Scope, names: &[String]) -> Result<EngineRep
 
 /// The removal both verbs share. The plan is made against a manifest
 /// without the declarations either way; `disown` is whether that manifest
-/// becomes the file. Kept declared, the planner is given no reason of its
-/// own to write one: the upstream skill merge waits for the refresh.
+/// becomes the file. Kept declared, nothing writes it: the upstream skill
+/// merge waits for the refresh, and so does any save the planner makes of
+/// its own, which would write the manifest without the declarations.
 fn removal(
     env: &Env,
     scope: &Scope,
@@ -155,6 +156,7 @@ fn removal(
     disown: bool,
 ) -> Result<EngineReport> {
     let mut manifest = manifest_for_mutation(env, scope)?;
+    let held = manifest.clone();
     let lock = crate::lock::load(&lock_path(env, scope))?;
     let bundles: Vec<String> = names
         .iter()
@@ -195,13 +197,17 @@ fn removal(
             manifest.bundles.remove(name);
             manifest.plugins.remove(name);
         }
+        // An empty table goes only where this removal emptied it: one the
+        // file already held empty is no change of the removal's.
         for kind in &kinds {
             manifest.declared_mut(*kind).remove(name);
-            if let Some(forks) = manifest.forks.get_mut(kind) {
-                forks.remove(name);
+            if let Some(forks) = manifest.forks.get_mut(kind)
+                && forks.remove(name).is_some()
+                && forks.is_empty()
+            {
+                manifest.forks.remove(kind);
             }
         }
-        manifest.forks.retain(|_, forks| !forks.is_empty());
         if kinds.contains(&ItemKind::Plugin) {
             manifest.plugins.remove(name);
         }
@@ -217,23 +223,72 @@ fn removal(
             // Taking an item away also un-takes it wherever it was chosen
             // as an optional extra: that choice is the whole reason it
             // would return.
-            for taken in manifest.optional_dependencies.values_mut() {
+            manifest.optional_dependencies.retain(|_, taken| {
+                let chose = taken.contains(name);
                 taken.retain(|chosen| chosen != name);
-            }
+                !(chose && taken.is_empty())
+            });
         }
     }
-    manifest.optional_dependencies.retain(|_, t| !t.is_empty());
     for (kind, name) in kept_removed(env, scope, &manifest, &lock, names, &options) {
         manifest.suppress(kind, &name);
     }
     let mut report = plan_scope(env, scope, &manifest, &lock, &options)?;
-    if disown {
-        report.notes.extend(unreadable_origins(
-            env, scope, &manifest, &lock, names, &options,
-        ));
-        ensure_manifest_persisted(env, scope, &manifest, &mut report)?;
+    match disown {
+        true => {
+            report.notes.extend(unreadable_origins(
+                env, scope, &manifest, &lock, names, &options,
+            ));
+            // A save of the manifest as it was read is no removal, and
+            // where the scope has no kendex.toml it would create one.
+            if manifest != held {
+                ensure_manifest_persisted(env, scope, &manifest, &mut report)?;
+                report.disowned = Some(disowned(&held, &manifest, names));
+            }
+        }
+        false => report
+            .plan
+            .ops
+            .retain(|op| !matches!(op.op, Op::WriteManifest { .. })),
     }
     Ok(report)
+}
+
+/// What `manifest` changes from `held` that names an item: the
+/// declarations of these names it no longer makes, and the suppressions it
+/// adds.
+fn disowned(held: &Manifest, manifest: &Manifest, names: &[String]) -> Disowned {
+    let mut dropped = Vec::new();
+    for name in names {
+        if held.bundles.contains_key(name) && !manifest.bundles.contains_key(name) {
+            dropped.push(DroppedDeclaration::Bundle { name: name.clone() });
+        }
+        if held.plugins.contains_key(name) && !manifest.plugins.contains_key(name) {
+            dropped.push(DroppedDeclaration::Item {
+                kind: ItemKind::Plugin,
+                name: name.clone(),
+            });
+        }
+        for kind in DECLARED_KINDS {
+            if held.declared(kind).contains_key(name) && !manifest.declared(kind).contains_key(name)
+            {
+                dropped.push(DroppedDeclaration::Item {
+                    kind,
+                    name: name.clone(),
+                });
+            }
+        }
+    }
+    let suppressed = manifest
+        .suppressed
+        .iter()
+        .flat_map(|(kind, names)| names.iter().map(|name| (*kind, name.clone())))
+        .filter(|(kind, name)| !held.is_suppressed(*kind, name))
+        .collect();
+    Disowned {
+        dropped,
+        suppressed,
+    }
 }
 
 /// Which of these names something that stays would pull straight back in,
