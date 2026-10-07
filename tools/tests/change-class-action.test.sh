@@ -75,7 +75,9 @@ LANES_LIB="$ROOT/skills/harness-ci/scripts/lib/ci-lanes.sh"
 ACTION="$ROOT/.github/actions/change-class/action.yml"
 
 mkdir -p "$ROOT/tmp"
-TMP="$(mktemp -d "$ROOT/tmp/change-class-action.XXXXXX")"
+TMP="$(mktemp -d "$ROOT/tmp/action-suite.XXXXXX")" || { echo "suite: scratch=mktemp-failed" >&2; exit 1; }
+[[ -d $TMP && ! -L $TMP ]] || { echo "suite: scratch=not-a-directory" >&2; exit 1; }
+TMP="$(cd -- "$TMP" && pwd -P)" || { echo "suite: scratch=resolve-failed" >&2; exit 1; }
 trap 'chmod -R u+rwX "${TMP:?}" 2>/dev/null; rm -rf -- "${TMP:?}"' EXIT
 
 PASS=0
@@ -169,6 +171,8 @@ reason=ineligible-event
 printf 'tree=%s\nworkflow=%s\nreuse=%s\nreason=%s\ndetail=stub\nrun=%s\nrecord=%s\n' \
   "${STUB_TREE:-}" "${STUB_WORKFLOW-.github/workflows/ci.yml}" "${STUB_REUSE:-false}" \
   "${STUB_REASON:-$reason}" "${STUB_RUN:-}" "$record"
+[ -z "${STUB_KIND:-}" ] || printf 'kind=%s\npatch_id=%s\nmacos_contract=%s\n' \
+  "$STUB_KIND" "${STUB_PATCH:-}" "${STUB_MACOS_CONTRACT:-}"
 STUB
 chmod +x "$STUB_PROOF"
 
@@ -522,7 +526,7 @@ check "a refused lane read writes no lanes or lane_verdicts output" "" \
 
 # The names one classify run writes, heredoc-delimited values skipped. The
 # standard row reaches every writer, lanes last.
-run "$CLASSIFY" STUB_CLASS=standard STUB_PATHS=skills/orch/SKILL.md >/dev/null
+run "$CLASSIFY" STUB_CLASS=standard STUB_PATHS=skills/orch/SKILL.md MACOS_PATCH_PROOF=true >/dev/null
 written="$(awk '
   collecting { if ($0 == delim) collecting = 0; next }
   /^[a-z_]+<</ { delim = $0; sub(/^[^<]*<</, "", delim); sub(/<<.*/, ""); print; collecting = 1; next }
@@ -574,11 +578,11 @@ NEEDLE="$needle" awk '
 ! cmp -s "$ACTION" "$TMP/action.yml" || { echo "the action.yml mutant changed nothing" >&2; exit 1; }
 check "must-fail: an action.yml whose lanes value is misspelled fails the forwarding row" \
   'declared-unforwarded: lanes ${{ steps.classify.outputs.lane }}' "$(forwarding "$TMP/action.yml")"
-[ "$(grep -c 'steps\.classify\.outputs\.record_dir' "$ACTION")" -eq 2 ] ||
+[ "$(grep -c 'steps\.classify\.outputs\.record_dir' "$ACTION")" -ge 2 ] ||
   { echo "the upload step no longer reads record_dir on two lines of $ACTION" >&2; exit 1; }
 sed 's/steps\.classify\.outputs\.record_dir/steps.classify.outputs.record_path/' "$ACTION" >"$TMP/action.yml"
-check "must-fail: an action.yml whose upload step reads no record_dir fails the forwarding row" \
-  'written-unread: record_dir' "$(forwarding "$TMP/action.yml")"
+check "must-fail: a misspelled record directory output fails forwarding" \
+  'declared-unforwarded: record_dir ${{ steps.classify.outputs.record_path }}' "$(forwarding "$TMP/action.yml")"
 
 # The inputs, the other way: `NAME: ${{ inputs.<input> }}` per entry of
 # ACTION_YML's `inputs:` block, NAME upper-cased with `-` as `_`, sorted.
@@ -916,6 +920,31 @@ check "a behaviour-preserving queue mutant reads as still answering its row" sur
   "$(queue_mutant classify '    elif [ "$queue_only" != true ]; then' \
     '    elif [ "$queue_only" != "true" ]; then' pr-unconfirmed)"
 
+# Patch proof has a separate output and never changes tree lane verdicts.
+status="$(run "$CLASSIFY" EVENT=merge_group MACOS_PATCH_PROOF=true STUB_REUSE=true STUB_KIND=macos-patch STUB_PATCH=p1 STUB_RUN=42 STUB_RECORD='covers=all')"
+check "patch proof classify exit" "0" "$status"
+check "patch proof keeps integrated lanes" "true false p1" "$(sed -n 's/^lanes=//p' "$OUT") $(sed -n 's/^proof_reuse=//p' "$OUT") $(sed -n 's/^patch_id=//p' "$OUT")"
+check "patch proof publishes macOS record separately" "macos_proof_record=covers=all" "$(outputs | tr ' ' '\n' | grep '^macos_proof_record=')"
+check "patch-only proof clears generic metadata" "patch-only-proof " \
+  "$(sed -n 's/^proof_reason=//p' "$OUT") $(sed -n 's/^proof_run=//p' "$OUT")"
+for field in proof_reason proof_run; do
+  case "$field" in
+    proof_reason) edit='/^  \[ "\$proof_reason" != exact-proof \] || proof_reason=patch-only-proof$/d' ;;
+    proof_run) edit='/^  proof_run=""$/d' ;;
+  esac
+  sed "$edit" "$CLASSIFY" >"$TMP/patch-metadata-classify"
+  ! cmp -s "$CLASSIFY" "$TMP/patch-metadata-classify" || exit 1
+  status="$(run "$TMP/patch-metadata-classify" EVENT=merge_group MACOS_PATCH_PROOF=true STUB_REUSE=true STUB_KIND=macos-patch STUB_RUN=42 STUB_RECORD='covers=all')"
+  [ "$status" = 0 ] && [ "$(sed -n 's/^proof_reason=//p' "$OUT") $(sed -n 's/^proof_run=//p' "$OUT")" != 'patch-only-proof ' ] &&
+    ok "must-fail: stale generic $field" || bad "must-fail: stale generic $field"
+done
+needle='  proof_reuse=false'
+[ "$(grep -cF -- "$needle" "$CLASSIFY")" -eq 1 ] || exit 1
+sed '/^  proof_reuse=false$/d; /^  proof_record=""$/d' "$CLASSIFY" >"$TMP/patch-leak-classify"
+! cmp -s "$CLASSIFY" "$TMP/patch-leak-classify" || exit 1
+status="$(run "$TMP/patch-leak-classify" EVENT=merge_group MACOS_PATCH_PROOF=true STUB_REUSE=true STUB_KIND=macos-patch STUB_PATCH=p1 STUB_RECORD='covers=all')"
+[ "$status" = 0 ] && [ "$(sed -n 's/^lanes=//p' "$OUT")" = false ] && ok "must-fail: patch proof leaks into tree proof" || bad "must-fail: patch proof leak control"
+
 # --- 6. The proof -------------------------------------------------------------
 
 # What a proof stands down. Every row reuses run 42 on tree t1 and reads the
@@ -1065,53 +1094,88 @@ case "$(skip_answer "$mutant" "STUB_TREE=t1 STUB_WORKFLOW= RUNNER_TEMP=$RUNNER")
   *) bad "must-fail: a classify recording an unread workflow writes the record" ;;
 esac
 
+# The shipped macOS proof reader requires the PR's contract to match the
+# merge group's contract before it can reuse the patch proof.
+PR_PATCH_RECORD='patch_id=p1
+macos_patch=true
+macos_contract=c1'
+status="$(run "$CLASSIFY" MACOS_PATCH_PROOF=true STUB_KIND=tree STUB_PATCH=p1 STUB_MACOS_CONTRACT=c1 STUB_TREE=t1 RUNNER_TEMP="$RUNNER")"
+check "PR patch record writer exit" "0" "$status"
+check "PR record carries patch identity, macOS opt-in and contract" "$PR_PATCH_RECORD" \
+  "$(grep -E '^(patch_id|macos_patch|macos_contract)=' "$RECORD_DIR/record")"
+plant classify 'macos_contract="$(proof_line macos_contract)"' \
+  'macos_contract="$(proof_line macos_contract)"; macos_contract=""'
+status="$(run "$PLANTED" MACOS_PATCH_PROOF=true STUB_KIND=tree STUB_PATCH=p1 STUB_MACOS_CONTRACT=c1 STUB_TREE=t1 RUNNER_TEMP="$RUNNER")"
+if [ "$status" = 0 ] && [ "$(grep -E '^(patch_id|macos_patch|macos_contract)=' "$RECORD_DIR/record")" != "$PR_PATCH_RECORD" ]; then
+  ok "must-fail: clearing the contract after reading it fails the PR record assertion"
+else
+  bad "must-fail: clearing the contract after reading it fails the PR record assertion"
+fi
+
 # The record's names, bound at both ends. The one file in record_dir is the
 # member proof unzips, and the upload step uploads record_dir itself, so the
 # artifact's root is that directory and its member the file's own name; a
 # file uploaded on its own lands at the artifact root under its basename.
-# The artifact's name is the upload step's prefix before proof_tree, and
-# proof looks a record up by its own prefix before the tree.
+# Each upload names the identity its proof reader uses: tree or patch_id.
 proof_member() { # PROOF — the member its unzip reads
   sed -n 's/^.*unzip -p "\$WORK\/record\.zip" \([^ ]*\) >.*$/\1/p' "$1"
 }
-proof_prefix() { # PROOF — the artifact name before the tree
-  sed -n 's/^artifact_name="\(.*\)\$tree"$/\1/p' "$1"
+proof_prefix() { # PROOF IDENTITY — the artifact name before its identity
+  sed -n "s/^.*artifact_name=\"\(.*\)\$$2\"\$/\1/p" "$1"
 }
-upload_key() { # ACTION_YML KEY — the upload step's KEY under `with:`
-  awk -v key="$2" '
-    /^    - / { upload = 0 }
-    /^      uses: actions\/upload-artifact@/ { upload = 1 }
-    upload && index($0, "        " key ": ") == 1 { print substr($0, length(key) + 11) }
+upload_key() { # YAML KEY — the proof upload step's KEY under `with:`
+  awk -v key="$2" -v wanted="${3:-1}" '
+    /^  [A-Za-z0-9_-]+:/ { upload = 0 }
+    /^ +[-] / { upload = 0 }
+    /^ +uses: actions\/upload-artifact@/ { upload = (++n == wanted) }
+    upload && $1 == key ":" { sub(/^ +[^:]+: */, ""); print }
   ' "$1"
 }
-binding() { # PROOF ACTION_YML — `bound`, or what disagrees
-  local member written prefix name
+binding() { # PROOF ACTION_YML [IDENTITY] — `bound`, or what disagrees
+  local member written prefix name identity="${3:-tree}" upload=1
   member="$(proof_member "$1")"
-  prefix="$(proof_prefix "$1")"
+  prefix="$(proof_prefix "$1" "$identity")"
   [ -n "$member" ] && [ -n "$prefix" ] ||
     { echo "no unzip member or artifact prefix read from $1, so a reader is broken"; return 0; }
   record_answer "$CLASSIFY" pr-all >/dev/null
   written="$(ls -A "$(sed -n 's/^record_dir=//p' "$OUT")")"
-  name="$(upload_key "$2" name)"
+  name="$(upload_key "$2" name "$upload")"
   if [ "$written" != "$member" ]; then
     echo "classify writes $written, proof reads $member"
-  elif [ "$(upload_key "$2" path)" != '${{ steps.classify.outputs.record_dir }}' ]; then
-    echo "the upload step uploads $(upload_key "$2" path), not record_dir"
-  elif [ "$name" != "$prefix\${{ steps.classify.outputs.proof_tree }}" ]; then
+  elif [ "$(upload_key "$2" path "$upload")" != '${{ steps.classify.outputs.record_dir }}' ]; then
+    echo "the upload step uploads $(upload_key "$2" path "$upload"), not record_dir"
+  elif [ "$identity" = patch_id ] && [ "$name" != "$prefix\${{ steps.classify.outputs.patch_id }}" ]; then
+    echo mismatch-macos-artifact
+  elif [ "$identity" = tree ] && [ "$name" != "$prefix\${{ steps.classify.outputs.proof_tree }}" ]; then
     echo "the upload step names $name, proof looks up $prefix<tree>"
   else
     echo bound
   fi
 }
 PROOF_SCRIPT="$ROOT/.github/actions/change-class/proof"
+PATCH_WORKFLOW="$ROOT/.github/workflows/skill-tests.yml"
 check "the record classify writes is the member and artifact proof reads, as the action uploads it" \
   bound "$(binding "$PROOF_SCRIPT" "$ACTION")"
+check "the macOS upload matches its proof reader identity and record directory" \
+  bound "$(binding "$PROOF_SCRIPT" "$PATCH_WORKFLOW" patch_id)"
+while IFS='@' read -r needle replacement; do
+  NEEDLE="$needle" REPLACEMENT="$replacement" awk '
+    $0 == ENVIRON["NEEDLE"] { print ENVIRON["REPLACEMENT"]; n++; next }
+    { print } END { exit n != 1 }
+  ' "$PATCH_WORKFLOW" >"$TMP/macos-upload.yml" || exit 1
+  ! cmp -s "$PATCH_WORKFLOW" "$TMP/macos-upload.yml" || exit 1
+  [ "$(binding "$PROOF_SCRIPT" "$TMP/macos-upload.yml" patch_id)" != bound ] &&
+    ok "must-fail: macOS upload $needle" || bad "must-fail: macOS upload $needle"
+done <<'ROWS'
+          name: change-class-macos-proof-${{ steps.classify.outputs.patch_id }}@          name: change-class-macos-record-${{ steps.classify.outputs.patch_id }}
+          path: ${{ steps.classify.outputs.record_dir }}@          path: ${{ runner.temp }}/change-class-record/record
+ROWS
 sed 's/unzip -p "$WORK\/record.zip" record >/unzip -p "$WORK\/record.zip" change-class-record >/' \
   "$PROOF_SCRIPT" >"$TMP/proof-member"
 ! cmp -s "$PROOF_SCRIPT" "$TMP/proof-member" || { echo "the member mutant changed nothing" >&2; exit 1; }
 check "must-fail: a proof reading another member breaks the binding" \
   "classify writes record, proof reads change-class-record" "$(binding "$TMP/proof-member" "$ACTION")"
-awk '$0 == "        path: ${{ steps.classify.outputs.record_dir }}" { print "        path: ${{ runner.temp }}/change-class-record/record"; n++; next } { print } END { exit n != 1 }' \
+awk '$0 == "        path: ${{ steps.classify.outputs.record_dir }}" && !n { print "        path: ${{ runner.temp }}/change-class-record/record"; n++; next } { print } END { exit n != 1 }' \
   "$ACTION" >"$TMP/action-upload.yml" || { echo "the upload path is no longer one line in $ACTION" >&2; exit 1; }
 check "must-fail: an action uploading the record file itself breaks the binding" \
   'the upload step uploads ${{ runner.temp }}/change-class-record/record, not record_dir' \

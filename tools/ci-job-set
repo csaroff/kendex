@@ -35,8 +35,16 @@
 #                  `docs_only` and `changed_path` lines are this script's
 #                  own inputs as that run had them, so what that run ran is
 #                  this selection over them, and a lane it ran stands down
-#                  here. A record whose lines this selection refuses stands
+#                  on a pull request. Groups ignore this tree proof.
+#                  A record whose lines this selection refuses stands
 #                  nothing down and says why on a `proof=ignored` line.
+#   MACOS_PROOF_RECORD  the change-class action's accepted macOS record.
+#                  The action owns record eligibility. Only this
+#                  proof can stand macOS lanes down on a merge group.
+#                  Tree proof never stands group Linux or Windows lanes down.
+#   MACOS_RECORD_DIR   the action's record_dir, where a pull request appends
+#                  its actual macOS lane bits and selected macOS shards.
+#                  The workflow uploads the patch artifact after selection.
 #   GITHUB_OUTPUT  the step output file the selection is appended to
 #
 # THE INVARIANT, stated once, with no list of what any lane reads:
@@ -82,15 +90,17 @@
 #     verdict and paths. With --event-parity the
 #     script derives the selection at both events and refuses
 #     `event-parity` where they differ.
-#   - A proof stands down the selections its record covers. The run's
-#     selection is re-derived from its record with the rules above, at its
-#     event; each covered lane stands down here. A shell runner stands down
-#     where that record selected it over every shard this diff selects.
+#   - Tree proof stands down the selections its record covers on a pull
+#     request. A merge group accepts only matching macOS patch proof and
+#     never stands Linux or Windows lanes down. Tree coverage is re-derived
+#     from its record. Patch coverage reads the PR's recorded selection,
+#     because base changes can change what the current checkout selects.
+#     A shell runner stands down where the record covers its current shards.
 #     A lane or shard outside that record keeps its current selection.
 #     bot_instructions is never covered: its changelog step judges the
 #     range from this event's base, and a record names no base.
-#     queue_macos_shards reads the macOS shell bit before any proof: no
-#     pull request runs the queue's macOS legs, so no proof covers them.
+#     queue_macos_shards reads the macOS bit after matching patch proof
+#     on merge groups, and the selected macOS bit on pull requests.
 #   - The compile lanes (cargo_lint, cargo_windows_check) run no test, so
 #     they run only where a build input changed: a path other than prose
 #     under a tools/rust-reads `build` or `include` row.
@@ -135,8 +145,8 @@
 #   ui                  the vitest, tsc and biome lane.
 #   queue_macos_shards  the selected members of QUEUE_MACOS_SHARDS, as a JSON
 #                       list in roster order, and empty where the macOS
-#                       shell bit is false. A merge group runs these on
-#                       macOS; no pull request does.
+#                       shell bit is false or group patch proof covers it.
+#                       Pull requests and groups run these on macOS.
 #
 # DOCS_ONLY is read and validated on every class, and it changes one thing: a
 # `standard` diff whose every path the docs verdict accepts (docs/,
@@ -510,8 +520,7 @@ macos_shard() { # SHARDS
 
 # One selection, printed as a word list: the lanes and shards CLASS, DOCS
 # and PATHS select at EVENT. Every rule on those four inputs is here, the
-# refusals included, so a proof record's lines are judged by the same rules
-# as the diff's own. Run it in a subshell: the readers above take the paths
+# refusals included. Run it in a subshell: the readers above take the paths
 # from `paths`, which it sets, and the shard search starts empty each time.
 select_row() { # CLASS DOCS PATHS EVENT
   local class="$1" docs="$2" event="$4" row read_lines="" platform uitree build shards shell macos known=false each
@@ -579,6 +588,8 @@ select_row() { # CLASS DOCS PATHS EVENT
 # A refused record stands nothing down and says why.
 was=""
 record="${PROOF_RECORD:-}"
+# A queue group must re-test every integrated-tree lane.
+[ "$EVENT" != merge_group ] || record=""
 if [ -n "$record" ]; then
   record_line() { printf '%s\n' "$record" | sed -n "s/^$1=//p"; }
   r_event="$(record_line event)"
@@ -601,6 +612,28 @@ if [ -n "$record" ]; then
   fi
 fi
 
+# The action accepts the macOS record; this selector decides its coverage.
+# A failed coverage read leaves every macOS lane selected.
+patch_record="${MACOS_PROOF_RECORD:-}"
+patch_was=""
+if [ "$EVENT" = merge_group ] && [ -n "$patch_record" ]; then
+  patch_line() { printf '%s\n' "$patch_record" | sed -n "s/^$1=//p"; }
+  if ! r_macos="$(patch_line macos_selected)" || ! r_cargo="$(patch_line cargo_macos_selected)" ||
+    ! r_shards="$(patch_line macos_shards)"; then
+    printf 'ci-job-set: proof=ignored cause=macos-coverage-read-failed\n' >&2
+  else
+    case "$r_macos:$r_cargo" in
+      true:true | true:false | false:true | false:false)
+        if r_shards="$(jq -cse 'select(length == 1) | .[0] | select(type == "array" and all(.[]; type == "string"))' <<<"$r_shards")"; then
+          patch_was="linux=false macos=$r_macos ui=false bot_instructions=false cargo_linux=false cargo_macos=$r_cargo cargo_lint=false cargo_windows=false cargo_windows_check=false shards=$r_shards"
+        fi ;;
+    esac
+    if [ -z "$patch_was" ]; then
+      printf 'ci-job-set: proof=ignored cause=macos-coverage-refused\n' >&2
+    fi
+  fi
+fi
+
 now="$(select_row "$CHANGE_CLASS" "$DOCS_ONLY" "$paths" "$EVENT")" || exit 2
 
 # Event parity: pull requests and merge groups receive equal lane, shard and
@@ -618,6 +651,8 @@ if [ "$parity" = true ]; then
   done
 fi
 
+[ -z "$patch_was" ] || was="$patch_was"
+
 # A proof clears the lane selections its source row covers. Shell runner
 # bits also require that source row to include every current shard.
 now_shards="$(sel_get "$now" shards)"
@@ -626,7 +661,9 @@ was_shards=""
 covered=false
 if [ -n "$was" ]; then
   covered=true
-  for shard in $SHARDS; do
+  coverage_shards="$SHARDS"
+  [ -z "$patch_was" ] || coverage_shards="$QUEUE_MACOS_SHARDS"
+  for shard in $coverage_shards; do
     case "$now_shards" in *"\"$shard\""*) ;; *) continue ;; esac
     case "$was_shards" in *"\"$shard\""*) ;; *) covered=false ;; esac
   done
@@ -638,6 +675,9 @@ for lane in $LEGS $JOBS; do
   ran=false
   [ -z "$was" ] || ran="$(sel_get "$was" "$lane")"
   case "$lane" in linux | macos) [ "$covered" = true ] || ran=false ;; esac
+  if [ "$EVENT" = merge_group ]; then
+    case "$lane" in macos | cargo_macos) ;; *) ran=false ;; esac
+  fi
   # The changelog step's verdict reads the base, which the record lacks.
   case "$lane" in bot_instructions) ran=false ;; esac
   if [ "$value:$ran" = true:true ]; then
@@ -656,7 +696,7 @@ done
 shell=false
 [ -z "$legs" ] || shell=true
 
-# The queue's macOS legs, off the selection before the proof above.
+# The PR and queue macOS legs; matching patch proof can clear only the group.
 queue=""
 if [ "$(sel_get "$now" macos)" = true ]; then
   for shard in $QUEUE_MACOS_SHARDS; do
@@ -664,5 +704,19 @@ if [ "$(sel_get "$now" macos)" = true ]; then
   done
 fi
 
+if [ "$EVENT" = merge_group ] && [ -n "$patch_was" ]; then
+  case "$legs" in *macos-latest*) ;; *) queue="" ;; esac
+fi
+
 # shellcheck disable=SC2086 # one `lane=value` word per job
 emit "shell_shards=$shell" "shell_os=[$legs]" $jobs "shards=$now_shards" "queue_macos_shards=[$queue]"
+
+# Only the PR's executed selection can attest coverage. The proving run
+# must succeed before the reader accepts the artifact this record enters.
+if [ "$EVENT" = pull_request ] && [ -n "${MACOS_RECORD_DIR:-}" ]; then
+  selected_macos=false
+  [ -z "$queue" ] || selected_macos=true
+  printf 'macos_selected=%s\ncargo_macos_selected=%s\nmacos_shards=[%s]\n' \
+    "$selected_macos" "$(sel_get "$jobs" cargo_macos)" "$queue" >>"$MACOS_RECORD_DIR/record" ||
+    die "macos-record-unwritable path=$MACOS_RECORD_DIR/record" "the actual macOS selection could not be recorded"
+fi
