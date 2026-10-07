@@ -161,11 +161,13 @@ pushes() {
 }
 
 RECORD_ARGS=(--pr 7)
+# CONTROL_STATE_DIR, where set, is the ORCH_STATE_DIR the overseer's own
+# machine runs under.
 record() { # ITEM TIER [ARGS...]
   local item="$1" tier="$2" rc=0 tier_args=()
   shift 2
   [[ -z "$tier" ]] || tier_args=(--tier "$tier")
-  (cd "$REPO" && PATH="$TMP_ROOT/bin:$PATH" env -u ORCH_STATE_DIR -u GH_REPO -u WORKTREE_DEFAULT_BRANCH "${RUN_BIN:-$BIN}" --state-dir "$CASE/state" record ${RECORD_ARGS[@]+"${RECORD_ARGS[@]}"} ${tier_args[@]+"${tier_args[@]}"} "$@" "$item") \
+  (cd "$REPO" && PATH="$TMP_ROOT/bin:$PATH" env -u ORCH_STATE_DIR -u GH_REPO -u WORKTREE_DEFAULT_BRANCH ${CONTROL_STATE_DIR:+ORCH_STATE_DIR="$CONTROL_STATE_DIR"} "${RUN_BIN:-$BIN}" --state-dir "$CASE/state" record ${RECORD_ARGS[@]+"${RECORD_ARGS[@]}"} ${tier_args[@]+"${tier_args[@]}"} "$@" "$item") \
     > "$CASE/out" 2> "$CASE/err" || rc=$?
   printf 'rc=%s %s' "$rc" "$(cat "$CASE/out")"
 }
@@ -411,6 +413,132 @@ mkdir -p "$CASE/host/w/KEN-4" "$CASE/host/clone/tmp"
 echo "gitdir: /clone/.git/worktrees/KEN-4" > "$CASE/host/w/KEN-4/.git"
 printf '{"cycles": 7}' > "$CASE/host/clone/tmp/workflow-state-KEN-4.json"
 assert_eq "$(field fix "$(record KEN-4 micro)")" "fix=7" "the fix count comes from the hosted clone's state"
+
+# The lane resolves its state directory on its own host: the overseer's
+# ORCH_STATE_DIR names a directory on the overseer's machine, and the lane's
+# worktree settings name its own.
+assert_eq "$(field fix "$(CONTROL_STATE_DIR=/fleet/state record KEN-4 micro)")" "fix=7" \
+  "a hosted lane's state is read in its own state directory, whatever the overseer's ORCH_STATE_DIR"
+mkdir -p "$CASE/host/clone/lane-state"
+printf '{"cycles": 3}' > "$CASE/host/clone/lane-state/workflow-state-KEN-4.json"
+printf '[env]\nORCH_STATE_DIR = "lane-state"\n' > "$CASE/host/w/KEN-4/kendex.settings.toml"
+assert_eq "$(field fix "$(record KEN-4 micro)")" "fix=3" \
+  "a hosted lane whose worktree settings name its state directory is read there"
+printf '[env]\nORCH_STATE_DIR = lane-state\n' > "$CASE/host/w/KEN-4/kendex.settings.toml"
+assert_eq "$(field fix "$(record KEN-4 micro)")|$(grep -c '^oversee-cycle: rounds-unread item=KEN-4$' "$CASE/err" || true)|$(grep -c "settings-unread path=/w/KEN-4/kendex.settings.toml" "$CASE/err" || true)" \
+  "fix=-|1|1" "a worktree settings file that does not parse records no rounds and names the file"
+printf '[env]\nORCH_STATE_DIR = ""\n' > "$CASE/host/w/KEN-4/kendex.settings.toml"
+assert_eq "$(field fix "$(record KEN-4 micro)")" "fix=7" "an empty state directory setting is tmp, as workflow-state reads it"
+# The lane's private env file outranks its settings, as workflow-state loads
+# them; this machine reads only a literal assignment from it, never runs it.
+mkdir -p "$CASE/host/clone/private-state" "$CASE/host/w/KEN-4/config"
+printf '{"cycles": 4}' > "$CASE/host/clone/private-state/workflow-state-KEN-4.json"
+printf '[env]\nORCH_STATE_DIR = "lane-state"\n' > "$CASE/host/w/KEN-4/kendex.settings.toml"
+printf 'SECRET=x\nexport ORCH_STATE_DIR="private-state"\n' > "$CASE/host/w/KEN-4/.env.local"
+assert_eq "$(field fix "$(record KEN-4 micro)")" "fix=4" \
+  "a hosted lane whose private env file names its state directory is read there, over its settings"
+printf '[env]\nORCH_STATE_DIR = "lane-state"\nKENDEX_ENV_FILE = "config/priv.env"\n' > "$CASE/host/w/KEN-4/kendex.settings.toml"
+mv -- "$CASE/host/w/KEN-4/.env.local" "$CASE/host/w/KEN-4/config/priv.env"
+assert_eq "$(field fix "$(record KEN-4 micro)")" "fix=4" \
+  "the private env file the settings name as KENDEX_ENV_FILE is the one read"
+printf 'ORCH_STATE_DIR=$HOME/state\n' > "$CASE/host/w/KEN-4/config/priv.env"
+assert_eq "$(field fix "$(record KEN-4 micro)")|$(grep -c '^oversee-cycle: rounds-unread item=KEN-4$' "$CASE/err" || true)|$(grep -c "private-env-unread path=/w/KEN-4/config/priv.env key=ORCH_STATE_DIR" "$CASE/err" || true)" \
+  "fix=-|1|1" "a private env file that sets the state directory other than literally records no rounds and names the file"
+rm -rf -- "${CASE:?}/host/w/KEN-4/kendex.settings.toml" "${CASE:?}/host/w/KEN-4/config"
+
+echo "=== a gone sandbox's rounds are read from the archive its close kept ==="
+# gone_case NAME [ARCHIVE [AT [STATE_DIR]]] — KEN-4 hosted on a host that
+# holds nothing, its close's kept= row in the fleet log, stamped AT seconds
+# past the launch (10 by default), naming ARCHIVE, by default the case's
+# kept.tgz, which holds the clone's and the worktree's tmp and the item's
+# state in the clone's STATE_DIR, tmp by default. Its lane-host-state member
+# names that state's member, as close records it, or GONE_MANIFEST where set:
+# `none` for an archive close wrote before it recorded one, empty for a lane
+# that wrote no state. GONE_STALE puts an older copy of the state, 9 fix
+# rounds, in the clone's tmp beside it, and GONE_WT_COPY another, 8, in the
+# worktree's tmp.
+gone_case() {
+  local archive manifest=() dir="${4:-tmp}"
+  new_case "$1"; printf micro > "$CASE/class"; timeline 1200
+  archive="${2:-$CASE/kept.tgz}"
+  mkdir -p "$CASE/archive/clone/$dir" "$CASE/archive/clone/tmp" "$CASE/archive/w/KEN-4/tmp" "${archive%/*}"
+  [[ -z "${GONE_STALE:-}" ]] || printf '{"cycles": 9}' > "$CASE/archive/clone/tmp/workflow-state-KEN-4.json"
+  [[ -z "${GONE_WT_COPY:-}" ]] || printf '{"cycles": 8}' > "$CASE/archive/w/KEN-4/tmp/workflow-state-KEN-4.json"
+  printf '{"cycles": 5}' > "$CASE/archive/clone/$dir/workflow-state-KEN-4.json"
+  printf '{}' > "$CASE/archive/w/KEN-4/tmp/dev-return-KEN-4-1.json"
+  if [[ "${GONE_MANIFEST-}" != none ]]; then
+    printf '%s\n' "${GONE_MANIFEST-clone/$dir/workflow-state-KEN-4.json}" > "$CASE/archive/lane-host-state"
+    manifest=(lane-host-state)
+  fi
+  tar -czf "$archive" -C "$CASE/archive" ${manifest[@]+"${manifest[@]}"} clone w
+  edit_json "$CASE/state/workflow-state-oversee.json" \
+    "(.lanes[] | select(.item == \"KEN-4\")) |= (.host = \"box\" | .mail_root = \"/w/KEN-4\")
+     | .fleet_log += [{at: \"$(at "${3:-10}")\", kind: \"lane\", item: \"KEN-4\", text: \"lane-closed KEN-4 kept=$archive\"}]"
+}
+gone_case gone
+assert_eq "$(field fix "$(record KEN-4 micro)")" "fix=5" "a gone sandbox's fix count comes from its kept= archive"
+gone_case gone-custom "" 10 lane-state
+assert_eq "$(field fix "$(record KEN-4 micro)")" "fix=5" \
+  "a gone sandbox whose settings named its state directory reads the state its close archived there"
+GONE_STALE=1 gone_case gone-moved "" 10 zz-state
+assert_eq "$(field fix "$(record KEN-4 micro)")" "fix=5" \
+  "an archive holding an older copy of the state in tmp reads the member its close recorded"
+GONE_STALE=1 GONE_MANIFEST='' gone_case gone-unwritten "" 10 zz-state
+assert_eq "$(field fix "$(record KEN-4 micro)")" "fix=-" \
+  "an archive whose close recorded no state reads none, whatever copies it holds"
+GONE_MANIFEST=none gone_case gone-unrecorded
+assert_eq "$(field fix "$(record KEN-4 micro)")" "fix=5" \
+  "an archive written before close recorded the member reads the clone's tmp copy"
+GONE_MANIFEST=none GONE_WT_COPY=1 gone_case gone-unrecorded-both
+assert_eq "$(field fix "$(record KEN-4 micro)")" "fix=5" \
+  "an archive written before close recorded the member reads the clone's copy before the worktree's"
+gone_case gone-non-ascii "" 10 café-state
+assert_eq "$(field fix "$(LC_ALL=C record KEN-4 micro)")" "fix=5" \
+  "a recorded member whose name the locale cannot print is read as written"
+# stream_read LIB — lane_archived_state from LIB on the case's archive, as
+# the fix rounds it read and what it left in its scratch directory, which the
+# control host reads archives without writing bulk data to.
+stream_read() {
+  rm -rf -- "${CASE:?}/scratch" && mkdir -p "$CASE/scratch"
+  ( source "$1/lane-gitfile.sh"
+    lane_archived_state KEN-4 "$CASE/kept.tgz" "$CASE/scratch" /w/KEN-4 || exit 1
+    printf '%s left=%s' "$(jq -r .cycles <<<"$LANE_ITEM_STATE")" "$(cd "$CASE/scratch" && ls -A | tr '\n' ' ')" )
+}
+gone_case gone-stream
+assert_eq "$(stream_read "$TEST_DIR/../scripts/lib")" "5 left=state.err " \
+  "the kept= archive is read as a stream, nothing of it written to disk"
+# hardlink_case NAME: an archive whose recorded member tar wrote as a hard
+# link to the same file archived first under the clone's tmp, as close writes
+# it where the clone's path reaches its state through a symlink.
+hardlink_case() {
+  gone_case "$1" "" 10 zz-state
+  rm -f -- "${CASE:?}/archive/clone/zz-state/workflow-state-KEN-4.json"
+  printf '{"cycles": 5}' > "$CASE/archive/clone/tmp/state-copy.json"
+  ln -- "$CASE/archive/clone/tmp/state-copy.json" "$CASE/archive/clone/zz-state/workflow-state-KEN-4.json"
+  tar -czf "$CASE/kept.tgz" -C "$CASE/archive" lane-host-state clone/tmp/state-copy.json clone/zz-state/workflow-state-KEN-4.json
+}
+hardlink_case gone-hardlink
+assert_eq "$(field fix "$(record KEN-4 micro)")" "fix=5" \
+  "a recorded member tar wrote as a hard link reads the file it names"
+GONE_MANIFEST=clone/elsewhere/workflow-state-KEN-4.json gone_case gone-misnamed
+assert_eq "$(field fix "$(record KEN-4 micro)")|$(grep -c '^archive-member-missing ' "$CASE/err" || true)" \
+  "fix=-|1" "an archive naming a member it does not hold is unread, the member named"
+gone_case gone-missing
+rm -f -- "${CASE:?}/kept.tgz"
+assert_eq "$(field fix "$(record KEN-4 micro)")|$(grep -c '^oversee-cycle: rounds-unread item=KEN-4$' "$CASE/err" || true)" \
+  "fix=-|1" "a kept= archive that is not there records no rounds and says so"
+gone_case gone-spaced "$TMP_ROOT/case-gone-spaced/my fleet/kept.tgz"
+assert_eq "$(field fix "$(record KEN-4 micro)")" "fix=5" "a kept= archive under a directory with spaces is read whole"
+gone_case gone-earlier "" -10
+assert_eq "$(field fix "$(record KEN-4 micro)")" "fix=-" "a kept= row from before the lane's session is an earlier run's, never read"
+# A live read that fails keeps its failure: an archive an earlier close kept
+# never answers for a lane whose host still holds its worktree.
+gone_case gone-live-fails
+mkdir -p "$CASE/host/w/KEN-4"
+echo "gitdir: /clone/.git/worktrees/KEN-4" > "$CASE/host/w/KEN-4/.git"
+printf '[env]\nORCH_STATE_DIR = lane-state\n' > "$CASE/host/w/KEN-4/kendex.settings.toml"
+assert_eq "$(field fix "$(record KEN-4 micro)")|$(grep -c '^oversee-cycle: rounds-unread item=KEN-4$' "$CASE/err" || true)" \
+  "fix=-|1" "a hosted read that fails with a kept= archive on file stays unread"
 
 echo "=== the repository the timeline is read from ==="
 new_case repo
@@ -777,10 +905,12 @@ Review rounds per pull request: micro 1, small 1, standard 2; seconds per round:
 # Planted defects in the record verb's target comparison, the span its verdict
 # judges and the stamps its phase reads, the rollup verb, and the
 # lane_item_state it reads rounds through, each in a private copy of that one
-# file among links to the shipped scripts, beside the same stubs.
+# file among links to the shipped scripts, beside the same stubs, the
+# lane-host fake among them.
 control() { # NAME FILE ANCHOR REPLACEMENT — sets RUN_BIN to the mutant's oversee-cycle
   local dir
   dir="$(mutant_scripts "skills/$1" "$2")" || exit 1
+  ln -sf -- "$LAYOUT/orch/scripts/lane-host" "$dir/lane-host" || exit 1
   mutate_file "$dir/$2" "$3" "$4"
   RUN_BIN="$dir/oversee-cycle"
 }
@@ -898,6 +1028,89 @@ new_case c-lane-root; printf micro > "$CASE/class"; timeline 1200
 edit_json "$CASE/state/workflow-state-oversee.json" "(.lanes[] | select(.item == \"KEN-5\")).mail_root = \"$ELSE\""
 assert_eq "$(field fix "$(record KEN-5 micro)")" "fix=-" \
   "control: read from the caller's checkout, another repository's lane has no rounds"
+
+control m-hosted-dir lib/lane-gitfile.sh 'lane_hosted_state_path "$LANE_HOSTED_CLONE" "$LANE_HOSTED_STATE_DIR" "$2"' \
+  'lane_hosted_state_path "$LANE_HOSTED_CLONE" "${ORCH_STATE_DIR:-tmp}" "$2"'
+new_case c-hosted-dir; printf micro > "$CASE/class"; timeline 1200
+edit_json "$CASE/state/workflow-state-oversee.json" '(.lanes[] | select(.item == "KEN-4")) |= (.host = "box" | .mail_root = "/w/KEN-4")'
+mkdir -p "$CASE/host/w/KEN-4" "$CASE/host/clone/tmp"
+echo "gitdir: /clone/.git/worktrees/KEN-4" > "$CASE/host/w/KEN-4/.git"
+printf '{"cycles": 7}' > "$CASE/host/clone/tmp/workflow-state-KEN-4.json"
+assert_eq "$(field fix "$(CONTROL_STATE_DIR=/fleet/state record KEN-4 micro)")" "fix=-" \
+  "control: read at the overseer's ORCH_STATE_DIR, a hosted lane has no rounds"
+control m-hosted-settings lib/lane-gitfile.sh 'for file in kendex.settings.toml .kendex/settings.toml; do' 'for file in; do'
+mkdir -p "$CASE/host/clone/lane-state"
+printf '{"cycles": 3}' > "$CASE/host/clone/lane-state/workflow-state-KEN-4.json"
+printf '[env]\nORCH_STATE_DIR = "lane-state"\n' > "$CASE/host/w/KEN-4/kendex.settings.toml"
+assert_eq "$(field fix "$(record KEN-4 micro)")" "fix=7" \
+  "control: without the worktree settings read, the lane's own state directory is missed"
+control m-empty-dir lib/lane-gitfile.sh 'LANE_HOSTED_STATE_DIR="${LANE_HOSTED_STATE_DIR:-tmp}"' ':'
+new_case c-empty-dir; printf micro > "$CASE/class"; timeline 1200
+edit_json "$CASE/state/workflow-state-oversee.json" '(.lanes[] | select(.item == "KEN-4")) |= (.host = "box" | .mail_root = "/w/KEN-4")'
+mkdir -p "$CASE/host/w/KEN-4" "$CASE/host/clone/tmp"
+echo "gitdir: /clone/.git/worktrees/KEN-4" > "$CASE/host/w/KEN-4/.git"
+printf '{"cycles": 7}' > "$CASE/host/clone/tmp/workflow-state-KEN-4.json"
+printf '[env]\nORCH_STATE_DIR = ""\n' > "$CASE/host/w/KEN-4/kendex.settings.toml"
+assert_eq "$(field fix "$(record KEN-4 micro)")" "fix=-" \
+  "control: without the empty-setting fallback, the state is sought at the clone's root"
+control m-gone-only lib/lane-gitfile.sh '[[ "$rc" -eq 0 && "$LANE_HOSTED_GONE" == 1 && -n "${8:-}" ]] || return "$rc"' \
+  '[[ -z "$LANE_ITEM_STATE" && -n "${8:-}" ]] || return "$rc"'
+gone_case c-gone-only
+mkdir -p "$CASE/host/w/KEN-4"
+echo "gitdir: /clone/.git/worktrees/KEN-4" > "$CASE/host/w/KEN-4/.git"
+printf '[env]\nORCH_STATE_DIR = lane-state\n' > "$CASE/host/w/KEN-4/kendex.settings.toml"
+assert_eq "$(field fix "$(record KEN-4 micro)")" "fix=5" \
+  "control: falling back on any empty read, a failed live read is answered from the archive"
+control m-kept-since oversee-cycle 'select(.item == $item and ((.at // "") >= $since))' 'select(.item == $item)'
+gone_case c-kept-since "" -10
+assert_eq "$(field fix "$(record KEN-4 micro)")" "fix=5" \
+  "control: without the session bound, an earlier run's archive is read"
+control m-kept-spaced oversee-cycle '(?<p>/.*[^\\s])\\s*$' '(?<p>/\\S+)'
+gone_case c-kept-spaced "$TMP_ROOT/case-c-kept-spaced/my fleet/kept.tgz"
+assert_eq "$(field fix "$(record KEN-4 micro)")" "fix=-" \
+  "control: a path cut at its first space names no archive"
+control m-kept-member lib/lane-gitfile.sh 'if "lane-host-state" in members:' 'if False:'
+GONE_STALE=1 gone_case c-kept-member "" 10 zz-state
+assert_eq "$(field fix "$(record KEN-4 micro)")" "fix=9" \
+  "control: matched by name alone, the older tmp copy, first in byte order, is read"
+control m-kept-listed lib/lane-gitfile.sh 'raw.decode(tar.encoding, "surrogateescape")' 'raw.decode("ascii", "backslashreplace")'
+gone_case c-kept-listed "" 10 café-state
+assert_eq "$(field fix "$(LC_ALL=C record KEN-4 micro)")" "fix=-" \
+  "control: matched against an escaped spelling, a name the locale cannot print is missed"
+control m-kept-stream lib/lane-gitfile.sh '  [[ -f "$2" ]] || { printf '"'"'archive-missing' \
+  '  tar -xzf "$2" -C "$3" 2>/dev/null || :; [[ -f "$2" ]] || { printf '"'"'archive-missing'
+gone_case c-kept-stream
+assert_eq "$(stream_read "${RUN_BIN%/*}/lib")" "5 left=clone lane-host-state state.err w " \
+  "control: an archive unpacked to be read leaves its members on disk"
+control m-kept-clone lib/lane-gitfile.sh 'key=lambda m: (m.name.startswith(root + "/"), m.name)' \
+  'key=lambda m: (not m.name.startswith(root + "/"), m.name)'
+GONE_MANIFEST=none GONE_WT_COPY=1 gone_case c-kept-clone
+assert_eq "$(field fix "$(record KEN-4 micro)")" "fix=8" \
+  "control: preferring the worktree's copy reads it over the clone's"
+control m-private-env lib/lane-gitfile.sh '  if [[ -n "$private" ]]; then' '  if false; then'
+new_case c-private-env; printf micro > "$CASE/class"; timeline 1200
+edit_json "$CASE/state/workflow-state-oversee.json" '(.lanes[] | select(.item == "KEN-4")) |= (.host = "box" | .mail_root = "/w/KEN-4")'
+mkdir -p "$CASE/host/w/KEN-4" "$CASE/host/clone/tmp" "$CASE/host/clone/private-state"
+echo "gitdir: /clone/.git/worktrees/KEN-4" > "$CASE/host/w/KEN-4/.git"
+printf '{"cycles": 7}' > "$CASE/host/clone/tmp/workflow-state-KEN-4.json"
+printf '{"cycles": 4}' > "$CASE/host/clone/private-state/workflow-state-KEN-4.json"
+printf 'ORCH_STATE_DIR=private-state\n' > "$CASE/host/w/KEN-4/.env.local"
+assert_eq "$(field fix "$(record KEN-4 micro)")" "fix=7" \
+  "control: without the private env file read, the lane's private state directory is missed"
+control m-private-named lib/lane-gitfile.sh '        e=*) private="${line#e=}" ;;' '        e=*) ;;'
+mkdir -p "$CASE/host/w/KEN-4/config"
+mv -- "$CASE/host/w/KEN-4/.env.local" "$CASE/host/w/KEN-4/config/priv.env"
+printf '[env]\nKENDEX_ENV_FILE = "config/priv.env"\n' > "$CASE/host/w/KEN-4/kendex.settings.toml"
+assert_eq "$(field fix "$(record KEN-4 micro)")" "fix=7" \
+  "control: reading .env.local whatever KENDEX_ENV_FILE names misses the named file"
+control m-kept-hardlink lib/lane-gitfile.sh 'readable = lambda m: m.isfile() or m.islnk()' 'readable = lambda m: m.isfile()'
+hardlink_case c-kept-hardlink
+assert_eq "$(field fix "$(record KEN-4 micro)")" "fix=-" \
+  "control: taking regular files alone, a hard-link entry reads as missing"
+control m-kept oversee-cycle '"$LANE_HOST_SPEC" "$LANE_ROOT" "$WORK" ${LANE_KEPT:+"$LANE_KEPT"}; then' '"$LANE_HOST_SPEC" "$LANE_ROOT" "$WORK"; then'
+gone_case c-kept
+assert_eq "$(field fix "$(record KEN-4 micro)")" "fix=-" \
+  "control: without the kept= archive, a gone sandbox has no rounds"
 
 control m-split oversee-cycle '     else gate_waits($seq[$gate - 1].at; $seq[$gate].at) end) as $waits' '     else null end) as $waits'
 new_case c-split; printf micro > "$CASE/class"

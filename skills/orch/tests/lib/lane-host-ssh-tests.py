@@ -1296,6 +1296,123 @@ fi
         self.assertEqual(closed.returncode, 0, closed.stderr)
         self.assertTrue(removed.exists())
 
+    def test_close_archives_the_state_the_lane_settings_place_outside_tmp(self):
+        # The lane's settings name a state directory outside both tmp trees;
+        # its close archives the item's state there, which oversee-cycle reads
+        # once the sandbox is gone.
+        state_dir = self.root / "lane-state"
+        scripts = self.source / ".agents/skills/orch/scripts"
+        for name in ("workflow-state", "git-context"):
+            shutil.copy2(PACKAGE / "scripts" / name, scripts / name)
+        (self.source / "kendex.settings.toml").write_text(f'[env]\nORCH_STATE_DIR = "{state_dir}"\n')
+        for args in (("add", "."), ("-c", "user.name=Test", "-c", "user.email=test@example.org", "commit", "-qm", "state dir")):
+            subprocess.run([self.env["REAL_GIT"], "-C", str(self.source), *args], check=True, capture_output=True)
+        self.assertEqual(self.create().returncode, 0)
+        state_dir.mkdir()
+        (state_dir / "workflow-state-TEST-1.json").write_text('{"cycles": 4}')
+        # An older copy in the clone's tmp, from before the settings moved it.
+        (Path(self.row["clone"]) / "tmp").mkdir(exist_ok=True)
+        (Path(self.row["clone"]) / "tmp/workflow-state-TEST-1.json").write_text('{"cycles": 9}')
+        closed = self.call("close", "--item", "TEST-1")
+        self.assertEqual(closed.returncode, 0, closed.stderr)
+        archive = Path(closed.stdout.decode().strip().removeprefix("kept="))
+        with tarfile.open(archive) as saved:
+            member = str(state_dir / "workflow-state-TEST-1.json").lstrip("/")
+            self.assertEqual(saved.extractfile("lane-host-state").read(), member.encode() + b"\n")
+            self.assertEqual(saved.extractfile(member).read(), b'{"cycles": 4}')
+
+    def test_close_records_a_dotted_state_directory_as_tar_names_it(self):
+        # A relative setting such as ../lane-state resolves to a path holding
+        # .. components; the record names the member tar writes for it. The
+        # kept= path is absolute though FLEET_DIR is relative, since tempfile
+        # makes the archive's directory absolute, which oversee-cycle's read
+        # of the kept= row relies on.
+        scripts = self.source / ".agents/skills/orch/scripts"
+        for name in ("workflow-state", "git-context"):
+            shutil.copy2(PACKAGE / "scripts" / name, scripts / name)
+        (self.source / "kendex.settings.toml").write_text('[env]\nORCH_STATE_DIR = "../lane-state"\n')
+        for args in (("add", "."), ("-c", "user.name=Test", "-c", "user.email=test@example.org", "commit", "-qm", "state dir")):
+            subprocess.run([self.env["REAL_GIT"], "-C", str(self.source), *args], check=True, capture_output=True)
+        self.assertEqual(self.create().returncode, 0)
+        state_dir = Path(self.row["clone"]).parent / "lane-state"
+        state_dir.mkdir()
+        (state_dir / "workflow-state-TEST-1.json").write_text('{"cycles": 6}')
+        closed = self.call("close", "--item", "TEST-1", FLEET_DIR="fleet-relative")
+        self.assertEqual(closed.returncode, 0, closed.stderr)
+        archive = Path(closed.stdout.decode().strip().removeprefix("kept="))
+        self.assertTrue(archive.is_absolute(), archive)
+        with tarfile.open(archive) as saved:
+            member = saved.extractfile("lane-host-state").read().decode().rstrip("\n")
+            self.assertEqual(member, str(state_dir / "workflow-state-TEST-1.json").lstrip("/"))
+            self.assertEqual(saved.extractfile(member).read(), b'{"cycles": 6}')
+
+    def test_close_follows_a_symlink_before_dots_in_the_state_directory(self):
+        # tmp/link/../lane-state names the directory beside link's target, as
+        # the filesystem follows it; collapsing link/.. first names
+        # tmp/lane-state, which here holds another copy, so the record would
+        # name a file that is not the lane's state.
+        scripts = self.source / ".agents/skills/orch/scripts"
+        for name in ("workflow-state", "git-context"):
+            shutil.copy2(PACKAGE / "scripts" / name, scripts / name)
+        (self.source / "kendex.settings.toml").write_text('[env]\nORCH_STATE_DIR = "tmp/link/../lane-state"\n')
+        for args in (("add", "."), ("-c", "user.name=Test", "-c", "user.email=test@example.org", "commit", "-qm", "state dir")):
+            subprocess.run([self.env["REAL_GIT"], "-C", str(self.source), *args], check=True, capture_output=True)
+        self.assertEqual(self.create().returncode, 0)
+        target = self.root / "elsewhere/inner"
+        target.mkdir(parents=True)
+        (Path(self.row["clone"]) / "tmp").mkdir(exist_ok=True)
+        (Path(self.row["clone"]) / "tmp/link").symlink_to(target)
+        (Path(self.row["clone"]) / "tmp/lane-state").mkdir()
+        (Path(self.row["clone"]) / "tmp/lane-state/workflow-state-TEST-1.json").write_text('{"cycles": 9}')
+        state_dir = (self.root / "elsewhere/lane-state").resolve()
+        state_dir.mkdir()
+        (state_dir / "workflow-state-TEST-1.json").write_text('{"cycles": 2}')
+        closed = self.call("close", "--item", "TEST-1")
+        self.assertEqual(closed.returncode, 0, closed.stderr)
+        archive = Path(closed.stdout.decode().strip().removeprefix("kept="))
+        with tarfile.open(archive) as saved:
+            member = saved.extractfile("lane-host-state").read().decode().rstrip("\n")
+            self.assertEqual(member, str(state_dir / "workflow-state-TEST-1.json").lstrip("/"))
+            self.assertEqual(saved.extractfile(member).read(), b'{"cycles": 2}')
+
+    def test_close_archives_the_state_the_lane_private_env_places(self):
+        # The lane's workflow-state loads its private env file over its
+        # settings; close resolves the state the way the lane does.
+        scripts = self.source / ".agents/skills/orch/scripts"
+        for name in ("workflow-state", "git-context"):
+            shutil.copy2(PACKAGE / "scripts" / name, scripts / name)
+        for args in (("add", "."), ("-c", "user.name=Test", "-c", "user.email=test@example.org", "commit", "-qm", "state reader")):
+            subprocess.run([self.env["REAL_GIT"], "-C", str(self.source), *args], check=True, capture_output=True)
+        created = self.create()
+        self.assertEqual(created.returncode, 0, created.stderr)
+        path = Path(dict(field.split("=", 1) for field in created.stdout.decode().strip().split("\t"))["path"])
+        state_dir = (self.root / "private-state").resolve()
+        state_dir.mkdir()
+        (state_dir / "workflow-state-TEST-1.json").write_text('{"cycles": 5}')
+        (path / ".env.local").write_text(f'ORCH_STATE_DIR="{state_dir}"\n')
+        closed = self.call("close", "--item", "TEST-1")
+        self.assertEqual(closed.returncode, 0, closed.stderr)
+        archive = Path(closed.stdout.decode().strip().removeprefix("kept="))
+        with tarfile.open(archive) as saved:
+            member = saved.extractfile("lane-host-state").read().decode().rstrip("\n")
+            self.assertEqual(member, str(state_dir / "workflow-state-TEST-1.json").lstrip("/"))
+            self.assertEqual(saved.extractfile(member).read(), b'{"cycles": 5}')
+
+    def test_close_stops_when_the_state_directory_does_not_resolve(self):
+        # A clone whose workflow-state fails leaves the item's state unplaced:
+        # close stops before the worktree goes, rather than archive without it.
+        scripts = self.source / ".agents/skills/orch/scripts"
+        self.executable(scripts / "workflow-state", "#!/usr/bin/env bash\necho 'workflow-state: settings broken' >&2\nexit 1\n")
+        for args in (("add", "."), ("-c", "user.name=Test", "-c", "user.email=test@example.org", "commit", "-qm", "broken state")):
+            subprocess.run([self.env["REAL_GIT"], "-C", str(self.source), *args], check=True, capture_output=True)
+        created = self.create()
+        self.assertEqual(created.returncode, 0, created.stderr)
+        path = Path(dict(field.split("=", 1) for field in created.stdout.decode().strip().split("\t"))["path"])
+        closed = self.call("close", "--item", "TEST-1")
+        self.assertNotEqual(closed.returncode, 0, closed.stderr)
+        self.assertIn(b"lane-host-ssh: state-unresolved item=TEST-1", closed.stderr)
+        self.assertEqual((closed.stdout, path.is_dir()), (b"", True))
+
     def test_close_refuses_a_drift_patch_that_does_not_carry_the_path(self):
         self.assertEqual(self.create().returncode, 0)
         clone = Path(self.row["clone"])
