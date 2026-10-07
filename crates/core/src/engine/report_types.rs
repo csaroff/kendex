@@ -727,7 +727,7 @@ pub type RecordedGone = (ItemKind, String);
 /// item of another kind along with it.
 pub type RemovalName = (Option<ItemKind>, String);
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct PlanOptions {
     /// Render each agent with the skills its declaration holds and keep the
     /// lock's upstream record as it is, leaving what upstream gained since
@@ -823,9 +823,10 @@ pub struct PlanOptions {
     /// declared at another repository or revision than that account was
     /// written for. The Pi settle resolves outside the plan, so a Pi
     /// package the record cannot place installs and records its own entry
-    /// at the source's tip while its source's entry is kept. Only
-    /// [`PlanOptions::locked`] sets this: `verify --at-record` weighs the
-    /// record against where each source resolves now, and reads that off
+    /// at the source's tip while its source's entry is kept.
+    /// [`PlanOptions::locked`] and [`PlanOptions::for_additions`] set this:
+    /// `verify --at-record` weighs the record against where each source
+    /// resolves now, and reads that off
     /// the record this pass would write. A write also reads fresh a
     /// declaration held at a commit this machine cannot read, where
     /// `verify --at-record` keeps it held: skipped, the write would de-list
@@ -833,9 +834,10 @@ pub struct PlanOptions {
     /// follower of a source declared at another revision than the record's
     /// account of it was written for, where any other hold keeps it: held
     /// at its recorded commit, the write would keep the source's entry and
-    /// no write would ever apply the edit, while a single-package update or
-    /// an add holds those followers, keeps that entry, and leaves the edit
-    /// pending, and `verify --at-record` holds them too but reads the
+    /// no write would ever apply the edit. An add applies that source edit
+    /// too, while a single-package update holds unrelated followers, keeps
+    /// that entry, and leaves the edit pending. `verify --at-record` holds
+    /// them too but reads the
     /// source at the revision declared now ([`PlanOptions::never_applied`]).
     /// A source declared at another repository has no follower any hold
     /// can place, since the record installed none from that repository:
@@ -905,13 +907,41 @@ pub enum Reach {
     /// declaration that required it and the sets that carry it, since a
     /// dependency cannot move while what it reads its bytes through holds.
     Carriers,
-    /// An add: the declarations it writes and nothing else. A package that
-    /// required the item before the add is not what the person named, and
-    /// stays at the commit its record names.
+    /// An add: only the declarations it writes are exempt from holding.
+    /// A package that required the item before the add is not what the
+    /// person named, and
+    /// stays at the commit its record names unless its source declaration
+    /// changed or the source no longer serves that commit.
     Declared,
 }
 
 impl PlanOptions {
+    /// Read every catalog at its current revision. Refresh and current-state
+    /// inspection use this; writes that retain installed revisions use locked().
+    pub fn current() -> Self {
+        Self {
+            hold_upstream_skills: false,
+            remove_orphans: false,
+            removal_filter: None,
+            sweep_unneeded: false,
+            prune_retired: false,
+            uninstalled_bundles: Vec::new(),
+            overwrite_edited: false,
+            replace_unmanaged: false,
+            replace_unmanaged_names: None,
+            overwrite_edited_names: None,
+            update_only: None,
+            keep_source_records: false,
+            manifest_base: None,
+            settings_draft: None,
+            supplied_settings: Vec::new(),
+            secrets_draft: None,
+            arriving_skills: BTreeSet::new(),
+            judge_pins: false,
+            never_applied: false,
+        }
+    }
+
     /// A plan scoped to one package: it resolves at its source's tip while
     /// every other follower in the scope holds at the commit its lock
     /// records. What every single-package surface asks for — the Updates
@@ -933,7 +963,7 @@ impl PlanOptions {
                     .collect(),
                 reach: Reach::Carriers,
             }),
-            ..PlanOptions::default()
+            ..PlanOptions::current()
         }
     }
 
@@ -960,7 +990,7 @@ impl PlanOptions {
     ///
     /// The plan of every write that brings no catalog current: a removal,
     /// a switch, a source change, an editor save, the package-check render.
-    /// [`PlanOptions::default`] reads every source where its mirror sits
+    /// [`PlanOptions::current`] reads every source where its mirror sits
     /// now, so a write planned from it moves every package whose catalog
     /// moved since the install, which only `refresh` is asked to do.
     pub fn locked() -> Self {
@@ -971,14 +1001,17 @@ impl PlanOptions {
     }
 
     /// The plan an add makes: the items and the sets it declares come
-    /// current, and nothing else moves ([`Reach::Declared`]).
+    /// current ([`Reach::Declared`]). Other packages keep their recorded
+    /// revisions unless their source declaration changed or their recorded
+    /// commit is no longer served ([`PlanOptions::keep_source_records`]).
+    /// Unread source records retain the installed revision.
     pub fn for_additions(declarations: impl IntoIterator<Item = Held>) -> Self {
         PlanOptions {
             update_only: Some(Targets {
                 declarations: declarations.into_iter().collect(),
                 reach: Reach::Declared,
             }),
-            ..PlanOptions::default()
+            ..PlanOptions::locked()
         }
     }
 
