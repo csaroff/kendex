@@ -1,10 +1,11 @@
 //! Unsubscribe — remove: the closure of a source is what leaves with it
 //! (declared items and their derived dependencies), computed by re-expansion,
-//! and removing the source uninstalls exactly that.
+//! and removing the source uninstalls exactly that. A surviving bundle's
+//! member transfers from the leaving source to the source that still carries it.
 #![cfg(unix)]
 
 use crate::test_util;
-use test_util::{rooted, source_path};
+use test_util::source_path;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -14,18 +15,8 @@ use kendex_core::env::{Env, FakeOs};
 use kendex_core::error::CoreError;
 use kendex_core::manifest::{self, ManifestFile};
 use kendex_core::model::{ItemKind, Scope};
-use kendex_core::{apply, remote, source_ops};
-
-#[allow(clippy::unwrap_used)]
-fn skill(catalog: &Path, name: &str, body: &str) {
-    let dir = catalog.join("skills").join(name);
-    fs::create_dir_all(&dir).unwrap();
-    fs::write(
-        dir.join("SKILL.md"),
-        format!("---\nname: {name}\ndescription: {name}\n---\n{body}\n"),
-    )
-    .unwrap();
-}
+use kendex_core::{apply, source_ops};
+use test_util::unsubscribe::{Gained, assert_kept_source, installed_then_gained, skill};
 
 #[allow(clippy::unwrap_used)]
 fn world(
@@ -248,7 +239,7 @@ fn a_member_another_bundle_carries_survives_removal() {
     )
     .unwrap();
     let other = home.join("other");
-    skill(&other, "shared", "s");
+    skill(&other, "shared", "from other");
     fs::write(
         other.join("kendex.toml"),
         "[bundles.also]\nskills = [\"shared\"]\n",
@@ -292,18 +283,6 @@ enum Leave {
     Keep,
 }
 
-/// How another marketplace's bundle gained a member after the install.
-#[derive(Debug, Clone, Copy)]
-enum Gained {
-    /// A new commit on top of the recorded one: the record still places
-    /// the bundle, at a commit that does not carry the member.
-    PastTheRecord,
-    /// The recorded commit amended away and this mirror cloned again: the
-    /// record names a commit nothing here serves, so a locked write reads
-    /// the bundle at the rewritten tip, which carries the member.
-    RewrittenHistory,
-}
-
 /// What becomes of `shared` once the source has left.
 #[derive(Debug, Clone, Copy)]
 enum Shared {
@@ -311,80 +290,16 @@ enum Shared {
     Uninstalled,
     /// Converted to the local source and installed from there.
     Converted,
-    /// Still installed under another source's bundle, not converted.
+    /// Transferred to the surviving bundle's source and installed from there.
     Kept,
-}
-
-/// A project whose bundle `core` from `cat` installed `shared`, beside
-/// `other`'s bundle `also`, recorded at a commit carrying `extra` alone,
-/// which then gained `shared` as `gained` says, fetched here.
-#[allow(clippy::unwrap_used)]
-fn installed_then_gained(gained: Gained) -> (tempfile::TempDir, Env, Scope) {
-    let tmp = tempfile::tempdir().unwrap();
-    let home = rooted(&tmp);
-    let env = Env::fake(&home, FakeOs::Linux);
-    let project = home.join("dev/app");
-    fs::create_dir_all(project.join(".claude")).unwrap();
-    let cat = home.join("cat");
-    skill(&cat, "shared", "s");
-    fs::write(
-        cat.join("kendex.toml"),
-        "[bundles.core]\nskills = [\"shared\"]\n",
-    )
-    .unwrap();
-    // `other` is a git catalog, so the record places its bundle at a
-    // commit; at that commit the bundle carries `extra` alone.
-    let other = home.join("other");
-    skill(&other, "extra", "e");
-    fs::write(
-        other.join("kendex.toml"),
-        "[bundles.also]\nskills = [\"extra\"]\n",
-    )
-    .unwrap();
-    test_util::git(&other, &["init", "--quiet", "-b", "main"]);
-    test_util::git(&other, &["add", "-A"]);
-    test_util::git(&other, &["commit", "--quiet", "-m", "also carries extra"]);
-    fs::write(
-        project.join("kendex.toml"),
-        format!(
-            "schema = 6\n\n[sources.cat]\n{}\n[sources.other]\nrepo = \"file://{}\"\n\n[install]\nharnesses = [\"claude\"]\nmethod = \"symlink\"\n\n[bundles.core]\nsource = \"cat\"\n[bundles.also]\nsource = \"other\"\n",
-            source_path(&cat),
-            other.display()
-        ),
-    )
-    .unwrap();
-    let scope = Scope::Project { root: project };
-    remote::sync_sources(&env, &manifest_of(&env, &scope)).unwrap();
-    apply_now(&env, &scope);
-    assert!(scope_skill(&scope, "shared").exists());
-
-    skill(&other, "shared", "s");
-    fs::write(
-        other.join("kendex.toml"),
-        "[bundles.also]\nskills = [\"extra\", \"shared\"]\n",
-    )
-    .unwrap();
-    test_util::git(&other, &["add", "-A"]);
-    match gained {
-        Gained::PastTheRecord => {
-            test_util::git(&other, &["commit", "--quiet", "-m", "also carries shared"]);
-        }
-        Gained::RewrittenHistory => {
-            test_util::git(&other, &["commit", "--quiet", "--amend", "-m", "rewritten"]);
-            test_util::git(&other, &["reflog", "expire", "--expire=now", "--all"]);
-            test_util::git(&other, &["gc", "--quiet", "--prune=now"]);
-            fs::remove_dir_all(env.source_cache_dir()).unwrap();
-        }
-    }
-    assert!(remote::fetch_all(&env, &manifest_of(&env, &scope)).is_empty());
-    (tmp, env, scope)
 }
 
 /// A member another marketplace's bundle gained leaves with the source as
 /// the removal and the re-sync after a keep read that bundle: held where the
 /// record places it, which does not carry the member, so the member leaves;
 /// read at the tip where the record's commit is gone, which carries it, so
-/// the member stays under that bundle. A closure that reads the bundle
+/// the member transfers to that bundle's source in both leave modes.
+/// A closure that reads the bundle
 /// anywhere else leaves the member installed under the source that is gone,
 /// or uninstalls one the plan keeps.
 #[test]
@@ -411,6 +326,12 @@ fn a_member_another_bundle_gains_leaves_as_the_plan_reads_that_bundle() {
         },
         Row {
             leave: Leave::Remove,
+            gained: Gained::RewrittenHistory,
+            closure: &[],
+            shared: Shared::Kept,
+        },
+        Row {
+            leave: Leave::Keep,
             gained: Gained::RewrittenHistory,
             closure: &[],
             shared: Shared::Kept,
@@ -460,15 +381,154 @@ fn a_member_another_bundle_gains_leaves_as_the_plan_reads_that_bundle() {
                 assert_eq!(declared.as_deref(), Some("local"), "{case}");
             }
             Shared::Kept => {
-                assert!(
-                    recorded.len() == 1 && recorded[0] != "local",
-                    "{case}: {recorded:?}"
-                );
+                assert_eq!(recorded, ["other"], "{case}: Kept");
                 assert!(installed, "{case}");
                 assert_eq!(declared, None, "{case}");
+                assert_kept_source(&env, &scope, &lock, &case);
             }
         }
         assert!(scope_skill(&scope, "extra").exists(), "{case}");
+    }
+}
+
+/// The remove dialog names the leaving edit. Its discard decision removes
+/// that package, while a transferred survivor keeps its unlisted hand edit.
+#[test]
+#[allow(clippy::unwrap_used)]
+fn discarding_a_leaving_edit_preserves_an_edited_transferred_survivor() {
+    let (_tmp, env, scope) = installed_then_gained(Gained::RewrittenHistory);
+    let cat = env.home.join("cat");
+    skill(&cat, "gh", "from cat");
+    fs::write(
+        cat.join("kendex.toml"),
+        "[bundles.core]\nskills = [\"shared\", \"gh\"]\n",
+    )
+    .unwrap();
+    apply_now(&env, &scope);
+    let shared = scope_skill(&scope, "shared").join("SKILL.md");
+    let gh = scope_skill(&scope, "gh").join("SKILL.md");
+    let shared_edit = fs::read_to_string(&shared).unwrap() + "\nmy shared edit\n";
+    let gh_edit = fs::read_to_string(&gh).unwrap() + "\nmy gh edit\n";
+    fs::write(&shared, &shared_edit).unwrap();
+    fs::write(&gh, &gh_edit).unwrap();
+
+    let preview = detach::preview(&env, &scope, "cat").unwrap();
+    assert_eq!(preview.edited, [(ItemKind::Skill, "gh".to_owned())]);
+    assert!(preview.removable.is_empty());
+    assert_eq!(preview.bundles, ["core"]);
+    let error = detach::remove(&env, &scope, "cat", false).unwrap_err();
+    assert!(matches!(error, CoreError::DetachEdited { names } if names == ["skill gh"]));
+    assert_eq!(fs::read_to_string(&shared).unwrap(), shared_edit);
+    assert_eq!(fs::read_to_string(&gh).unwrap(), gh_edit);
+
+    let report = detach::remove(&env, &scope, "cat", true).unwrap();
+    let held = report
+        .drift
+        .iter()
+        .find(|row| row.kind == ItemKind::Skill && row.name == "shared")
+        .unwrap();
+    assert_eq!(held.state, kendex_core::engine::DriftState::Conflict);
+    assert_eq!(held.cause, Some(kendex_core::engine::DriftCause::Both));
+    apply::execute(&env, &report.plan).unwrap();
+    assert!(!scope_skill(&scope, "gh").exists());
+    assert_eq!(fs::read_to_string(&shared).unwrap(), shared_edit);
+    let manifest = manifest_of(&env, &scope);
+    assert!(!manifest.sources.contains_key("cat"));
+    assert!(!manifest.bundles.contains_key("core"));
+    let lock = kendex_core::lock::load(&kendex_core::lock::lock_path(&env, &scope)).unwrap();
+    let recorded: Vec<_> = lock
+        .entries
+        .values()
+        .filter(|entry| entry.kind == ItemKind::Skill && entry.name == "shared")
+        .map(|entry| entry.source.as_str())
+        .collect();
+    assert_eq!(recorded, ["other"]);
+}
+
+/// Folder bundles have no recorded commits. A transfer must save its record
+/// even when no package leaves and the normal item pass holds the bytes.
+#[test]
+#[allow(clippy::unwrap_used)]
+fn folder_survivors_save_their_transfer_without_other_lock_changes() {
+    use kendex_core::engine::{DriftCause, DriftState};
+
+    for edited in [true, false] {
+        let (_tmp, env, scope, cat) = world(
+            "[bundles.core]\nsource = \"cat\"\n[bundles.also]\nsource = \"other\"\n",
+            "",
+        );
+        let other = env.home.join("other");
+        for catalog in [&cat, &other] {
+            skill(catalog, "shared", "same bytes");
+        }
+        fs::write(
+            cat.join("kendex.toml"),
+            "[bundles.core]\nskills = [\"shared\"]\n",
+        )
+        .unwrap();
+        fs::write(other.join("kendex.toml"), "[bundles.also]\nskills = []\n").unwrap();
+        let manifest_path = manifest::manifest_path(&env, &scope);
+        let declaration = fs::read_to_string(&manifest_path).unwrap();
+        fs::write(
+            &manifest_path,
+            format!("{declaration}\n[sources.other]\n{}", source_path(&other)),
+        )
+        .unwrap();
+        apply_now(&env, &scope);
+        let before = kendex_core::lock::load(&kendex_core::lock::lock_path(&env, &scope)).unwrap();
+        assert!(before.sources.is_empty());
+        assert!(before.bundles.is_empty());
+        let installed = scope_skill(&scope, "shared").join("SKILL.md");
+        if edited {
+            let bytes = fs::read_to_string(&installed).unwrap() + "\nmy edit\n";
+            fs::write(&installed, bytes).unwrap();
+        }
+        let preserved = fs::read(&installed).unwrap();
+        fs::write(
+            other.join("kendex.toml"),
+            "[bundles.also]\nskills = [\"shared\"]\n",
+        )
+        .unwrap();
+        let closure = detach::closure(&env, &scope, "cat", &manifest_of(&env, &scope)).unwrap();
+        assert!(closure.items.is_empty());
+        let report = detach::remove(&env, &scope, "cat", false).unwrap();
+        apply::execute(&env, &report.plan).unwrap();
+
+        let manifest = manifest_of(&env, &scope);
+        assert!(!manifest.sources.contains_key("cat"));
+        assert!(!manifest.bundles.contains_key("core"));
+        let after = kendex_core::lock::load(&kendex_core::lock::lock_path(&env, &scope)).unwrap();
+        let recorded: Vec<_> = after
+            .entries
+            .values()
+            .map(|entry| entry.source.as_str())
+            .collect();
+        assert_eq!(recorded, ["other"], "edited={edited}: persisted transfer");
+        assert!(after.sources.is_empty());
+        assert!(after.bundles.is_empty());
+        assert_eq!(fs::read(&installed).unwrap(), preserved, "edited={edited}");
+        for (key, entry) in &after.entries {
+            assert_eq!(entry.rendered_hash, before.entries[key].rendered_hash);
+            assert_eq!(entry.emitted, before.entries[key].emitted);
+        }
+        let later = kendex_core::engine::audit(&env, &scope).unwrap();
+        let shared: Vec<_> = later
+            .drift
+            .iter()
+            .filter(|row| row.name == "shared")
+            .collect();
+        if edited {
+            assert!(!shared.is_empty());
+            for row in shared {
+                assert_eq!(row.state, DriftState::Conflict);
+                assert!(matches!(
+                    row.cause,
+                    Some(DriftCause::LocalEdit | DriftCause::Both)
+                ));
+            }
+        } else {
+            assert!(shared.is_empty());
+        }
     }
 }
 

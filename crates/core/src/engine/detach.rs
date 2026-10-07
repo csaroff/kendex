@@ -181,12 +181,52 @@ fn without_source(manifest: &Manifest, source_name: &str) -> Manifest {
     out
 }
 
+/// Transfer only the leaving source's records that the surviving expansion
+/// carries, at the revision the locked plan reads. Other collisions still
+/// reach the normal rebind refusal.
+fn rebound_survivors(
+    env: &Env,
+    scope: &Scope,
+    source_name: &str,
+    without: &Manifest,
+    lock: &crate::lock::Lock,
+) -> Result<crate::lock::Lock> {
+    let (survivors, _) =
+        planned_closure_held(env, scope, without, lock, &super::PlanOptions::locked())?;
+    let mut rebound = lock.clone();
+    for item in survivors {
+        let entries: Vec<_> = rebound
+            .entries
+            .values_mut()
+            .filter(|entry| {
+                entry.source == source_name && entry.kind == item.kind && entry.name == item.name
+            })
+            .collect();
+        if entries.is_empty() {
+            continue;
+        }
+        let source = crate::source::require_ready_at(
+            env,
+            scope,
+            &item.decl.source,
+            without,
+            item.decl.rev.as_deref(),
+        )?;
+        for entry in entries {
+            super::item_plan::rebind_detached(entry, source_name, &source);
+        }
+    }
+    Ok(rebound)
+}
+
 /// Unsubscribe and uninstall: remove every declaration the source's closure
 /// covers, then let the plan sweep the installations and any dependency whose
 /// only parents left with it. Members another marketplace's bundle still
-/// carries stay, by the same edge rules an ordinary removal follows. An edited
+/// carries transfer to that bundle's source before the normal plan compares
+/// and records their installations. An edited
 /// installation is never swept without a decision — remove refuses while any
-/// package is edited unless `discard_edits` says to take the edits too.
+/// leaving package is edited unless `discard_edits` says to take those edits
+/// too. Surviving packages keep their edit hold.
 pub fn remove(
     env: &Env,
     scope: &Scope,
@@ -225,10 +265,18 @@ pub fn remove(
                 .collect(),
         ),
         sweep_unneeded: true,
-        overwrite_edited: discard_edits,
+        overwrite_edited_names: discard_edits.then(|| {
+            closure
+                .items
+                .iter()
+                .map(|item| (item.kind, item.name.clone()))
+                .collect()
+        }),
         ..super::PlanOptions::locked()
     };
-    let mut report = super::plan_scope(env, &scope, &without, &lock, &options)?;
+    let rebound = rebound_survivors(env, &scope, source_name, &without, &lock)?;
+    let mut report =
+        super::plan_scope_with_lock_base(env, &scope, &without, &rebound, &lock, &options)?;
     if !super::persists_manifest(&report.plan.ops) {
         crate::engine::ops::insert_manifest_save(env, &scope, &mut report.plan, without)?;
     }
@@ -321,8 +369,8 @@ fn local_target(env: &Env, scope: &Scope, kind: ItemKind, name: &str) -> Result<
     Ok(target)
 }
 
-/// Unsubscribe but keep the packages: convert each installation to a local one
-/// and remove the source. This copies each item's **source-form** bytes from
+/// Unsubscribe but keep the packages that would leave: convert each to a local
+/// installation and remove the source. This copies each item's **source-form** bytes from
 /// the catalog at the exact commit it was installed from into the scope's local
 /// source, flips its declaration to `local`, and records the conversion as a
 /// fork whose bytes did not change. The local writes are ordered before the
@@ -380,6 +428,15 @@ pub fn source(env: &Env, scope: &Scope, source_name: &str) -> Result<Plan> {
     for (name, carry) in carried {
         carry.apply(&mut converted, &name);
     }
+
+    let rebound = rebound_survivors(
+        env,
+        &scope,
+        source_name,
+        &without_source(&manifest, source_name),
+        &lock,
+    )?;
+    super::plan_lock_write(env, &scope, &converted, &lock, &rebound, &mut ops)?;
 
     let manifest_path = crate::manifest::manifest_path(env, &scope);
     ops.push(PlannedOp {
