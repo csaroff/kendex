@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use super::text::shown;
+use super::text::{shown, verbatim};
 use super::*;
 use crate::lock::{InstallRef, LockEntry, Reason};
 use crate::model::HarnessId;
@@ -1023,11 +1023,57 @@ impl ScopeCheck<'_> {
                     ));
                 }
             } else {
-                sections.unknown.push(unknown(format!(
-                    "{prefix}{kind} {name}: {}",
-                    shown(&note.message)
-                )));
+                sections.unknown.push(self.unreadable_line(manifest, note));
             }
+        }
+    }
+
+    /// The could-not-check line for evidence the last comparison could not
+    /// read, at the mirror state that produced it.
+    ///
+    /// A fetch that is due re-derives the comparison in the background
+    /// refresh this check starts, which settles most of these: a cached
+    /// copy missing a commit is the usual one. That refresh fetches only
+    /// the enabled sources this manifest declares, so a note on any other
+    /// mirror has no retry coming and stays could-not-check. A recorded
+    /// fetch error means the last retry failed: a failure keeps the old
+    /// fetch time, so the stamp still reads as due, but nothing has settled
+    /// and the person is told. A success clears the error.
+    fn unreadable_line(
+        &self,
+        manifest: Option<&crate::manifest::Manifest>,
+        note: &crate::drift::snapshot::UnreadableSnapshot,
+    ) -> Line {
+        let fetched = !note.repo.is_empty() && {
+            let mirror = crate::remote::cache_key(self.env, &note.repo);
+            manifest.is_some_and(|manifest| {
+                manifest.sources.values().any(|source| {
+                    source.enabled
+                        && source
+                            .repo
+                            .as_deref()
+                            .is_some_and(|repo| crate::remote::cache_key(self.env, repo) == mirror)
+                })
+            })
+        };
+        let settles = fetched
+            && stamp_for(self.env, &note.repo)
+                .is_some_and(|stamp| stamp.is_stale(self.now) && stamp.last_error.is_none());
+        Line {
+            class: match settles {
+                true => Class::Settling,
+                false => Class::Unknown,
+            },
+            text: format!(
+                "{}{} '{}': {}",
+                self.prefix,
+                note.kind.name(),
+                shown(&note.name),
+                shown(&note.message)
+            )
+            .into(),
+            remedy: None,
+            detail: note.detail.as_deref().map(verbatim),
         }
     }
 
@@ -1107,16 +1153,14 @@ impl ScopeCheck<'_> {
                 continue;
             };
             if let Some(since) = stamp.failing_since(self.now) {
-                sections.unknown.push(unknown(format!(
-                    "{prefix}source {} unreachable since {}{}",
-                    shown(repo),
-                    crate::clock::iso_from_unix(since),
-                    stamp
-                        .last_error
-                        .as_deref()
-                        .map(|error| format!(" ({})", shown(error)))
-                        .unwrap_or_default()
-                )));
+                sections.unknown.push(Line {
+                    detail: stamp.last_error.as_deref().map(verbatim),
+                    ..unknown(format!(
+                        "{prefix}source {} unreachable since {}",
+                        shown(repo),
+                        crate::clock::iso_from_unix(since),
+                    ))
+                });
             }
         }
     }

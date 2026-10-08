@@ -15,7 +15,7 @@ use crate::model::{ItemKind, Scope};
 
 /// Bumped when the shape changes; an older or newer snapshot reads as
 /// absent, which the check reports as not-yet-evaluated.
-pub const SNAPSHOT_SCHEMA: u32 = 3;
+pub const SNAPSHOT_SCHEMA: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -39,6 +39,9 @@ pub struct UnreadableSnapshot {
     pub kind: ItemKind,
     pub name: String,
     pub message: String,
+    /// The warning's technical cause, for `check --verbose` and `--json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
     pub repo: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refs_state: Option<String>,
@@ -207,6 +210,7 @@ pub fn record_with(
                 kind: warning.kind,
                 name: warning.name.clone(),
                 message: warning.message.clone(),
+                detail: warning.detail.clone(),
                 refs_state: evaluated_refs(env, &repo, &mut refs_by_repo),
                 repo,
             }
