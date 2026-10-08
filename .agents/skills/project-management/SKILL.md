@@ -22,6 +22,35 @@ tags: [planning]
 Problems with a kendex-owned skill go through `kendex report`; check ownership in the file first.
 <!-- kendex:shared-instructions:end -->
 
+### Intake
+
+File a kendex issue only when its body names one of these two, in addition to the Creation bar in § Disposition:
+
+- **A failure that happened**: a `**Symptom**:` header that names where it broke, when, and what broke.
+- **An owner request**: an `**Owner**:` header, placed right after `**Reached by**:`, that names the owner's note or ask. That `**Reached by**:` line names the same ask, as § Disposition says of an owner-directed item.
+
+For kendex, `templates/issue-description-template.md` keeps the `**Symptom**:` header at every priority and from every source where a failure happened. Its rule that drops the line outside a review-born priority-2 filing does not apply here.
+
+Intake decides only whether new work is filed. A create that groups or splits work already filed or already approved is never skipped or declined under Intake: a coordination parent per `templates/parent-issue-template.md` Rule 7, a tpm-audit § 7.0 hierarchy-contract child, a decomposed child, a research issue or spike for an existing item, or a roadmap child of an approved plan. Such a create carries its source item's `**Symptom**:` or `**Owner**:` line when the source has one. A child of an approved plan names, on its `**Owner**:` line, the approval that admitted the plan: the roadmap-plan § 5 answer or the audit-issues § 6 approval. Otherwise it needs neither line.
+
+audit-issues applies Intake to every kendex create it executes, whatever producer built its input and whatever `create_fields` that producer filled:
+
+- § 6, in `ask` and `auto` mode alike, shows each new-work candidate with the Symptom or Owner text it rests on: a line in its proposal comment, its source item or its `create_fields`, or the owner's ask in this session. It declines a candidate with neither, naming this rule.
+- § 7.2 writes each new-work create's `**Symptom**:` or `**Owner**:` header from the text § 6 showed for it, and writes no header that text lacks. A create that Intake exempts carries only the line the paragraph above gives it, or neither.
+
+No producer marks a candidate `skip` under this rule. A create the primary session runs outside audit-issues applies the same check and headers at its own create.
+
+The 2026-10-08 backlog read canceled these four kinds, each filed with neither line:
+
+- A post-merge reading's remainder filed as a new item (KEN-3369, KEN-3371, KEN-3375). The reading stays on its originating item, per § Disposition.
+- A plan follow-up that proposes a migration with no failing action (KEN-2360, KEN-2361, KEN-2362).
+- An audit item that reclassifies a correct refusal (KEN-2378, KEN-2397).
+- A scanner or grammar extension with no live failure (KEN-2207, KEN-3285).
+
+An organization setup request, one that names a host, account, repository or person of this organization, is not filed as asked. Restate it as a need any catalog consumer has. Otherwise return it to its sender with its destination named: the overseer, or the repository or Linear team that owns this organization's setup.
+
+`issues create` checks neither line, apart from its review-born priority-2 `Symptom:` refusal. The author applies this rule.
+
 ### Project taxonomy
 
 Require one agent and one surface label. Surface means where a person meets the work. Agent names are declared by LINEAR_AGENT_LABELS in kendex.settings.toml. Labels outside these categories are legacy and are not assigned.
