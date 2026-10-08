@@ -234,14 +234,35 @@ pub fn confirm_and_apply(
     report: &EngineReport,
     yes: bool,
 ) -> Result<usize, Box<dyn std::error::Error>> {
+    match confirm_plan_and_apply(env, report, yes)? {
+        PlanApplication::Applied(applied) => Ok(applied),
+        PlanApplication::Declined => Err("cancelled — these changes were not written".into()),
+    }
+}
+
+pub(super) enum PlanApplication {
+    Applied(usize),
+    Declined,
+}
+
+/// Plan consent shared by verbs that handle a decline as their own outcome.
+pub(super) fn confirm_plan_and_apply(
+    env: &Env,
+    report: &EngineReport,
+    yes: bool,
+) -> Result<PlanApplication, Box<dyn std::error::Error>> {
     // The count is the consequence: an answer given to a bare "apply?" is
     // an answer to the verb's name rather than to what it writes. An empty
     // plan asks nothing and writes nothing, and still reaches the offer.
     if !report.plan.is_empty() {
         let ops = report.plan.ops.len();
-        ask_before_writing(&format!("write {ops} change{}?", plural(ops)), yes)?;
+        if confirm_before_writing(&format!("write {ops} change{}?", plural(ops)), yes)?
+            == Confirmation::Declined
+        {
+            return Ok(PlanApplication::Declined);
+        }
     }
-    apply_report(env, report)
+    apply_report(env, report).map(PlanApplication::Applied)
 }
 
 /// Execute a report's plan — the one way a CLI verb holding an
@@ -315,13 +336,30 @@ pub fn apply_report(env: &Env, report: &EngineReport) -> Result<usize, Box<dyn s
 /// Asked through `ui::consent`: Enter is no and exits 1; Escape and Ctrl-C
 /// cancel, which the run exits 130 on.
 pub fn ask_before_writing(question: &str, yes: bool) -> CliResult {
+    match confirm_before_writing(question, yes)? {
+        Confirmation::Accepted => Ok(()),
+        Confirmation::Declined => Err("cancelled — these changes were not written".into()),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Confirmation {
+    Accepted,
+    Declined,
+}
+
+/// A decline leaves the caller's scope unchanged; read errors still stop it.
+pub(super) fn confirm_before_writing(
+    question: &str,
+    yes: bool,
+) -> Result<Confirmation, Box<dyn std::error::Error>> {
     require_yes_in_non_interactive(yes)?;
     if yes {
-        return Ok(());
+        return Ok(Confirmation::Accepted);
     }
     match ui::consent(question)? {
-        true => Ok(()),
-        false => Err("cancelled — these changes were not written".into()),
+        true => Ok(Confirmation::Accepted),
+        false => Ok(Confirmation::Declined),
     }
 }
 

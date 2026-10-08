@@ -5,8 +5,8 @@
 //! exactly one. Escape, Ctrl-C and the end of input cancel: the read comes
 //! back as an interrupted error, which [`super::cancelled`] recognises and
 //! the run exits 130 on, having written nothing the question asked about. A
-//! key the question does not show is ignored and the read waits for another,
-//! so a stray key picks nothing. Keys that reached the terminal before a
+//! key the question does not show is ignored by [`choose`]. Write consent
+//! also accepts n or N as an alias for No. Keys that reached the terminal before a
 //! question is drawn are discarded. A key typed after it is drawn answers
 //! it, an Enter included that follows a key leading straight to an
 //! instantly drawn question, such as the offer's `c` and the message
@@ -39,8 +39,7 @@ pub fn choose<T: Copy>(options: &[(Choice<'_>, T)]) -> io::Result<T> {
 }
 
 /// The consent a write needs: the question as a callout, `[y] yes` and
-/// `[Enter] no`. Enter, the answer a stray key is likeliest to be, never
-/// writes.
+/// `[Enter] no`. Enter, n and N select No and never write.
 pub fn consent(question: &str) -> io::Result<bool> {
     let mut keys = Keys::ready()?;
     let reading = keys.reading;
@@ -51,11 +50,22 @@ fn consented(
     style: &Style,
     reading: Reading,
     question: &str,
-    read: impl FnMut() -> io::Result<Pressed>,
+    mut read: impl FnMut() -> io::Result<Pressed>,
     mut draw: impl FnMut(&[String]),
 ) -> io::Result<bool> {
     draw(&style.callout(question, None, &[]));
-    asked(style, reading, &CONSENT, read, draw)
+    asked(
+        style,
+        reading,
+        &CONSENT,
+        || {
+            read().map(|key| match key {
+                Pressed::Char('n' | 'N') => Pressed::Enter,
+                key => key,
+            })
+        },
+        draw,
+    )
 }
 
 const CONSENT: [(Choice<'static>, bool); 2] = [
@@ -627,7 +637,7 @@ mod tests {
         ];
         let plain_asked = ["! write 3 changes?", "  [y] yes · [Enter] no"];
         type Row = (&'static str, Pressed, bool, &'static str, &'static str);
-        let rows: [Row; 2] = [
+        let rows: [Row; 4] = [
             (
                 "accept",
                 Pressed::Char('y'),
@@ -638,6 +648,20 @@ mod tests {
             (
                 "decline",
                 Pressed::Enter,
+                false,
+                "  <34>›</> <1>no</>",
+                "  › no",
+            ),
+            (
+                "typed no",
+                Pressed::Char('n'),
+                false,
+                "  <34>›</> <1>no</>",
+                "  › no",
+            ),
+            (
+                "typed No",
+                Pressed::Char('N'),
                 false,
                 "  <34>›</> <1>no</>",
                 "  › no",
