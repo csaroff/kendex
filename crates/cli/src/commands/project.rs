@@ -257,21 +257,44 @@ pub fn registrable(env: &Env, root: &std::path::Path, flag: ThrowawayFlag) -> Cl
 ///
 /// A run with no named project registers nothing and is asked nothing:
 /// writing the project a command was typed in is what every release
-/// before `--project-path` did, and it never touched the registry.
+/// before `--project-path` did, and it never touched the registry. Nor is
+/// a linked git worktree, which [`register_target`] never lists.
+///
+/// Whether a root lies inside a linked worktree, its own repository's or
+/// one enclosing that repository, is settled here, once, and the
+/// [`Registering`] returned is what [`register_target`] spends after the
+/// write. A git that cannot answer refuses the run here, before anything
+/// is written, rather than reading as a main checkout and listing a
+/// worktree nobody classified.
 pub fn target_registrable(
     env: &Env,
     target: &crate::flags::ProjectTargetFlag,
     scopes: &[Scope],
-) -> CliResult {
+) -> Result<Registering, Box<dyn std::error::Error>> {
     if target.path().is_none() {
-        return Ok(());
+        return Ok(Registering::Nothing);
     }
+    let mut worktrees = Vec::new();
     for scope in scopes {
-        if let Scope::Project { root } = scope {
-            registrable(env, root, target.throwaway)?;
+        let Scope::Project { root } = scope else {
+            continue;
+        };
+        match kendex_core::guard::Repo::enclosed_by_linked(root)? {
+            true => worktrees.push(root.clone()),
+            false => registrable(env, root, target.throwaway)?,
         }
     }
-    Ok(())
+    Ok(Registering::Named { worktrees })
+}
+
+/// What a run puts on the projects list after its write, settled before
+/// it by [`target_registrable`].
+pub enum Registering {
+    /// No `--project-path`, or a run that writes nothing: no registration.
+    Nothing,
+    /// A named project, registered unless its root is one of these linked
+    /// git worktrees.
+    Named { worktrees: Vec<PathBuf> },
 }
 
 /// The project a `--project-path` named, on the projects list now that the
@@ -291,18 +314,31 @@ pub fn target_registrable(
 /// where a Pi settle before the final confirm has already written what
 /// this then registers.
 ///
-/// Called by `refresh`, `apply` and `updates --apply` after the write, and
-/// only where the destination was named: a walked-up project is the one
-/// the command was typed in, which those verbs have never registered.
-pub fn register_target(
-    env: &Env,
-    target: &crate::flags::ProjectTargetFlag,
-    scope: &Scope,
-) -> CliResult {
-    match target.path() {
-        Some(_) => register_destination(env, scope),
-        None => Ok(()),
+/// A named root inside a linked git worktree, a repository nested in one
+/// included, is never registered, and no flag changes that: a worktree is removed when its lane ends, and an
+/// entry for it would outlive it on every projects list. The run says so
+/// in one `worktree-not-listed=<root>` line instead. A person who wants
+/// one listed names it to `project add`, the explicit door, which lists
+/// any folder it is given.
+///
+/// Called by `refresh`, `apply` and `updates --apply` after the write, with
+/// the [`Registering`] their preflight settled, and registers only where
+/// the destination was named: a walked-up project is the one the command
+/// was typed in, which those verbs have never registered.
+pub fn register_target(env: &Env, registering: &Registering, scope: &Scope) -> CliResult {
+    let Registering::Named { worktrees } = registering else {
+        return Ok(());
+    };
+    if let Scope::Project { root } = scope
+        && worktrees.contains(root)
+    {
+        out(&format!(
+            "worktree-not-listed={}: a linked git worktree is not added to your projects",
+            root.display()
+        ));
+        return Ok(());
     }
+    register_destination(env, scope)
 }
 
 /// Put the folder an install has just written into on the list of projects
