@@ -255,15 +255,6 @@ enum Verdict {
 const EDITED: &str =
     "no longer wanted, but its files were edited on disk — remove it by name to confirm";
 
-/// The conflict a kept retired item's copy leaves once its files are gone.
-/// A prune takes the record with nothing left to hold.
-const RETIRED_GONE: &str = "its catalog retired it and its installed files are gone — refresh with --prune takes the record, or remove it by name";
-
-/// The conflict a kept retired item's copy leaves once its files were
-/// edited: a prune holds the edits as it holds any orphan's, so only
-/// naming it takes them.
-const RETIRED_EDITED: &str = "its catalog retired it and its installed files were edited on disk — remove it by name to take them";
-
 /// Removing by name affects every tool that still installs the item.
 /// Applying with edits discarded takes only the unwanted copy.
 const EDITED_KEPT: &str = "no longer wanted, but its files were edited on disk: apply with --discard-edits to confirm; removing it by name would also remove it from tools that still request, require or bundle it";
@@ -920,26 +911,40 @@ fn pi_state(env: &Env, scope: &Scope, entry: &LockEntry) -> Result<PackageState>
 /// keeps, raises against its record, or `None` where every recorded file is there with the bytes the
 /// record names. A file counts as there under its switched-off name too.
 pub(super) fn retired_copy(env: &Env, scope: &Scope, entry: &LockEntry) -> Option<DriftRow> {
-    let detail = retired_copy_detail(env, scope, entry)?;
-    Some(row(
-        scope,
-        entry,
-        DriftState::Conflict,
-        detail,
-        Some(super::DriftCause::Retired),
-    ))
+    let (detail, remedy) = retired_copy_detail(env, scope, entry)?;
+    Some(DriftRow {
+        remedy,
+        ..row(
+            scope,
+            entry,
+            DriftState::Conflict,
+            detail,
+            Some(super::DriftCause::Retired),
+        )
+    })
 }
 
-/// What [`retired_copy`] says, where it says anything.
-fn retired_copy_detail(env: &Env, scope: &Scope, entry: &LockEntry) -> Option<String> {
-    let detail = match entry.kind {
+/// What [`retired_copy`] says, where it says anything, and the removal
+/// that settles it. A prune holds the copy wherever an edit holds, as it
+/// holds any orphan's, so only naming the item takes it, even with some of
+/// its files gone; with no edit left to hold and a file gone, a prune
+/// takes the record.
+fn retired_copy_detail(
+    env: &Env,
+    scope: &Scope,
+    entry: &LockEntry,
+) -> Option<(String, Option<super::RowRemedy>)> {
+    let (gone, held) = match entry.kind {
         ItemKind::PiExtension => match pi_state(env, scope, entry) {
             Ok(PackageState::Current { .. }) => return None,
-            Ok(PackageState::Missing) => RETIRED_GONE,
-            Ok(PackageState::Different) => RETIRED_EDITED,
+            Ok(PackageState::Missing) => (true, false),
+            Ok(PackageState::Different) => (false, true),
             Err(unread) => {
-                return Some(format!(
-                    "its catalog retired it and its installed package could not be compared: {unread}"
+                return Some((
+                    format!(
+                        "its catalog retired it and its installed package could not be compared: {unread}"
+                    ),
+                    None,
                 ));
             }
         },
@@ -950,16 +955,20 @@ fn retired_copy_detail(env: &Env, scope: &Scope, entry: &LockEntry) -> Option<St
                     .iter()
                     .all(|candidate| !candidate.exists() && !candidate.is_symlink())
             });
-            if gone {
-                RETIRED_GONE
-            } else if edit_holds(env, scope, entry) {
-                RETIRED_EDITED
-            } else {
-                return None;
-            }
+            (gone, edit_holds(env, scope, entry))
         }
     };
-    Some(detail.to_owned())
+    match (held, gone) {
+        (true, _) => Some((
+            "its catalog retired it".to_owned(),
+            Some(super::RowRemedy::RemoveEdited),
+        )),
+        (false, true) => Some((
+            "its catalog retired it and its installed files are gone".to_owned(),
+            Some(super::RowRemedy::PruneOrRemove),
+        )),
+        (false, false) => None,
+    }
 }
 
 /// Whether this installation only ever existed for another item's sake —

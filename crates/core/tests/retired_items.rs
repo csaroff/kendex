@@ -1237,8 +1237,11 @@ enum ByHand {
 /// copy deleted or edited by hand on one tool is a conflict on that tool's
 /// installation alone, its cause the retirement a refresh never fails on,
 /// the plan `kendex verify` reads failing that row,
-/// and an untouched copy raises none. A prune then takes the record of a
-/// copy that is gone and holds an edited one.
+/// and an untouched copy raises none. The row carries the removal that
+/// settles it, which verify renders with the item's kind and scope: a
+/// prune or a removal by name for a copy that is gone, only the removal
+/// for an edited one. A prune then takes the record of a copy that is gone
+/// and holds an edited one.
 #[test]
 #[allow(clippy::unwrap_used)]
 fn a_kept_retired_copy_gone_or_edited_is_a_conflict() {
@@ -1270,17 +1273,19 @@ fn a_kept_retired_copy_gone_or_edited_is_a_conflict() {
 
             let report = audit(&f.env, &f.scope).unwrap();
 
-            let conflicted: Vec<(HarnessId, Option<DriftCause>)> = report
+            let conflicted: Vec<(HarnessId, Option<DriftCause>, Option<RowRemedy>)> = report
                 .drift
                 .iter()
                 .filter(|row| {
                     row.kind == kind && row.name == name && row.state == DriftState::Conflict
                 })
-                .map(|row| (row.harness, row.cause))
+                .map(|row| (row.harness, row.cause, row.remedy))
                 .collect();
+            let retired = Some(DriftCause::Retired);
             let changed = match by_hand {
                 ByHand::Untouched => vec![],
-                ByHand::Deleted | ByHand::Edited => vec![(harness, Some(DriftCause::Retired))],
+                ByHand::Deleted => vec![(harness, retired, Some(RowRemedy::PruneOrRemove))],
+                ByHand::Edited => vec![(harness, retired, Some(RowRemedy::RemoveEdited))],
             };
             assert_eq!(conflicted, changed, "{case}");
 
@@ -1292,6 +1297,65 @@ fn a_kept_retired_copy_gone_or_edited_is_a_conflict() {
                 "{case}"
             );
         }
+    }
+}
+
+/// A kept retired skill installed by link records its shared tree and
+/// the tool's link to it, and the link is deleted by hand. With nothing
+/// else touched a prune takes the record, and the row names the prune or
+/// the removal; with the shared tree edited a prune holds it, so the row
+/// names the removal alone, never the prune that would leave the conflict
+/// standing.
+#[test]
+#[allow(clippy::unwrap_used)]
+fn a_kept_retired_copy_partly_gone_names_the_remedy_a_prune_honours() {
+    let (kind, name, harness) = (ItemKind::Skill, "deploy", HarnessId::Claude);
+    for (edited, remedy) in [
+        (false, RowRemedy::PruneOrRemove),
+        (true, RowRemedy::RemoveEdited),
+    ] {
+        let f = installed(kind, name);
+        let manifest = f.project.join("kendex.toml");
+        let declared = fs::read_to_string(&manifest).unwrap();
+        let linked = declared.replace("method = \"copy\"", "method = \"symlink\"");
+        assert_ne!(linked, declared, "the fixture installs by copy");
+        fs::write(&manifest, linked).unwrap();
+        let relinked = audit(&f.env, &f.scope).unwrap();
+        apply::execute(&f.env, &relinked.plan).unwrap();
+        let link = f.project.join(".claude/skills").join(name);
+        let shared = f.project.join(".agents/skills").join(name);
+        assert!(link.is_symlink(), "the fixture links {}", link.display());
+        assert!(shared.is_dir(), "the fixture shares {}", shared.display());
+        f.retire(kind, name, "");
+        fs::remove_file(&link).unwrap();
+        if edited {
+            let file = shared.join("SKILL.md");
+            let mut bytes = fs::read_to_string(&file).unwrap();
+            bytes.push_str("The person's line.\n");
+            fs::write(&file, bytes).unwrap();
+        }
+
+        let report = audit(&f.env, &f.scope).unwrap();
+        let pruned = plan_apply(&f.env, &f.scope, &prune_options()).unwrap();
+
+        let remedies: Vec<Option<RowRemedy>> = report
+            .drift
+            .iter()
+            .filter(|row| {
+                row.kind == kind
+                    && row.name == name
+                    && row.harness == harness
+                    && row.cause == Some(DriftCause::Retired)
+            })
+            .map(|row| row.remedy)
+            .collect();
+        assert_eq!(remedies, [Some(remedy)], "edited={edited}");
+        let key = lock::entry_key(kind, name, harness);
+        assert_eq!(
+            pruned.record.entries.contains_key(&key),
+            edited,
+            "edited={edited}: the prune's hold"
+        );
     }
 }
 
