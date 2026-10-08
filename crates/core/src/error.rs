@@ -154,6 +154,25 @@ pub enum CoreError {
         requested: String,
     },
 
+    #[error("add-conflict={} {name}\nconflicting source commits: {existing} and {requested}\nremove or update the conflicting package before adding", .kind.name())]
+    AddRevisionConflict {
+        kind: crate::model::ItemKind,
+        name: String,
+        existing: String,
+        requested: String,
+    },
+
+    #[error("add-position-conflict={} {name}\n{path} is retained by {} {installed_name} from {existing}\nrequested source: {requested}", .kind.name(), .installed_kind.name())]
+    AddPositionConflict {
+        kind: crate::model::ItemKind,
+        name: String,
+        installed_kind: crate::model::ItemKind,
+        installed_name: String,
+        path: PathBuf,
+        existing: Box<str>,
+        requested: Box<str>,
+    },
+
     // Said as what a person would see if they looked: the name they clicked
     // is a shortcut somebody else set up, and the files are somewhere else.
     // "Foreign symlink, not a clobber target" is the same fact in words that

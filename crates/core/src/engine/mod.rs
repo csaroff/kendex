@@ -196,12 +196,27 @@ fn plan_scope_with_lock_base(
     // update reads from a copy with every other follower pinned at its
     // installed commit — the pins steer this pass and never reach the file.
     let (manifest, mut state, held) = desired_pass(env, scope, declared, lock, options)?;
+    if let Some(targets) = &options.update_only
+        && targets.reach == Reach::Declared
+    {
+        ops::protect_installed(
+            env,
+            scope,
+            &manifest,
+            lock,
+            &mut state,
+            &targets.declarations,
+        )?;
+    }
     // Advisory scoring over what this plan would write, before the ops are
     // planned: the rows ride out on the report beside the plan.
     let safety = scoring::run(scope, &state);
     let (mut drift, mut ops) = (Vec::new(), Vec::<PlannedOp>::new());
     let (mut new_lock, readings) = fresh_lock(env, &manifest, lock, &state, options, &held);
     let (mut written, mut kept) = (written::Written::default(), item_plan::KeptAsIs::default());
+    for key in &state.addition_kept {
+        kept.keep(&mut new_lock, key, &lock.entries[key]);
+    }
     let mut config_edits = config_edits::ConfigEditPlan::default();
 
     plan_manifest_write(env, scope, options.manifest_base.as_ref(), &state, &mut ops)?;
@@ -254,7 +269,7 @@ fn plan_scope_with_lock_base(
     state.warnings.extend(notices);
     let kept = kept_members(lock, &new_lock, &options.uninstalled_bundles);
     let repo_effects_leaving = repo_effects::leaving(env, scope, lock, &new_lock)?;
-    let trees = generated_paths::Unrendered::of(env, scope, &state, lock, &new_lock)?;
+    let trees = generated_paths::Unrendered::of(env, scope, &state, &item_pass, lock, &new_lock)?;
     // Read off before the record moves into its write: a pass that
     // writes no record still says which commit each revision resolved to.
     let resolved_sources = resolved_revisions(&new_lock, &state);
@@ -387,8 +402,7 @@ fn report(
 }
 
 /// Finalize the kept Pi records and plan the native switches a declaration
-/// changed and the project's inherited instructions. Each append-file edit
-/// joins that file's other config edits.
+/// changed. Each append-file edit joins that file's other config edits.
 fn plan_pi_switches(
     env: &Env,
     scope: &Scope,
@@ -412,16 +426,28 @@ fn plan_pi_switches(
     for (path, label, edit) in edits {
         config_edits.push(path, label, edit);
     }
+    Ok(drift)
+}
+
+/// Pi prefers a project's append file over the global file. A first project
+/// style must therefore carry global instructions alongside its own edits.
+fn plan_pi_inheritance(
+    env: &Env,
+    scope: &Scope,
+    reconcile: bool,
+    config_edits: &mut config_edits::ConfigEditPlan,
+) -> Result<()> {
     if let Scope::Project { root } = scope {
         let pi_root = root.join(".pi");
         let path = crate::pi_ext::append_system_path(&pi_root);
-        if let Some(edit) =
-            crate::pi_ext::inherited_edit(env, &pi_root, config_edits.by_file.contains_key(&path))?
+        let updating = config_edits.by_file.contains_key(&path);
+        if (reconcile || updating)
+            && let Some(edit) = crate::pi_ext::inherited_edit(env, &pi_root, updating)?
         {
             config_edits.push(path, "global Pi instructions".into(), edit);
         }
     }
-    Ok(drift)
+    Ok(())
 }
 
 /// Everything a plan takes away, after every write is planned: what a
@@ -451,7 +477,7 @@ fn plan_removals(
     // trash twice.
     let mut guard = removal::TrashGuard::new(&state.items, owned::paths(env, scope, new_lock));
     stale::stale_emitted(lock, new_lock, &mut guard, ops)?;
-    let decided_keys = plan_pass::plan_not_written(
+    let mut decided_keys = plan_pass::plan_not_written(
         env,
         scope,
         manifest,
@@ -464,6 +490,7 @@ fn plan_removals(
         new_lock,
         kept,
     )?;
+    decided_keys.extend(state.addition_kept.iter().cloned());
     let removed = removal::orphans(
         env,
         scope,
@@ -483,14 +510,17 @@ fn plan_removals(
     )?;
     // Orphan retention copies old entries; carrier comparison must finalize
     // the retained Pi records after that pass, including native enablement.
-    drift.extend(plan_pi_switches(
-        env,
-        scope,
-        manifest,
-        new_lock,
-        ops,
-        config_edits,
-    )?);
+    if state.additions.is_none() {
+        drift.extend(plan_pi_switches(
+            env,
+            scope,
+            manifest,
+            new_lock,
+            ops,
+            config_edits,
+        )?);
+    }
+    plan_pi_inheritance(env, scope, state.additions.is_none(), config_edits)?;
     Ok(removed)
 }
 
