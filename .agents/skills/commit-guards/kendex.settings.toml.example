@@ -60,9 +60,15 @@ COMMIT_GUARDS_MD_REFS_PATHS = "AGENTS.md */AGENTS.md CLAUDE.md */CLAUDE.md SKILL
 
 # The source files whose comments, and a TOML file's string values too, are
 # checked for those same document links, as path patterns separated by
-# spaces. Unset uses the file extensions the skill ships; an explicitly
-# empty value is refused, so name a path or drop the check.
+# spaces. Unset uses the file extensions the skill ships. An empty combined
+# base and EXTRA list is refused, so name a path or drop the check.
 # COMMIT_GUARDS_MD_REFS_SOURCE_PATHS = "*.rs *.sh"
+
+# Path patterns added to either list above, the shipped one or the value
+# that replaces it, so adding a file restates none of the rest. Empty adds
+# nothing.
+# COMMIT_GUARDS_MD_REFS_PATHS_EXTRA = "docs/guides/*.md"
+# COMMIT_GUARDS_MD_REFS_SOURCE_PATHS_EXTRA = "bin/fleet"
 
 # The source files the comments check reads, as path patterns separated by
 # spaces. A value replaces the list of file extensions the skill ships; add
