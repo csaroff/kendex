@@ -371,6 +371,112 @@ mv "$R/scripts/big.new" "$R/scripts/big.sh"
 run_pf
 fires "deleting the trap line from the same large file restores the finding" "scripts/big.sh:3: [mktemp-trap]"
 
+echo "=== an EXIT trap whose quoted action spans lines arms cleanup ==="
+seed multitrap
+cat >"$R/scripts/multitrap.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+D="$(mktemp -d)"
+trap '
+  rm -rf -- "${D:?}"
+' EXIT
+echo "$D"
+EOF
+cat >"$R/scripts/multitrap-continued.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+D="$(mktemp -d)"
+trap '
+  rm -rf -- "${D:?}"
+' \
+  EXIT
+echo "$D"
+EOF
+cat >"$R/scripts/multitrap-listed.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+D="$(mktemp -d)"
+trap "
+  rm -rf -- \"\${D:?}\"
+" INT 'EXIT'; echo "armed"
+echo "$D"
+EOF
+cat >"$R/scripts/multitrap-substituted.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+D="$(mktemp -d)"
+trap "
+  rm -rf -- \"\${D:?}\" $(printf "%s" done)" EXIT
+echo "$D"
+EOF
+run_pf
+clean "a multiline EXIT trap is read as the EXIT trap it is, with its signal continued, quoted, followed by a quoted command, or after quotes inside a substitution" 4
+
+echo "=== control: the action's own words name no signal ==="
+cat >"$R/scripts/multitrap.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+D="$(mktemp -d)"
+trap '
+  echo EXIT
+' INT
+echo "$D"
+EOF
+cat >"$R/scripts/multisubst-trap.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+D="$(mktemp -d)"
+trap "
+  echo EXIT $(printf done)
+" INT
+echo "$D"
+EOF
+cat >"$R/scripts/heredoc-trap.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+D="$(mktemp -d)"
+cat >"$D/child.sh" <<'CHILD'
+trap '
+  echo cleanup
+' EXIT
+CHILD
+echo "$D"
+EOF
+cat >"$R/scripts/comment-trap.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+D="$(mktemp -d)"
+trap '
+  echo cleanup
+' INT # no EXIT trap
+echo "$D"
+EOF
+cat >"$R/scripts/later-command-trap.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+D="$(mktemp -d)"
+trap '
+  echo cleanup
+' INT; exit 0
+echo "$D"
+EOF
+cat >"$R/scripts/inner-quote-trap.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+D="$(mktemp -d)"
+trap "
+  echo $(printf "%s" EXIT)" INT
+echo "$D"
+EOF
+run_pf
+fires "a multiline INT trap whose action says EXIT, plainly, beside or inside a substitution, an EXIT trap in a here-document, or EXIT after the trap command ends, still leaves scratch behind" \
+  "scripts/inner-quote-trap.sh:3: [mktemp-trap]" \
+  "scripts/multitrap.sh:3: [mktemp-trap]" \
+  "scripts/multisubst-trap.sh:3: [mktemp-trap]" \
+  "scripts/heredoc-trap.sh:3: [mktemp-trap]" \
+  "scripts/comment-trap.sh:3: [mktemp-trap]" \
+  "scripts/later-command-trap.sh:3: [mktemp-trap]"
+
 echo "=== a temp-path literal is a finding only in a creation call's hands ==="
 seed tmppath
 mkdir -p "$R/src"
