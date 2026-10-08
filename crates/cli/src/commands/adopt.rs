@@ -1,5 +1,6 @@
-use kendex_core::engine::{adopt, audit};
+use kendex_core::engine::{adopt, audit, ops};
 use kendex_core::env::Env;
+use kendex_core::harness::installs_here;
 use kendex_core::model::{HarnessId, ItemKind};
 
 use super::advisory::{Listing, print_safety};
@@ -32,10 +33,22 @@ pub fn run(
             harnesses.push(parsed);
         }
     }
-    if harnesses.is_empty() {
-        harnesses.push(HarnessId::Claude);
-    }
     let scope = resolve_scopes(env, filter)?.remove(0);
+    if harnesses.is_empty() {
+        harnesses = ops::manifest_for_mutation(env, &scope)?.install.harnesses;
+        if harnesses.is_empty() {
+            return Err("cannot adopt: no harnesses are enabled in [install].harnesses".into());
+        }
+        harnesses.retain(|harness| installs_here(*harness, kind, &scope));
+        if harnesses.is_empty() {
+            return Err(format!(
+                "cannot adopt: no enabled harness supports {} in {}",
+                kind.name(),
+                scope.label()
+            )
+            .into());
+        }
+    }
 
     let move_plan = adopt::adopt(env, &scope, kind, &name, &harnesses)?;
     for op in &move_plan.ops {
