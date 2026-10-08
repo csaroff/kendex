@@ -172,6 +172,7 @@ reset_case() {
   git -C "$repo" clean -qfd
 }
 
+
 # The first line alone: a wiring error's key/value line, ahead of its English.
 # Cut in the shell rather than piped into head, which stops reading while its
 # producer still writes.
@@ -191,6 +192,223 @@ write_lines() { # REPO PATH COUNT|binary
     printf 'line %d\n' "$n" >>"$1/$2"
   done
 }
+
+# Hosted lanes use blob:none clones. The source store retains missing blobs;
+# the proof checkout must fetch into its own object store instead.
+reset_case
+set_verifier clean
+write_lines "$repo" .agents/skills/orch/app.ts 2
+git -C "$repo" add -A
+git -C "$repo" commit -q -m 'render in a partial clone'
+git -C "$repo" config uploadpack.allowFilter true
+git -C "$repo" config uploadpack.allowAnySHA1InWant true
+partial="$SANDBOX/partial"
+git clone -q --no-checkout --filter=blob:none "file://$repo" "$partial"
+git -C "$partial" config gc.auto 0
+git -C "$partial" config maintenance.auto false
+git -C "$partial" checkout -q --detach "$base"
+while IFS='|' read -r label remote_url; do
+  git -C "$partial" remote set-url origin "$remote_url"
+  missing="$(git -C "$partial" rev-list --objects --missing=print case)"
+  assert_eq "$label partial clone has a missing head blob before classification" true \
+    "$(grep -Eq '^\?' <<<"$missing" && echo true || echo false)"
+  PATH="$stub_bin:$PATH" assert_class "$label partial clone fetches missing blobs privately" render \
+    --repo "$partial" --event pull_request --base "$base" --head case
+  assert_eq "$label partial clone working tree stays at its original commit" "$base" \
+    "$(git -C "$partial" rev-parse HEAD)"
+  assert_eq "$label partial clone keeps its remote URL" "$remote_url" \
+    "$(git -C "$partial" remote get-url origin)"
+  missing="$(git -C "$partial" rev-list --objects --missing=print case)"
+  assert_eq "$label partial clone still lacks the head blob after classification" true \
+    "$(grep -Eq '^\?' <<<"$missing" && echo true || echo false)"
+done <<URLS
+file URL|file://$repo
+absolute path|$repo
+relative path|../change-class
+explicit local path|./../change-class
+URLS
+relative_mutant="$(mutant partial-relative-url change-class \
+  '                value="$remote_base/$value" ;;' \
+  '                : ;;')"
+relative_err="$(PATH="$stub_bin:$PATH" "$relative_mutant" --repo "$partial" \
+  --event pull_request --base "$base" --head case 2>&1 >/dev/null)"
+assert_eq 'control: copying a relative URL without its base cannot check out the head' true \
+  "$(grep -Eq '^class: class=standard measured=false cause=head-checkout-failed head=' <<<"$relative_err" && echo true || echo false)"
+partial_mutant="$(mutant partial-promisor change-class \
+  '    git -C "$private_tree" config "$key" "$value" 2>>"$3" || return 1' \
+  '    :')"
+partial_err="$(PATH="$stub_bin:$PATH" "$partial_mutant" --repo "$partial" \
+  --event pull_request --base "$base" --head case 2>&1 >/dev/null)"
+assert_eq 'control: alternates without promisor settings cannot check out the head' true \
+  "$(grep -Eq '^class: class=standard measured=false cause=head-checkout-failed head=' <<<"$partial_err" && echo true || echo false)"
+git -C "$partial" remote set-url origin ../missing-remote
+partial_err="$(PATH="$stub_bin:$PATH" "$CHANGE_CLASS" --repo "$partial" \
+  --event pull_request --base "$base" --head case 2>&1 >/dev/null)"
+assert_eq 'an unavailable relative remote still refuses the head checkout' true \
+  "$(grep -Eq '^class: class=standard measured=false cause=head-checkout-failed head=' <<<"$partial_err" && echo true || echo false)"
+git -C "$partial" remote set-url origin ../change-class
+assert_eq 'the judged clone can fetch the missing blob with its relative remote' \
+  $'line 1\nline 2' "$(git -C "$partial" show case:.agents/skills/orch/app.ts)"
+assert_eq 'native relative fetch keeps the judged working tree at its original commit' "$base" \
+  "$(git -C "$partial" rev-parse HEAD)"
+
+# The public transport is a local release fixture. The classifier still runs
+# its own fetch and exact-pin comparison; no ownership operation is stubbed.
+release_catalog="$(new_repo released-caller)"
+mkdir -p "$release_catalog/skills/review-gate/templates"
+released_template="$SANDBOX/released-caller.yml"
+cp "$TEST_DIR/../../review-gate/templates/kendex-refresh.yml" "$released_template"
+cp "$released_template" \
+  "$release_catalog/skills/review-gate/templates/kendex-refresh.yml"
+git -C "$release_catalog" add -A
+git -C "$release_catalog" commit -q -m 'released refresh caller'
+git -C "$release_catalog" tag v1
+release_commit="$(git -C "$release_catalog" rev-parse v1)"
+# A version-shaped branch is not a release tag, even with matching bytes.
+sed 's|refresh-consumer.yml@v1$|refresh-consumer.yml@v2|' "$released_template" \
+  >"$release_catalog/skills/review-gate/templates/kendex-refresh.yml"
+git -C "$release_catalog" add -A
+git -C "$release_catalog" commit -q -m 'unreleased branch caller'
+git -C "$release_catalog" branch v2
+release_bin="$SANDBOX/release-bin"
+mkdir -p "$release_bin"
+real_git="$(command -v git)"
+cat >"$release_bin/git" <<WRAPPER
+#!/usr/bin/env bash
+set -euo pipefail
+args=()
+for arg in "\$@"; do
+  [ "\$arg" != fetch ] || printf '%s\n' "\$*" >>'$SANDBOX/release-fetches'
+  [ "\$arg" != https://github.com/vanillagreencom/kendex.git ] || arg='file://$release_catalog'
+  args+=("\$arg")
+done
+exec '$real_git' "\${args[@]}"
+WRAPPER
+chmod +x "$release_bin/git"
+caller_rows=0
+while IFS='|' read -r label variation help_mode extra expected; do
+  caller_rows=$((caller_rows + 1))
+  reset_case
+  set_verifier clean
+  echo "$help_mode" >"$KENDEX_STUB_HELP"
+  : >"$SANDBOX/release-fetches"
+  mkdir -p "$repo/.github/workflows"
+  cp "$released_template" "$repo/.github/workflows/kendex-refresh.yml"
+  case "$variation" in
+    symlink)
+      # A consumer PR can replace its workflow with a link to released bytes.
+      rm "$repo/.github/workflows/kendex-refresh.yml"
+      MSYS=winsymlinks:nativestrict ln -s "$released_template" \
+        "$repo/.github/workflows/kendex-refresh.yml"
+      [ -L "$repo/.github/workflows/kendex-refresh.yml" ] || exit 1 ;;
+    byte-edited) printf '#' >>"$repo/.github/workflows/kendex-refresh.yml" ;;
+    unreleased)
+      printf '\n# caller not published at its pin\n' >>"$repo/.github/workflows/kendex-refresh.yml" ;;
+    unavailable)
+      sed 's|refresh-consumer.yml@v1$|refresh-consumer.yml@v999999|' \
+        "$repo/.github/workflows/kendex-refresh.yml" >"$SANDBOX/unavailable-caller"
+      mv "$SANDBOX/unavailable-caller" "$repo/.github/workflows/kendex-refresh.yml" ;;
+    branch-only | commit-pin)
+      pin=v2
+      [ "$variation" != commit-pin ] || pin="$release_commit"
+      sed "s|refresh-consumer.yml@v1$|refresh-consumer.yml@$pin|" "$released_template" \
+        >"$repo/.github/workflows/kendex-refresh.yml" ;;
+  esac
+  if [ -n "$extra" ]; then
+    write_lines "$repo" "$extra" 4
+    # Legacy engine rows can own these paths without whole bot-output proof.
+    jq --arg path "$extra" '.rows += [{"kind":"skill","state":"ok",
+      "positions":[{"path":$path,"owns":"file"}]}]' \
+      "$KENDEX_STUB_LEDGER" >"$SANDBOX/mixed-ledger"
+    mv "$SANDBOX/mixed-ledger" "$KENDEX_STUB_LEDGER"
+  fi
+  git -C "$repo" add -A
+  git -C "$repo" commit -q -m "$label"
+  caller_err="$(PATH="$release_bin:$stub_bin:$PATH" "$CHANGE_CLASS" --repo "$repo" \
+    --event pull_request --base "$base" --head HEAD 2>&1 >/dev/null)"
+  assert_eq "$label classification" "class=$expected" \
+    "$(sed -n 's/^class: \(class=[^ ]*\).*/\1/p' <<<"$caller_err")"
+  if [ "$expected" = render ]; then
+    want='class=render measured=true cause=renders-match-their-sources'
+    assert_eq "$label ownership" "$want" "$(sed -n 's/^class: //p' <<<"$caller_err")"
+  elif [ -z "$extra" ]; then
+    want='class=standard measured=true cause=render-path-unowned path=.github/workflows/kendex-refresh.yml'
+    assert_eq "$label ownership refusal" "$want" "$(sed -n 's/^class: //p' <<<"$caller_err")"
+  fi
+  case "$variation" in
+    symlink) symlink_head="$(git -C "$repo" rev-parse HEAD)" ;;
+    commit-pin)
+      commit_pin_head="$(git -C "$repo" rev-parse HEAD)"
+      assert_eq "$label grants no release fetch" '' "$(cat "$SANDBOX/release-fetches")" ;;
+    branch-only) branch_pin_head="$(git -C "$repo" rev-parse HEAD)" ;;
+  esac
+  if [ "$extra|$help_mode" = '.github/copilot-instructions.md|legacy' ]; then
+    mixed_legacy_head="$(git -C "$repo" rev-parse HEAD)"
+  fi
+done <<'CALLERS'
+adopted released caller|released|supported||render
+adopted released caller with legacy verifier|released|legacy||render
+symlink to released caller|symlink|supported||standard
+byte-edited caller|byte-edited|supported||standard
+unpublished caller bytes|unreleased|supported||standard
+unavailable release|unavailable|supported||standard
+version-shaped branch without release tag|branch-only|supported||standard
+arbitrary commit pin|commit-pin|supported||standard
+caller and engine render with legacy verifier|released|legacy|.agents/skills/orch/SKILL.md|render
+caller and copilot output with legacy verifier|released|legacy|.github/copilot-instructions.md|standard
+caller and copilot output with supporting verifier|released|supported|.github/copilot-instructions.md|render
+caller and instruction output with legacy verifier|released|legacy|.github/instructions/kendex.instructions.md|standard
+caller and excluded workflow with legacy verifier|released|legacy|.github/workflows/ci.yml|standard
+caller and excluded workflow with supporting verifier|released|supported|.github/workflows/ci.yml|render
+CALLERS
+require_rows change-class-released-caller "$caller_rows"
+
+reset_case
+git -C "$repo" checkout -q --detach "$symlink_head"
+set_verifier clean
+symlink_mutant="$(mutant symlink-caller change-class \
+  '  [ -f "$proof_tree/$1" ] && [ ! -L "$proof_tree/$1" ] || return 1' \
+  '  [ -f "$proof_tree/$1" ] || return 1')"
+PATH="$release_bin:$stub_bin:$PATH" CHANGE_CLASS="$symlink_mutant" assert_class \
+  'must-fail: following a symlink caller wrongly grants render' render \
+  --repo "$repo" --event pull_request --base "$base" --head HEAD
+
+reset_case
+git -C "$repo" checkout -q --detach "$commit_pin_head"
+set_verifier clean
+: >"$SANDBOX/release-fetches"
+commit_pin_mutant="$(mutant commit-pin change-class \
+  '  grep -Eq '\''^v[0-9]+(\.[0-9]+){0,2}$'\'' <<<"$pin" || return 1' \
+  '  grep -Eq '\''^(v[0-9]+(\.[0-9]+){0,2}|[0-9a-f]{40})$'\'' <<<"$pin" || return 1')"
+PATH="$release_bin:$stub_bin:$PATH" "$commit_pin_mutant" --repo "$repo" \
+  --event pull_request --base "$base" --head HEAD >/dev/null 2>&1
+assert_eq 'must-fail: accepting a commit pin violates the no-fetch assertion' true \
+  "$([ -s "$SANDBOX/release-fetches" ] && echo true || echo false)"
+
+reset_case
+git -C "$repo" checkout -q --detach "$branch_pin_head"
+set_verifier clean
+branch_pin_mutant="$(mutant branch-pin change-class \
+  '      https://github.com/vanillagreencom/kendex.git "refs/tags/$pin" >>"$work/release-stderr" 2>&1 || {' \
+  '      https://github.com/vanillagreencom/kendex.git "$pin" >>"$work/release-stderr" 2>&1 || {')"
+PATH="$release_bin:$stub_bin:$PATH" CHANGE_CLASS="$branch_pin_mutant" assert_class \
+  'must-fail: an unqualified ref accepts an unreleased branch' render \
+  --repo "$repo" --event pull_request --base "$base" --head HEAD
+
+reset_case
+git -C "$repo" checkout -q --detach "$mixed_legacy_head"
+set_verifier clean
+echo legacy >"$KENDEX_STUB_HELP"
+jq '.rows += [{"kind":"skill","state":"ok","positions":[
+  {"path":".github/copilot-instructions.md","owns":"file"}]}]' \
+  "$KENDEX_STUB_LEDGER" >"$SANDBOX/mixed-ledger"
+mv "$SANDBOX/mixed-ledger" "$KENDEX_STUB_LEDGER"
+mixed_mutant="$(mutant mixed-legacy change-class \
+  '    if [ "${1:-}" = narrow ] && [ "$RENDER_BOT_INSTRUCTIONS" = false ]; then' \
+  '    if false && [ "$RENDER_BOT_INSTRUCTIONS" = false ]; then')"
+PATH="$release_bin:$stub_bin:$PATH" CHANGE_CLASS="$mixed_mutant" assert_class \
+  'must-fail: the caller cannot lift another legacy exclusion' render \
+  --repo "$repo" --event pull_request --base "$base" --head HEAD
 
 # label | expected | verifier | file:lines pairs
 table_rows=0
@@ -864,54 +1082,6 @@ pull_request
 push
 BASELESS
 require_rows change-class-baseless "$baseless_row_count"
-
-# The header `--help` prints is the script's own account of what it touches
-# in the tree it judges, and a reader acts on it. The rows below assert its
-# TEXT: that it still names each read, and still claims no merge base. Each
-# claim is looked for in a flattened copy of the paragraph, so a sentence
-# rewrapped is the same sentence and a row that broke on the wrap would be a
-# row about the margin. What the text cannot see is a read added or dropped
-# while the sentence stands; the row after them is the one that reads the
-# code and catches that.
-help_text="$("$CHANGE_CLASS" --help | tr '\n' ' ')"
-git_read_count=0
-while IFS='|' read -r expected git_read; do
-  git_read_count=$((git_read_count + 1))
-  assert_eq "the header names what it reads: $git_read" "$expected" \
-    "$(grep -qF -- "$git_read" <<<"$help_text" && echo present || echo absent)"
-done <<'GIT_READS'
-present|four reads and no write
-present|where its object store is
-present|the commit the base endpoint names
-present|settings files that commit holds
-present|The private env file is never read
-present|never the judged checkout's working tree
-present|cause=render-path-unowned
-present|cause=render-path-partial
-present|--json
-absent|merge base
-GIT_READS
-require_rows change-class-git-reads "$git_read_count"
-
-# `git -C "$repo"` is the one spelling the script runs against the tree it
-# judges, which the first row establishes, so counting those call sites
-# counts the reads. The only other git the script runs writes a private
-# checkout, the one the proof weighs or the one the queue selector runs in,
-# and every such line names it, as proof_tree or as private_checkout's
-# private_tree. The
-# count and the word the header prints are asserted against one expected
-# pair: a read added while the sentence stands reds here, and so does a
-# sentence reworded while the code stands. A maintainer changing either on
-# purpose moves the pair with it.
-assert_eq "every git the script runs on the judged tree carries --repo" "0" \
-  "$(awk '/^[[:space:]]*#/ { next }
-     /git / && !/git -C "\$repo"/ && !/"\$(proof_tree|private_tree)"/ { n++ }
-     END { print n + 0 }' "$CHANGE_CLASS")"
-git_read_sites="$(grep -c 'git -C "$repo"' "$CHANGE_CLASS" | tr -d ' ')"
-git_read_word="$(grep -oE '[a-z]+ reads? and no write' <<<"$help_text" |
-  tail -1 | cut -d' ' -f1)"
-assert_eq "the header spells the number of git call sites the script holds" \
-  "4 four" "$git_read_sites $git_read_word"
 
 # A refresh that adds a rendered file gains an inventory entry, and the shipped
 # harness-only rule refuses a gain: a branch could otherwise name a product
@@ -1915,6 +2085,7 @@ TOML
   git -C "$consumer" add -A
   git -C "$consumer" commit -q -m "the consumer with kendex installed"
   consumer_base="$(git -C "$consumer" rev-parse HEAD)"
+  cp -R "$render_home/.cache/kendex" "$SANDBOX/base-source-cache"
 
   # The render carries the consumer's own instructions, which the catalog file
   # does not. Without this the catalog-byte inverse below would pass by
@@ -1947,6 +2118,20 @@ TOML
   rm -rf -- "${render_home:?}/.cache/kendex"
   classify_here "no mirror, no proof" standard \
     --repo "$consumer" --event pull_request --base "$consumer_base" --head HEAD
+  cp -R "$SANDBOX/base-source-cache" "$render_home/.cache/kendex"
+  missing_err="$(classify_stderr --repo "$consumer" --event pull_request \
+    --base "$consumer_base" --head HEAD)"
+  assert_eq 'a mirror behind the recorded head names its source refresh remedy' \
+    'class=standard measured=false cause=source-mirror-missing verb=source operation=refresh verifier=path' \
+    "$(printf '%s\n' "$missing_err" | sed -n 's/^class: \(.*\) version=[^ ]*$/\1/p')"
+  missing_mutant="$(mutant missing-source-cause change-class \
+    '      RENDER_REFUSAL="cause=source-mirror-missing verb=source operation=refresh verifier=$kind version=$verifier_version"' \
+    '      :')"
+  missing_control="$(CHANGE_CLASS="$missing_mutant" classify_stderr --repo "$consumer" \
+    --event pull_request --base "$consumer_base" --head HEAD)"
+  assert_eq 'control: removing the keyed remedy restores the generic refusal' \
+    'class=standard measured=false cause=verify-refused verifier=path' \
+    "$(printf '%s\n' "$missing_control" | sed -n 's/^class: \(.*\) version=[^ ]*$/\1/p')"
   kendex_here "$consumer" source refresh
   assert_eq "the priming step left the judged tree exactly as committed" "" \
     "$(git -C "$consumer" status --porcelain)"
@@ -1966,6 +2151,19 @@ TOML
     "$(printf '%s\n' "$refresh_err" | sed -n 's/^class: //p')"
   assert_eq "and a record the catalog has not moved past trails nothing" "" \
     "$(printf '%s\n' "$refresh_err" | sed -n '/^render-stale: /p')"
+  git -C "$consumer" checkout -q -B unknown-source refreshed
+  jq '.entries |= with_entries(.value.sourceCommit = "0000000000000000000000000000000000000000")' \
+    "$consumer/.kendex-lock.json" >"$SANDBOX/unknown-source-lock"
+  mv "$SANDBOX/unknown-source-lock" "$consumer/.kendex-lock.json"
+  git -C "$consumer" add -A
+  git -C "$consumer" commit -q -m 'record names a commit the source never held'
+  kendex_here "$consumer" source refresh
+  unknown_err="$(classify_stderr --repo "$consumer" --event pull_request \
+    --base "$consumer_base" --head HEAD)"
+  assert_eq 'a commit the source never held remains a source-mirror refusal after refresh' \
+    'class=standard measured=false cause=source-mirror-missing verb=source operation=refresh verifier=path' \
+    "$(printf '%s\n' "$unknown_err" | sed -n 's/^class: \(.*\) version=[^ ]*$/\1/p')"
+  git -C "$consumer" checkout -q refreshed
 
   # Optional real released executables prove the compatibility boundary.
   # The fixture above is made by the newer engine on PATH, not by either
