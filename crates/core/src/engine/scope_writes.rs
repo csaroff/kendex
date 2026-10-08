@@ -173,6 +173,30 @@ pub(super) struct RecordReadings {
     sets: BTreeMap<String, Reading<BundleRev>>,
 }
 
+/// A conflict keeps the old selector with its bytes. Synthetic holds
+/// also read under that selector, even when the source was redeclared
+/// beside a targeted update; recording the new one would apply no edit.
+pub(super) fn record_entry_selectors(
+    state: &DesiredState,
+    new_lock: &mut Lock,
+    pass: &super::plan_pass::ItemPass,
+    kept: &super::item_plan::KeptAsIs,
+) {
+    for (key, entry) in &mut new_lock.entries {
+        if entry.kind != crate::model::ItemKind::PiExtension
+            && pass
+                .planned
+                .contains(&(entry.kind, entry.name.clone(), entry.harness))
+            && !kept.contains(key)
+        {
+            let Some(basis) = state.selector_bases.get(&(entry.kind, entry.name.clone())) else {
+                unreachable!("a successfully planned item has its reading owner's selector basis");
+            };
+            entry.selector = basis.recorded();
+        }
+    }
+}
+
 /// Reads every declared source and set for the record. A source no item
 /// named, one only a Pi extension names among them, has no resolution in
 /// the pass and is read from its mirror alone, so its entry is held to the
@@ -263,6 +287,17 @@ pub(super) fn record_readings(
                     commit_reading(env, repo, rev, resolution, false).map(|commit| BundleRev {
                         source: decl.source.clone(),
                         source_repo: repo.to_owned(),
+                        selector: if held.iter().any(|pin| {
+                            matches!(&pin.held, super::Held::Set { name: held_name } if held_name == name)
+                        }) {
+                            lock.bundles.get(name).and_then(|old| old.selector.clone())
+                        } else {
+                            Some(crate::lock::DeclaredSelector::of(
+                                manifest,
+                                &decl.source,
+                                decl.rev.as_deref(),
+                            ))
+                        },
                         commit,
                     })
                 }

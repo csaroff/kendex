@@ -282,6 +282,9 @@ pub struct DesiredState {
     pub(super) agent_names: crate::source::agent_names::Uses,
     pub declaration_status: super::DeclarationStatus,
     pub items: Vec<Desired>,
+    /// The selector each expansion owner read under. A synthetic hold
+    /// keeps the old selector instead.
+    pub(super) selector_bases: BTreeMap<(ItemKind, String), SelectorBasis>,
     /// Sources that could not be read (pending remotes, missing paths) and
     /// declared items the source does not carry.
     pub notes: Vec<String>,
@@ -417,6 +420,21 @@ pub struct DesiredState {
     /// harness declares as tracked output, by agent name;
     /// `EngineReport::tracked_outputs`.
     pub tracked_outputs: BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) enum SelectorBasis {
+    Declared(crate::lock::DeclaredSelector),
+    Held(Option<crate::lock::DeclaredSelector>),
+}
+
+impl SelectorBasis {
+    pub(super) fn recorded(&self) -> Option<crate::lock::DeclaredSelector> {
+        match self {
+            Self::Declared(selector) => Some(selector.clone()),
+            Self::Held(selector) => selector.clone(),
+        }
+    }
 }
 
 /// Why a declared set's installed members stay as recorded, each with
@@ -731,6 +749,7 @@ fn compute(
     // installed bundles carry, and what those skills require — while the
     // manifest keeps holding only what was chosen.
     let expansion = super::expansion::expand(env, scope, manifest, held, &mut state);
+    state.selector_bases = selector_bases(&expansion, manifest, held);
     state.kept_members =
         super::bundles::kept_members(lock, manifest, &state.kept_bundles, &expansion);
     let model_classes = if expansion.of(ItemKind::Agent).is_empty() {
@@ -816,13 +835,64 @@ fn compute(
         }
     }
     manifest_changed |= settle_retired(env, scope, manifest, &mut state, &mut updated_manifest);
-    desired_kinds::desired_plugins(env, scope, manifest, &mut state);
-    super::desired_custom_hooks::desired_custom_hooks(env, scope, manifest, &mut state);
+    inline(env, scope, manifest, &mut state);
 
     if manifest_changed {
         state.manifest_update = Some(updated_manifest);
     }
     Ok(state)
+}
+
+fn selector_bases(
+    expansion: &super::expansion::Expansion,
+    manifest: &Manifest,
+    held: Option<&hold::HeldPins>,
+) -> BTreeMap<(ItemKind, String), SelectorBasis> {
+    let mut bases = expansion.selector_bases(manifest);
+    bases.extend(pi_selector_bases(manifest, held));
+    bases
+}
+
+pub(super) fn pi_selector_bases(
+    manifest: &Manifest,
+    held: Option<&hold::HeldPins>,
+) -> BTreeMap<(ItemKind, String), SelectorBasis> {
+    let mut bases = BTreeMap::new();
+    for (name, decl) in &manifest.pi_extensions {
+        let owner = (
+            decl.source.clone(),
+            super::Held::Item {
+                kind: ItemKind::PiExtension,
+                name: name.clone(),
+            },
+        );
+        let basis = match held.and_then(|pins| pins.selectors().get(&owner)) {
+            Some(selector) => SelectorBasis::Held(selector.clone()),
+            None => SelectorBasis::Declared(crate::lock::DeclaredSelector::of(
+                manifest,
+                &decl.source,
+                decl.rev.as_deref(),
+            )),
+        };
+        bases.insert((ItemKind::PiExtension, name.clone()), basis);
+    }
+    bases
+}
+
+fn inline(env: &Env, scope: &Scope, manifest: &Manifest, state: &mut DesiredState) {
+    let start = state.items.len();
+    desired_kinds::desired_plugins(env, scope, manifest, state);
+    super::desired_custom_hooks::desired_custom_hooks(env, scope, manifest, state);
+    for item in &state.items[start..] {
+        state.selector_bases.insert(
+            (item.kind, item.name.clone()),
+            SelectorBasis::Declared(crate::lock::DeclaredSelector::of(
+                manifest,
+                &item.source_name,
+                None,
+            )),
+        );
+    }
 }
 
 /// [`DesiredState::recorded_requires`] from `lock`: each companion's
