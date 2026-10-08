@@ -8,7 +8,8 @@
 # the exit status, the tool's keyed stderr records, whether a restack is still
 # paused, whether each hook parses under `bash -n` and runs, which saved copies
 # exist, and which files carry conflict markers. A library a declared hook
-# sources, directly or through another library, is held the same way.
+# sources, directly or through another library, is held the same way, as is a
+# script a declared hook executes.
 set -euo pipefail
 # The fixtures' origin is a local path that names no GitHub repository, so
 # the suite names the default branch.
@@ -73,6 +74,30 @@ LIB=.agents/skills/guard/scripts/lib/guard.sh
 INNER=.agents/skills/guard/scripts/lib/inner.sh
 OTHER=.agents/skills/other/scripts/lib/inner.sh
 EXTRA=.agents/skills/guard/scripts/lib/extra.sh
+# The Codex hook executes RUN, tracked executable, from a root it computes, as
+# lane-mail-check.sh executes lane-mail; runs TOOL, a non-executable .sh,
+# through bash from that root; and reads DATA, tracked non-executable, from it.
+# From a scripts directory no path names at the root it runs STEP, a
+# non-executable library, SOLO, an executable, and ONE, a non-executable .sh
+# that exists only in another tree, as lane-mail-check.sh runs
+# $SCRIPTS/workflow-state. RUN executes HELPER against its own directory, as
+# lane-mail runs $SCRIPT_DIR/../../worktree/scripts/worktree; DECOY ends in
+# the same path in another tree. It runs ASSEMBLED through a variable it
+# assigns a literal path, as worktree-session-claim.sh runs
+# "$AT/skills/$GUARD", and POS under a positional root, as lane-mail-check.sh
+# runs "$1/lib/lane-context.sh". It names NOTE, tracked executable, only
+# in a comment.
+RUN=.agents/skills/guard/scripts/run
+NOTE=.agents/skills/guard/scripts/note
+DATA=.agents/skills/guard/data.txt
+TOOL=.agents/skills/guard/tool.sh
+STEP=.agents/skills/guard/scripts/lib/step.sh
+SOLO=.agents/skills/guard/scripts/solo
+ONE=.agents/skills/other/one.sh
+HELPER=.agents/skills/guard/tool/helper
+DECOY=.agents/skills/decoy/tool/helper
+ASSEMBLED=.agents/skills/guard/scripts/assembled
+POS=.agents/skills/guard/scripts/lib/pos.sh
 
 # A hook sourcing a library the way a shipped hook does: under set -e, so a
 # library that fails to parse fails the hook, with a directive naming the
@@ -112,7 +137,13 @@ JSON
   write_hook "$MAIN/$INNER" base
   write_hook "$MAIN/$OTHER" base
   write_hook "$MAIN/$EXTRA" base
-  write_hook "$MAIN/$CODEX_HOOK" base
+  mkdir -p "$MAIN/${CODEX_HOOK%/*}"
+  printf '#!/usr/bin/env bash\nset -euo pipefail\n# Not run: $ROOT/%s\nROOT="$(pwd)"\nSCRIPTS="$ROOT/%s"\n"$ROOT/%s" >/dev/null\nbash "${ROOT}/%s" >/dev/null\ncat "${ROOT}/%s" >/dev/null\nbash "$SCRIPTS/lib/%s" >/dev/null\n"$SCRIPTS/%s" >/dev/null\nbash "$SCRIPTS/%s" >/dev/null 2>&1 || true\nPART=%s\n"$ROOT/.agents/skills/$PART" >/dev/null\nbash -c '"'"'bash "$1/lib/%s"'"'"' _ "$SCRIPTS" >/dev/null\necho base\n' \
+    "$NOTE" "${SOLO%/*}" "$RUN" "$TOOL" "$DATA" "${STEP##*/}" "${SOLO##*/}" "${ONE##*/}" "${ASSEMBLED#.agents/skills/}" "${POS##*/}" >"$MAIN/$CODEX_HOOK"
+  mkdir -p "${MAIN:?}/${RUN%/*}"
+  printf '#!/usr/bin/env bash\nset -euo pipefail\nHERE="$(cd "$(dirname "$0")" && pwd)"\n"$HERE/../tool/%s" >/dev/null\necho base\n' "${HELPER##*/}" >"$MAIN/$RUN"
+  for path in "$NOTE" "$DATA" "$TOOL" "$STEP" "$SOLO" "$ONE" "$HELPER" "$DECOY" "$ASSEMBLED" "$POS"; do write_hook "$MAIN/$path" base; done
+  chmod +x "$MAIN/$RUN" "$MAIN/$NOTE" "$MAIN/$SOLO" "$MAIN/$HELPER" "$MAIN/$DECOY" "$MAIN/$ASSEMBLED"
   write_hook "$MAIN/$SOURCE_HOOK" base
   write_hook "$MAIN/$CURSOR_HOOK" base
   printf 'orig\n' >"$MAIN/file.txt"
@@ -155,6 +186,24 @@ step() {
     lib) make_pair; edit wt "$LIB"; edit main "$LIB" ;;
     # A library that library sources conflicts.
     inner) make_pair; edit wt "$INNER"; edit main "$INNER" ;;
+    # A script the Codex hook executes conflicts.
+    run) make_pair; edit wt "$RUN"; edit main "$RUN" ;;
+    # A non-executable file the Codex hook reads from the same root conflicts.
+    data) make_pair; edit wt "$DATA"; edit main "$DATA" ;;
+    # An executable the Codex hook names only in a comment conflicts.
+    note) make_pair; edit wt "$NOTE"; edit main "$NOTE" ;;
+    # A non-executable .sh the Codex hook runs through bash conflicts.
+    tool) make_pair; edit wt "$TOOL"; edit main "$TOOL" ;;
+    # Files the Codex hook runs from a scripts directory conflict.
+    step) make_pair; edit wt "$STEP"; edit main "$STEP" ;;
+    solo) make_pair; edit wt "$SOLO"; edit main "$SOLO" ;;
+    one) make_pair; edit wt "$ONE"; edit main "$ONE" ;;
+    # The script RUN executes against its directory and its namesake conflict.
+    # A script the Codex hook runs through an assigned path, and one under a
+    # positional root, conflict.
+    assembled) make_pair; edit wt "$ASSEMBLED"; edit main "$ASSEMBLED" ;;
+    pos) make_pair; edit wt "$POS"; edit main "$POS" ;;
+    helper) make_pair; edit wt "$HELPER" "$DECOY"; edit main "$HELPER" "$DECOY" ;;
     # A file named like a sourced library, in a directory nothing sources from.
     other) make_pair; edit wt "$OTHER"; edit main "$OTHER" ;;
     # A later branch commit than the conflicting one starts sourcing EXTRA,
@@ -216,6 +265,14 @@ step() {
       chmod +x "$ROOT/stub/jq"
       PATH="$ROOT/stub:$PATH"
       ;;
+    # A cut that fails, ahead of the real one: the tracked listing cannot be
+    # split into paths.
+    broken-cut)
+      mkdir -p "$ROOT/stub"
+      printf '#!/usr/bin/env bash\nexit 1\n' >"$ROOT/stub/cut"
+      chmod +x "$ROOT/stub/cut"
+      PATH="$ROOT/stub:$PATH"
+      ;;
     # A git that fails the one discovery read named after the colon, ahead of
     # the real one: the grep and the read of the declarations, the listing of
     # tracked files, the read of the Claude hook as a sourcing script, and the
@@ -225,7 +282,7 @@ step() {
       case "${1#broken-git:}" in
         grep) read='*" grep -l -F "*' ;;
         declaration) read='*" cat-file -p "*":.claude/settings.json "*' ;;
-        ls-tree) read='*" ls-tree -r --name-only "*' ;;
+        ls-tree) read='*" ls-tree -r "*' ;;
         sourcing) read="*\" cat-file -p \"*\":$CLAUDE_HOOK \"*" ;;
         pick) read='*" rev-parse --verify -q REBASE_HEAD^{commit} "*' ;;
         *) echo "UNKNOWN-READ: $1" >&2; exit 2 ;;
@@ -364,6 +421,7 @@ U=.cursor/hooks/stop.sh.restack-conflict
 L=$LIB.restack-conflict
 I=$INNER.restack-conflict
 E=$EXTRA.restack-conflict
+R=$RUN.restack-conflict
 HELD="worktree-restack-hook-held: $CLAUDE_HOOK $CODEX_HOOK"
 
 # label|fixture|command|expected
@@ -383,6 +441,7 @@ a declaration grep that fails holds every conflicted path, an ordinary one inclu
 a declaration that cannot be read holds every conflicted path, an ordinary one included|source broken-git:declaration|create topic --restack|rc=1 err=worktree-rebase-conflicts: <wt>;worktree-restack-hook-held: $SOURCE_HOOK paused=yes parses=ok,ok runs=ok,ok saved=$S markers=$S body=base,base ordinary=-
 a tracked-file listing that fails holds every conflicted path, an ordinary one included|source broken-git:ls-tree|create topic --restack|rc=1 err=worktree-rebase-conflicts: <wt>;worktree-restack-hook-held: $SOURCE_HOOK paused=yes parses=ok,ok runs=ok,ok saved=$S markers=$S body=base,base ordinary=-
 a sourcing script that cannot be read holds every conflicted path, an ordinary one included|source broken-git:sourcing|create topic --restack|rc=1 err=worktree-rebase-conflicts: <wt>;worktree-restack-hook-held: $SOURCE_HOOK paused=yes parses=ok,ok runs=ok,ok saved=$S markers=$S body=base,base ordinary=-
+a tracked listing that cannot be split holds every conflicted path, an ordinary one included|source broken-cut|create topic --restack|rc=1 err=worktree-rebase-conflicts: <wt>;worktree-restack-hook-held: $SOURCE_HOOK paused=yes parses=ok,ok runs=ok,ok saved=$S markers=$S body=base,base ordinary=-
 a recorded pick that does not resolve holds every conflicted path, an ordinary one included|source broken-git:pick|create topic --restack|rc=1 err=worktree-rebase-conflicts: <wt>;worktree-restack-hook-held: $SOURCE_HOOK paused=yes parses=ok,ok runs=ok,ok saved=$S markers=$S body=base,base ordinary=-
 declarations that cannot be read hold every conflicted path, an ordinary one included|source broken-jq|create topic --restack|rc=1 err=worktree-rebase-conflicts: <wt>;worktree-restack-hook-held: $SOURCE_HOOK paused=yes parses=ok,ok runs=ok,ok saved=$S markers=$S body=base,base ordinary=-
 a hook declared only at the pre-restack head is held|branch-declared|create topic --restack|rc=1 err=worktree-rebase-conflicts: <wt>;worktree-restack-hook-held: $CURSOR_HOOK paused=yes parses=ok,ok runs=ok,ok saved=$U markers=$U body=base,base ordinary=-
@@ -396,6 +455,17 @@ a library only the pre-restack head's hook sources is held|branch-sourced|create
 a library only the commit being rebased sources is held|replayed-sourced|create topic --restack|rc=1 err=worktree-rebase-conflicts: <wt>;worktree-restack-hook-held: $EXTRA paused=yes parses=ok,ok runs=ok,ok saved=$E markers=$E body=base,base ordinary=-
 a library only the commit being replayed sources is held|replayed-sourced|create topic --restack --replay|rc=1 err=worktree-replay-conflicts: <wt>;worktree-restack-hook-held: $EXTRA paused=yes parses=ok,ok runs=ok,ok saved=$E markers=$E body=base,base ordinary=-
 a library only the paused HEAD's hook sources is held|base-sourced|create topic --restack|rc=1 err=worktree-rebase-conflicts: <wt>;worktree-restack-hook-held: $EXTRA paused=yes parses=ok,ok runs=ok,ok saved=$E markers=$E body=base,base ordinary=-
+a script a declared hook executes is held so the hook still runs|run|create topic --restack|rc=1 err=worktree-rebase-conflicts: <wt>;worktree-restack-hook-held: $RUN paused=yes parses=ok,ok runs=ok,ok saved=$R markers=$R body=base,base ordinary=-
+a replay holds a script a declared hook executes the same way|run|create topic --restack --replay|rc=1 err=worktree-replay-conflicts: <wt>;worktree-restack-hook-held: $RUN paused=yes parses=ok,ok runs=ok,ok saved=$R markers=$R body=base,base ordinary=-
+a non-executable file a declared hook reads keeps its markers|data|create topic --restack|rc=1 err=worktree-rebase-conflicts: <wt> paused=yes parses=ok,ok runs=ok,ok saved=- markers=$DATA body=base,base ordinary=$DATA
+a non-executable script a declared hook runs through an interpreter is held|tool|create topic --restack|rc=1 err=worktree-rebase-conflicts: <wt>;worktree-restack-hook-held: $TOOL paused=yes parses=ok,ok runs=ok,ok saved=$TOOL.restack-conflict markers=$TOOL.restack-conflict body=base,base ordinary=-
+a library a hook runs from a directory found by searching is held|step|create topic --restack|rc=1 err=worktree-rebase-conflicts: <wt>;worktree-restack-hook-held: $STEP paused=yes parses=ok,ok runs=ok,ok saved=$STEP.restack-conflict markers=$STEP.restack-conflict body=base,base ordinary=-
+an executable a hook runs by bare name from a directory found by searching is held|solo|create topic --restack|rc=1 err=worktree-rebase-conflicts: <wt>;worktree-restack-hook-held: $SOLO paused=yes parses=ok,ok runs=ok,ok saved=$SOLO.restack-conflict markers=$SOLO.restack-conflict body=base,base ordinary=-
+a non-executable script elsewhere sharing a bare name a hook runs keeps its markers|one|create topic --restack|rc=1 err=worktree-rebase-conflicts: <wt> paused=yes parses=ok,ok runs=ok,ok saved=- markers=$ONE body=base,base ordinary=$ONE
+a script an executed script runs against its own directory is held and its namesake elsewhere keeps its markers|helper|create topic --restack|rc=1 err=worktree-rebase-conflicts: <wt>;worktree-restack-hook-held: $HELPER paused=yes parses=ok,ok runs=ok,ok saved=$HELPER.restack-conflict markers=$DECOY,$HELPER.restack-conflict body=base,base ordinary=$DECOY
+a script a hook runs through a variable it assigns a literal path is held|assembled|create topic --restack|rc=1 err=worktree-rebase-conflicts: <wt>;worktree-restack-hook-held: $ASSEMBLED paused=yes parses=ok,ok runs=ok,ok saved=$ASSEMBLED.restack-conflict markers=$ASSEMBLED.restack-conflict body=base,base ordinary=-
+a script a hook runs under a positional root is held|pos|create topic --restack|rc=1 err=worktree-rebase-conflicts: <wt>;worktree-restack-hook-held: $POS paused=yes parses=ok,ok runs=ok,ok saved=$POS.restack-conflict markers=$POS.restack-conflict body=base,base ordinary=-
+an executable a declared hook names only in a comment keeps its markers|note|create topic --restack|rc=1 err=worktree-rebase-conflicts: <wt> paused=yes parses=ok,ok runs=ok,ok saved=- markers=$NOTE body=base,base ordinary=$NOTE
 "
 
 echo "=== worktree restack over a conflicted harness hook ==="
@@ -425,8 +495,9 @@ without the cleanup abort leaves the saved copies behind@scripts/worktree@rm -f 
 without the unreadable fallback an ordinary path keeps its markers@scripts/lib/restack-state.sh@printf '%s\n' \"\$conflicts\"@1@:@source broken-jq@create topic --restack@rc=1 err=worktree-rebase-conflicts: <wt> paused=yes parses=ok,ok runs=ok,ok saved=- markers=$SOURCE_HOOK body=base,base ordinary=$SOURCE_HOOK
 without the declaration grep failing the hold an ordinary path keeps its markers@scripts/lib/restack-state.sh@'*.json')\" || rc=\$?@1@'*.json')\" || rc=0@source broken-git:grep@create topic --restack@rc=1 err=worktree-rebase-conflicts: <wt> paused=yes parses=ok,ok runs=ok,ok saved=- markers=$SOURCE_HOOK body=base,base ordinary=$SOURCE_HOOK
 without the declaration read failing the hold an ordinary path keeps its markers@scripts/lib/restack-state.sh@2>/dev/null)\"\$'\\n' || return 1@1@2>/dev/null)\"\$'\\n'@source broken-git:declaration@create topic --restack@rc=1 err=worktree-rebase-conflicts: <wt> paused=yes parses=ok,ok runs=ok,ok saved=- markers=$SOURCE_HOOK body=base,base ordinary=$SOURCE_HOOK
-without the tracked-file listing failing the hold an ordinary path keeps its markers@scripts/lib/restack-state.sh@--name-only \"\$rev\")\" || return 1@1@--name-only \"\$rev\")\"@source broken-git:ls-tree@create topic --restack@rc=1 err=worktree-rebase-conflicts: <wt> paused=yes parses=ok,ok runs=ok,ok saved=- markers=$SOURCE_HOOK body=base,base ordinary=$SOURCE_HOOK
-without the sourcing-script read failing the hold an ordinary path keeps its markers@scripts/lib/restack-state.sh@\\1/p')\" || return 1@1@\\1/p')\"@source broken-git:sourcing@create topic --restack@rc=1 err=worktree-rebase-conflicts: <wt> paused=yes parses=ok,ok runs=ok,ok saved=- markers=$SOURCE_HOOK body=base,base ordinary=$SOURCE_HOOK
+without the tracked-file listing failing the hold an ordinary path keeps its markers@scripts/lib/restack-state.sh@ls-tree -r \"\$rev\")\" || return 1@1@ls-tree -r \"\$rev\")\"@source broken-git:ls-tree@create topic --restack@rc=1 err=worktree-rebase-conflicts: <wt> paused=yes parses=ok,ok runs=ok,ok saved=- markers=$SOURCE_HOOK body=base,base ordinary=$SOURCE_HOOK
+without the sourcing-script read failing the hold an ordinary path keeps its markers@scripts/lib/restack-state.sh@\"\$rev:\$script\")\" || return 1@1@\"\$rev:\$script\")\"@source broken-git:sourcing@create topic --restack@rc=1 err=worktree-rebase-conflicts: <wt> paused=yes parses=ok,ok runs=ok,ok saved=- markers=$SOURCE_HOOK body=base,base ordinary=$SOURCE_HOOK
+without the listing split failing the hold an ordinary path keeps its markers@scripts/lib/restack-state.sh@cut -f 2- <<<\"\$listing\")\" || return 1@1@cut -f 2- <<<\"\$listing\")\"@source broken-cut@create topic --restack@rc=1 err=worktree-rebase-conflicts: <wt> paused=yes parses=ok,ok runs=ok,ok saved=- markers=$SOURCE_HOOK body=base,base ordinary=$SOURCE_HOOK
 without the recorded pick failing the hold an ordinary path keeps its markers@scripts/lib/restack-state.sh@-q \"\$pick^{commit}\"@1@-q \"\${pick}^{commit}\" || true@source broken-git:pick@create topic --restack@rc=1 err=worktree-rebase-conflicts: <wt> paused=yes parses=ok,ok runs=ok,ok saved=- markers=$SOURCE_HOOK body=base,base ordinary=$SOURCE_HOOK
 without the pre-restack head a branch-declared hook keeps its markers@scripts/lib/restack-state.sh@\"\$(restack_state_get \"\$wt\" originalHead)\" HEAD \${paused@1@HEAD \${paused@branch-declared@create topic --restack@rc=1 err=worktree-rebase-conflicts: <wt> paused=yes parses=ok,ok runs=ok,ok saved=- markers=$CURSOR_HOOK body=base,base ordinary=$CURSOR_HOOK
 without the paused HEAD a base-declared hook keeps its markers@scripts/lib/restack-state.sh@originalHead)\" HEAD \${paused@1@originalHead)\" \${paused@base-declared@create topic --restack@rc=1 err=worktree-rebase-conflicts: <wt> paused=yes parses=ok,ok runs=ok,ok saved=- markers=$CURSOR_HOOK body=base,base ordinary=$CURSOR_HOOK
@@ -436,12 +507,23 @@ with the branch's side taken first the held hooks keep the branch's version@scri
 without the index check a replay continue records a staged copy in the branch@scripts/lib/restack-state.sh@! staged=\"\$(git -C \"\$wt\" ls-files -- \"\$copy\")\" || [[ -n \"\$staged\" ]]@1@false@hooks restack-replay stage-all consume-staged@restack continue topic@rc=0 err=worktree-rebase-count: 1 paused=no parses=ok,ok runs=ok,ok saved=$C,$X markers=- body=resolved,resolved ordinary=-
 without the library follow a sourced library keeps its markers and the hook fails@scripts/lib/restack-state.sh@restack_hook_libraries \"\$wt\" \"\$rev\" \"\$words\" || return 1@1@:@lib@create topic --restack@rc=1 err=worktree-rebase-conflicts: <wt> paused=yes parses=ok,ok runs=FAIL,ok saved=- markers=$LIB body=base,base ordinary=$LIB
 without the indent allowance a directive inside a function is not read@scripts/lib/restack-state.sh@sed -n 's/^[[:space:]]*#[[:space:]]*shellcheck@1@sed -n 's/^#[[:space:]]*shellcheck@inner@create topic --restack@rc=1 err=worktree-rebase-conflicts: <wt> paused=yes parses=ok,ok runs=FAIL,ok saved=- markers=$INNER body=base,base ordinary=$INNER
-without following a library's own directives a library it sources keeps its markers@scripts/lib/restack-state.sh@queue=\"\$queue\"\$'\\n'\"\$target\"@1@:@inner@create topic --restack@rc=1 err=worktree-rebase-conflicts: <wt> paused=yes parses=ok,ok runs=FAIL,ok saved=- markers=$INNER body=base,base ordinary=$INNER
+without following a library's own directives a library it sources keeps its markers@scripts/lib/restack-state.sh@queue=\"\$queue\"\$'\\n'\"\$target\"@2@:@inner@create topic --restack@rc=1 err=worktree-rebase-conflicts: <wt> paused=yes parses=ok,ok runs=FAIL,ok saved=- markers=$INNER body=base,base ordinary=$INNER
 with every directive matched as a path suffix a same-named unsourced file is held@scripts/lib/restack-state.sh@if [[ \"\$target\" == ../* ]]; then@1@if true; then@other@create topic --restack@rc=1 err=worktree-rebase-conflicts: <wt>;worktree-restack-hook-held: $OTHER paused=yes parses=ok,ok runs=ok,ok saved=$OTHER.restack-conflict markers=$OTHER.restack-conflict body=base,base ordinary=-
 with libraries read at the paused HEAD only a library the branch's hook sources keeps its markers@scripts/lib/restack-state.sh@restack_hook_libraries \"\$wt\" \"\$rev\"@1@restack_hook_libraries \"\$wt\" HEAD@branch-sourced@create topic --restack@rc=1 err=worktree-rebase-conflicts: <wt> paused=yes parses=ok,ok runs=ok,ok saved=- markers=$EXTRA body=base,base ordinary=$EXTRA
 with libraries read at the pre-restack head only a library the base's hook sources keeps its markers@scripts/lib/restack-state.sh@restack_hook_libraries \"\$wt\" \"\$rev\"@1@restack_hook_libraries \"\$wt\" \"\$1\"@base-sourced@create topic --restack@rc=1 err=worktree-rebase-conflicts: <wt> paused=yes parses=ok,ok runs=ok,FAIL saved=- markers=$EXTRA body=base,base ordinary=$EXTRA
 without the commit being rebased a library only it sources keeps its markers@scripts/lib/restack-state.sh@HEAD \${paused:+\"\$paused\"})\"@1@HEAD)\"@replayed-sourced@create topic --restack@rc=1 err=worktree-rebase-conflicts: <wt> paused=yes parses=ok,ok runs=ok,FAIL saved=- markers=$EXTRA body=base,base ordinary=$EXTRA
 without the commit being replayed a library only it sources keeps its markers@scripts/lib/restack-state.sh@HEAD \${paused:+\"\$paused\"})\"@1@HEAD)\"@replayed-sourced@create topic --restack --replay@rc=1 err=worktree-replay-conflicts: <wt> paused=yes parses=ok,ok runs=ok,FAIL saved=- markers=$EXTRA body=base,base ordinary=$EXTRA
+without the executed-script follow a script a hook executes keeps its markers and the hook fails@scripts/lib/restack-state.sh@done <<<\"\$named\"@1@done <<<\"\"@run@create topic --restack@rc=1 err=worktree-rebase-conflicts: <wt> paused=yes parses=ok,ok runs=ok,FAIL saved=- markers=$RUN body=base,base ordinary=$RUN
+with every tracked file taken as a script a data file a hook reads is held@scripts/lib/restack-state.sh@\$2 ~ /[.](sh|bash|py|js|mjs|cjs|awk)\$/ {@1@1 {@data@create topic --restack@rc=1 err=worktree-rebase-conflicts: <wt>;worktree-restack-hook-held: $DATA paused=yes parses=ok,ok runs=ok,ok saved=$DATA.restack-conflict markers=$DATA.restack-conflict body=base,base ordinary=-
+without the interpreter names a non-executable script a hook runs keeps its markers and the hook fails@scripts/lib/restack-state.sh@\$2 ~ /[.](sh|bash|py|js|mjs|cjs|awk)\$/ {@1@0 {@tool@create topic --restack@rc=1 err=worktree-rebase-conflicts: <wt> paused=yes parses=ok,ok runs=ok,FAIL saved=- markers=$TOOL body=base,base ordinary=$TOOL
+without the suffix fallback a library a hook runs from a searched directory keeps its markers and the hook fails@scripts/lib/restack-state.sh@&& (multi || p in exe)) print p@1@&& 0) print p@step@create topic --restack@rc=1 err=worktree-rebase-conflicts: <wt> paused=yes parses=ok,ok runs=ok,FAIL saved=- markers=$STEP body=base,base ordinary=$STEP
+with the multi-segment suffix limited to executables a non-executable library keeps its markers@scripts/lib/restack-state.sh@&& (multi || p in exe)) print p@1@&& (p in exe)) print p@step@create topic --restack@rc=1 err=worktree-rebase-conflicts: <wt> paused=yes parses=ok,ok runs=ok,FAIL saved=- markers=$STEP body=base,base ordinary=$STEP
+with a bare name matched against every script a non-executable namesake elsewhere is held@scripts/lib/restack-state.sh@&& (multi || p in exe)) print p@1@&& 1) print p@one@create topic --restack@rc=1 err=worktree-rebase-conflicts: <wt>;worktree-restack-hook-held: $ONE paused=yes parses=ok,ok runs=ok,ok saved=$ONE.restack-conflict markers=$ONE.restack-conflict body=base,base ordinary=-
+without resolving against the naming file's directory both namesakes are held@scripts/lib/restack-state.sh@r = norm(dir == \"\" ? w : dir \"/\" w)@1@r = w@helper@create topic --restack@rc=1 err=worktree-rebase-conflicts: <wt>;worktree-restack-hook-held: $DECOY $HELPER paused=yes parses=ok,ok runs=ok,ok saved=$DECOY.restack-conflict,$HELPER.restack-conflict markers=$DECOY.restack-conflict,$HELPER.restack-conflict body=base,base ordinary=-
+with the suffix fallback run beside a direct match both namesakes are held@scripts/lib/restack-state.sh@if (hit) continue@1@hit = hit@helper@create topic --restack@rc=1 err=worktree-rebase-conflicts: <wt>;worktree-restack-hook-held: $DECOY $HELPER paused=yes parses=ok,ok runs=ok,ok saved=$DECOY.restack-conflict,$HELPER.restack-conflict markers=$DECOY.restack-conflict,$HELPER.restack-conflict body=base,base ordinary=-
+without the assigned paths a script a hook runs through a variable keeps its markers and the hook fails@scripts/lib/restack-state.sh@val[name] = val[name] SUBSEP v@1@v = v@assembled@create topic --restack@rc=1 err=worktree-rebase-conflicts: <wt> paused=yes parses=ok,ok runs=ok,FAIL saved=- markers=$ASSEMBLED body=base,base ordinary=$ASSEMBLED
+without positional roots a script a hook runs under one keeps its markers and the hook fails@scripts/lib/restack-state.sh@[A-Za-z0-9_]*|[0-9])[}]?@1@[A-Za-z0-9_]*)[}]?@pos@create topic --restack@rc=1 err=worktree-rebase-conflicts: <wt> paused=yes parses=ok,ok runs=ok,FAIL saved=- markers=$POS body=base,base ordinary=$POS
+with comments read as invocations an executable named only in a comment is held@scripts/lib/restack-state.sh@if (\$0 ~ /^[[:space:]]*#/) continue@1@if (0) continue@note@create topic --restack@rc=1 err=worktree-rebase-conflicts: <wt>;worktree-restack-hook-held: $NOTE paused=yes parses=ok,ok runs=ok,ok saved=$NOTE.restack-conflict markers=$NOTE.restack-conflict body=base,base ordinary=-
 "
 m=0
 while IFS='@' read -r label target text count replacement fixture command want; do

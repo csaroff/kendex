@@ -189,10 +189,17 @@ unstage the copy with 'git rm -q --cached --ignore-unmatch --
 'worktree-restack-hook-unconsumed:' while a saved copy is in the worktree or
 the index; deleting it, staging the path and unstaging the copy keeps the held
 side. abort removes the saved copies. The held set is the paths a
-declaration's command names and the libraries those hooks source, directly or
-through another library, read from the '# shellcheck source=' directive above
-each 'source' or '.' line, at the pre-restack head, the paused HEAD and the
-commit being replayed. A directive resolves against the sourcing file's
+declaration's command names and the libraries and scripts those hooks source
+or execute, directly or through another such file, at the pre-restack head,
+the paused HEAD and the commit being replayed. A sourced library is read from
+the '# shellcheck source=' directive above each 'source' or '.' line. An
+executed script is a tracked executable, or a file named for an interpreter
+(.sh, .bash, .py, .js, .mjs, .cjs, .awk), that a '$VAR/<rest>',
+'${VAR}/<rest>' or '$1/<rest>' word on a line that is not a comment names at
+the repository root or against the naming file's directory, a variable inside
+<rest> taking each literal path the file assigns it; where neither holds one, every
+such script ending in <rest> (only executables for a one-segment <rest>).
+Any other file a hook names is data it reads and is not held. A directive resolves against the sourcing file's
 directory; one that climbs out of it ('../skills/<skill>/...') matches every
 tracked path ending in the rest of it, since the hook finds that library by
 searching. When any read that discovery makes fails, the lookup of the
