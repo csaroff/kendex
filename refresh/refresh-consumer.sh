@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Runs with the consumer's default-branch checkout as the working directory,
 # from the kendex release tree the shared workflow checked out. It rebuilds the rolling branch from the
-# checkout, never executes the remote rolling branch, and pushes only after
-# the shared classifier measures the complete diff. It requests auto-merge
+# checkout and never executes the remote rolling branch. It requests auto-merge
 # after GitHub shows the published head. SKILL.md defines the arm outcomes.
 # Output records: refresh-state=current pr=none class=none, or
 # refresh-state=unchanged|pushed pr=NUMBER class=CLASS, or
@@ -375,9 +374,11 @@ while IFS= read -r line; do
       'queue-only: '*' cause=queue-settings-unreadable') setting_notes+=("$line") ;;
   esac
 done <<<"$class_output"
-# change-class also emits standard as a fallback. Publication requires its
-# leading class and measured fields to agree with stdout, not path/cause text.
-if [ "$class_result" -ne 0 ] || [ -z "$class" ] || [[ "$class_line" != "class: class=$class measured=true "* ]]; then
+# An unmeasured standard verdict widens review and CI. Narrower classes still
+# need measurement, with leading fields that agree with stdout.
+if [ "$class_result" -ne 0 ] || [ -z "$class" ] ||
+    { [[ "$class_line" != "class: class=$class measured=true "* ]] &&
+      { [ "$class" != standard ] || [[ "$class_line" != "class: class=standard measured=false "* ]]; }; }; then
   printf 'refresh-error=read value=class\n' >&2
   exit 1
 fi
