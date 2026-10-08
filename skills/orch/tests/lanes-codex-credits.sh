@@ -83,8 +83,8 @@ cloud_body() {
   local remaining="" limit="" resets="" locked=""
   [[ -z "${2:-}" ]] || IFS=':' read -r remaining limit resets locked <<<"$2"
   jq -n --argjson w "$1" --arg rem "$remaining" --arg lim "$limit" --arg at "$resets" --arg locked "$locked" '{
-    five_hour: {utilization: 10, resets_at: "2026-07-27T06:00:00Z"},
-    seven_day: {utilization: $w, resets_at: "2026-08-01T06:00:00Z"}}
+    five_hour: {utilization: 10, resets_at: "2099-07-27T06:00:00Z"},
+    seven_day: {utilization: $w, resets_at: "2099-08-01T06:00:00Z"}}
     + if $rem == "" then {} else {iguana_necktie: {limit_dollars: ($lim | tonumber), remaining_dollars: ($rem | tonumber),
         used_dollars: (($lim | tonumber) - ($rem | tonumber)), resets_at: ($at | sub("_"; ":"; "g")),
         locked_reason: (if $locked == "" then null else $locked end)}} end'
@@ -195,17 +195,20 @@ echo "=== an account on its credits carries no plan-window wall forecast ==="
 # usage_rate_state and projected_wall_minutes off this record for its rate
 # mark, so an account on its credits carries neither.
 RATE_STORE="$TMP_ROOT/rate-store"
+RATE_RESET="$(( $(date +%s) + 86400 ))"
 rate_samples() { # LANES_SCRIPT
   rm -rf -- "${RATE_STORE:?}"
   local w
   for w in 99 100; do
-    codex_body "$w" 62300 true false false > "$FIXTURE_DIR/.codex.json"
+    codex_body "$w" 62300 true false false "$RATE_RESET" \
+      | jq --argjson reset "$RATE_RESET" '.rate_limit.primary_window.reset_at = $reset' > "$FIXTURE_DIR/.codex.json" || return 1
     (cd "$NOSETTINGS" && env GIT_CEILING_DIRECTORIES="$TMP_ROOT" LANES_HOME="$H" ORCH_LANES_FETCH_CMD="$FETCHER" \
       OVERSEE_WATCH_STATE_DIR="$RATE_STORE" ORCH_STATE_DIR="$TMP_ROOT/rate-fleet" "$(dirs codex)" \
       "$1" list --harness codex --json --no-cache >/dev/null) || return 1
     [[ "$w" == 100 ]] || age_usage_record "$RATE_STORE" "$H/.codex" 900
   done
-  codex_body 100 62300 true false false > "$FIXTURE_DIR/.codex.json"
+  codex_body 100 62300 true false false "$RATE_RESET" \
+    | jq --argjson reset "$RATE_RESET" '.rate_limit.primary_window.reset_at = $reset' > "$FIXTURE_DIR/.codex.json" || return 1
 }
 rate_samples "$LANES" || { echo "lanes-codex-credits: rate-samples=failed" >&2; exit 1; }
 table \

@@ -11,6 +11,11 @@
 # this file out of the run. The sourcing suite sets TMP_ROOT first, which only
 # `new_home` reads, so a suite that wants `settled_mutex` alone needs none.
 
+# Keep every write in this suite on the same quota period, including retained
+# samples. A reset within an hour keeps a live claim's session charge at one hour.
+CLAUDE_USAGE_SESSION_RESET="$(date +%s)" || exit 1
+CLAUDE_USAGE_SESSION_RESET="$(jq -nr --argjson now "$CLAUDE_USAGE_SESSION_RESET" '$now + 1800 | todate')" || exit 1
+
 # make_lane HOME NAME [EXPIRES_IN_S] [PLAN] — a claude config dir with an
 # OAuth credentials file; a negative EXPIRES_IN_S is an already-expired token.
 make_lane() {
@@ -136,12 +141,13 @@ STUB
   chmod +x "$path"
 }
 
-# claude_usage SESSION_PCT WEEKLY_PCT MODEL_PCT MODEL_LABEL — a usage body.
+# claude_usage SESSION_PCT WEEKLY_PCT MODEL_PCT MODEL_LABEL: a usage body.
 claude_usage() {
-  jq -n --argjson s "$1" --argjson w "$2" --argjson m "$3" --arg lbl "$4" '{
-    five_hour: {utilization: $s, resets_at: "2026-07-27T06:00:00Z"},
-    seven_day: {utilization: $w, resets_at: "2026-08-01T06:00:00Z"},
-    limits: [{kind: "weekly_scoped", percent: $m, resets_at: "2026-08-01T06:00:00Z",
+  jq -n --argjson s "$1" --argjson w "$2" --argjson m "$3" --arg lbl "$4" \
+    --arg reset "$CLAUDE_USAGE_SESSION_RESET" '{
+    five_hour: {utilization: $s, resets_at: $reset},
+    seven_day: {utilization: $w, resets_at: "2099-08-01T06:00:00Z"},
+    limits: [{kind: "weekly_scoped", percent: $m, resets_at: "2099-08-01T06:00:00Z",
               scope: {model: {display_name: $lbl}}}]
   }'
 }

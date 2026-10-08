@@ -77,8 +77,8 @@ new_home invalid-pct
 for lane in sclaude mclaude nclaude oclaude lclaude aclaude; do make_lane "$H" "$lane" 3600; done
 for lane in scodex mcodex ncodex ocodex; do make_codex_lane "$H/.$lane"; done
 claude_body() { # LANE FILTER
-  jq -n '{five_hour: {utilization: 10, resets_at: "2026-07-27T06:00:00Z"},
-          seven_day: {utilization: 20, resets_at: "2026-08-01T06:00:00Z"},
+  jq -n '{five_hour: {utilization: 10, resets_at: "2099-07-27T06:00:00Z"},
+          seven_day: {utilization: 20, resets_at: "2099-08-01T06:00:00Z"},
           limits: [{kind: "weekly_scoped", percent: 30, scope: {model: {display_name: "Opus"}}},
                    {kind: "weekly_scoped", percent: 40, scope: {model: {display_name: "Fable"}}}]} | '"$2" \
     > "$FIXTURE_DIR/.$1.json" || exit 1
@@ -128,11 +128,13 @@ range='and . >= 0 and . <= 1e12'
 for spec in claude:sclaude:type:round claude:nclaude:range:round codex:scodex:type:floor codex:ncodex:range:floor \
   claude:nclaude:order:round claude:sclaude:whole: codex:scodex:whole:; do
   IFS=':' read -r harness lane rule op <<<"$spec"
+  [[ -z "$op" ]] || op='if $rounding == "unrounded" then . else '"$op"' end'
+  range_then="$range"$'\n\t\t                 then '
   dir="$(mutant_scripts "mutant-pct-$harness-$rule" lib/lane-usage.sh)" || exit 1
   case "$harness:$rule" in
     *:type) mutate_file "$dir/lib/lane-usage.sh" "then $op else null end;" "then $op else 0 end;" ;;
-    *:range) mutate_file "$dir/lib/lane-usage.sh" "$range then $op" "then $op" ;;
-    claude:order) mutate_file "$dir/lib/lane-usage.sh" "$range then $op else null end;" \
+    *:range) mutate_file "$dir/lib/lane-usage.sh" "$range_then$op" "then $op" ;;
+    claude:order) mutate_file "$dir/lib/lane-usage.sh" "$range_then$op else null end;" \
       "then $op | (if (. > 1e12 or . < 0) then null else . end) else null end;" ;;
     claude:whole) mutate_file "$dir/lib/lane-usage.sh" 'if $unread then null' 'if false then null' ;;
     codex:whole) mutate_file "$dir/lib/lane-usage.sh" '(if any(.[]; .pct == null) then' '(if false then' ;;
