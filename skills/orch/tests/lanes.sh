@@ -1100,6 +1100,9 @@ standard_home home
 # that claims it, or it would tie claude for the pick.
 BSDIR="$H/.back\\tclaude"
 ln -sfn "$H/.claude" "$TMP_ROOT/claude-link"
+# A second home on the same host, whose `.eclaude` is the same account as
+# this home's: a store several homes share names it by both paths.
+AWAY_HOME="$TMP_ROOT/away-home"
 
 # stage_panes SPEC — the pane file(s) for one run: `live:%1,dead:%2` lists
 # panes by server (live is this process, dead a pid no server has); `N=...;`
@@ -1138,11 +1141,16 @@ stage_panes() {
 
 # stage_claims SPEC — the claim files for one run, `name:server:pane:dir` items
 # separated by `;`: server is live or dead, dir one of the home's lane names,
-# `claude/` for a trailing slash, `link` for a symlink to claude, `bs` for the
-# backslash-named lane; `junk` writes a malformed record. Any other token is
-# a typo and aborts the suite rather than staging the opposite world.
+# `claude/` for a trailing slash, `link` for a symlink to claude, `away` for
+# eclaude reached from a second home, `awaydefault` for that home's own
+# `.claude`, `srv` for a second `.eclaude` this home lists beside its own, `srvf` for a
+# listed `.fclaude`, `pia` for a Pi root, `aliased` for a second home's `.other`
+# whose launch named it by that spelling and whose canonical target is
+# `creds-b`, `written` for that claim written through lane_claim_write, `bs`
+# for the backslash-named lane; `junk` writes a malformed record. Any other
+# token is a typo and aborts the suite rather than staging the opposite world.
 stage_claims() {
-  local spec="$1" items item name server pane dir pid
+  local spec="$1" items item name server pane dir pid named
   STORE="$RUN/store"
   mkdir -p "$STORE/claims"
   [[ -n "$spec" ]] || return 0
@@ -1153,6 +1161,7 @@ stage_claims() {
       continue
     fi
     IFS=':' read -r name server pane dir <<<"$item"
+    named=""
     case "$server" in
       live) pid="$LIVE_PID" ;;
       dead) pid="$DEAD_PID" ;;
@@ -1162,6 +1171,24 @@ stage_claims() {
       claude | eclaude | nclaude) dir="$H/.$dir" ;;
       claude/) dir="$H/.claude/" ;;
       link) dir="$TMP_ROOT/claude-link" ;;
+      away) dir="$AWAY_HOME/.eclaude"; mkdir -p "$dir" ;;
+      awaydefault) dir="$AWAY_HOME/.claude"; mkdir -p "$dir" ;;
+      srv) dir="$TMP_ROOT/srv/.eclaude"; mkdir -p "$dir" ;;
+      srvf) dir="$TMP_ROOT/srv/.fclaude"; mkdir -p "$dir" ;;
+      pia) dir="$TMP_ROOT/pi/.pia"; mkdir -p "$dir" ;;
+      aliased)
+        dir="$AWAY_HOME/creds-b"; named="$AWAY_HOME/.other"
+        mkdir -p "$dir"; ln -sfn "$dir" "$named"
+        ;;
+      written)
+        # The same claim as `aliased`, written by the claims library beside the
+        # `lanes` under test, whatever record that library writes.
+        mkdir -p "$AWAY_HOME/creds-b"; ln -sfn "$AWAY_HOME/creds-b" "$AWAY_HOME/.other"
+        ( source "$(dirname "$LANES")/lib/lane-claims.sh" \
+          && lane_claim_write "$STORE/claims" "$pid" "$pane" "$AWAY_HOME/.other" "$name" "" ) \
+          || { echo "stage_claims: lane_claim_write failed for $item" >&2; exit 1; }
+        continue
+        ;;
       bs)
         dir="$BSDIR"
         mkdir -p "$BSDIR"
@@ -1170,7 +1197,11 @@ stage_claims() {
         ;;
       *) echo "stage_claims: unknown dir token in $item" >&2; exit 1 ;;
     esac
-    printf '%s\t%s\t%s\t%s\t2026-08-16T00:00:00Z\n' "$pid" "$pane" "$dir" "$name" > "$STORE/claims/$name.claim"
+    printf '%s\t%s\t%s\t%s\t2026-08-16T00:00:00Z' "$pid" "$pane" "$dir" "$name" > "$STORE/claims/$name.claim"
+    # The record lane_claim_put writes ends in the fleet and the named spelling;
+    # the other tokens stage the older record that carries neither.
+    [[ -z "$named" ]] || printf '\t\t%s' "$named" >> "$STORE/claims/$name.claim"
+    printf '\n' >> "$STORE/claims/$name.claim"
   done
 }
 
@@ -1223,7 +1254,65 @@ claims_table \
   "a claim written after the pane snapshot is not pruned by it|1=live:%1;2=live:%1,live:%4;*=live:%4|racer:live:%4:claude||$LIST|claude.claims=1 files=racer" \
   "a backslash-bearing config dir still counts its live claim|live:%5|backslash:live:%5:bs||$LIST|bs.claims=1" \
   "the one-lane form counts the same claims the fleet pick and the listing do|live:%1,live:%2|one:live:%1:claude||pick --lane $H/.claude --harness claude --json|rc=0 claims=1" \
-  "a malformed claim record is dropped on read|live:%1|junk||$LIST|files=none"
+  "a malformed claim record is dropped on read|live:%1|junk||$LIST|files=none" \
+  "claims on one account from two homes count under that one account|live:%1,live:%2|mine:live:%1:eclaude;theirs:live:%2:away||$LIST|eclaude.claims=2 claude.claims=0" \
+  "the one-lane form charges both homes' claims to the account|live:%1,live:%2|mine:live:%1:eclaude;theirs:live:%2:away||pick --lane $H/.eclaude --harness claude --json|rc=0 claims=2" \
+  "another home's own .claude is another account, never charged to this one|live:%1,live:%2|mine:live:%1:claude;theirs:live:%2:awaydefault||$LIST|claude.claims=1"
+ORCH_LANE_ALIASES="claude=work" claims_table \
+  "a .claude both homes alias to one account name counts as that one account|live:%1,live:%2|mine:live:%1:claude;theirs:live:%2:awaydefault||$LIST|work.claims=2"
+# Two lanes this home lists share the alias `eclaude`; a claim on one is never
+# charged to the other.
+ORCH_LANE_DIRS="$H/.eclaude:$TMP_ROOT/srv/.eclaude" claims_table \
+  "a claim on one of two listed lanes sharing an alias is never charged to the other|live:%1|theirs:live:%1:srv||pick --lane $H/.eclaude --harness claude --json|rc=0 claims=0"
+# The same holds for a local lane the alias setting joins to `.eclaude` but
+# that is excluded, or is a Pi root: both are this machine's own.
+OWN_WORK="eclaude=work,fclaude=work,pia=work"
+ORCH_LANE_DIRS="$H/.eclaude:$TMP_ROOT/srv/.fclaude" ORCH_LANE_EXCLUDE=fclaude ORCH_LANE_ALIASES="$OWN_WORK" claims_table \
+  "a claim on an excluded local lane sharing an alias is never charged to the other|live:%1|theirs:live:%1:srvf||pick --lane $H/.eclaude --harness claude --json|rc=0 claims=0"
+ORCH_LANE_DIRS="$H/.eclaude" ORCH_LANE_COPILOT_POOL="$TMP_ROOT/pi/.pia=1/10" ORCH_LANE_ALIASES="$OWN_WORK" claims_table \
+  "a claim on a local Pi root sharing an alias is never charged to the other|live:%1|theirs:live:%1:pia||pick --lane $H/.eclaude --harness claude --json|rc=0 claims=0"
+
+# The fleet names one account `work` in both homes: this home's `.eclaude` and
+# the other's `.other`, a symlink to a target named for neither.
+WORK_ALIASES="eclaude=work,other=work"
+ORCH_LANE_ALIASES="$WORK_ALIASES" claims_table \
+  "a claim keys by the alias its launch named, not its canonical target's name|live:%1,live:%2|mine:live:%1:eclaude;theirs:live:%2:aliased||$LIST|work.claims=2 claude.claims=0" \
+  "a claim lane_claim_write records through a symlinked spelling keys by that spelling's alias|live:%1,live:%2|mine:live:%1:eclaude;theirs:live:%2:written||$LIST|work.claims=2 claude.claims=0"
+
+# Controls: keyed by the canonical path alone, the second home's claim lands
+# on a key no listed lane carries and the account reads half its load; keyed
+# by the canonical target's name, or written with no named spelling, the
+# aliased claim misses `work` the same way.
+claims_scripts="$(mutant_scripts mutant-claims-path-key lanes)" || exit 1
+mutate_file "$claims_scripts/lanes" ' || ($2 != "" && $2 == ENVIRON["LANE_CLAIMS_ACCOUNT_Q"])' ''
+LANES="$claims_scripts/lanes" claims_table \
+  "control: a path key counts two homes' claims on one account as two accounts|live:%1,live:%2|mine:live:%1:eclaude;theirs:live:%2:away||$LIST|eclaude.claims=1 claude.claims=0"
+claims_scripts="$(mutant_scripts mutant-claims-canon-alias lanes)" || exit 1
+mutate_file "$claims_scripts/lanes" '"$(lane_account_name "${named:-$cfg}")"' '"$(lane_account_name "$cfg")"'
+ORCH_LANE_ALIASES="$WORK_ALIASES" LANES="$claims_scripts/lanes" claims_table \
+  "control: the canonical target's name splits one aliased account in two|live:%1,live:%2|mine:live:%1:eclaude;theirs:live:%2:aliased||$LIST|work.claims=1 claude.claims=0"
+claims_scripts="$(mutant_scripts mutant-claims-unnamed lib/lane-claims.sh)" || exit 1
+mutate_file "$claims_scripts/lib/lane-claims.sh" '"$7" "$5" > "$tmp"' '"$7" "" > "$tmp"'
+ORCH_LANE_ALIASES="$WORK_ALIASES" LANES="$claims_scripts/lanes" claims_table \
+  "control: a writer that drops the named spelling keys the claim by its target's name|live:%1,live:%2|mine:live:%1:eclaude;theirs:live:%2:written||$LIST|work.claims=1 claude.claims=0"
+claims_scripts="$(mutant_scripts mutant-claims-default-merged lanes)" || exit 1
+mutate_file "$claims_scripts/lanes" '[[ "$alias" == "$base" && "$base" =~ ^(claude|codex|copilot)$ ]] || printf' 'printf'
+LANES="$claims_scripts/lanes" claims_table \
+  "control: keying a home's default .claude by its bare name charges every home's default to it|live:%1,live:%2|mine:live:%1:claude;theirs:live:%2:awaydefault||$LIST|claude.claims=2"
+claims_scripts="$(mutant_scripts mutant-claims-own-named lanes)" || exit 1
+mutate_file "$claims_scripts/lanes" 'case "$own" in *$'"'"'\n'"'"'"$cfg"$'"'"'\n'"'"'*) ;; *) key="$(lane_account_name "${named:-$cfg}")" ;; esac' 'key="$(lane_account_name "${named:-$cfg}")"'
+ORCH_LANE_DIRS="$H/.eclaude:$TMP_ROOT/srv/.eclaude" LANES="$claims_scripts/lanes" claims_table \
+  "control: naming a claim a listed lane holds charges it to the other lane sharing its alias|live:%1|theirs:live:%1:srv||pick --lane $H/.eclaude --harness claude --json|rc=0 claims=1"
+claims_scripts="$(mutant_scripts mutant-claims-own-unexcluded lanes)" || exit 1
+mutate_file "$claims_scripts/lanes" 'done < <(lane_dirs "$h" all)' 'done < <(lane_dirs "$h")'
+ORCH_LANE_DIRS="$H/.eclaude:$TMP_ROOT/srv/.fclaude" ORCH_LANE_EXCLUDE=fclaude ORCH_LANE_ALIASES="$OWN_WORK" LANES="$claims_scripts/lanes" claims_table \
+  "control: an inventory of listed lanes alone names the excluded lane's claim|live:%1|theirs:live:%1:srvf||pick --lane $H/.eclaude --harness claude --json|rc=0 claims=1"
+claims_scripts="$(mutant_scripts mutant-claims-own-no-pi lanes)" || exit 1
+# The inventory loop alone: the chooser walks the same harness list.
+mutate_file "$claims_scripts/lanes" $'\tfor h in claude codex copilot pi; do\n\t\twhile IFS= read -r d; do\n\t\t\t[[ -z "$d" ]] || own+=' \
+  $'\tfor h in claude codex copilot; do\n\t\twhile IFS= read -r d; do\n\t\t\t[[ -z "$d" ]] || own+='
+ORCH_LANE_DIRS="$H/.eclaude" ORCH_LANE_COPILOT_POOL="$TMP_ROOT/pi/.pia=1/10" ORCH_LANE_ALIASES="$OWN_WORK" LANES="$claims_scripts/lanes" claims_table \
+  "control: an inventory without Pi roots names the Pi root's claim|live:%1|theirs:live:%1:pia||pick --lane $H/.eclaude --harness claude --json|rc=0 claims=1"
 
 # Root reads a mode-000 path, so these rows cannot fail a read there.
 if [[ "$(id -u)" -eq 0 ]]; then
