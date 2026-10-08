@@ -2658,12 +2658,21 @@ overseer_recovery_blocked() { # ROW ROWS IDENTITY PANE WINDOW
   local errf="$WORK_DIR/overseer-blocked.err"
   lane_row_commit "$(lane_row_set "$row" "$rows" "$identity" reported)"
   OVERSEER_STOP=1
-  printf 'overseer-recovery-blocked: no account qualifies for a successor to the overseer in tmux window %s (pane %s). Its own account is %s and its binding bucket frees up at %s. The repeat stops; start a fresh overseer by hand once an account has room.\n' \
-    "$window" "$pane" "${OVERSEER_MARK_ACCOUNT:-unknown}" "${OVERSEER_MARK_RESETS:-none}" > "$notice" \
+  local account="" resets=""
+  [[ "$OVERSEER_MARK_READ" -ne 1 ]] || { account="$OVERSEER_MARK_ACCOUNT"; resets="$OVERSEER_MARK_RESETS"; }
+  local remedy="Start a fresh overseer by hand once an account qualifies."
+  if [[ "$OV_SOURCE" == auth || ( "$OV_SOURCE" == rows && "$SESSION_ROWS_WALL_KIND" == auth ) ]]; then
+    account="" resets=""
+    remedy="The login failed and has no usage reset. Sign in to an account, then start a fresh overseer by hand."
+  elif [[ -n "$account" && -n "$resets" ]]; then
+    remedy="Account $account has a measured binding bucket reset at $resets. Start a fresh overseer by hand once an account has room."
+  fi
+  printf 'overseer-recovery-blocked: no account qualifies for a successor to the overseer in tmux window %s (pane %s). %s The repeat stops.\n' \
+    "$window" "$pane" "$remedy" > "$notice" \
     || { overseer_note overseer-notice-failed "channel=file"; return 0; }
   overseer_publish "$notice" "$record" "$errf"
   ow_message overseer-recovery-blocked "pane=$pane" \
-    "account=${OVERSEER_MARK_ACCOUNT:-unknown}" "resets=${OVERSEER_MARK_RESETS:-none}" >&2
+    "account=${account:-unknown}" "resets=${resets:-none}" >&2
 }
 
 overseer_relaunch_failed() { # ROW ROWS IDENTITY PANE WINDOW ATTEMPT STEP
@@ -3117,6 +3126,13 @@ overseer_pane_read() { # PANE
   OV_START="$(ol_session_start "$server" "$pane")" \
     || { overseer_note overseer-unreadable "pane=$pane" "field=server-start"; return 1; }
   [[ "$OL_INSPECT_STATE" != exited ]] || bare=1
+  # Login failure is this harness's wall even with a last successful row or
+  # room on its account. The shared judge supplies the failure classification.
+  if [[ "$OL_INSPECT_STATE" == walled ]] \
+    && [[ "$OL_INSPECT_WALL_KIND" == auth ]]; then
+    OV_STATE=walled OV_SOURCE=auth OV_SCREEN="$OL_DETAIL"
+    return 0
+  fi
   [[ ",$OL_INSPECT_CAUSE," != *,process-probe,* ]] || note_probe_unusable "$pane" "$OL_INSPECT_PROBE"
   # The rows file and the exit status the record holds for THIS pane on THIS
   # server, by `ol_names`, and neither for a record naming another session:
@@ -3192,7 +3208,9 @@ overseer_judge() { # PANE
   case "$OV_STATE" in
     exited) OV_VERDICT=exited ;;
     walled)
-      if [[ "$OV_SOURCE" == rows ]]; then
+      if [[ "$OV_SOURCE" == auth || ( "$OV_SOURCE" == rows && "$SESSION_ROWS_WALL_KIND" == auth ) ]]; then
+        OV_VERDICT=walled
+      elif [[ "$OV_SOURCE" == rows ]]; then
         if ! overseer_marks_judge || [[ "$OVERSEER_MARK_KEY" != below-mark ]]; then OV_VERDICT=walled
         else overseer_note overseer-wall-lifted "pane=$1"; fi
       elif overseer_wall_confirmed "$1"; then OV_VERDICT=walled; fi ;;
@@ -3416,9 +3434,9 @@ check_lanes() {
   # No lane to watch still leaves the items: a handoff is read from state.
   [[ ${#LANES[@]} -gt 0 ]] || { check_handoff; return 0; }
   local lane pane below cmd pid state window i states="" claims="" claimed pane_key
-  local seen seen_at seen_pane seen_reported seen_key reset_at reset_utc reset_note event quiet
+  local seen seen_at seen_pane seen_reported seen_key reset_at reset_utc reset_note event reported_event quiet
   local asking_state fingerprint prior turn_identity capacity capacity_key screen_key close_failed=0
-  local banner banner_rc turn hosted_item hosted_harness
+  local banner banner_rc turn hosted_item hosted_harness wall_kind
   # One liveness read and one pane capture per lane per pass: a lane's kind is
   # decided from a single observation, never from two screens taken apart. The
   # pid leads the format so a command carrying a space cannot shift the split.
@@ -3457,7 +3475,7 @@ check_lanes() {
       || die limit-scan-failed "" "lane=$lane"
     # Provider failures stay unjudged; local probe failures still permit pane judgment.
     [[ -n "$hosted_item" || "$LANE_PROBE_RC" -le 1 ]] || note_probe_unusable "$lane"
-    states+="$i"$'\t'"$state"$'\t'"$LANE_EXIT_SOURCE"$'\n'
+    states+="$i"$'\t'"$state"$'\t'"$LANE_EXIT_SOURCE"$'\t'"$LANE_WALL_KIND"$'\n'
     if [[ "$state" == gone ]]; then
       echo "EVENT window-gone $lane"
       PASS_EVENT=1
@@ -3557,8 +3575,10 @@ check_lanes() {
     fi
     seen_at=""; seen_pane=""; seen_reported=""; seen_key=""
     [[ -z "$seen" ]] || IFS='|' read -r seen_at seen_pane seen_reported seen_key <<<"$seen"
+    wall_kind="$(lane_field "$states" "$i" 4)" || die state-read-failed "" "lane=$lane" "field=wall-kind"
     reset_at=""
     [[ -z "$seen_key" ]] || reset_at="$(usage_reset_epoch "$seen_key" "$seen_at")"
+    [[ "$wall_kind" != auth ]] || reset_at=""
     event=usage-limit
     reset_note=""
     reset_utc=""
@@ -3573,7 +3593,11 @@ check_lanes() {
     # lane stays walled above; a reset going by turns the event into
     # usage-limit-passed, which is news once more. Such a pass only
     # records the wall (lib/account-wall.sh).
-    quiet=""; [[ "$seen_reported" != "$event" ]] || quiet=1
+    # A retry can replace a no-reset usage wall with a failed login in the
+    # same pane. Its report identity must differ without moving the reset's day.
+    reported_event="$event"
+    [[ "$wall_kind" != auth ]] || reported_event="$event:auth"
+    quiet=""; [[ "$seen_reported" != "$reported_event" ]] || quiet=1
     # The detail is a nicety; a claim store this process cannot read must
     # not take down the event that carries the payload.
     claims="$(lane_claims_read "$(lane_claims_dir "$PROJECT_ROOT")" || true)"
@@ -3606,10 +3630,11 @@ check_lanes() {
     [[ -n "$banner" ]] || die limit-banner-missing "" "lane=$lane"
     account_wall_record "$PROJECT_ROOT" "$claimed" "$reset_at" "$PASS_NOW" "$banner" "${LANE_ROWS[$i]:+row}" || true
     [[ -z "$quiet" ]] || continue
-    echo "EVENT $event $lane${claimed:+ $claimed}$reset_note"
+    [[ "$wall_kind" == auth ]] || wall_kind=""
+    echo "EVENT $event $lane${claimed:+ $claimed}$reset_note${wall_kind:+ wall_kind=$wall_kind}"
     banner_payload "$below" "$banner" || die limit-banner-missing "" "lane=$lane"
     PASS_EVENT=1
-    asking_state="$(lane_row_set usage-limit "$asking_state" "$lane" "${seen_at:-$PASS_NOW}|${seen_pane:-$pane_key}|$event|$seen_key")"
+    asking_state="$(lane_row_set usage-limit "$asking_state" "$lane" "${seen_at:-$PASS_NOW}|${seen_pane:-$pane_key}|$reported_event|$seen_key")"
   done
   # A pane keeps its last screen, so neither a stale prompt under a bare shell
   # nor a dialog answered passes ago is a live question. A current prompt is
