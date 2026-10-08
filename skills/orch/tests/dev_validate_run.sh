@@ -50,6 +50,8 @@ clock_now() { cat "$STUB_CLOCK"; }
 make_proj() { # NAME CMD TIMEOUT_SECS
   local dir="$TMP_ROOT/$1"
   git init -q "$dir"
+  git -C "$dir" config gc.auto 0
+  git -C "$dir" config maintenance.auto false
   {
     printf '[env]\n'
     printf 'DEV_VALIDATE_CMD = "%s"\n' "$2"
@@ -88,6 +90,7 @@ run_script() { # SCRIPT ARG...
   # means to hand one in names it in INHERITED_CLASS.
   OUT="$(env -u DEV_VALIDATE_CMD -u DEV_VALIDATE_TIMEOUT_SECS -u DEV_VALIDATE_RANGE_CMD -u DEV_VALIDATE_BASE \
     -u DEV_VALIDATE_CLASS -u DEV_VALIDATE_DOCS_ONLY -u DEV_VALIDATE_PATHS -u WORKTREE_DEFAULT_BRANCH -u DEV_VALIDATE_CI_CONTEXT -u DEV_VALIDATE_FINDING_PREFIX \
+    -u DEV_VALIDATE_SELECTION_CMD -u DEV_VALIDATE_SCOPED -u GH_TOKEN -u GITHUB_TOKEN -u GH_BOT_TOKEN -u KENDEX_GITHUB_VALIDATED_TOKEN \
     ${INHERITED_CLASS:+DEV_VALIDATE_CLASS=$INHERITED_CLASS} \
     PATH="${RUN_PATH:-$PATH}" "$script" "$@" 2>"$err")"
   RC=$?
@@ -673,8 +676,11 @@ assert_eq "$RC" "2" "and exits 2"
 # selectors straight off the log.
 LAYOUT="$TMP_ROOT/layout"
 mkdir -p "$LAYOUT/orch/scripts/lib" "$LAYOUT/harness-ci/scripts"
-cp "$SCRIPTS_DIR/dev-validate-run" "$SCRIPTS_DIR/orch-env" "$SCRIPTS_DIR/resolve-base-branch" "$LAYOUT/orch/scripts/"
+cp "$SCRIPTS_DIR/dev-validate-run" "$SCRIPTS_DIR/orch-env" "$SCRIPTS_DIR/resolve-base-branch" "$SCRIPTS_DIR/pr-view-json" "$LAYOUT/orch/scripts/"
 cp -R "$SCRIPTS_DIR/lib/." "$LAYOUT/orch/scripts/lib/"
+# Exercise the installed PR lookup chain; only its external gh calls are stubs.
+mkdir -p "$LAYOUT/github"
+cp -R "$REPO_ROOT/skills/github/scripts" "$LAYOUT/github/scripts"
 cat > "$LAYOUT/harness-ci/scripts/change-class" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$@" > "$STUB_ARGS"
@@ -809,9 +815,18 @@ mv "$LAYOUT/harness-ci.off" "$LAYOUT/harness-ci"
 # verdict and the measured marker.
 GH_STUB_BIN="$TMP_ROOT/gh-stub"
 mkdir -p "$GH_STUB_BIN"
+REAL_JQ="$(command -v jq)"
+export REAL_JQ
+cat > "$GH_STUB_BIN/jq" <<'SH'
+#!/usr/bin/env bash
+[[ "$*" != *'@uri'* || "${STUB_URI_EXIT:-0}" == 0 ]] || exit "$STUB_URI_EXIT"
+exec "$REAL_JQ" "$@"
+SH
+chmod +x "$GH_STUB_BIN/jq"
 cat > "$GH_STUB_BIN/gh" <<'SH'
 #!/usr/bin/env bash
 case "${1:-} ${2:-}" in
+  "auth status") exit 0 ;;
   "pr view") path=pr-view ;;
   "api "*) path="$2" ;;
   *) exit 9 ;;
@@ -826,12 +841,14 @@ while (( $# > 0 )); do
     *) exit 9 ;;
   esac
 done
-[[ -n "$filter" ]] || exit 9
+[[ -n "$filter" || "$path" == pr-view ]] || exit 9
 list() { jq -cn --arg v "$1" '$v | split(",") | map(select(. != ""))'; }
 case "$path" in
   pr-view)
-    payload="$(jq -cn --arg base "${STUB_PR_BASE:-main}" --arg state "${STUB_PR_STATE:-OPEN}" '{baseRefName: $base, state: $state}')"
+    payload="${STUB_PR_PAYLOAD:-}"
+    [[ -n "$payload" ]] || payload="$(jq -cn --arg base "${STUB_PR_BASE-main}" --arg state "${STUB_PR_STATE:-OPEN}" '{baseRefName: $base, state: $state}')"
     status="${STUB_PR_EXIT:-0}"
+    [[ -z "${STUB_PR_STDERR:-}" ]] || printf '%s\n' "$STUB_PR_STDERR" >&2
     ;;
   'repos/{owner}/{repo}/rules/branches/feature%2Fparent')
     payload='[]'
@@ -859,7 +876,7 @@ case "$path" in
     ;;
   *) exit 9 ;;
 esac
-jq -r "$filter" <<<"$payload" || exit $?
+if [[ -n "$filter" ]]; then jq -r "$filter" <<<"$payload" || exit $?; else printf '%s\n' "$payload"; fi
 exit "$status"
 SH
 chmod +x "$GH_STUB_BIN/gh"
@@ -874,12 +891,13 @@ chmod +x "$GH_STUB_BIN/gh"
 #   classic-fail    the classic read prints CI, then fails
 #   stacked         main requires CI; the pull request's base,
 #                   feature/parent, requires nothing
-#   pr-merged       main requires CI; the branch's pull request is merged
-#   pr-unread       main requires CI; the pull request read prints main's
-#                   name, then fails
+#   pr-no-pr        gh reports no pull request; pr-view-json confirms no_pr
+#   pr-closed/merged  the branch's older pull request is CLOSED/MERGED
+#   pr-unread/network  the PR lookup fails with an auth/network error
+#   pr-invalid/state/empty/uri  the response or base encoding cannot be read
 ci_world() {
   export STUB_RULES=Lint STUB_OTHER="" STUB_CLASSIC="" STUB_CLASSIC_CHECKS="" STUB_RULES_EXIT=0 STUB_CLASSIC_EXIT=0 \
-    STUB_PR_BASE=main STUB_PR_STATE=OPEN STUB_PR_EXIT=0
+    STUB_PR_BASE=main STUB_PR_STATE=OPEN STUB_PR_EXIT=0 STUB_PR_PAYLOAD="" STUB_PR_STDERR="" STUB_URI_EXIT=0
   case "$1" in
     rules) STUB_RULES=Lint,CI ;;
     classic) STUB_CLASSIC=CI ;;
@@ -890,8 +908,15 @@ ci_world() {
     classic-absent) STUB_CLASSIC=absent ;;
     classic-fail) STUB_CLASSIC=CI STUB_CLASSIC_EXIT=1 ;;
     stacked) STUB_RULES=Lint,CI STUB_PR_BASE=feature/parent ;;
+    pr-no-pr) STUB_PR_EXIT=1 STUB_PR_STDERR='no pull requests found for branch' ;;
+    pr-closed) STUB_RULES=Lint,CI STUB_PR_STATE=CLOSED ;;
     pr-merged) STUB_RULES=Lint,CI STUB_PR_STATE=MERGED ;;
-    pr-unread) STUB_RULES=Lint,CI STUB_PR_EXIT=1 ;;
+    pr-unread) STUB_RULES=Lint,CI STUB_PR_EXIT=1 STUB_PR_STDERR='gh: HTTP 401: Bad credentials' ;;
+    pr-network) STUB_PR_EXIT=1 STUB_PR_STDERR='request failed: network unavailable' ;;
+    pr-invalid) STUB_PR_PAYLOAD='invalid JSON' ;;
+    pr-state) STUB_RULES=Lint,CI STUB_PR_STATE=unknown ;;
+    pr-empty) STUB_PR_BASE="" ;;
+    pr-uri) STUB_URI_EXIT=1 ;;
     *) printf 'ci_world: world=%s\n' "$1" >&2; return 1 ;;
   esac
 }
@@ -899,6 +924,7 @@ ci_proj() { # NAME CONTEXT — CONTEXT empty leaves the setting unset
   local dir
   dir="$(make_mode_proj "$1" 'echo range')"
   [[ -z "$2" ]] || printf 'DEV_VALIDATE_CI_CONTEXT = "%s"\n' "$2" >> "$dir/kendex.settings.toml"
+  printf 'DEV_VALIDATE_FINDING_PREFIX = "echo: "\n' >> "$dir/kendex.settings.toml"
   printf 'tmp/\n' > "$dir/.gitignore"
   git -C "$dir" add -A
   git -C "$dir" -c user.name=t -c user.email=t@example.com commit -q -m ignore
@@ -922,8 +948,15 @@ CI_ROWS=(
   "a branch payload with no protection runs the range command|yes|classic-absent|change_class=standard|false|true|state=done guard-exit=0 validate=pass range|range|rules-unread"
   "a classic read that fails runs the range command|yes|classic-fail|change_class=standard|false|true|state=done guard-exit=0 validate=pass range|range|rules-unread"
   "a stacked pull request whose own base requires nothing runs the range command|yes|stacked|change_class=standard|false|true|state=done guard-exit=0 validate=pass range|range|context-unrequired"
-  "a branch whose pull request is merged runs the range command|yes|pr-merged|change_class=standard|false|true|state=done guard-exit=0 validate=pass range|range|base-unresolved"
+  "a branch whose pull request is merged runs the range command|yes|pr-merged|change_class=standard|false|true|state=done guard-exit=0 validate=pass range|range|pr-not-open"
+  "a branch with no pull request runs the range command|yes|pr-no-pr|change_class=standard|false|true|state=done guard-exit=0 validate=pass range|range|pr-not-open"
+  "a branch whose pull request is closed runs the range command|yes|pr-closed|change_class=standard|false|true|state=done guard-exit=0 validate=pass range|range|pr-not-open"
   "a pull request read that fails runs the range command|yes|pr-unread|change_class=standard|false|true|state=done guard-exit=0 validate=pass range|range|base-unresolved"
+  "a network lookup failure runs the range command|yes|pr-network|change_class=standard|false|true|state=done guard-exit=0 validate=pass range|range|base-unresolved"
+  "an invalid PR response runs the range command|yes|pr-invalid|change_class=standard|false|true|state=done guard-exit=0 validate=pass range|range|base-unresolved"
+  "an unknown PR state runs the range command|yes|pr-state|change_class=standard|false|true|state=done guard-exit=0 validate=pass range|range|base-unresolved"
+  "an empty PR base runs the range command|yes|pr-empty|change_class=standard|false|true|state=done guard-exit=0 validate=pass range|range|base-unresolved"
+  "a URI encoding failure runs the range command|yes|pr-uri|change_class=standard|false|true|state=done guard-exit=0 validate=pass range|range|base-unresolved"
   "a render diff, whose checks CI stands down, runs the range command|yes|rules|change_class=render|false|true|state=done guard-exit=0 validate=pass range|range|class-uncovered"
   "a trivial diff outside the docs set runs the range command|yes|rules|change_class=trivial|false|true|state=done guard-exit=0 validate=pass range|range|class-uncovered"
   "a standard diff of docs alone runs the range command|yes|rules|change_class=standard|true|true|state=done guard-exit=0 validate=pass range|range|class-uncovered"
@@ -1023,15 +1056,19 @@ ci_control 'classic protection unread' '"repos/{owner}/{repo}/branches/$uri"' '"
   "a context classic protection's contexts require is left to CI" \
   'state=done guard-exit=0 validate=pass range|range|rules-unread'
 ci_control "the default branch read instead of the pull request's base" \
-  "gh pr view --json baseRefName,state --jq 'select(.state == \"OPEN\") | .baseRefName'" \
+  "jq -er '.baseRefName | select(type == \"string\" and length > 0)' <<<\"\$pr_json\"" \
   '"$SCRIPT_DIR/resolve-base-branch" "$worktree"' \
   'a stacked pull request whose own base requires nothing runs the range command'
-ci_control 'the pull request state unread' 'select(.state == "OPEN") | .baseRefName' '.baseRefName' \
+ci_control 'the pull request state unread' \
+  'NO_PR|CLOSED|MERGED) ci_fallback=pr-not-open; return 1 ;;' \
+  'NO_PR) ci_fallback=pr-not-open; return 1 ;;' \
   'a branch whose pull request is merged runs the range command'
-ci_control 'a failed pull request read kept' ".baseRefName' 2>>\"\$log\")\"" ".baseRefName' 2>>\"\$log\" || true)\"" \
-  'a pull request read that fails runs the range command'
-ci_control 'an empty base read as a branch' $'    || [[ -z "$base_branch" ]] \\\n' '' \
-  'a branch whose pull request is merged runs the range command' \
+ci_control 'an unknown pull request state accepted' \
+  '.state | select(. == "OPEN" or . == "CLOSED" or . == "MERGED")' '.state' \
+  'an unknown PR state runs the range command'
+ci_control 'an empty pull request base accepted' \
+  'type == "string" and length > 0' 'type == "string"' \
+  'an empty PR base runs the range command' \
   'state=done guard-exit=0 validate=pass range|range|rules-unread'
 ci_control 'an unread rule named as unrequired' 'if [[ "$unread" == true ]]; then' 'if false; then' \
   'a ruleset read that fails runs the range command' \
@@ -1040,7 +1077,7 @@ ci_control 'the class cause unrecorded' $'    ci_fallback=class-uncovered\n' '' 
   'a render diff, whose checks CI stands down, runs the range command' \
   'state=done guard-exit=0 validate=pass range|range|'
 ci_control 'render among the covered classes' \
-  'micro|small|standard) if ci_runs_validation' 'micro|small|standard|render) if ci_runs_validation' \
+  'micro|small|standard) return 0 ;;' 'micro|small|standard|render) return 0 ;;' \
   'a render diff, whose checks CI stands down, runs the range command'
 ci_control 'the docs verdict unread' ' && "$docs_only" == false ]]' ' ]]' \
   'a standard diff of docs alone runs the range command'
@@ -1197,7 +1234,7 @@ MODE_REFUSALS=(
   "a record of a wall time whose seconds are no number is refused|--record --run-dir $TMP_ROOT/badtimed|dev-validate-run: timing-unreadable path=$TMP_ROOT/badtimed/timing"
   "a record of a wall time whose start is no UTC time is refused|--record --run-dir $TMP_ROOT/badstart|dev-validate-run: timing-unreadable path=$TMP_ROOT/badstart/timing"
   "a record of a wall time whose end is no UTC time is refused|--record --run-dir $TMP_ROOT/badend|dev-validate-run: timing-unreadable path=$TMP_ROOT/badend/timing"
-  "a base handed to --resolve-mode is refused|--resolve-mode --worktree $proj_refuse --base HEAD|dev-validate-run: option-unused option=--base mode=resolve"
+  "a base handed to --stop is refused|--stop --worktree $proj_refuse --base HEAD|dev-validate-run: option-unused option=--base mode=stop"
   "a validation mode handed to --resolve-mode is refused|--resolve-mode --worktree $proj_refuse --validate-mode range|dev-validate-run: option-unused option=--validate-mode mode=resolve"
   "--resolve-mode with no worktree is refused|--resolve-mode|dev-validate-run: required option=--worktree"
 )
@@ -1738,6 +1775,150 @@ run_script "$MUTANT" --last-pass --worktree "$proj_last_ci"
 assert_eq "$([[ "${OUT%% *} rc=$RC" == "run-dir=$last_full_dir rc=0" ]] && echo full || echo other)" "other" \
   "control: a read that takes any mode names the ci run"
 
+# --- The command's own preview resolves an all selection before launch -------
+# label|requested mode|probe configured|selection|PR world|recorded mode|scoped|record selection|class base|local launch|exit
+SELECTION_ROWS=(
+  "a full all selection uses required PR CI|full|yes|all|rules|ci||unreported|no|absent|0"
+  "a range all selection uses required PR CI|range|yes|all|rules|ci||unreported|no|absent|0"
+  "a full subset retains local execution|full|yes|subset|rules|full||unreported|no|full|0"
+  "a range subset retains local execution|range|yes|subset|rules|range||unreported|yes|range|0"
+  "an unset selector preserves local execution|full|no|all|rules|full||unreported|no|full|0"
+  "an unset selector preserves range local execution|range|no|all|rules|range||unreported|yes|range|0"
+  "a failed preview preserves local execution|full|yes|failed|rules|full||unreported|no|full|0"
+  "an unknown selection preserves local execution|full|yes|unknown|rules|full||unreported|no|full|0"
+  "an all selection without required CI retains local execution|full|yes|all|unrequired|full||unreported|no|full|0"
+  "an all selection CI does not cover retains local execution|full|yes|all-render|rules|full||unreported|no|full|0"
+  "a pre-open full all selection runs the selector's scoped suites|full|yes|all|pr-no-pr|full|true|subset|yes|absent|0"
+  "a pre-open range all selection runs the selector's scoped suites|range|yes|all|pr-no-pr|range|true|subset|yes|absent|0"
+  "a closed PR full all selection runs scoped suites|full|yes|all|pr-closed|full|true|subset|yes|absent|0"
+  "a closed PR range all selection runs scoped suites|range|yes|all|pr-closed|range|true|subset|yes|absent|0"
+  "a merged PR full all selection runs scoped suites|full|yes|all|pr-merged|full|true|subset|yes|absent|0"
+  "a merged PR range all selection runs scoped suites|range|yes|all|pr-merged|range|true|subset|yes|absent|0"
+  "a failed full PR lookup keeps the original failure|full|yes|all|pr-unread|full||unreported|no|full|1"
+  "a failed range PR lookup keeps the original failure|range|yes|all|pr-unread|range||unreported|yes|range|1"
+  "a full network failure keeps the original failure|full|yes|all|pr-network|full||unreported|no|full|1"
+  "a range network failure keeps the original failure|range|yes|all|pr-network|range||unreported|yes|range|1"
+  "a full invalid response keeps the original failure|full|yes|all|pr-invalid|full||unreported|no|full|1"
+  "a range invalid response keeps the original failure|range|yes|all|pr-invalid|range||unreported|yes|range|1"
+  "a full unknown state keeps the original failure|full|yes|all|pr-state|full||unreported|no|full|1"
+  "a range unknown state keeps the original failure|range|yes|all|pr-state|range||unreported|yes|range|1"
+  "a full empty base keeps the original failure|full|yes|all|pr-empty|full||unreported|no|full|1"
+  "a range empty base keeps the original failure|range|yes|all|pr-empty|range||unreported|yes|range|1"
+  "a full URI failure keeps the original failure|full|yes|all|pr-uri|full||unreported|no|full|1"
+  "a range URI failure keeps the original failure|range|yes|all|pr-uri|range||unreported|yes|range|1"
+)
+selection_rows() { # SCRIPT [LABEL]
+  local row label requested configured selection world proj dir got_mode got_scoped got_selection got_base got_launch got_rc expected_rc args n answer
+  local initial_fail="$FAIL"
+  n=0
+  for row in "${SELECTION_ROWS[@]}"; do
+    IFS='|' read -r label requested configured selection world _ _ _ _ _ expected_rc <<<"$row"
+    [[ -z "${2:-}" || "$label" == "$2" ]] || continue
+    n=$((n + 1))
+    proj="$(ci_proj "proj-selection-$n" CI)"
+    cat > "$proj/local-command" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$1" >> local-launch
+printf '%s\n' "$1"
+exit "${STUB_LOCAL_EXIT:-0}"
+SH
+    chmod +x "$proj/local-command"
+    sed -i.bak 's/^DEV_VALIDATE_CMD = .*/DEV_VALIDATE_CMD = ".\/local-command full"/; s/^DEV_VALIDATE_RANGE_CMD = .*/DEV_VALIDATE_RANGE_CMD = ".\/local-command range"/' "$proj/kendex.settings.toml"
+    cat > "$proj/selection" <<'SH'
+#!/usr/bin/env bash
+if [[ "${DEV_VALIDATE_SCOPED:-false}" == true ]]; then
+  printf 'validate: lanes=scoped-suites selection=subset\n'
+else
+  [[ "$STUB_SELECTION" != failed ]] || exit 1
+  printf 'selection=%s\n' "$STUB_SELECTION"
+fi
+SH
+    chmod +x "$proj/selection"
+    [[ "$configured" != yes ]] || printf 'DEV_VALIDATE_SELECTION_CMD = "./selection"\n' >> "$proj/kendex.settings.toml"
+    ci_world "$world"
+    answer=change_class=standard
+    if [[ "$selection" == all-render ]]; then selection=all; answer=change_class=render; fi
+    args=()
+    [[ "$requested" != range ]] || args=(--validate-mode range --base HEAD)
+    RUN_PATH="$GH_STUB_BIN:$PATH" STUB_ANSWER="$answer" STUB_DOCS=false STUB_MEASURED=true \
+      STUB_SELECTION="$selection" STUB_LOCAL_EXIT="$expected_rc" run_script "$1" --worktree "$proj" --poll 1 ${args[@]+"${args[@]}"}
+    got_rc="$RC"
+    dir="$(run_dir_of "$OUT")"
+    got_mode="$(start_line "$dir" validate-mode)"
+    got_scoped="$(start_line "$dir" scoped)"
+    got_base=no
+    [[ -z "$(start_line "$dir" class-base)" ]] || got_base=yes
+    run_script "$1" --record --run-dir "$dir"
+    got_selection="$(record_field selection "$OUT")"
+    if [[ "$got_scoped" == true ]]; then
+      assert_eq "$(record_field scoped "$OUT") $(record_field class-base "$OUT")" \
+        "true $(git -C "$proj" rev-parse HEAD)" "$label: scoped receipt cannot stand for the whole battery" "$ERR"
+    fi
+    got_launch=absent
+    [[ ! -f "$proj/local-launch" ]] || got_launch="$(cat "$proj/local-launch")"
+    printf '%s\t%s|%s|%s|%s|%s|%s\n' "$label" "$got_mode" "$got_scoped" "$got_selection" "$got_base" "$got_launch" "$got_rc"
+    # A base-aware read resolves the same range selection without starting.
+    if [[ "$requested" == range ]]; then
+      RUN_PATH="$GH_STUB_BIN:$PATH" STUB_ANSWER="$answer" STUB_DOCS=false STUB_MEASURED=true \
+        STUB_SELECTION="$selection" run_script "$1" --resolve-mode --worktree "$proj" --base HEAD
+      assert_eq "$RC $OUT" "0 validate-mode=$got_mode" "$label: selection-aware resolution" "$ERR"
+    fi
+    rm -rf -- "$proj"
+  done
+  if [[ "$FAIL" != "$initial_fail" ]]; then
+    printf 'selection_rows: failed-assertions=%s\n' "$((FAIL - initial_fail))" >&2
+    return 1
+  fi
+}
+SELECTION_GOT="$(selection_rows "$CI_SCRIPT")"
+for row in "${SELECTION_ROWS[@]}"; do
+  IFS='|' read -r label _ _ _ _ want_mode want_scoped want_selection want_base want_launch want_rc <<<"$row"
+  assert_eq "$(awk -F'\t' -v want="$label" '$1 == want { print $2 }' <<<"$SELECTION_GOT")" \
+    "$want_mode|$want_scoped|$want_selection|$want_base|$want_launch|$want_rc" "$label"
+done
+selection_control() { # LABEL ANCHOR REPLACEMENT ROW
+  local got want
+  cp -p -- "$CI_SCRIPT" "$CI_SCRIPT.mutant"
+  mutate_file "$CI_SCRIPT.mutant" "$2" "$3"
+  want="$(awk -F'\t' -v want="$4" '$1 == want { print $2 }' <<<"$SELECTION_GOT")"
+  got="$(selection_rows "$CI_SCRIPT.mutant" "$4" | awk -F'\t' -v want="$4" '$1 == want { print $2 }')"
+  assert_eq "$([[ "$got" != "$want" ]] && echo turned || echo held)" turned "control: $1"
+}
+# shellcheck disable=SC2016 # private production mutations
+{
+selection_control 'ignoring an all selection turns CI resolution red' \
+  '"$selection" == selection=all' '"$selection" == selection=subset' \
+  'a full all selection uses required PR CI'
+selection_control 'treating a subset as all turns local execution red' \
+  '"$selection" == selection=all' '"$selection" == selection=subset' \
+  'a full subset retains local execution'
+selection_control 'inventing a selector when unset turns compatibility red' \
+  '"$SCRIPT_DIR/orch-env" DEV_VALIDATE_SELECTION_CMD ""' '"$SCRIPT_DIR/orch-env" DEV_VALIDATE_SELECTION_CMD "./selection"' \
+  'an unset selector preserves local execution'
+selection_control 'omitting the pre-open scoped route turns its receipt red' \
+  '"$ci_fallback" == pr-not-open' '"$ci_fallback" == never' \
+  "a pre-open full all selection runs the selector's scoped suites"
+selection_control 'ignoring confirmed no_pr turns the pre-open route red' \
+  '.status == "no_pr"' 'false' \
+  "a pre-open full all selection runs the selector's scoped suites"
+selection_control 'ignoring class coverage turns automatic CI resolution red' \
+  '&& [[ "$selection" == selection=all ]] && ci_class_covered; then' \
+  '&& [[ "$selection" == selection=all ]] && true; then # ci_class_covered' \
+  'an all selection CI does not cover retains local execution'
+for row in "${SELECTION_ROWS[@]}"; do
+  IFS='|' read -r label _ _ _ _ _ _ _ _ want_launch want_rc <<<"$row"
+  if [[ "$want_rc" == 1 ]]; then
+    selection_control "treating an unread PR as pre-open turns $label red" \
+      '"$ci_fallback" == pr-not-open' '"$ci_fallback" == base-unresolved' "$label"
+  fi
+  [[ "$want_launch" == absent ]] || continue
+  selection_control "launching the original command before preview turns $label red" \
+    $'  scoped=false\n  if [[ "$validate_mode" != ci ]]; then' \
+    $'  scoped=false\n  if [[ "$validate_mode" != ci ]]; then\n    "$BASH" -c "$cmd" >/dev/null' \
+    "$label"
+done
+}
+
 # --- A run the bound already ended answers a later run over no fewer paths ----
 # plant_run plants a finished run directory the way the runner leaves one: the
 # command its mode runs in these projects, a log whose first line names the
@@ -1788,6 +1969,11 @@ bound_row() {
   printf '%s\n' "$n" > "$TMP_ROOT/bound-n"
   proj="$(ci_proj "proj-bound-$n" CI)"
   plant_run "$proj" 20000101T000000Z-1 "$3" "$4" "$5" "$6" "$7"
+  if [[ "$7" == prefix-changed ]]; then
+    sed -i.bak 's/DEV_VALIDATE_FINDING_PREFIX = "echo: "/DEV_VALIDATE_FINDING_PREFIX = "guard: "/' "$proj/kendex.settings.toml"
+  elif [[ "$7" == no-finding-prefix ]]; then
+    sed -i.bak 's/DEV_VALIDATE_FINDING_PREFIX = "echo: "/DEV_VALIDATE_FINDING_PREFIX = ""/' "$proj/kendex.settings.toml"
+  fi
   shift 7
   ci_world unrequired
   RUN_PATH="$GH_STUB_BIN:$PATH" STUB_ANSWER=change_class=micro STUB_DOCS=false STUB_MEASURED=true STUB_PATHS="$paths" \
@@ -1815,6 +2001,7 @@ BOUND_ROWS=(
   "a ci request that falls back to range keeps its local run after a range run from another base|docs/a.md|range|docs/a.md|20||validate-base=0000000000000000000000000000000000000000|--validate-mode ci --base HEAD|range|$OK|range|"
   "a bound-ended run handed another class is no evidence|docs/a.md|full|docs/a.md|20||class=standard|--|full|$OK|full|"
   "a bound-ended run handed another docs verdict is no evidence|docs/a.md|full|docs/a.md|20||docs-only=true|--|full|$OK|full|"
+  "a corrected finding prefix keeps its local run after a bound-ended run missed a finding|docs/a.md|full|docs/a.md|20|guard: suite=tests/a.sh|prefix-changed|--|full|$OK|full|"
 )
 bound_rows() { # SCRIPT [LABEL]
   local row label paths pmode ppaths psecs plog pstart args
@@ -1865,6 +2052,9 @@ bound_control 'no class rule' $'    [[ "$(start_field "$start_file" class)" == "
   'a bound-ended run handed another class is no evidence'
 bound_control 'no docs rule' $'    [[ "$(start_field "$start_file" docs-only)" == "$6" ]] || continue\n' '' \
   'a bound-ended run handed another docs verdict is no evidence'
+bound_control 'no current prefix rule' '    [[ "$(start_field "$start_file" finding-prefix)" == "$8" ]] || continue' \
+  '    [[ "$(start_field "$start_file" finding-prefix)" == "$8" ]] || :' \
+  'a corrected finding prefix keeps its local run after a bound-ended run missed a finding'
 }
 # The range timeout, then a full request (another command, so it runs), then
 # a range request: the range request is answered by the range run, never
