@@ -15,8 +15,19 @@ use crate::lock::{Reason, entry_key};
 use crate::manifest::{Manifest, Method};
 use crate::model::{HarnessId, ItemKind, Scope};
 
-/// The provenance a `[[custom-hooks]]` entry is planned and recorded under.
+// Existing locks use this identity in every scope. A display filename must
+// not turn a refresh into a change of source.
 const PROVENANCE: &str = "kendex.toml [[custom-hooks]]";
+
+pub(super) fn provenance_label(env: &Env, scope: &Scope, provenance: &str) -> String {
+    match provenance == PROVENANCE {
+        true => format!(
+            "{} [[custom-hooks]]",
+            crate::manifest::manifest_file_name(env, scope)
+        ),
+        false => provenance.to_owned(),
+    }
+}
 
 pub(super) fn desired_custom_hooks(
     env: &Env,
