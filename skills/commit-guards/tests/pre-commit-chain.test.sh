@@ -164,6 +164,102 @@ run_rows \
   "a violation and a step that did not complete both print, every later lane still runs, and the verdict is the error's|fx_both||$BARE||rc=2 $DL;fixture=doc-limits-violation --staged;$PF;fixture=preflight-error --staged;$(incomplete preflight 2);$BATCH_OK;$LOCAL_NONE;$ERRORS" \
   "a status past 1 is a step that did not complete, with its status|fx_bot_dies||$BARE||rc=2 $BOT;fixture=bot-error check --staged;$(incomplete 'bot-instructions check --staged' 3);$BATCH_OK;$LOCAL_NONE;$ERRORS"
 
+echo "=== a bot-instructions install the manifest never configured blocks nothing; every other refusal blocks ==="
+# The real package, so the record the lane reads is the one it prints. The
+# package is installed in a commit of its own after the seed; the commit under
+# test stages AGENTS.md and the manifest.
+bot_real() { # MANIFEST
+  mkdir -p "$R/.agents/skills"
+  cp -R "$SKILL_DIR/../bot-instructions" "$R/.agents/skills/bot-instructions"
+  rm -rf -- "${R:?}/.agents/skills/bot-instructions/tests"
+  git -C "$R" add -A && git -C "$R" commit -qm 'chore: install bot-instructions'
+  printf '# fixture\n\n## Code Review Rules\n\nx\n' >"$R/AGENTS.md"
+  printf '%b' "$1" >"$R/kendex.toml"
+  git -C "$R" add -A
+}
+fx_bot_unadopted() { repo bot-unadopted; bot_real '[skills.orch]\n'; }
+BOT_CONFIGURED='[bot-instructions]\nschema = 1\n\n[bot-instructions.repo]\nname = "fixture"\nsummary = "A fixture."\n\n[bot-instructions.bots]\ncodex = true\n'
+fx_bot_stale() { repo bot-stale; bot_real "$BOT_CONFIGURED"; }
+fx_bot_refuses() { repo bot-refuses; tree bot-instructions "bot-instructions: source=<repo>" 2; }
+# A copy older than the package's orphan scan: the record with no
+# `renders=none` attestation under it, whatever renders the tree holds. The
+# lane names that cause after the package's own text.
+fx_bot_bare() { repo bot-bare; tree bot-instructions $'bot-instructions: unconfigured=kendex.toml\nfixture=pre-scan-copy' 2; }
+UNADOPTED="rc=0 $BOT;pre-commit: not-adopted=bot-instructions:kendex.toml;$BATCH_OK;$LOCAL_NONE;$CHAIN_OK"
+REFUSED="rc=2 $BOT;bot-instructions: source=<repo> check --staged;$(incomplete 'bot-instructions check --staged' 2);$BATCH_OK;$LOCAL_NONE;$ERRORS"
+BARE_REFUSED="rc=2 $BOT;bot-instructions: unconfigured=kendex.toml;fixture=pre-scan-copy check --staged;pre-commit: unattested=bot-instructions:kendex.toml;$(incomplete 'bot-instructions check --staged' 2);$BATCH_OK;$LOCAL_NONE;$ERRORS"
+run_rows \
+  "an installed package with no [bot-instructions] table is not adopted: one line, and the chain passes|fx_bot_unadopted||$BARE||$UNADOPTED" \
+  "any other exit-2 refusal is a step that did not complete, and blocks|fx_bot_refuses||$BARE||$REFUSED" \
+  "an unconfigured record without its renders=none attestation blocks, its cause named|fx_bot_bare||$BARE||$BARE_REFUSED"
+fx_bot_stale
+stale="$(run "" "$BARE" "")"
+case "$stale" in
+  "rc=1 $BOT;bot-instructions: findings="*";$BATCH_OK;$LOCAL_NONE;$BLOCKED") stale=blocked ;;
+esac
+assert_eq "a configured repository whose rendered bot files are stale still blocks" blocked "$stale"
+
+# Adopted, rendered and committed, then the table removed: the bots still load
+# the renders, so the package names each as an orphan and the lane blocks. The
+# control is the same tree under a package copy that never looks for marked
+# renders, which calls it unconfigured and passes.
+bot_rendered() { # NAME
+  repo "$1"
+  bot_real "$BOT_CONFIGURED"
+  # adopt takes the hand-written region over and reports it with exit 1; the
+  # render that follows fails unless it did.
+  "$R/.agents/skills/bot-instructions/scripts/bot-instructions" adopt --repo "$R" >/dev/null 2>&1 || true
+  "$R/.agents/skills/bot-instructions/scripts/bot-instructions" render --repo "$R" >/dev/null
+  git -C "$R" add -A && git -C "$R" commit -qm 'chore: render bot instructions'
+  printf '[skills.orch]\n' >"$R/kendex.toml"
+  git -C "$R" add -A
+}
+bot_rendered bot-table-removed
+removed="$(run "" "$BARE" "")"
+case "$removed" in
+  "rc=1 $BOT;bot-instructions: findings=2;orphan: "*" [.github/instructions/code-review.md];orphan: "*" [AGENTS.md];$BATCH_OK;$LOCAL_NONE;$BLOCKED") removed=blocked ;;
+esac
+assert_eq "an adopted, rendered repository whose table is removed blocks on each render left behind" blocked "$removed"
+bot_rendered bot-table-removed-control
+python3 - "$R/.agents/skills/bot-instructions/scripts/lib/run.py" <<'EDIT'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1])
+s = p.read_text()
+old = "stranded = vr.unconfigured_orphans(tree, config_path)"
+assert s.count(old) == 1
+p.write_text(s.replace(old, "stranded = []"))
+EDIT
+assert_eq "control: a package that never looks for marked renders passes the removed table as not adopted" "rc=0" "$(run "" "$BARE" "" | cut -d' ' -f1)"
+
+# Controls, each on a private install: without the not-adopted branch the
+# unconfigured install blocks, with the record's key unread every exit-2
+# refusal passes, and with the attestation unread the bare record passes.
+bot_mutant() { # NAME OLD NEW
+  install "$TMP/bot-mutant-$1"
+  python3 - "$TMP/bot-mutant-$1/commit-guards/scripts/pre-commit" "$2" "$3" <<'EDIT'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1])
+s = p.read_text()
+assert s.count(sys.argv[2]) == 1
+p.write_text(s.replace(sys.argv[2], sys.argv[3]))
+EDIT
+}
+bot_mutant unread '"$status" -eq 2 ] && [[' '"$status" -eq 99 ] && [['
+bot_mutant keyless '"bot-instructions: unconfigured="*' '"bot-instructions: "*'
+bot_mutant unattested 'if [ "${rest' 'if true || [ "${rest'
+fx_bot_unadopted_control() { repo bot-unadopted-control; bot_real '[skills.orch]\n'; }
+# The attestation under another key, so only the key match stands between it
+# and a pass.
+fx_bot_refuses_control() { repo bot-refuses-control; tree bot-instructions $'bot-instructions: source=<repo>\nbot-instructions: renders=none\nfixture=attested' 2; }
+fx_bot_bare_control() { repo bot-bare-control; tree bot-instructions "bot-instructions: unconfigured=kendex.toml" 2; }
+fx_bot_unadopted_control
+assert_eq "control: a lane that ignores the unconfigured record blocks the unconfigured install" "rc=2" "$(run "" bot-mutant-unread "" | cut -d' ' -f1)"
+fx_bot_refuses_control
+assert_eq "control: a lane that matches any refusal key passes an attested source refusal" "rc=0" "$(run "" bot-mutant-keyless "" | cut -d' ' -f1)"
+assert_eq "the real lane blocks the attested source refusal" "rc=2" "$(run "" "$BARE" "" | cut -d' ' -f1)"
+fx_bot_bare_control
+assert_eq "control: a lane that reads no attestation passes the bare record" "rc=0" "$(run "" bot-mutant-unattested "" | cut -d' ' -f1)"
+
 echo "=== the repo-local entry: announced, run last, and its status folded like every lane's ==="
 fx_local_ran() { repo local-ran; local_entry '#!/bin/sh\necho "fixture=local-clean"\nexit 0\n'; }
 fx_local_fails() { repo local-fails; local_entry '#!/bin/sh\necho "fixture=local-violation"\nexit 1\n'; }
