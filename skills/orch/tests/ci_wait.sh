@@ -2,7 +2,8 @@
 # Tests for orch/scripts/ci-wait: the auth ladder (env token, keyring, bot
 # token), the deterministic result contract (pass, fail, timeout, error, on
 # stdout in both modes, pending at the deadline never silent), the no-checks
-# registration grace, and the run correlations that keep a stale or
+# registration grace, and the run correlations that keep an active run or
+# unreadable head-run evidence from passing and keep a stale or
 # superseded failure from ending a wait: latest run per workflow,
 # approval-gated status replacement, superseded same-head runs the rollup
 # omits, rerun attempts under an older run id, and the transient-failure
@@ -19,7 +20,9 @@ unset GH_TOKEN GITHUB_TOKEN GH_BOT_TOKEN
 
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$TEST_DIR/../../.." && pwd)"
-TMP_ROOT="$(mktemp -d)"
+TMP_ROOT="$(mktemp -d)" || { echo 'ci_wait: scratch=mktemp-failed' >&2; exit 1; }
+[[ -d $TMP_ROOT && ! -L $TMP_ROOT ]] || { echo "ci_wait: scratch=not-a-directory value=[$TMP_ROOT]" >&2; exit 1; }
+TMP_ROOT="$(cd -- "$TMP_ROOT" && pwd -P)" || { echo 'ci_wait: scratch=resolve-failed' >&2; exit 1; }
 trap 'rm -rf "$TMP_ROOT"' EXIT
 
 # shellcheck source=lib/assertions.sh
@@ -75,19 +78,57 @@ case "${1:-}" in
     if [[ "${2:-}" == repos/*/actions/workflows && -n "${STUB_PROBE_COST:-}" ]]; then
       sleep "$STUB_PROBE_COST"
     fi
-    # superseded-failure correlation queries the head's Actions
+    # Settled-verdict correlation queries the head's Actions
     # runs. Record the query when asked so tests can prove head-sha scoping.
     if [[ "${2:-}" == repos/*/actions/runs* ]]; then
       _stub_auth_ok || { echo "HTTP 401: Bad credentials" >&2; exit 1; }
       if [[ -n "${STUB_ACTIONS_RUNS_QUERY_FILE:-}" ]]; then
         printf '%s' "$2" > "$STUB_ACTIONS_RUNS_QUERY_FILE"
       fi
-      if [[ -n "${STUB_ACTIONS_RUNS_FIXTURE:-}" ]]; then
-        cat "$STUB_ACTIONS_RUNS_FIXTURE"
-      else
+      if [[ "${STUB_ACTIONS_RUNS_EXIT:-0}" != 0 ]]; then
+        printf 'HTTP 403: Resource not accessible by integration\n' >&2
         echo '{"workflow_runs":[]}'
+        exit "$STUB_ACTIONS_RUNS_EXIT"
+      fi
+      paginate=false
+      slurp=false
+      for arg in "$@"; do
+        [[ "$arg" != --paginate ]] || paginate=true
+        [[ "$arg" != --slurp ]] || slurp=true
+      done
+      fixture="${STUB_ACTIONS_RUNS_FIXTURE:-}"
+      if [[ -n "${STUB_ACTIONS_RUNS_RELEASE_AFTER:-}" ]] && [[ "$(cat "$STUB_PR_CHECKS_COUNT_FILE")" -gt "$STUB_ACTIONS_RUNS_RELEASE_AFTER" ]]; then
+        fixture="$STUB_ACTIONS_RUNS_RELEASE_FIXTURE"
+      fi
+      if [[ -n "$fixture" ]]; then
+        pages=$(jq -c 'if type == "array" then . else [. + {total_count: (.workflow_runs | length)}] end' "$fixture")
+      else
+        pages='[{"total_count":0,"workflow_runs":[]}]'
+      fi
+      if ! $paginate || [[ "${STUB_ACTIONS_RUNS_LATE_EXIT:-0}" != 0 ]]; then
+        pages=$(jq -c '.[0:1]' <<<"$pages")
+      fi
+      if $slurp; then
+        printf '%s\n' "$pages"
+      else
+        jq -c '.[]' <<<"$pages"
+      fi
+      if $paginate && [[ "${STUB_ACTIONS_RUNS_LATE_EXIT:-0}" != 0 ]]; then
+        printf 'HTTP 403: Resource not accessible by integration\n' >&2
+        exit "$STUB_ACTIONS_RUNS_LATE_EXIT"
       fi
       exit 0
+    fi
+    if [[ -n "${STUB_REQUIRED_CONTEXT:-}" ]]; then
+      if [[ "${2:-}" == repos/*/rules/branches/* ]]; then
+        [[ "${STUB_REQUIRED_READ_EXIT:-0}" == 0 ]] || exit "$STUB_REQUIRED_READ_EXIT"
+        printf 'ctx:%s\n' "$STUB_REQUIRED_CONTEXT"
+        exit 0
+      fi
+      if [[ "${2:-}" == repos/*/branches/* ]]; then
+        echo '{"protection":{"required_status_checks":{"contexts":[]}}}'
+        exit 0
+      fi
     fi
     if [[ "${2:-}" == "user" ]]; then
       if [[ -n "${STUB_GH_API_USER_COUNT_FILE:-}" ]]; then
@@ -123,11 +164,23 @@ case "${1:-}" in
     fi
     if [[ "${2:-}" == "view" ]]; then
       _stub_auth_ok || { echo "HTTP 401: Bad credentials" >&2; exit 1; }
-      # `--json headRefOid` asks for the head sha the superseded-
-      # failure correlation scopes its Actions-runs query to.
+      # A checks sequence can move to another head after the first poll,
+      # as GitHub does when a push lands while a waiter remains active.
       for _a in "$@"; do
         if [[ "$_a" == "headRefOid" ]]; then
+          if [[ "${STUB_HEAD_EXIT:-0}" != 0 ]]; then
+            printf 'HTTP 403: Resource not accessible by integration\n' >&2
+            exit "$STUB_HEAD_EXIT"
+          fi
+          if [[ -n "${STUB_NEXT_HEAD_SHA:-}" ]] && [[ "$(cat "$STUB_PR_CHECKS_COUNT_FILE")" -gt 1 ]]; then
+            echo "$STUB_NEXT_HEAD_SHA"
+            exit 0
+          fi
           echo "${STUB_HEAD_SHA:-737bce791577e140436490e0fed5751bb5144a61}"
+          exit 0
+        fi
+        if [[ "$_a" == "baseRefName" && -n "${STUB_REQUIRED_CONTEXT:-}" ]]; then
+          echo main
           exit 0
         fi
       done
@@ -185,6 +238,7 @@ case "${1:-}" in
           mixed)   echo '[{"name":"build","state":"SUCCESS"},{"name":"docs","state":"SKIPPED"}]'; exit 0 ;;
           skipped) echo '[{"name":"build","state":"SKIPPED"}]'; exit 0 ;;
           pending) echo '[{"name":"build","state":"IN_PROGRESS"}]'; exit 8 ;;
+          request) cat "$STUB_REQUEST_CHECK_FIXTURE"; exit 0 ;;
           empty)   echo '[]'; exit 0 ;;
           fail_rerun)
             [[ ! -s "${STUB_RERUN_CALLS_FILE:-/dev/null}" ]] || { echo '[{"name":"build","state":"SUCCESS"}]'; exit 0; }
@@ -353,6 +407,7 @@ needle() { printf '%s' "${1//+/ }"; }
 #   mail_unreadable             the path on a `ci-wait: mail-unreadable=` line
 #   stderr_first~<text>         whether stderr's first line is <text>
 #   rollup.<name>               whether the JSON rollup_key names that check
+#   lookup_http_status          upstream HTTP status preserved on stderr
 observe() {
   local got="" token name value n
   for token in $1; do
@@ -376,6 +431,7 @@ observe() {
       stderr~*) value="$(grep -qF -- "$(needle "${name#stderr~}")" "$RUN/stderr" && echo true || echo false)" ;;
       stdout) value="$([[ -n "$OUT" ]] && echo line || echo empty)" ;;
       stderr) value="$([[ -s "$RUN/stderr" ]] && echo line || echo empty)" ;;
+      lookup_http_status) value="$(sed -n 's/^HTTP \([0-9]*\):.*/\1/p' "$RUN/stderr" | sort -u)" ;;
       error_named) value="$(json '(.error | type) == "string" and .error != ""')" ;;
       api_user_calls) value="$(cat "$RUN/api-user-calls" 2>/dev/null || echo 0)" ;;
       checks_polls) value="$(cat "$RUN/checks-polls" 2>/dev/null || echo 0)" ;;
@@ -570,6 +626,112 @@ table "$JSON" \
   "approved jobs passed but the aggregate lags: pending to the bounded timeout||$JSON_SHORT|STUB_PR_CHECKS_FIXTURE=$FX/stale-preapproval-status-lag.json,STUB_PR_CHECKS_EXIT=1|rc=1 status=timeout verdict=pending check.CI+Required=EXPECTED" \
   "the replacement status published against the approved run passes|||STUB_PR_CHECKS_FIXTURE=$FX/approved-status-replaced.json|rc=0 status=complete verdict=pass check.CI+Required=SUCCESS failed=0"
 
+echo "=== settled green checks respect the required set and current-head CI ==="
+# GitHub can register only request-copilot-review's successful check while
+# the new head's workflow is active, including a push or manual dry run
+# from publish-homebrew.yml. The budget exceeds the
+# stale window, both without visible progress and after an older head showed
+# progress. Completed CI releases the hold; an unreadable read cannot do so.
+# Separate pull_request workflows can finish a required build while optional
+# docs still runs. A known required set completes; a failed protection read
+# falls back to every check and the current-head Actions hold.
+NEXT_HEAD=d049a699ebe08c6b639fdc19855a7152ae768084
+REQUEST="STUB_PR_CHECKS_FIXTURE=$FX/request-only-checks.json,STUB_HEAD_SHA=$NEXT_HEAD"
+ACTIVE="STUB_ACTIONS_RUNS_FIXTURE=$FX/runs-request-only-active.json"
+jq '.workflow_runs[0].status = "queued"' "$FX/runs-request-only-active.json" > "$TMP_ROOT/runs-request-only-queued.json"
+jq '.workflow_runs[0].status = "completed" | .workflow_runs[0].conclusion = "success"' "$FX/runs-request-only-active.json" > "$TMP_ROOT/runs-request-only-completed.json"
+jq '.workflow_runs[0].event = "push" | .workflow_runs[0].status = "queued"' "$FX/runs-request-only-active.json" > "$TMP_ROOT/runs-request-only-push-queued.json"
+jq '.workflow_runs[0].event = "push"' "$FX/runs-request-only-active.json" > "$TMP_ROOT/runs-request-only-push-active.json"
+jq '.workflow_runs[0].event = "workflow_dispatch" | .workflow_runs[0].status = "queued"' "$FX/runs-request-only-active.json" > "$TMP_ROOT/runs-request-only-manual-queued.json"
+jq '.workflow_runs[0].event = "workflow_dispatch"' "$FX/runs-request-only-active.json" > "$TMP_ROOT/runs-request-only-manual-active.json"
+jq '.workflow_runs[0].event = "workflow_dispatch"' "$TMP_ROOT/runs-request-only-completed.json" > "$TMP_ROOT/runs-request-only-manual-completed.json"
+printf '{"workflow_runs":null}\n' > "$TMP_ROOT/runs-unreadable.json"
+jq '.workflow_runs[0].name = "Docs"' "$FX/runs-request-only-active.json" > "$TMP_ROOT/runs-optional-docs.json"
+printf '[{"name":"build","state":"SUCCESS","bucket":"pass"},{"name":"docs","state":"IN_PROGRESS","bucket":"pending"}]\n' > "$TMP_ROOT/required-build-optional-docs.json"
+OPTIONAL="STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-optional-docs.json,STUB_HEAD_SHA=$NEXT_HEAD"
+table "$JSON" \
+  "an unchanged request-only rollup stays pending beyond the stale window|||$REQUEST,$ACTIVE|rc=1 status=timeout verdict=pending check.request=SUCCESS check.current-head+Actions=EXPECTED failed=0 elapsed_seconds=300 runs_head=$NEXT_HEAD" \
+  "a queued substantive run also holds the request-only rollup|||$REQUEST,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-request-only-queued.json|rc=1 status=timeout verdict=pending check.request=SUCCESS check.current-head+Actions=EXPECTED" \
+  "a queued push run holds the request-only rollup|||$REQUEST,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-request-only-push-queued.json|rc=1 status=timeout verdict=pending check.request=SUCCESS check.current-head+Actions=EXPECTED elapsed_seconds=300" \
+  "an in-progress push run holds the request-only rollup|||$REQUEST,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-request-only-push-active.json|rc=1 status=timeout verdict=pending check.request=SUCCESS check.current-head+Actions=EXPECTED elapsed_seconds=300" \
+  "a queued manual run holds the request-only rollup|||$REQUEST,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-request-only-manual-queued.json|rc=1 status=timeout verdict=pending check.request=SUCCESS check.current-head+Actions=EXPECTED elapsed_seconds=300" \
+  "an in-progress manual run holds the request-only rollup|||$REQUEST,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-request-only-manual-active.json|rc=1 status=timeout verdict=pending check.request=SUCCESS check.current-head+Actions=EXPECTED elapsed_seconds=300" \
+  "a completed manual run releases the request-only rollup|||$REQUEST,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-request-only-manual-completed.json|rc=0 status=complete verdict=pass check.request=SUCCESS pending=0 elapsed_seconds=90" \
+  "progress on the old head cannot pass request-only checks on the new head|||STUB_PR_CHECKS_SEQUENCE=pending:request,STUB_REQUEST_CHECK_FIXTURE=$FX/request-only-checks.json,STUB_HEAD_SHA=$DEFAULT_HEAD,STUB_NEXT_HEAD_SHA=$NEXT_HEAD,$ACTIVE|rc=1 status=timeout verdict=pending check.request=SUCCESS check.current-head+Actions=EXPECTED elapsed_seconds=300 runs_head=$NEXT_HEAD" \
+  "completed substantive CI releases the request-only rollup after confirmation|||$REQUEST,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-request-only-completed.json|rc=0 status=complete verdict=pass check.request=SUCCESS pending=0" \
+  "CI completing during the wait starts a fresh confirmation window|||STUB_PR_CHECKS_SEQUENCE=request,STUB_REQUEST_CHECK_FIXTURE=$FX/request-only-checks.json,STUB_HEAD_SHA=$NEXT_HEAD,$ACTIVE,STUB_ACTIONS_RUNS_RELEASE_AFTER=2,STUB_ACTIONS_RUNS_RELEASE_FIXTURE=$TMP_ROOT/runs-request-only-completed.json|rc=0 status=complete verdict=pass pending=0 elapsed_seconds=150" \
+  "a known required build passes while optional docs is active||$JSON --required-only|STUB_REQUIRED_CONTEXT=build,STUB_PR_CHECKS_FIXTURE=$TMP_ROOT/required-build-optional-docs.json,$OPTIONAL|rc=0 status=complete verdict=pass check.build=SUCCESS check.docs=absent check.current-head+Actions=absent pending=0 rollup.build=true rollup.docs=false elapsed_seconds=90" \
+  "an unreadable required set keeps the Actions hold||$JSON --required-only|STUB_REQUIRED_CONTEXT=build,STUB_REQUIRED_READ_EXIT=1,$OPTIONAL|rc=1 status=timeout verdict=pending check.build=SUCCESS check.current-head+Actions=EXPECTED runs_head=$NEXT_HEAD elapsed_seconds=300" \
+  "a missing required build stays pending with only the request check visible||$JSON --required-only|STUB_REQUIRED_CONTEXT=build,$REQUEST,$OPTIONAL|rc=1 status=timeout verdict=pending check.build+(missing)=EXPECTED check.request=absent" \
+  "a failed Actions read with a green-looking response stays pending|||$REQUEST,STUB_ACTIONS_RUNS_EXIT=1|rc=1 status=timeout verdict=pending check.current-head+Actions=EXPECTED stderr~ci-wait:+actions-read-failed=true lookup_http_status=403" \
+  "an unreadable Actions array stays pending|||$REQUEST,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-unreadable.json|rc=1 status=timeout verdict=pending check.current-head+Actions=EXPECTED stderr~ci-wait:+actions-response-invalid=true" \
+  "a failed head read preserves its cause and stays pending|||$REQUEST,STUB_HEAD_EXIT=1|rc=1 status=timeout verdict=pending check.current-head+Actions=EXPECTED runs_head=none stderr~ci-wait:+head-read-failed=true lookup_http_status=403" \
+  "an unreadable head stays pending|||STUB_PR_CHECKS_FIXTURE=$FX/request-only-checks.json,STUB_HEAD_SHA=unknown|rc=1 status=timeout verdict=pending check.current-head+Actions=EXPECTED runs_head=none stderr~ci-wait:+head-response-invalid=true"
+
+echo "=== every Actions page must finish before a green rollup passes ==="
+# GitHub returns at most 100 runs per page and caps head_sha searches at
+# 1,000 results. A completed first page cannot prove later work finished.
+jq -s '
+  .[0].workflow_runs[0] as $completed
+  | [{total_count: 101, workflow_runs: [range(100) as $i | $completed + {id: ($completed.id + $i + 1)}]},
+     {total_count: 101, workflow_runs: .[1].workflow_runs}]
+' "$TMP_ROOT/runs-request-only-completed.json" "$FX/runs-request-only-active.json" > "$TMP_ROOT/runs-pages-active.json"
+jq '.[1].workflow_runs[0].status = "completed" | .[1].workflow_runs[0].conclusion = "success"' "$TMP_ROOT/runs-pages-active.json" > "$TMP_ROOT/runs-pages-completed.json"
+jq '.[0:1]' "$TMP_ROOT/runs-pages-completed.json" > "$TMP_ROOT/runs-pages-incomplete.json"
+jq '.[1].workflow_runs = null' "$TMP_ROOT/runs-pages-completed.json" > "$TMP_ROOT/runs-pages-malformed.json"
+jq '.[0].total_count = 102' "$TMP_ROOT/runs-pages-completed.json" > "$TMP_ROOT/runs-pages-changed-total.json"
+jq '
+  .[0].workflow_runs[0] as $completed
+  | [range(10) as $page | {total_count: 1000,
+      workflow_runs: [range(100) as $i | $completed + {id: ($completed.id + $page * 100 + $i)}]}]
+' "$TMP_ROOT/runs-pages-completed.json" > "$TMP_ROOT/runs-pages-cap.json"
+jq 'map(.total_count = 1001)' "$TMP_ROOT/runs-pages-cap.json" > "$TMP_ROOT/runs-pages-over-cap.json"
+jq '.[9].workflow_runs = .[9].workflow_runs[0:99] | map(.total_count = 999)' "$TMP_ROOT/runs-pages-cap.json" > "$TMP_ROOT/runs-pages-below-cap.json"
+table "$JSON" \
+  "an active run on a later page holds request-only checks|||$REQUEST,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-pages-active.json|rc=1 status=timeout verdict=pending check.current-head+Actions=EXPECTED" \
+  "completed later-page work releases request-only checks|||$REQUEST,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-pages-completed.json|rc=0 status=complete verdict=pass pending=0" \
+  "a later-page read failure preserves its cause and holds the first page|||$REQUEST,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-pages-completed.json,STUB_ACTIONS_RUNS_LATE_EXIT=1|rc=1 status=timeout verdict=pending check.current-head+Actions=EXPECTED lookup_http_status=403" \
+  "an incomplete run list holds completed first-page work|||$REQUEST,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-pages-incomplete.json|rc=1 status=timeout verdict=pending check.current-head+Actions=EXPECTED" \
+  "a malformed later page cannot release the hold|||$REQUEST,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-pages-malformed.json|rc=1 status=timeout verdict=pending check.current-head+Actions=EXPECTED" \
+  "a changing total across pages keeps completed work unconfirmed|||$REQUEST,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-pages-changed-total.json|rc=1 status=timeout verdict=pending check.current-head+Actions=EXPECTED" \
+  "the filtered-search cap keeps completed pages pending|||$REQUEST,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-pages-cap.json|rc=1 status=timeout verdict=pending check.current-head+Actions=EXPECTED" \
+  "a total above the cap keeps completed pages pending|||$REQUEST,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-pages-over-cap.json|rc=1 status=timeout verdict=pending check.current-head+Actions=EXPECTED" \
+  "a complete list below the cap passes without an argument-size limit|||$REQUEST,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-pages-below-cap.json|rc=0 status=complete verdict=pass pending=0" \
+  "known required checks pass without reading capped optional runs||$JSON --required-only|STUB_REQUIRED_CONTEXT=build,STUB_PR_CHECKS_FIXTURE=$TMP_ROOT/required-build-optional-docs.json,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-pages-cap.json|rc=0 verdict=pass pending=0 runs_head=none"
+
+# Each control edits a private script copy. The same pending assertion must
+# reject its false pass, proving later-page work, incomplete totals and the
+# endpoint cap each hold the verdict independently.
+control_source=$(cat "$REPO_ROOT/skills/orch/scripts/ci-wait")
+control_rows=(
+  'later-page work~[$runs[] | {id, event, status, conclusion, workflow_id, run_attempt, updated_at}]~[$runs[0:100][] | {id, event, status, conclusion, workflow_id, run_attempt, updated_at}]~runs-pages-active.json'
+  'incomplete totals~select(all(.[]; .total_count == ($runs | length)))~select(true)~runs-pages-incomplete.json'
+  'the endpoint cap~select(($runs | length) < 1000)~select(true)~runs-pages-cap.json'
+)
+mkdir -p "$TMP_ROOT/control/skills/orch/scripts"
+ln -s "$REPO_ROOT/skills/orch/scripts/lib" "$TMP_ROOT/control/skills/orch/scripts/lib"
+ln -s "$REPO_ROOT/skills/github" "$TMP_ROOT/control/skills/github"
+for row in "${control_rows[@]}"; do
+  IFS='~' read -r label match replacement fixture <<<"$row"
+  [[ "$control_source" == *"$match"* && "${control_source#*"$match"}" != *"$match"* ]] || { echo 'ci_wait: control-match=invalid' >&2; exit 1; }
+  mutant="${control_source/"$match"/"$replacement"}"
+  [[ "$mutant" != "$control_source" ]] || { echo 'ci_wait: control-edit=unchanged' >&2; exit 1; }
+  printf '%s\n' "$mutant" > "$TMP_ROOT/control/skills/orch/scripts/ci-wait"
+  chmod +x "$TMP_ROOT/control/skills/orch/scripts/ci-wait"
+  rm "$TMP_ROOT/repo/.agents/skills/orch"
+  ln -s "$TMP_ROOT/control/skills/orch" "$TMP_ROOT/repo/.agents/skills/orch"
+  # shellcheck disable=SC2086
+  run_wait "$REQUEST,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/$fixture" $JSON
+  assert_eq "$(observe 'rc=0 verdict=pass')" 'rc=0 verdict=pass' "control bypasses $label through the real entry point" "$RUN/stderr"
+  set +e
+  ( FAIL=0; assert_eq "$(observe 'rc=1 verdict=pending')" 'rc=1 verdict=pending' "$label"; [[ "$FAIL" -eq 0 ]] ) > "$TMP_ROOT/control/assertion.log"
+  control_rc=$?
+  set -e
+  assert_eq "$control_rc" 1 "the pending assertion rejects the $label control"
+  rm "$TMP_ROOT/repo/.agents/skills/orch"
+  ln -s "$REPO_ROOT/skills/orch" "$TMP_ROOT/repo/.agents/skills/orch"
+done
+
 echo "=== a settled failure attributable only to superseded runs is correlated against the head's Actions runs ==="
 # The rollup can omit a newer same-head run entirely; an active newer
 # substantive run keeps the wait pending, a successful one discards the stale
@@ -577,6 +739,7 @@ echo "=== a settled failure attributable only to superseded runs is correlated a
 # the current head.
 table "$JSON" \
   "an active newer sibling keeps the cancelled run's failure pending, queried for the head||$JSON_SHORT|STUB_PR_CHECKS_FIXTURE=$FX/cancelled-review-run-checks.json,STUB_PR_CHECKS_EXIT=1,STUB_ACTIONS_RUNS_FIXTURE=$FX/runs-newer-sibling-active.json|rc=1 status=timeout verdict=pending failed=0 check.CI+Required=EXPECTED check.CI+Gate+Publisher=EXPECTED runs_head=$DEFAULT_HEAD" \
+  "a required failure still waits for active replacement work||$JSON_SHORT --required-only|STUB_REQUIRED_CONTEXT=CI Required,STUB_PR_CHECKS_FIXTURE=$FX/cancelled-review-run-checks.json,STUB_PR_CHECKS_EXIT=1,STUB_ACTIONS_RUNS_FIXTURE=$FX/runs-newer-sibling-active.json|rc=1 status=timeout verdict=pending failed=0 check.CI+Required=EXPECTED runs_head=$DEFAULT_HEAD" \
   "a successful newer sibling discards the frozen failures and passes|||STUB_PR_CHECKS_FIXTURE=$FX/cancelled-review-run-status-replaced.json,STUB_PR_CHECKS_EXIT=1,STUB_ACTIONS_RUNS_FIXTURE=$FX/runs-newer-sibling-success.json|rc=0 status=complete verdict=pass failed=0 check.CI+Required=SUCCESS" \
   "a failed newer sibling is terminal at once|||STUB_PR_CHECKS_FIXTURE=$FX/cancelled-review-run-checks.json,STUB_PR_CHECKS_EXIT=1,STUB_ACTIONS_RUNS_FIXTURE=$FX/runs-newer-sibling-failure.json|rc=1 status=complete verdict=fail check.CI+Required=FAILURE" \
   "a cancelled run with no newer sibling fails closed|||STUB_PR_CHECKS_FIXTURE=$FX/cancelled-review-run-checks.json,STUB_PR_CHECKS_EXIT=1,STUB_ACTIONS_RUNS_FIXTURE=$FX/runs-cancelled-alone.json|rc=1 status=complete verdict=fail check.CI+Gate+Publisher=FAILURE"
