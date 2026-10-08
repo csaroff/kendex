@@ -2,8 +2,8 @@
 # tools/guard --range BASE, a fix round's validation: the default rules read
 # over the changes since BASE, cargo clippy for the crates those
 # changes touch, the UI checks and suite for a non-Markdown UI change, the
-# suites a touched skill's changed files map to and the suites of the other
-# trees they touch, and none of what --full adds beyond that: the
+# skill, hook and tools suites their changed inputs map to and the suites of
+# the other trees they touch, and none of what --full adds beyond that: the
 # workspace test run, cross-target checks, the documentation build, the Bash
 # 3.2 parse, the working-tree bot-instructions check, the decision-ID check,
 # the cargo free-space floor and the class lane selection. Every compiler and
@@ -738,10 +738,10 @@ MAP_CONTROLS=(
   "control: without the .md arm a changed SKILL.md runs the whole set~append~skills/mapped/SKILL.md~s/^    \*:references\/\* | \*.md) echo doc ;;$/    *:references\/*) echo doc ;;/~$MAPPED_ALL"
   "control: with no skill-root pattern for a root doc the root's globber stands down~append~skills/mapped/SKILL.md~s/^    \*) dir='.*' ;;$/    *) dir=NEVER ;;/~catalogscan skillmd walker"
   "control: with every doc's directory read as references the workflow directory's globber stands down~append~skills/mapped/workflows/flow.md~s|dir=\"/\\\${rel%%/\\*}(|dir=\"/references(|~catalogscan docscan flowread readflow refsuse walker"
-  "control: with the reference matched by its bare name the suite naming another directory's table.conf runs~append~skills/mapped/references/table.conf~s|grep -qF -e \"/\$rel\"|grep -qF -e \"/\${rel:11}\"|~catalogscan docscan refsuse tool tool_extra toolbox walker"
+  'control: with the reference matched by its bare name the suite naming table.conf in another directory runs~append~skills/mapped/references/table.conf~s|for pattern in "/[$]rel"|for pattern in "/${rel:11}"|~catalogscan docscan refsuse tool tool_extra toolbox walker'
   "control: with comment lines read as code the script citing a reference in a comment runs its suite~append~skills/plain/references/note.md~s/'^\[\[:space:\]\]\*/'^NEVER/~alpha.test.sh"
-  "control: without the whole-token match the suite reading the schema doc through a table stands down~append~skills/mapped/schemas/rec.md~s/grep -qE -e \"\\\$token\"/false/~catalogscan walker"
-  "control: without the directory-reader match the glob readers stand down~append~skills/mapped/references/table.conf~s/grep -qE -e \"\\\$dir\"/false/~catalogscan tool tool_extra walker"
+  'control: without the whole-token match the suite reading the schema doc through a table stands down~append~skills/mapped/schemas/rec.md~s/"[$]token" "[$]dir"/"NEVER" "$dir"/~catalogscan walker'
+  'control: without the directory-reader match the glob readers stand down~append~skills/mapped/references/table.conf~s/"[$]token" "[$]dir"/"$token" "NEVER"/~catalogscan tool tool_extra walker'
   'control: with the directory pattern taking any reference path a reader of another reference runs~append~skills/mapped/references/table.conf~s,}(/?\\\$|,}(/|/?\\\$|,~catalogscan docscan helped probed refsuse tool tool_extra walker wrap'
   "control: without the readers seeding the scan only the suites reading the reference run~append~skills/mapped/references/table.conf~/^  if \[ \"\$role\" = doc \]; then$/,/^  else$/s/reach_join .*/:/~catalogscan docscan walker"
   "control: with a skill-root variable no longer taken as a walk start the skill-root walker stands down~append~skills/mapped/references/table.conf~s/\[A-Z_\]\*SKILL\[A-Z_\]\*/NEVER/~catalogscan docscan refsuse tool tool_extra"
@@ -753,7 +753,7 @@ MAP_CONTROLS=(
   "control: with each path's suites overwriting the last only the last path's run~append~skills/mapped/scripts/tool skills/mapped/tests/other.sh~s/^            run=\"\$run\$sel$/            run=\"\$sel/~other"
   "control: with the no-runner loop reading the whole set every suite runs~append~skills/plain/scripts/alpha.sh~s/^        done <<<\"\$run\"$/        done <<<\"\$(skill_suites \"\$d\")\"/~$PLAIN_ALL"
   "control: without the .test strip the script's suite goes unmatched and the whole set runs~append~skills/plain/scripts/alpha.sh~/base=\"\${base%.test}\"/d~$PLAIN_ALL"
-  "control: with the mapping taking skills alone a changed hook runs the whole hooks set~append~hooks/alpha.sh~s/ in skills\/\* | hooks) run=\"\" ;;/ in skills\/*) run=\"\" ;;/~$HOOKS_ALL"
+  "control: with the mapping taking skills alone a changed hook runs the whole hooks set~append~hooks/alpha.sh~s/ in skills\/\* | hooks | tools) run=\"\" ;;/ in skills\/* | tools) run=\"\" ;;/~$HOOKS_ALL"
   "control: with a render's path kept whole a changed hook render runs the whole hooks set~append~.codex/hooks/demo.sh~s/^        rel=\"\${f#\*hooks\/}\"$/        rel=\"\$f\"/~$HOOKS_ALL"
   "control: without the hook arm a changed hook runs the whole hooks set~append~hooks/alpha.sh~/^    hooks:\*.sh) echo script ;;$/d~$HOOKS_ALL"
 )

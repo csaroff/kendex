@@ -22,6 +22,10 @@ tags: [automation]
 Problems with a kendex-owned skill go through `kendex report`; check ownership in the file first.
 <!-- kendex:shared-instructions:end -->
 
+### Validation routing
+
+- In submit-pr § 1.1, reuse a passing local range result for the current commit before the first push. After the pull request opens, resolve its base branch with `resolve-base-branch`, then resolve the branch merge base with `git merge-base HEAD origin/<base-branch>`. Request validation with `dev-validate-run --validate-mode ci --base <merge-base>`. A failed base lookup or local result blocks publication. Fix rounds keep their delegated round base. CI and the merge queue hold the full validation record.
+
 ### Owner messages
 
 - The owner's time zone is Pacific (America/Los_Angeles). Write a time in it as `9:29 pm`, per rule 3 of `skills/orch/references/communication-modes.md` § Owner messages.

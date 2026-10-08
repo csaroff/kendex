@@ -256,9 +256,9 @@ space_stop() { # KEY VALUE — a full run without room ends here, before any lat
   exit 1
 }
 
-# default is the commit chain's lane: the staged change. range is a fix
-# round's validation: what changed since BASE, working tree included. full is
-# development completion and submit: everything, plus the touched trees.
+# default is the commit chain's lane: the staged change. range validates
+# what changed since BASE, working tree included. full adds workspace checks
+# to the suites the changed inputs reach.
 MODE=default
 range_base=""
 selection_only=0
@@ -290,17 +290,18 @@ case "${1:-}" in
       '        cargo clippy for the crates they touch, any non-Markdown file inside' \
       '        one included (the workspace for a shared input or a file compiled code includes),' \
       '        the UI checks and suite when they touch a non-Markdown file under ui/, the' \
-      '        suites of a touched skill or of hooks/ its changed files map to' \
-      '        (mapped_suites), and the suites of the tool and Pi-package trees they' \
-      '        touch. A Markdown file compiles nothing unless compiled code includes' \
+      '        skill, hook and tools suites their changed inputs map to' \
+      '        (mapped_suites), and the suites of the Pi-package trees they' \
+      '        touch. Tools suites can read inputs outside tools/.' \
+      '        A Markdown file compiles nothing unless compiled code includes' \
       '        it, and runs no UI check.' \
       '        None of what --full adds beyond that: the workspace test run, cross-target' \
       '        checks, the documentation build, the Bash 3.2 parse, the working-tree' \
       '        bot-instructions check, the decision-ID check, the cargo free-space floor' \
       '        and the class lane selection.' \
-      '--full: full Rust and UI validation for development completion and submit,' \
-      '        plus the suites of a touched skill or of hooks/ its changed files map to' \
-      '        (mapped_suites), and the suites of the tool and Pi-package trees it touched.' \
+      '--full: full Rust and UI validation, plus skill, hook and tools suites' \
+      '        their changed inputs map to (mapped_suites), and the suites of' \
+      '        the Pi-package trees it touched.' \
       '        DEV_VALIDATE_CLASS, DEV_VALIDATE_DOCS_ONLY and DEV_VALIDATE_PATHS, set by' \
       '        dev-validate-run, stand down the lanes tools/ci-job-set does not select.' \
       '--selection: report selection=all|subset without running checks or suites.' \
@@ -844,10 +845,8 @@ fi
 # to accept it. --full and not the commit chain: the pass needs a real Bash
 # 3.2 — macOS's own /bin/bash, or the bash:3.2 image under a container
 # runtime — and refuses when it can reach neither, so in the chain a machine
-# without either could not commit at all. This run is the early one: it
-# happens at development completion, before any CI leg. The guards-scans
-# shard runs the same lane on both of its legs, which is where this class was
-# reported from before the lane existed.
+# without either could not commit at all. The configured development range
+# leaves this parse to the guards-scans shard, which runs it on both legs.
 # One line on purpose, like the lane above it: the must-fail control in
 # tools/tests/guard-full.test.sh removes this lane by deleting it.
 [ "$MODE" != full ] || ! lane_on shell_shards || "$TOOLS_DIR/bash32-parse" || say bash32-parse "$?"
@@ -1252,7 +1251,7 @@ fi
 # pi-extensions/package-policy.test.mjs holds CI to). An untouched suite is
 # not evidence about this change and is not run here; CI also runs the
 # shards of the packages that read a touched one, as tools/ci-job-set selects.
-# Of a skill's tests and hooks/tests, mapped_suites below states which run.
+# Of skill, hook and tools tests, mapped_suites below states which run.
 # A Pi package whose suite value-imports Pi has no lockfile for those peers;
 # CI installs them in the step before its suite, so a checkout without that
 # install names the missing peers beside the failing suite rather than in
@@ -1261,7 +1260,7 @@ pi_suite_failed() { # DIR
   [ -d "$1/node_modules" ] || say missing-peers "$1"
   say suite "$1"
 }
-# The role of REL, a path inside the tree DIR (a skill or hooks/), in the
+# The role of REL, a path inside the tree DIR (a skill, hooks/ or tools/), in the
 # reach scan; this table, with mapped_suites' header, is the one statement of
 # which files the scan reads and what each is taken to be:
 #   script     a top-level script, scripts/<file>, or a hook, <name>.sh at
@@ -1331,12 +1330,13 @@ skill_files() { # DIR
 # SCAN_PATH, SCAN_ROLE, SCAN_CODE, its lines that are no `#` comment,
 # SCAN_READ_CODE, those lines filtered to document reads for scripts/libs,
 # SCAN_NAMES, each `/<name>` that code spells, and SCAN_SOURCED, each
-# `/<name>` its `source` and `.` lines spell, one per line between newlines.
+# `/<name>` its `source` and `.` lines spell, one per line between newlines,
+# and SCAN_INPUTS, the repository path patterns in its input notes.
 # A name is the whole run of letters, digits, `.`, `_` and `-` after a slash,
 # less any trailing dots, so `/lane-state` is no name in `/lane-state.sh` and
 # `/oversee` none in `/oversee-watch`. Status 2 is a file it could not read.
 scan_load() { # DIR
-  local role f code read_code names lines sourced
+  local role f code read_code names lines sourced inputs
   SCAN_DIR=""
   SCAN_PATH=()
   SCAN_ROLE=()
@@ -1344,6 +1344,7 @@ scan_load() { # DIR
   SCAN_READ_CODE=()
   SCAN_NAMES=()
   SCAN_SOURCED=()
+  SCAN_INPUTS=()
   while IFS=' ' read -r role f; do
     [ -n "$f" ] || continue
     code=$(grep -v '^[[:space:]]*#' -- "$f") || [ $? -eq 1 ] || return 2
@@ -1386,12 +1387,14 @@ scan_load() { # DIR
     names=$(grep -oE '/[[:alnum:]._-]*[[:alnum:]_-]' <<<"$code") || [ $? -eq 1 ] || return 2
     lines=$(grep -E '(^|[;&|({[:space:]])(source|\.)[[:space:]]' <<<"$code") || [ $? -eq 1 ] || return 2
     sourced=$(grep -oE '/[[:alnum:]._-]*[[:alnum:]_-]' <<<"$lines") || [ $? -eq 1 ] || return 2
+    inputs=$(sed -n 's/^# Inputs: //p' "$f" | tr ' ' '\n') || return 2
     SCAN_PATH+=("$f")
     SCAN_ROLE+=("$role")
     SCAN_CODE+=("$code")
     SCAN_READ_CODE+=("$read_code")
     SCAN_NAMES+=($'\n'"$names"$'\n')
     SCAN_SOURCED+=($'\n'"$sourced"$'\n')
+    SCAN_INPUTS+=("$inputs")
   done <<<"$(skill_files "$1")"
   SCAN_DIR=$1
 }
@@ -1415,8 +1418,9 @@ scan_load() { # DIR
 # A comment, printed brief or API path reads nothing, nor does a find from
 # any other start or a walk in another language.
 doc_readers() { # REL
-  local rel="$1" i code dir token
-  token="(^|[^[:alnum:]._/-])$(sed 's/[][\\.*^$+?(){}|]/\\&/g' <<<"$rel")([^[:alnum:]_/-]|\$)"
+  local rel="$1" i code dir token pattern flag status
+  token=$(sed 's/[][\\.*^$+?(){}|]/\\&/g' <<<"$rel") || return 2
+  token="(^|[^[:alnum:]._/-])$token([^[:alnum:]_/-]|\$)"
   case "$rel" in
     */*)
       dir="/${rel%%/*}(/?\$|/[^[:alnum:]._-]|[\"}]*[[:space:]]*/?[*\$])|[\"'](\\\$|[./])[^\"']*/${rel%%/*}[\"']([[:space:]]|\\)|\$)"
@@ -1425,12 +1429,18 @@ doc_readers() { # REL
   esac
   for ((i = 0; i < ${#SCAN_PATH[@]}; i++)); do
     code=${SCAN_READ_CODE[i]}
-    if grep -qF -e "/$rel" <<<"$code" ||
-      grep -qE -e "$token" <<<"$code" ||
-      grep -qE -e "$dir" <<<"$code" ||
-      grep -qE -e '(^|[^[:alnum:]_-])find[[:space:]]+(-[HLP][[:space:]]+)?([^-[:space:]][^[:space:]]*[[:space:]]+)*"?(\$\{?[A-Z_]*SKILL[A-Z_]*\}?|[^[:space:]"]*/skills)"?([[:space:]]|\)|$)' <<<"$code"; then
-      printf '%s\n' "$i"
-    fi
+    flag=-qF
+    for pattern in "/$rel" "$token" "$dir" \
+      '(^|[^[:alnum:]_-])find[[:space:]]+(-[HLP][[:space:]]+)?([^-[:space:]][^[:space:]]*[[:space:]]+)*"?(\$\{?[A-Z_]*SKILL[A-Z_]*\}?|[^[:space:]"]*/skills)"?([[:space:]]|\)|$)'; do
+      status=0
+      grep "$flag" -e "$pattern" <<<"$code" || status=$?
+      case "$status" in
+        0) printf '%s\n' "$i"; break ;;
+        1) ;;
+        *) return 2 ;;
+      esac
+      flag=-qE
+    done
   done
 }
 # A file in the reach adds its name as a needle by its role, into the
@@ -1446,7 +1456,7 @@ reach_join() { # ROLE PATH
     *) return 3 ;;
   esac
 }
-# The suites run for one changed path of a tree, a skill or hooks/,
+# The suites run for one changed path of a skill, hooks/ or tools/,
 # REL being the path inside it; this comment, with path_role's table and
 # doc_readers' for a doc, is the one statement of the rule.
 #   - A changed or deleted script, lib or helper starts a scan over
@@ -1470,28 +1480,51 @@ reach_join() { # ROLE PATH
 #     A module no suite names runs nothing.
 #   - A path of no role, a changed test module, and a path whose
 #     reach holds no suite map to no suite.
+#   - tools/ also scans repository inputs outside its tree. Whole paths in
+#     code and `# Inputs:` path patterns seed the same reader reach. Input
+#     notes name indirect reads that the text scan cannot resolve.
 # The reach is what the scan can see, not every caller: a script run through
 # a variable path is missed, and so is a suite that runs a changed script
 # only through another script that runs it. CI's full run owns completeness.
 # The suites land in MAPPED, one per line, rather than on stdout, so the
 # scan stays loaded for the tree's next path. None with status 0 is a
 # deleted suite, a module no suite names or a doc no file reads; status 1 is a path mapped to no
-# suite, status 2 a file the scan could not read, and status 3 a role
+# suite, status 2 evidence the scan could not read or compare, and status 3 a role
 # reach_join does not know, a broken guard.
 mapped_suites() { # DIR REL
-  local dir="$1" rel="$2" role="" i n hit names readers f t name base out="" nl=$'\n'
+  local dir="$1" rel="$2" role="" i n hit names readers f t name base input input_path noted="" out="" nl=$'\n'
   MAPPED=""
   local reached=() next_any=() next_script=() any=() scripts=() reach_scripts=()
-  role=$(path_role "$dir" "$rel") || return 1
+  case "$rel" in
+    ../*) role=doc ;;
+    *) role=$(path_role "$dir" "$rel") || return 1 ;;
+  esac
   case "$role" in test-module) return 1 ;; esac
   [ "${SCAN_DIR-}" = "$dir" ] || scan_load "$dir" || return 2
   for ((i = 0; i < ${#SCAN_PATH[@]}; i++)); do
     [ "${SCAN_PATH[i]}" != "$dir/$rel" ] || reached[i]=1
+    input_path="$dir/$rel"
+    [[ $rel != ../* ]] || input_path=${rel#../}
+    while IFS= read -r input; do
+      [ -n "$input" ] || continue
+      case "$input_path" in $input)
+        reached[i]=1
+        noted="$noted$i"$'\n'
+        reach_join "${SCAN_ROLE[i]}" "${SCAN_PATH[i]}" || return 3
+        ;;
+      esac
+    done <<<"${SCAN_INPUTS[i]}"
   done
   if [ "$role" = doc ]; then
-    readers=$(doc_readers "$rel") || return 2
+    if [[ $rel == ../* ]]; then
+      readers=$(doc_readers "${rel#../}") || return 2
+    else
+      readers=$(doc_readers "$rel") || return 2
+    fi
+    readers="$noted$readers"
     [ -n "$readers" ] || return 0
     while IFS= read -r i; do
+      [ -n "$i" ] || continue
       reached[i]=1
       reach_join "${SCAN_ROLE[i]}" "${SCAN_PATH[i]}" || return 3
     done <<<"$readers"
@@ -1604,10 +1637,14 @@ if [ "$MODE" != default ] && lane_on shell_shards; then
         tree="pi-extensions/${x%%/*}"
         rel="${x#*/}"
         ;;
-      *) continue ;;
+      *) tree=tools; rel="../$f" ;;
     esac
     tree_paths="$tree_paths$tree	$rel	$f
 "
+    if [ "$tree" != tools ]; then
+      tree_paths="${tree_paths}tools	../$f	$f
+"
+    fi
   done <<<"$touched"
   for d in $(cut -f1 <<<"$tree_paths" | sort -u); do
     case "$d" in
@@ -1628,13 +1665,14 @@ if [ "$MODE" != default ] && lane_on shell_shards; then
       *)
         [ -d "$d/tests" ] || continue
         run=all
-        case "$d" in skills/* | hooks) run="" ;; esac
+        case "$d" in skills/* | hooks | tools) run="" ;; esac
         [ "$scoped_only" -eq 0 ] || run=""
         if [ "$run" != all ]; then
           while IFS='	' read -r tree rel f; do
             [ "$tree" = "$d" ] || continue
             if [ "$scoped_only" -eq 1 ]; then
               role=$(path_role "$d" "$rel") || continue
+              [[ $rel != ../* ]] || role=script
               case "$role" in script | lib | helper | module | suite | test-module) ;; *) continue ;; esac
             fi
             map_status=0
