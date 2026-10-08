@@ -133,6 +133,46 @@ case "${1:-}" in
             prev="$a"
         done
         case "${2:-}" in
+            'repos/org/source' | 'repos/org/other')
+                [[ "${STUB_SOURCE_EXIT:-0}" == 0 ]] || exit "$STUB_SOURCE_EXIT"
+                source_name=${2#repos/}
+                case "$source_name" in org/source) id=999 ;; org/other) id=888 ;; esac
+                jq -cn --argjson id "${STUB_SOURCE_ID:-$id}" --arg name "$source_name" '{id:$id,full_name:$name,default_branch:"main"}'
+                exit 0 ;;
+            'repos/'*'/commits/'*)
+                [[ "${STUB_SOURCE_REVISION_EXIT:-0}" == 0 ]] || exit "$STUB_SOURCE_REVISION_EXIT"
+                echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+                exit 0 ;;
+            graphql)
+                if [[ "${3:-}" == --input ]]; then
+                    [[ "${STUB_WORKFLOW_FILES_EXIT:-0}" == 0 ]] || exit "$STUB_WORKFLOW_FILES_EXIT"
+                    request=$(cat -- "$4")
+                    if [[ -n "${STUB_WORKFLOW_FILES:-}" ]]; then
+                        printf '%s\n' "$STUB_WORKFLOW_FILES"
+                    else
+                        jq -cn --argjson request "$request" --argjson pages "$STUB_WORKFLOW_RUNS" \
+                            --arg source "${STUB_WORKFLOW_SOURCE_REPO:-owner/repo}" \
+                            --arg revision "${STUB_WORKFLOW_SOURCE_REVISION:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" '
+                            {data:{nodes:[$pages[].workflow_runs[] | . as $run
+                                | select($request.variables.ids | index($run.check_suite_node_id))
+                                | {id:.check_suite_node_id,databaseId:.check_suite_id,workflowRun:{databaseId:.id,runAttempt:(.run_attempt // 1),file:{path:.path,repositoryName:$source,repositoryFileUrl:("https://github.com/" + $source + "/blob/" + $revision + "/" + .path),viewerCanReadRepository:true}}}] | unique_by(.id)}}'
+                    fi
+                    exit 0
+                fi ;;
+            'repos/{owner}/{repo}/actions/runs?head_sha='*)
+                [[ "${STUB_WORKFLOW_RUNS_EXIT:-0}" == 0 ]] || exit "$STUB_WORKFLOW_RUNS_EXIT"
+                printf '%s\n' "${STUB_WORKFLOW_RUNS:-[]}"
+                exit 0
+                ;;
+            'repos/{owner}/{repo}/check-suites/'*'/check-runs?per_page=100')
+                [[ "${STUB_WORKFLOW_CHECKS_EXIT:-0}" == 0 ]] || exit "$STUB_WORKFLOW_CHECKS_EXIT"
+                suite=${2#repos/\{owner\}/\{repo\}/check-suites/}
+                suite=${suite%%/*}
+                jq -ce --arg suite "$suite" '
+                    if has($suite) then .[$suite] else error("unmatched check suite") end
+                ' <<<"${STUB_WORKFLOW_CHECKS:-null}"
+                exit 0
+                ;;
             # An installation token (ghs_) has no user: gh's integration 403.
             # A revoked token (*_REVOKED) gets gh's plain 401.
             user)
@@ -176,13 +216,14 @@ case "${1:-}" in
                     exit "$STUB_REPO_EXIT"
                 fi
                 repo_json=$(jq -cn \
+                    --argjson id "${STUB_REPO_ID:-123}" \
                     --argjson auto "${STUB_ALLOW_AUTO_MERGE:-true}" \
                     --arg methods "${STUB_MERGE_METHODS-squash merge rebase}" \
                     --argjson deletes "${STUB_DELETE_BRANCH_ON_MERGE:-false}" \
                     --arg default "${STUB_DEFAULT_BRANCH:-main}" \
                     --argjson pushless "${STUB_REPO_PUSHLESS:-false}" \
                     '($methods | split(" ")) as $m
-                    | {allow_auto_merge: $auto, default_branch: $default}
+                    | {id: $id, full_name: "owner/repo", allow_auto_merge: $auto, default_branch: $default}
                     + if $pushless then {} else {allow_squash_merge: ($m | index("squash") != null), allow_merge_commit: ($m | index("merge") != null), allow_rebase_merge: ($m | index("rebase") != null), delete_branch_on_merge: $deletes} end')
                 if [[ -n "$jq_filter" ]]; then jq -r "$jq_filter" <<<"$repo_json"; else printf '%s\n' "$repo_json"; fi
                 exit 0

@@ -311,7 +311,7 @@ After any fix-up push: push → the Restart check, and on a restart wait for a N
 ## 5. Verify CI
 
 ```bash
-.agents/skills/orch/scripts/ci-wait [PR_NUMBER] --json --item [ISSUE_ID]
+.agents/skills/orch/scripts/ci-wait [PR_NUMBER] --required-only --json --item [ISSUE_ID]
 ```
 
 | Result | Action |
@@ -364,7 +364,7 @@ A PR merges on exactly four deterministic gates. Gates 2 and 4 **verify results 
 
 Empty `json_paths` means no internal review is recorded: report the unmet gate and recommend `orch review-pr [PR_NUMBER]`.
 
-**Gate 2** = the recorded § 5 result — do not re-run ci-wait, and raw `gh pr checks` output is never the gate. On a `pr-merge --check` refusal run `.agents/skills/github/scripts/github.sh ci-classify-refusal [PR_NUMBER]` and report its `cause:` line with its printed detail (for `ci_failed` that includes the `fail:` and `superseded:` run ids) rather than forcing or abandoning the merge.
+**Gate 2** is the recorded § 5 result. Do not re-run ci-wait. Raw `gh pr checks` output is never the gate. On a `pr-merge --check` refusal run `.agents/skills/github/scripts/github.sh ci-classify-refusal [PR_NUMBER]` and report its `cause:` line with its printed detail. Read `ci-classify-refusal --help` for the output contract.
 
 **Gate 3** — final live check. Replying to every bot comment stays § 3.1's hygiene rule, which is not a gate in any mode.
 

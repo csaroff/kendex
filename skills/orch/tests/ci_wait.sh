@@ -98,7 +98,7 @@ case "${1:-}" in
         [[ "$arg" != --slurp ]] || slurp=true
       done
       fixture="${STUB_ACTIONS_RUNS_FIXTURE:-}"
-      if [[ -n "${STUB_HEAD_DURING_ACTIONS:-}" ]]; then
+      if [[ -n "${STUB_HEAD_DURING_ACTIONS:-}" && "$(cat "$STUB_PR_CHECKS_COUNT_FILE")" -ge "${STUB_HEAD_DURING_ACTIONS_AFTER:-0}" ]]; then
         : > "$STUB_PR_CHECKS_COUNT_FILE.actions-pushed"
         if [[ "$2" == *"head_sha=$STUB_HEAD_DURING_ACTIONS&"* && -n "${STUB_ACTIONS_NEXT_HEAD_FIXTURE:-}" ]]; then
           fixture="$STUB_ACTIONS_NEXT_HEAD_FIXTURE"
@@ -115,6 +115,9 @@ case "${1:-}" in
       if ! $paginate || [[ "${STUB_ACTIONS_RUNS_LATE_EXIT:-0}" != 0 ]]; then
         pages=$(jq -c '.[0:1]' <<<"$pages")
       fi
+      if [[ -n "${STUB_REQUIRED_WORKFLOW:-}" ]]; then
+        pages=$(jq -c 'map(.workflow_runs |= map(. + {check_suite_node_id:("suite-" + (.id | tostring))}))' <<<"$pages")
+      fi
       if $slurp; then
         printf '%s\n' "$pages"
       else
@@ -126,10 +129,45 @@ case "${1:-}" in
       fi
       exit 0
     fi
-    if [[ -n "${STUB_REQUIRED_CONTEXT:-}" ]]; then
+    if [[ -n "${STUB_REQUIRED_WORKFLOW:-}" && "${2:-}" == repos/org/source ]]; then
+      [[ "${STUB_SOURCE_EXIT:-0}" == 0 ]] || exit "$STUB_SOURCE_EXIT"
+      jq -cn --argjson id "${STUB_SOURCE_ID:-999}" '{id:$id,full_name:"org/source",default_branch:"main"}'
+      exit 0
+    fi
+    if [[ -n "${STUB_REQUIRED_WORKFLOW:-}" && "${2:-}" == repos/org/source/commits/* ]]; then
+      echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      exit 0
+    fi
+    if [[ -n "${STUB_REQUIRED_WORKFLOW:-}" && "${2:-}" == graphql && "${3:-}" == --input ]]; then
+      [[ "${STUB_WORKFLOW_FILES_EXIT:-0}" == 0 ]] || exit "$STUB_WORKFLOW_FILES_EXIT"
+      request=$(cat -- "$4")
+      fixture="$STUB_ACTIONS_RUNS_FIXTURE"
+      if [[ -n "${STUB_ACTIONS_RUNS_RELEASE_AFTER:-}" ]] && [[ "$(cat "$STUB_PR_CHECKS_COUNT_FILE")" -gt "$STUB_ACTIONS_RUNS_RELEASE_AFTER" ]]; then
+        fixture="$STUB_ACTIONS_RUNS_RELEASE_FIXTURE"
+      fi
+      jq -cn --argjson request "$request" --slurpfile pages "$fixture" --arg revision "${STUB_WORKFLOW_SOURCE_REVISION:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" '
+        ($pages | if .[0] | type == "array" then .[0] else . end) as $pages
+        | {data:{nodes:[$pages[].workflow_runs[] | . + {check_suite_node_id:(.check_suite_node_id // ("suite-" + (.id | tostring)))} | . as $run
+            | select($request.variables.ids | index($run.check_suite_node_id))
+            | {id:.check_suite_node_id,databaseId:.check_suite_id,workflowRun:{databaseId:.id,runAttempt:(.run_attempt // 1),file:{path:.path,repositoryName:"org/source",repositoryFileUrl:("https://github.com/org/source/blob/" + $revision + "/" + .path),viewerCanReadRepository:true}}}]}}'
+      exit 0
+    fi
+    if [[ -n "${STUB_REQUIRED_WORKFLOW:-}" && "${2:-}" == repos/*/check-suites/*/check-runs* ]]; then
+      [[ "${STUB_WORKFLOW_CHECKS_EXIT:-0}" == 0 ]] || exit "$STUB_WORKFLOW_CHECKS_EXIT"
+      suite=${2#*/check-suites/}
+      suite=${suite%%/*}
+      jq -ce --arg suite "$suite" 'if has($suite) then .[$suite] else error("unmatched check suite") end' "$STUB_WORKFLOW_CHECKS_FIXTURE"
+      exit 0
+    fi
+    if [[ -n "${STUB_REQUIRED_WORKFLOW:-}" && "${2:-}" == repos/owner/repo ]]; then
+      echo 123
+      exit 0
+    fi
+    if [[ -n "${STUB_REQUIRED_CONTEXT:-}${STUB_REQUIRED_WORKFLOW:-}" ]]; then
       if [[ "${2:-}" == repos/*/rules/branches/* ]]; then
         [[ "${STUB_REQUIRED_READ_EXIT:-0}" == 0 ]] || exit "$STUB_REQUIRED_READ_EXIT"
-        printf 'ctx:%s\n' "$STUB_REQUIRED_CONTEXT"
+        [[ -z "${STUB_REQUIRED_CONTEXT:-}" ]] || printf 'ctx:%s\n' "$STUB_REQUIRED_CONTEXT"
+        [[ -z "${STUB_REQUIRED_WORKFLOW:-}" ]] || printf 'workflow:{"path":".github/workflows/request-copilot-review.yml","repository_id":999}\n'
         exit 0
       fi
       if [[ "${2:-}" == repos/*/branches/* ]]; then
@@ -198,7 +236,7 @@ case "${1:-}" in
           echo "${STUB_HEAD_SHA:-737bce791577e140436490e0fed5751bb5144a61}"
           exit 0
         fi
-        if [[ "$_a" == "baseRefName" && -n "${STUB_REQUIRED_CONTEXT:-}" ]]; then
+        if [[ "$_a" == "baseRefName" && -n "${STUB_REQUIRED_CONTEXT:-}${STUB_REQUIRED_WORKFLOW:-}" ]]; then
           echo main
           exit 0
         fi
@@ -214,6 +252,9 @@ case "${1:-}" in
         exit 0
       fi
       if [[ -n "${STUB_PR_CHECKS_FIXTURE:-}" ]]; then
+        count=0
+        [[ ! -f "$STUB_PR_CHECKS_COUNT_FILE" ]] || count=$(cat "$STUB_PR_CHECKS_COUNT_FILE")
+        printf '%s' "$((count + 1))" > "$STUB_PR_CHECKS_COUNT_FILE"
         cat "$STUB_PR_CHECKS_FIXTURE"
         exit "${STUB_PR_CHECKS_EXIT:-0}"
       fi
@@ -699,6 +740,55 @@ table "$JSON" \
   "a failed head read preserves its cause and stays pending|||$REQUEST,STUB_HEAD_EXIT=1|rc=1 status=timeout verdict=pending check.current-head+Actions=EXPECTED runs_head=none stderr~ci-wait:+head-read-failed=true lookup_http_status=403" \
   "an unreadable head stays pending|||STUB_PR_CHECKS_FIXTURE=$FX/request-only-checks.json,STUB_HEAD_SHA=unknown|rc=1 status=timeout verdict=pending check.current-head+Actions=EXPECTED runs_head=none stderr~ci-wait:+head-response-invalid=true"
 
+echo "=== required workflow outcomes and optional CodeQL waits ==="
+jq -cn --arg head "$NEXT_HEAD" '{workflow_runs:[{id:500,workflow_id:500,path:".github/workflows/request-copilot-review.yml",head_sha:$head,repository:{id:123},check_suite_id:500,check_suite_node_id:"suite-500",event:"pull_request_target",status:"completed",conclusion:"success",run_attempt:1,updated_at:"2026-10-08T14:35:29Z"},{id:499,workflow_id:499,path:"dynamic/github-code-scanning/codeql",head_sha:$head,repository:{id:123},check_suite_id:499,event:"dynamic",status:"queued",conclusion:null}]}' > "$TMP_ROOT/runs-required-completed.json"
+jq '.workflow_runs[0].status = "in_progress" | .workflow_runs[0].conclusion = null' "$TMP_ROOT/runs-required-completed.json" > "$TMP_ROOT/runs-required-active.json"
+jq '.workflow_runs[0].conclusion = "failure"' "$TMP_ROOT/runs-required-completed.json" > "$TMP_ROOT/runs-required-failed.json"
+jq '.workflow_runs[0].conclusion = null' "$TMP_ROOT/runs-required-completed.json" > "$TMP_ROOT/runs-required-unreadable.json"
+jq '.workflow_runs += [.workflow_runs[0] + {id:123,check_suite_node_id:"suite-123",conclusion:"failure",updated_at:"2026-10-08T14:36:31Z"}]' "$TMP_ROOT/runs-required-completed.json" > "$TMP_ROOT/runs-required-older-finished.json"
+printf '{"500":[{"total_count":1,"check_runs":[{"name":"request","html_url":"https://github.com/owner/repo/actions/runs/500/job/501"}]}]}\n' > "$TMP_ROOT/required-workflow-checks.json"
+printf '{"500":[{"total_count":0,"check_runs":[]}]}\n' > "$TMP_ROOT/required-workflow-empty.json"
+printf '[{"name":"build","state":"SUCCESS","bucket":"pass"},{"name":"request","state":"SUCCESS","bucket":"pass","workflow":"Required","link":"https://github.com/owner/repo/actions/runs/500/job/501"}]\n' > "$TMP_ROOT/required-workflow-green.json"
+jq '.[1] += {state:"FAILURE",bucket:"fail",workflow:"Required",link:"https://github.com/owner/repo/actions/runs/500/job/501"}' "$TMP_ROOT/required-workflow-green.json" > "$TMP_ROOT/required-workflow-runner-failed.json"
+printf 'runner error: network timeout\n' > "$TMP_ROOT/required-workflow-runner.log"
+jq '. + [{name:"CodeQL",state:"IN_PROGRESS",bucket:"pending"}]' "$TMP_ROOT/required-workflow-green.json" > "$TMP_ROOT/required-workflow-optional-pending.json"
+jq '.[2].state = "QUEUED"' "$TMP_ROOT/required-workflow-optional-pending.json" > "$TMP_ROOT/required-workflow-optional-queued.json"
+WORKFLOW="STUB_REQUIRED_CONTEXT=build,STUB_REQUIRED_WORKFLOW=1,STUB_HEAD_SHA=$NEXT_HEAD,STUB_WORKFLOW_CHECKS_FIXTURE=$TMP_ROOT/required-workflow-checks.json"
+WORKFLOW_GREEN="$WORKFLOW,STUB_PR_CHECKS_FIXTURE=$TMP_ROOT/required-workflow-green.json"
+WORKFLOW_RETRY="$WORKFLOW,STUB_PR_CHECKS_FIXTURE=$TMP_ROOT/required-workflow-runner-failed.json,STUB_PR_CHECKS_EXIT=1,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-required-failed.json,STUB_RUN_LOG_FILE=$TMP_ROOT/required-workflow-runner.log"
+WORKFLOW_PENDING="$WORKFLOW,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-required-completed.json,STUB_PR_CHECKS_FIXTURE=$TMP_ROOT/required-workflow-optional-pending.json,STUB_PR_CHECKS_EXIT=8"
+WORKFLOW_QUEUED="$WORKFLOW,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-required-completed.json,STUB_PR_CHECKS_FIXTURE=$TMP_ROOT/required-workflow-optional-queued.json,STUB_PR_CHECKS_EXIT=8"
+jq '. + [{name:"request",state:"FAILURE",bucket:"fail",workflow:"Optional",link:"https://github.com/owner/repo/actions/runs/600/job/601"}]' "$TMP_ROOT/required-workflow-green.json" > "$TMP_ROOT/required-workflow-same-failed.json"
+jq '.[2] += {state:"IN_PROGRESS",bucket:"pending"}' "$TMP_ROOT/required-workflow-same-failed.json" > "$TMP_ROOT/required-workflow-same-pending.json"
+jq '.[2].state = "QUEUED"' "$TMP_ROOT/required-workflow-same-pending.json" > "$TMP_ROOT/required-workflow-same-queued.json"
+jq '[.[2], (.[1] + {state:"FAILURE",bucket:"fail"}), .[0]]' "$TMP_ROOT/required-workflow-same-failed.json" > "$TMP_ROOT/required-workflow-same-retry.json"
+WORKFLOW_MEMBER_RETRY="$WORKFLOW,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-required-completed.json,STUB_PR_CHECKS_FIXTURE=$TMP_ROOT/required-workflow-same-retry.json,STUB_RUN_LOG_FILE=$TMP_ROOT/required-workflow-runner.log"
+WORKFLOW_PASS='rc=0 status=complete verdict=pass check.build=SUCCESS check.request=SUCCESS check.CodeQL=absent pending=0 elapsed_seconds=90'
+WORKFLOW_HOLD='rc=1 status=timeout verdict=pending check.required+workflow=EXPECTED passed=0'
+WORKFLOW_PUSH="$WORKFLOW,STUB_PR_CHECKS_SEQUENCE=pending:request,STUB_REQUEST_CHECK_FIXTURE=$TMP_ROOT/required-workflow-green.json,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-required-completed.json,STUB_HEAD_DURING_ACTIONS=$DEFAULT_HEAD,STUB_HEAD_DURING_ACTIONS_AFTER=2"
+table "$JSON --required-only" \
+  "a push during required workflow evidence cannot consume old-head progress|||$WORKFLOW_PUSH|$WORKFLOW_HOLD" \
+  "a source workflow runs in its consumer while optional CodeQL is pending|||$WORKFLOW_PENDING|$WORKFLOW_PASS" \
+  "queued default-setup CodeQL cannot hold completed required jobs|||$WORKFLOW_QUEUED|$WORKFLOW_PASS" \
+  "optional same-name failure cannot fail required work|||$WORKFLOW,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-required-completed.json,STUB_PR_CHECKS_FIXTURE=$TMP_ROOT/required-workflow-same-failed.json|rc=0 verdict=pass failed=0 pending=0 elapsed_seconds=90" \
+  "classic required contexts keep same-name optional jobs blocking|||$WORKFLOW,STUB_REQUIRED_CONTEXT=request,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-required-completed.json,STUB_PR_CHECKS_FIXTURE=$TMP_ROOT/required-workflow-same-failed.json|rc=1 verdict=fail failed=1" \
+  "same-name optional failure cannot supply the infrastructure retry run|||$WORKFLOW_MEMBER_RETRY|rc=1 verdict=fail failed=1 reruns=500" \
+  "optional same-name pending cannot hold the confirmation clock|||$WORKFLOW,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-required-completed.json,STUB_PR_CHECKS_FIXTURE=$TMP_ROOT/required-workflow-same-pending.json,STUB_PR_CHECKS_EXIT=8|rc=0 verdict=pass failed=0 pending=0 elapsed_seconds=90" \
+  "optional same-name queued cannot hold required work|||$WORKFLOW,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-required-completed.json,STUB_PR_CHECKS_FIXTURE=$TMP_ROOT/required-workflow-same-queued.json,STUB_PR_CHECKS_EXIT=8|rc=0 verdict=pass failed=0 pending=0 elapsed_seconds=90" \
+  "unreadable source metadata holds required work|||$WORKFLOW_PENDING,STUB_WORKFLOW_FILES_EXIT=1|$WORKFLOW_HOLD" \
+  "unreadable documented source lookup holds required work|||$WORKFLOW_PENDING,STUB_SOURCE_EXIT=1|$WORKFLOW_HOLD" \
+  "a source repository ID mismatch holds required work|||$WORKFLOW_PENDING,STUB_SOURCE_ID=888|$WORKFLOW_HOLD" \
+  "a wrong source pin holds required work|||$WORKFLOW_PENDING,STUB_WORKFLOW_SOURCE_REVISION=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb|$WORKFLOW_HOLD" \
+  "an active required workflow holds with every visible job green|||$WORKFLOW_GREEN,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-required-active.json|$WORKFLOW_HOLD stderr~ci-wait:+required-workflow-unreadable=false" \
+  "required workflow completion during the wait releases its hold|||$WORKFLOW_GREEN,STUB_PR_CHECKS_SEQUENCE=green,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-required-active.json,STUB_ACTIONS_RUNS_RELEASE_AFTER=2,STUB_ACTIONS_RUNS_RELEASE_FIXTURE=$TMP_ROOT/runs-required-completed.json|rc=0 status=complete verdict=pass pending=0" \
+  "unregistered required workflow jobs hold visible green jobs|||$WORKFLOW_GREEN,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-required-completed.json,STUB_WORKFLOW_CHECKS_FIXTURE=$TMP_ROOT/required-workflow-empty.json|$WORKFLOW_HOLD" \
+  "unreadable required run evidence cannot pass visible green jobs|||$WORKFLOW_GREEN,STUB_ACTIONS_RUNS_EXIT=1|$WORKFLOW_HOLD stderr~ci-wait:+required-workflow-unreadable=true" \
+  "unreadable required job evidence cannot pass visible green jobs|||$WORKFLOW_GREEN,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-required-completed.json,STUB_WORKFLOW_CHECKS_EXIT=1|$WORKFLOW_HOLD" \
+  "an unreadable required conclusion cannot pass visible green jobs|||$WORKFLOW_GREEN,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-required-unreadable.json|$WORKFLOW_HOLD" \
+  "a failed required run cannot pass visible green jobs|||$WORKFLOW_GREEN,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-required-failed.json|rc=1 status=complete verdict=fail check.required+workflow=FAILURE" \
+  "a required runner timeout retries run 500 and refuses its unrecovered failure|||$WORKFLOW_RETRY|rc=1 status=complete verdict=fail check.required+workflow=FAILURE reruns=500" \
+  "an older failed run finishing later cannot replace successful required work|||$WORKFLOW_GREEN,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-required-older-finished.json|rc=0 status=complete verdict=pass failed=0"
+
 echo "=== the latest Actions workflow outcome decides a green rollup ==="
 jq '.workflow_runs[0].conclusion = "failure"' "$TMP_ROOT/runs-request-only-completed.json" > "$TMP_ROOT/runs-request-only-failed.json"
 jq '.workflow_runs += [.workflow_runs[0] + {id: (.workflow_runs[0].id + 1), conclusion: "success"}]' "$TMP_ROOT/runs-request-only-failed.json" > "$TMP_ROOT/runs-request-newer-success.json"
@@ -744,6 +834,7 @@ jq '
 ' "$TMP_ROOT/runs-pages-completed.json" > "$TMP_ROOT/runs-pages-cap.json"
 jq 'map(.total_count = 1001)' "$TMP_ROOT/runs-pages-cap.json" > "$TMP_ROOT/runs-pages-over-cap.json"
 jq '.[9].workflow_runs = .[9].workflow_runs[0:99] | map(.total_count = 999)' "$TMP_ROOT/runs-pages-cap.json" > "$TMP_ROOT/runs-pages-below-cap.json"
+jq --arg head "$NEXT_HEAD" 'map(.workflow_runs |= map(. + {path:".github/workflows/request-copilot-review.yml",head_sha:$head,repository:{id:123},check_suite_id:500,workflow_id:500}))' "$TMP_ROOT/runs-pages-cap.json" > "$TMP_ROOT/runs-required-cap.json"
 table "$JSON" \
   "an active run on a later page holds request-only checks|||$REQUEST,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-pages-active.json|rc=1 status=timeout verdict=pending check.current-head+Actions=EXPECTED" \
   "completed later-page work releases request-only checks|||$REQUEST,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-pages-completed.json|rc=0 status=complete verdict=pass pending=0" \
@@ -754,7 +845,8 @@ table "$JSON" \
   "the filtered-search cap keeps completed pages pending|||$REQUEST,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-pages-cap.json|rc=1 status=timeout verdict=pending check.current-head+Actions=EXPECTED" \
   "a total above the cap keeps completed pages pending|||$REQUEST,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-pages-over-cap.json|rc=1 status=timeout verdict=pending check.current-head+Actions=EXPECTED" \
   "a complete list below the cap passes without an argument-size limit|||$REQUEST,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-pages-below-cap.json|rc=0 status=complete verdict=pass pending=0" \
-  "known required checks pass without reading capped optional runs||$JSON --required-only|STUB_REQUIRED_CONTEXT=build,STUB_PR_CHECKS_FIXTURE=$TMP_ROOT/required-build-optional-docs.json,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-pages-cap.json|rc=0 verdict=pass pending=0 runs_head=none"
+  "known required checks pass without reading capped optional runs||$JSON --required-only|STUB_REQUIRED_CONTEXT=build,STUB_PR_CHECKS_FIXTURE=$TMP_ROOT/required-build-optional-docs.json,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-pages-cap.json|rc=0 verdict=pass pending=0 runs_head=none" \
+  "a capped required workflow collection cannot prove its current outcome||$JSON --required-only|$WORKFLOW_GREEN,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-required-cap.json|$WORKFLOW_HOLD"
 
 # Each control edits a private script copy. The same pending assertion must
 # reject its false pass, proving later-page work, incomplete totals and the
@@ -762,13 +854,14 @@ table "$JSON" \
 # Splice literal text: Bash 3.2 keeps replacement quotes in ${var/pat/rep}.
 control_source=$(cat "$REPO_ROOT/skills/orch/scripts/ci-wait")
 control_rows=(
-  'later-page work~[$runs[] | {id, event, status, conclusion, workflow_id, run_attempt, updated_at}]~[$runs[0:100][] | {id, event, status, conclusion, workflow_id, run_attempt, updated_at}]~runs-pages-active.json'
+  'later-page work~[$runs[] | {id, event, status, conclusion, workflow_id, run_attempt, updated_at, run_started_at}]~[$runs[0:100][] | {id, event, status, conclusion, workflow_id, run_attempt, updated_at, run_started_at}]~runs-pages-active.json'
   'incomplete totals~select(all(.[]; .total_count == ($runs | length)))~select(true)~runs-pages-incomplete.json'
   'the endpoint cap~select(($runs | length) < 1000)~select(true)~runs-pages-cap.json'
 )
 mkdir -p "$TMP_ROOT/control/skills/orch/scripts"
 ln -s "$REPO_ROOT/skills/orch/scripts/lib" "$TMP_ROOT/control/skills/orch/scripts/lib"
-ln -s "$REPO_ROOT/skills/github" "$TMP_ROOT/control/skills/github"
+mkdir -p "$TMP_ROOT/control/skills/github"
+cp -R "$REPO_ROOT/skills/github/scripts" "$TMP_ROOT/control/skills/github/scripts"
 for row in "${control_rows[@]}"; do
   IFS='~' read -r label match replacement fixture <<<"$row"
   [[ "$control_source" == *"$match"* && "${control_source#*"$match"}" != *"$match"* ]] || { echo 'ci_wait: control-match=invalid' >&2; exit 1; }
@@ -792,28 +885,57 @@ done
 
 echo "=== controls reject progress carry-over and false Actions conclusions ==="
 head_reset='if [ -z "$checks_head" ] || [ "$checks_head" != "$confirmation_head" ]; then'
+workflow_pending_match='| if length == 0 or any(.[]; .status != "completed") then {state: "pending"}'
+workflow_pending_bypass='| if length == 0 or any(.[]; .status != "completed") then {state: "ready", runs: map({id, suite_id: .check_suite_id})}'
+workflow_failed_match='elif any(.[]; (.conclusion | IN("success", "neutral", "skipped")) | not) then {state: "failed", failed_runs: [ .[] | select((.conclusion | IN("success", "neutral", "skipped")) | not) | .id ]}'
+workflow_failed_bypass='elif any(.[]; (.conclusion | IN("success", "neutral", "skipped")) | not) then {state: "ready", runs: map({id, suite_id: .check_suite_id})}'
+workflow_unreadable_match="then \$runs else error(\"incomplete workflow runs\") end' <<<\"\$runs\" 2>/dev/null); then\\n            echo '{\"state\":\"unreadable\",\"contexts\":[]}'"
+workflow_unreadable_bypass="then \$runs else error(\"incomplete workflow runs\") end' <<<\"\$runs\" 2>/dev/null); then\\n            echo '{\"state\":\"ready\",\"contexts\":[\"build\",\"request\"]}'"
 control_rows=(
   "head progress~$head_reset~if false; then~STUB_PR_CHECKS_SEQUENCE=pending:request,STUB_REQUEST_CHECK_FIXTURE=$FX/request-only-checks.json,STUB_NEXT_HEAD_SHA=$NEXT_HEAD~rc=0 verdict=pass elapsed_seconds=120"
   "head window~$head_reset~if false; then~STUB_PR_CHECKS_SEQUENCE=green,STUB_NEXT_HEAD_SHA=$NEXT_HEAD~rc=0 verdict=pass elapsed_seconds=120"
   "same-head completion~if [ \"\$seen_in_progress\" = true ]; then~if [ \"\$seen_in_progress\" = false ]; then~STUB_PR_CHECKS_SEQUENCE=pending:green~rc=0 verdict=pass elapsed_seconds=30"
   "snapshot head~[ \"\$before_checks_head\" != \"\$checks_head\" ]~false~STUB_PR_CHECKS_SEQUENCE=green,STUB_HEAD_DURING_CHECKS=$NEXT_HEAD~rc=0 verdict=pass elapsed_seconds=120"
   "failed Actions outcome~select((.conclusion // \"\") | IN(\"success\", \"neutral\", \"skipped\") | not)~select(false)~$REQUEST,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-request-only-failed.json~rc=1 verdict=fail elapsed_seconds=0"
-  "newer successful run~max_by([(.updated_at // \"\"), .id]))) as \$latest~min_by([(.updated_at // \"\"), .id]))) as \$latest~$REQUEST,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-request-newer-success.json~rc=0 verdict=pass elapsed_seconds=90"
-  "rerun activity~max_by([(.updated_at // \"\"), .id]))) as \$latest~max_by(.id))) as \$latest~$REQUEST,STUB_ACTIONS_RUNS_FIXTURE=$FX/runs-rerun-attempt-success.json~rc=0 verdict=pass elapsed_seconds=90"
+  "newer successful run~latest_workflow_attempt)) as \$latest~min_by(.id))) as \$latest~$REQUEST,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-request-newer-success.json~rc=0 verdict=pass elapsed_seconds=90"
+  "rerun activity~latest_workflow_attempt)) as \$latest~max_by(.id))) as \$latest~$REQUEST,STUB_ACTIONS_RUNS_FIXTURE=$FX/runs-rerun-attempt-success.json~rc=0 verdict=pass elapsed_seconds=90"
   "failed rerun identity~(map(select(.conclusion != \"skipped\"))) as \$substantive~(map(select(.conclusion != \"skipped\" and (((.run_attempt // 1) > 1 and .conclusion == \"failure\") | not)))) as \$substantive~$REQUEST,STUB_ACTIONS_RUNS_FIXTURE=$FX/runs-rerun-attempt-failure.json~rc=1 status=complete verdict=fail check.Actions+run+29662588017=FAILURE~~rc=1 status=complete verdict=fail check.Actions+run+29662812172=CANCELLED check.Actions+run+29662588017=absent"
   "separate workflow outcomes~group_by(.workflow_id)~group_by(null)~$REQUEST,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-request-other-workflow-success.json~rc=1 status=complete verdict=fail check.Actions+run+37737962683=FAILURE~~rc=0 status=complete verdict=pass failed=0"
-  "required head binding~if [ -z \"\$checks_head\" ] || ! \$REQUIRED_ONLY || [ \"\$REQUIRED_CONTEXTS\" = '[]' ]; then~if ! \$REQUIRED_ONLY || [ \"\$REQUIRED_CONTEXTS\" = '[]' ]; then~STUB_REQUIRED_CONTEXT=build,STUB_PR_CHECKS_FIXTURE=$TMP_ROOT/required-build-optional-docs.json,$OPTIONAL,STUB_HEAD_EXIT=1~rc=1 status=timeout verdict=pending check.build=absent check.docs=absent check.current-head+Actions=EXPECTED runs_head=none lookup_http_status=403~$JSON --required-only~rc=1 status=timeout verdict=pending check.build=SUCCESS check.current-head+Actions=absent pending=0"
+  "required head binding~if [ -z \"\$checks_head\" ] || ! \$REQUIRED_ONLY || jq -en --argjson req \"\$REQUIREMENTS\" \"\$CI_RUN_JQ_DEFS\"'(requirement_set(\$req) | .all_checks == true)' >/dev/null; then~if ! \$REQUIRED_ONLY || jq -en --argjson req \"\$REQUIREMENTS\" \"\$CI_RUN_JQ_DEFS\"'(requirement_set(\$req) | .all_checks == true)' >/dev/null; then~STUB_REQUIRED_CONTEXT=build,STUB_PR_CHECKS_FIXTURE=$TMP_ROOT/required-build-optional-docs.json,$OPTIONAL,STUB_HEAD_EXIT=1~rc=1 status=timeout verdict=pending check.build=absent check.docs=absent check.current-head+Actions=EXPECTED runs_head=none lookup_http_status=403~$JSON --required-only~rc=1 status=timeout verdict=pending check.build=SUCCESS check.current-head+Actions=absent pending=0"
   "green Actions push~[ \"\$after_actions_head\" != \"\$checks_head\" ]~false~STUB_PR_CHECKS_SEQUENCE=pending:green,$ACTION_PUSH~rc=1 status=timeout verdict=pending failed=0 check.current-head+Actions=EXPECTED elapsed_seconds=300~~rc=0 status=complete verdict=pass elapsed_seconds=30"
   "failed Actions push~[ \"\$after_actions_head\" != \"\$checks_head\" ]~false~$FAILED_ROLLUP,$ACTION_PUSH~rc=1 status=timeout verdict=pending failed=0 check.current-head+Actions=EXPECTED elapsed_seconds=300~~rc=1 status=complete verdict=fail elapsed_seconds=0"
   "unreadable green Actions head~after_actions_head=\$(read_checks_head) || after_actions_head=\"\"~after_actions_head=\$(read_checks_head) || after_actions_head=\"\$checks_head\"~STUB_PR_CHECKS_SEQUENCE=pending:green,STUB_HEAD_AFTER_ACTIONS_EXIT=1~rc=1 status=timeout verdict=pending failed=0 passed=0 pending=1 check.current-head+Actions=EXPECTED elapsed_seconds=300~~rc=0 status=complete verdict=pass elapsed_seconds=30"
   "unreadable failed Actions head~after_actions_head=\$(read_checks_head) || after_actions_head=\"\"~after_actions_head=\$(read_checks_head) || after_actions_head=\"\$checks_head\"~$FAILED_ROLLUP,STUB_HEAD_AFTER_ACTIONS_EXIT=1~rc=1 status=timeout verdict=pending failed=0 passed=0 pending=1 check.current-head+Actions=EXPECTED elapsed_seconds=300~~rc=1 status=complete verdict=fail elapsed_seconds=0"
+  "required workflow head window~[ \"\$required_head\" != \"\$checks_head\" ]~false~$WORKFLOW_PUSH~$WORKFLOW_HOLD~$JSON --required-only~rc=0 status=complete verdict=pass elapsed_seconds=30"
+  "workflow job membership~or any(\$requirements.workflows[]?.runs[]?.checks[]?; .link == \$check.link)~or any(\$requirements.workflows[]?.runs[]?.checks[]?; .name == \$check.name)~$WORKFLOW_PENDING,STUB_PR_CHECKS_FIXTURE=$TMP_ROOT/required-workflow-same-pending.json~rc=0 verdict=pass pending=0 elapsed_seconds=90~$JSON --required-only~rc=1 verdict=pending~github"
+  "workflow retry membership~or any(\$requirements.workflows[]?.runs[]?.checks[]?; .link == \$check.link)~or any(\$requirements.workflows[]?.runs[]?.checks[]?; .name == \$check.name)~$WORKFLOW_MEMBER_RETRY~rc=1 verdict=fail failed=1 reruns=500~$JSON --required-only~rc=1 verdict=fail failed=2 reruns=600~github"
+  "consumer workflow identity~and .repository.id == \$repo_id)]~and .repository.id == \$workflow.repository_id)]~$WORKFLOW_PENDING~$WORKFLOW_PASS~$JSON --required-only~$WORKFLOW_HOLD~github"
+  "required workflow completion~$workflow_pending_match~$workflow_pending_bypass~$WORKFLOW_GREEN,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-required-active.json~$WORKFLOW_HOLD~$JSON --required-only~rc=0 status=complete verdict=pass pending=0~github"
+  "unrecovered required workflow failure~$workflow_failed_match~$workflow_failed_bypass~$WORKFLOW_GREEN,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-required-failed.json,STUB_RUN_LOG_FILE=$TMP_ROOT/required-workflow-runner.log~rc=1 status=complete verdict=fail check.required+workflow=FAILURE reruns=500~$JSON --required-only~rc=0 status=complete verdict=pass pending=0~github"
+  "required workflow retry~[ \$retries -lt \$max_retries ]~[ \$retries -lt 0 ]~$WORKFLOW_RETRY~rc=1 status=complete verdict=fail check.required+workflow=FAILURE reruns=500~$JSON --required-only~rc=1 status=complete verdict=fail reruns=none"
+  "required workflow retry binding~.failed_runs[0] // empty~\"499\"~$WORKFLOW_RETRY~rc=1 status=complete verdict=fail reruns=500~$JSON --required-only~rc=1 status=complete verdict=fail reruns=499"
+  "unreadable required diagnostic~ci_message required-workflow-unreadable >&2~:~$WORKFLOW_GREEN,STUB_ACTIONS_RUNS_EXIT=1~$WORKFLOW_HOLD stderr=line~$JSON --required-only~$WORKFLOW_HOLD stderr=empty"
+  "unreadable required run~$workflow_unreadable_match~$workflow_unreadable_bypass~$WORKFLOW_GREEN,STUB_ACTIONS_RUNS_EXIT=1~$WORKFLOW_HOLD~$JSON --required-only~rc=0 status=complete verdict=pass pending=0~github"
+  "unregistered required jobs~if [ \"\$checks\" = '[]' ]; then~if false; then~$WORKFLOW_GREEN,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-required-completed.json,STUB_WORKFLOW_CHECKS_FIXTURE=$TMP_ROOT/required-workflow-empty.json~$WORKFLOW_HOLD~$JSON --required-only~rc=0 status=complete verdict=pass pending=0~github"
+  "required workflow endpoint cap~if length > 0 and (\$runs | length) < 1000 and all~if length > 0 and all~$WORKFLOW_GREEN,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-required-cap.json~$WORKFLOW_HOLD~$JSON --required-only~rc=0 status=complete verdict=pass pending=0~github"
+  "older completion cannot replace a newer run~max_by(.id) as \$newest~max_by([(.updated_at // \"\"), .id]) as \$newest~$WORKFLOW_GREEN,STUB_ACTIONS_RUNS_FIXTURE=$TMP_ROOT/runs-required-older-finished.json~rc=0 status=complete verdict=pass failed=0~$JSON --required-only~rc=1 status=complete verdict=fail check.required+workflow=FAILURE~github"
 )
 for row in "${control_rows[@]}"; do
-  IFS='~' read -r label match replacement env expect args mutant_expect <<<"$row"
-  [[ "$control_source" == *"$match"* && "${control_source#*"$match"}" != *"$match"* ]] || { echo 'ci_wait: control-match=invalid' >&2; exit 1; }
-  mutant="${control_source%%"$match"*}$replacement${control_source#*"$match"}"
-  [[ "$mutant" != "$control_source" ]] || { echo 'ci_wait: control-edit=unchanged' >&2; exit 1; }
-  printf '%s\n' "$mutant" > "$TMP_ROOT/control/skills/orch/scripts/ci-wait"
+  IFS='~' read -r label match replacement env expect args mutant_expect control_owner <<<"$row"
+  match=${match//\\n/$'\n'}
+  replacement=${replacement//\\n/$'\n'}
+  control_file="$TMP_ROOT/control/skills/orch/scripts/ci-wait"
+  printf '%s\n' "$control_source" > "$control_file"
+  cp "$REPO_ROOT/skills/github/scripts/lib/ci-run-correlation.sh" "$TMP_ROOT/control/skills/github/scripts/lib/ci-run-correlation.sh"
+  edit_source="$control_source"
+  if [[ "$control_owner" == github ]]; then
+    control_file="$TMP_ROOT/control/skills/github/scripts/lib/ci-run-correlation.sh"
+    edit_source=$(cat "$control_file")
+  fi
+  [[ "$edit_source" == *"$match"* && "${edit_source#*"$match"}" != *"$match"* ]] || { echo "ci_wait: control-match=invalid label=$label" >&2; exit 1; }
+  mutant="${edit_source%%"$match"*}$replacement${edit_source#*"$match"}"
+  [[ "$mutant" != "$edit_source" ]] || { echo 'ci_wait: control-edit=unchanged' >&2; exit 1; }
+  printf '%s\n' "$mutant" > "$control_file"
   chmod +x "$TMP_ROOT/control/skills/orch/scripts/ci-wait"
   rm "$TMP_ROOT/repo/.agents/skills/orch"
   ln -s "$TMP_ROOT/control/skills/orch" "$TMP_ROOT/repo/.agents/skills/orch"
