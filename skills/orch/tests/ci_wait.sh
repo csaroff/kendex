@@ -71,6 +71,10 @@ case "${1:-}" in
     fi
     ;;
   api)
+    # A probe that charges the virtual clock, to prove the waiter counts it.
+    if [[ "${2:-}" == repos/*/actions/workflows && -n "${STUB_PROBE_COST:-}" ]]; then
+      sleep "$STUB_PROBE_COST"
+    fi
     # superseded-failure correlation queries the head's Actions
     # runs. Record the query when asked so tests can prove head-sha scoping.
     if [[ "${2:-}" == repos/*/actions/runs* ]]; then
@@ -180,6 +184,8 @@ case "${1:-}" in
           green2)  echo '[{"name":"build","state":"SUCCESS"},{"name":"lint","state":"SUCCESS"}]'; exit 0 ;;
           mixed)   echo '[{"name":"build","state":"SUCCESS"},{"name":"docs","state":"SKIPPED"}]'; exit 0 ;;
           skipped) echo '[{"name":"build","state":"SKIPPED"}]'; exit 0 ;;
+          pending) echo '[{"name":"build","state":"IN_PROGRESS"}]'; exit 8 ;;
+          empty)   echo '[]'; exit 0 ;;
           fail_rerun)
             [[ ! -s "${STUB_RERUN_CALLS_FILE:-/dev/null}" ]] || { echo '[{"name":"build","state":"SUCCESS"}]'; exit 0; }
             echo '[{"name":"build","state":"FAILURE","bucket":"fail","link":"https://github.com/owner/repo/actions/runs/29099680623/job/301","workflow":"CI","startedAt":"2026-07-10T11:00:00Z"}]'
@@ -193,6 +199,11 @@ case "${1:-}" in
         exit 8
       fi
       if [[ "${STUB_PR_CHECKS_MODE:-}" == "empty" ]]; then
+        # A first read that charges the virtual clock before its answer.
+        if [[ -n "${STUB_FIRST_CHECKS_COST:-}" && ! -f "${STUB_PR_CHECKS_COUNT_FILE:?}.charged" ]]; then
+          : > "$STUB_PR_CHECKS_COUNT_FILE.charged"
+          sleep "$STUB_FIRST_CHECKS_COST"
+        fi
         echo '[]'
         exit 0
       fi
@@ -489,6 +500,35 @@ table "$JSON" \
   "no checks registered inside the default grace window stays pending||$JSON_SHORT|STUB_PR_CHECKS_MODE=empty|rc=1 status=timeout verdict=pending" \
   'a settled failing check is a complete fail|||STUB_PR_CHECKS_MODE=failure|rc=1 status=complete verdict=fail check.build=FAILURE' \
   'an auth failure with --json is a parseable error object naming its cause|||GH_TOKEN=bad-token,STUB_GH_DENY_KEYRING=1|rc=3 status=error error_named=true'
+
+echo "=== the no-checks grace is the default the settings template declares ==="
+# The Customize view shows the template's value as the default, so the grace
+# ci-wait resolves for an unset, empty or non-numeric key is that value; an
+# explicit whole number, leading zero included, is taken as given in base 10.
+# The budget outlasts any of them, so elapsed_seconds on the no-checks error
+# is the grace it resolved, at an interval that divides the grace and at the production one that does
+# not. The grace runs from the wait's start, and the probe's seconds count
+# against it: a 100-second first read and a 50-second probe at a 400-second
+# interval end a 600-second grace at 600, where a grace counted from the first
+# empty answer ends at 700 and one that skips the probe at 650. At the
+# production interval and budget, a first read that took time still ends in
+# the no-checks error at the deadline rather than a pending timeout. Checks
+# that registered and then vanished start a fresh grace at the first empty
+# answer after them.
+GRACE_DECLARED=$(sed -n 's/^CI_WAIT_NO_CHECKS_GRACE = "\([0-9]*\)"$/\1/p' "$REPO_ROOT/skills/orch/kendex.settings.toml.example")
+[[ -n "$GRACE_DECLARED" ]] || { echo "the settings template declares no CI_WAIT_NO_CHECKS_GRACE default" >&2; exit 1; }
+table '1 30 3600 --json' \
+  "an unset grace waits the declared default|||-u,CI_WAIT_NO_CHECKS_GRACE,STUB_PR_CHECKS_MODE=empty|rc=1 status=error elapsed_seconds=${GRACE_DECLARED}" \
+  "a grace ending on the budget's deadline is the no-checks error, not a timeout||1 180 ${GRACE_DECLARED} --json|-u,CI_WAIT_NO_CHECKS_GRACE,STUB_PR_CHECKS_MODE=empty|rc=1 status=error elapsed_seconds=${GRACE_DECLARED}" \
+  "a grace ending past the budget's deadline stays a pending timeout at the deadline||1 180 $((GRACE_DECLARED - 10)) --json|-u,CI_WAIT_NO_CHECKS_GRACE,STUB_PR_CHECKS_MODE=empty|rc=1 status=timeout verdict=pending elapsed_seconds=$((GRACE_DECLARED - 10))" \
+  "an unset grace at the production interval waits the declared default||1 180 3600 --json|-u,CI_WAIT_NO_CHECKS_GRACE,STUB_PR_CHECKS_MODE=empty|rc=1 status=error elapsed_seconds=${GRACE_DECLARED}" \
+  "an empty grace waits the declared default|||STUB_PR_CHECKS_MODE=empty,CI_WAIT_NO_CHECKS_GRACE=|rc=1 status=error elapsed_seconds=${GRACE_DECLARED}" \
+  "a non-numeric grace waits the declared default|||STUB_PR_CHECKS_MODE=empty,CI_WAIT_NO_CHECKS_GRACE=abc|rc=1 status=error elapsed_seconds=${GRACE_DECLARED}" \
+  'an explicit grace is taken as given|||STUB_PR_CHECKS_MODE=empty,CI_WAIT_NO_CHECKS_GRACE=90|rc=1 status=error elapsed_seconds=90' \
+  'a leading-zero grace is read in base 10|||STUB_PR_CHECKS_MODE=empty,CI_WAIT_NO_CHECKS_GRACE=090|rc=1 status=error elapsed_seconds=90' \
+  "a slow first read and probe spend the grace from the wait's start||1 400 3600 --json|-u,CI_WAIT_NO_CHECKS_GRACE,STUB_PR_CHECKS_MODE=empty,STUB_FIRST_CHECKS_COST=100,STUB_PROBE_COST=50|rc=1 status=error elapsed_seconds=${GRACE_DECLARED}" \
+  "a first read that took time at the production interval and budget is the no-checks error||1 180 ${GRACE_DECLARED} --json|-u,CI_WAIT_NO_CHECKS_GRACE,STUB_PR_CHECKS_MODE=empty,STUB_FIRST_CHECKS_COST=5|rc=1 status=error elapsed_seconds=${GRACE_DECLARED}" \
+  'checks that vanish start a fresh grace at the first empty answer after them|||STUB_PR_CHECKS_SEQUENCE=pending:empty,CI_WAIT_NO_CHECKS_GRACE=90|rc=1 status=error elapsed_seconds=120'
 
 echo "=== text mode prints a result line for every terminal status ==="
 # The line beyond its leading words is not a contract anything parses; the
