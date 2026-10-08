@@ -206,6 +206,264 @@ fn enabled_fixture_at(armed: bool, harness: HarnessId, package_rel: &str) -> Fix
     fixture
 }
 
+/// The trusted checker owns the file set. The installed launcher is data,
+/// and an edited output fails comparison before it can grant ownership.
+#[test]
+#[allow(clippy::unwrap_used)]
+fn trusted_verification_compares_whole_bot_files_without_running_installed_code() {
+    enum Change {
+        None,
+        Output,
+        Launcher,
+    }
+    for change in [Change::None, Change::Output, Change::Launcher] {
+        let fixture = enabled_fixture_with_arming(false);
+        let copilot = fixture.root.join(".github/copilot-instructions.md");
+        match change {
+            Change::None => {}
+            Change::Output => {
+                let text = fs::read_to_string(&copilot).unwrap();
+                fs::write(&copilot, format!("{text}\nHand-written rules.\n")).unwrap();
+            }
+            Change::Launcher => {
+                fs::write(
+                    fixture
+                        .root
+                        .join(CODEX_PACKAGE)
+                        .join("scripts/bot-instructions"),
+                    "#!/bin/sh\ntouch judged-code-ran\nexit 1\n",
+                )
+                .unwrap();
+            }
+        }
+        let before = fs::read(&copilot).unwrap();
+        let index = fs::read(fixture.root.join(".git/index")).unwrap();
+        let positions = bot_instructions::verify(
+            &fixture.env,
+            &fixture.scope,
+            &test_util::checkout_root().join("skills/bot-instructions"),
+        );
+        match change {
+            Change::Output => assert!(matches!(
+                positions,
+                Err(kendex_core::error::CoreError::Guard { check, .. })
+                    if check == "bot-instructions"
+            )),
+            Change::None | Change::Launcher => {
+                let positions = positions.unwrap().unwrap();
+                assert!(positions.iter().any(|position| position.path == copilot));
+                assert!(
+                    positions
+                        .iter()
+                        .all(|position| position.owns == kendex_core::engine::Owns::File)
+                );
+                assert!(
+                    !positions
+                        .iter()
+                        .any(|position| position.path == fixture.root.join("AGENTS.md"))
+                );
+            }
+        }
+        assert_eq!(fs::read(&copilot).unwrap(), before);
+        assert_eq!(fs::read(fixture.root.join(".git/index")).unwrap(), index);
+        assert!(!fixture.root.join("judged-code-ran").exists());
+        let repo = kendex_core::guard::Repo::at(&fixture.root).unwrap();
+        assert!(
+            !kendex_core::repo_effects::armed::recorded(
+                kendex_core::repo_effects::armed::record_dir(&repo, false),
+                "bot-instructions",
+            )
+            .unwrap()
+        );
+    }
+}
+
+/// Interpreter startup settings come from a caller's process, not from the
+/// trusted checker. The selected tool path still has to reach the checker.
+#[test]
+#[allow(clippy::unwrap_used)]
+fn trusted_verification_excludes_caller_settings_and_interpreter_imports() {
+    use std::ffi::OsString;
+    use std::os::unix::fs::PermissionsExt;
+
+    const ROOT: &str = "KENDEX_TEST_CHECKER_ROOT";
+    const CALLER_SETTING: &str = "KENDEX_TEST_CHECKER_SETTING";
+    if let Some(root) = std::env::var_os(ROOT) {
+        assert!(std::env::var_os("PYTHONPATH").is_some());
+        assert!(std::env::var_os("BASH_ENV").is_some());
+        assert!(std::env::var_os(CALLER_SETTING).is_some());
+        let root = PathBuf::from(root);
+        let env = Env::fake(root.parent().unwrap().join("home"), FakeOs::Linux);
+        let scope = Scope::Project { root: root.clone() };
+        let positions = bot_instructions::verify(
+            &env,
+            &scope,
+            &test_util::checkout_root().join("skills/bot-instructions"),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(positions.iter().any(|position| {
+            position.path == root.join(".github/copilot-instructions.md")
+                && position.owns == kendex_core::engine::Owns::File
+        }));
+        fs::write(root.parent().unwrap().join("checker-proof"), "verified").unwrap();
+        return;
+    }
+
+    let fixture = enabled_fixture_with_arming(false);
+    let base = fixture.root.parent().unwrap();
+    let tools = base.join("tools");
+    let imports = base.join("imports");
+    fs::create_dir(&tools).unwrap();
+    fs::create_dir(&imports).unwrap();
+    let inherited_path = std::env::var_os("PATH").unwrap();
+    let python = std::env::split_paths(&inherited_path)
+        .map(|directory| directory.join("python3"))
+        .find(|path| kendex_core::fs::is_executable(path))
+        .unwrap();
+    let python = std::path::absolute(python).unwrap();
+    let selected_python = tools.join("python3");
+    fs::write(
+        &selected_python,
+        format!(
+            "#!/bin/sh\n[ -z \"${{{CALLER_SETTING}+x}}\" ] || exit 1\nprintf '%s' invoked > {tool:?}\nexec {python:?} \"$@\"\n",
+            tool = base.join("selected-tool-ran"),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&selected_python, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(
+        imports.join("sitecustomize.py"),
+        format!(
+            "from pathlib import Path\nPath({:?}).write_text('executed')\n",
+            base.join("import-ran"),
+        ),
+    )
+    .unwrap();
+    let shell_startup = base.join("shell-startup");
+    fs::write(
+        &shell_startup,
+        format!(
+            "printf '%s' executed > {:?}\n",
+            base.join("shell-startup-ran")
+        ),
+    )
+    .unwrap();
+    let path =
+        std::env::join_paths(std::iter::once(tools).chain(std::env::split_paths(&inherited_path)))
+            .unwrap();
+    let mut environment = vec![
+        (ROOT, fixture.root.as_os_str().to_owned()),
+        (CALLER_SETTING, OsString::from("caller-value")),
+        ("PATH", path),
+        ("PYTHONPATH", imports.into_os_string()),
+        (
+            "PYTHONHOME",
+            base.join("absent-python-home").into_os_string(),
+        ),
+        ("BASH_ENV", shell_startup.into_os_string()),
+        ("TMPDIR", base.as_os_str().to_owned()),
+    ];
+    environment.extend(test_util::fixture_env(&base.join("home")));
+    let output = test_util::reexecute_test(
+        module_path!(),
+        "trusted_verification_excludes_caller_settings_and_interpreter_imports",
+        &environment,
+    )
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(fs::read(base.join("checker-proof")).unwrap(), b"verified");
+    assert_eq!(
+        fs::read(base.join("selected-tool-ran")).unwrap(),
+        b"invoked"
+    );
+    assert!(!base.join("import-ran").exists());
+    assert!(!base.join("shell-startup-ran").exists());
+}
+
+#[test]
+#[allow(clippy::unwrap_used)]
+fn trusted_verification_refuses_code_in_the_checked_project() {
+    let fixture = enabled_fixture_with_arming(false);
+    for trusted in [
+        fixture.root.join(CODEX_PACKAGE),
+        fixture.root.parent().unwrap().to_owned(),
+    ] {
+        let verified = bot_instructions::verify(&fixture.env, &fixture.scope, &trusted);
+        assert!(matches!(
+            verified,
+            Err(kendex_core::error::CoreError::Guard { check, .. }) if check == "bot-instructions"
+        ));
+    }
+}
+
+#[test]
+#[allow(clippy::unwrap_used)]
+fn trusted_verification_without_configuration_grants_no_positions() {
+    let fixture = fixture_with_arming("schema = 6\n[install]\nharnesses = [\"codex\"]\n", false);
+    let verified = bot_instructions::verify(
+        &fixture.env,
+        &fixture.scope,
+        &test_util::checkout_root().join("skills/bot-instructions"),
+    )
+    .unwrap();
+    assert!(verified.is_none());
+}
+
+/// A caller can select an older or incompatible trusted checker. Its report
+/// must read at this version and must not grant a position outside the project.
+#[test]
+#[allow(clippy::unwrap_used)]
+fn trusted_verification_rejects_unusable_reports() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = fixture_with_arming("schema = 6\n", false);
+    let trusted = fixture.root.parent().unwrap().join("trusted");
+    let launcher = trusted.join("scripts/bot-instructions");
+    fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+    for report in [
+        "check clean",
+        r#"{"version":2,"paths":[".github/copilot-instructions.md"]}"#,
+        r#"{"version":1,"paths":["../outside.md"]}"#,
+        r#"{"version":1,"paths":["/outside.md"]}"#,
+    ] {
+        fs::write(&launcher, format!("#!/bin/sh\nprintf '%s\\n' '{report}'\n")).unwrap();
+        fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755)).unwrap();
+        let verified = bot_instructions::verify(&fixture.env, &fixture.scope, &trusted);
+        assert!(matches!(
+            verified,
+            Err(kendex_core::error::CoreError::Guard { check, .. }) if check == "bot-instructions"
+        ));
+    }
+}
+
+#[test]
+#[allow(clippy::unwrap_used)]
+fn trusted_verification_refuses_a_launcher_link_into_the_checked_project() {
+    let fixture = enabled_fixture_with_arming(false);
+    let trusted = fixture.root.parent().unwrap().join("trusted");
+    let launcher = trusted.join("scripts/bot-instructions");
+    fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(
+        fixture
+            .root
+            .join(CODEX_PACKAGE)
+            .join("scripts/bot-instructions"),
+        &launcher,
+    )
+    .unwrap();
+    let verified = bot_instructions::verify(&fixture.env, &fixture.scope, &trusted);
+    assert!(matches!(
+        verified,
+        Err(kendex_core::error::CoreError::Guard { check, .. }) if check == "repo-effects"
+    ));
+}
+
 /// Adopt the fixture's hand-written surfaces.
 ///
 /// The package reports the hand-written `## Code Review Rules` region under
@@ -254,7 +512,15 @@ fn package_run(root: &Path, package_rel: &str, args: &[&str]) -> std::process::O
     let script = root.join(package_rel).join("scripts/bot-instructions");
     let mut argv: Vec<std::ffi::OsString> = args.iter().map(Into::into).collect();
     argv.extend(["--repo".into(), root.as_os_str().to_owned()]);
-    Hardened::package_script(&script, argv, root).run().unwrap()
+    Hardened::package_script(
+        &script,
+        argv,
+        root,
+        kendex_core::process::ScriptEnvironment::Installed,
+    )
+    .unwrap()
+    .run()
+    .unwrap()
 }
 
 /// Commit what the fixture staged, so a later change reads as one.

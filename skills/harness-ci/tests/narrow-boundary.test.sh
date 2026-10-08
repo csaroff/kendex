@@ -19,6 +19,11 @@
 set -euo pipefail
 # shellcheck source=lib/sandbox.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib/sandbox.sh"
+# shellcheck source=../../commit-guards/scripts/lib/common.sh
+. "$TEST_DIR/../../commit-guards/scripts/lib/common.sh"
+# shellcheck source=../../commit-guards/scripts/lib/comment-text.sh
+. "$TEST_DIR/../../commit-guards/scripts/lib/comment-text.sh"
+GG_TMP="$SANDBOX"
 
 CATALOG="$(cd "$TEST_DIR/../.." && pwd)"
 
@@ -57,10 +62,13 @@ boundary_declared() { # CATALOG
 # file, through a variable naming each in turn.
 SOURCE_EXEMPTION='skills/orch/scripts/lib/kendex-env.sh|source "$file" >&2'
 
-# One line per loader in FILE: `path <catalog path>` where its word
-# resolves, `unsupported <line number>` where it does not.
+# One line per shell loader in FILE: `path <catalog path>` where its word
+# resolves, `unsupported <line number>` where it does not. Other source
+# languages still join the boundary but carry no shell loaders.
 sourced_paths() { # CATALOG CATALOG_PATH FILE
-  local exempt=""
+  local exempt="" family
+  family="$(gg_comment_family "$2" "$3")" || { echo 'language-error'; return; }
+  [ "$family" = hash-shell ] || return 0
   [ "${SOURCE_EXEMPTION%%|*}" != "$2" ] || exempt="${SOURCE_EXEMPTION#*|}"
   awk -v root="$1" -v dir="${2%/*}" -v exempt="$exempt" '
     function norm(p,   n, i, parts, out, k, res) {
@@ -159,6 +167,41 @@ sourced_paths() { # CATALOG CATALOG_PATH FILE
     }' "$3"
 }
 
+# The shared language reader selects shell files by extension or shebang.
+# Python documentation can contain the same text without loading a file.
+language_rows=0
+while IFS='|' read -r name shebang quote expected; do
+  language_rows=$((language_rows + 1))
+  language_file="$SANDBOX/$name"
+  printf '%s\n' "$shebang" "$quote" 'source ../../orch/scripts/lib/lane-relaunch.sh' "$quote" >"$language_file"
+  assert_eq "the include walk reads $name under its source language" "$expected" \
+    "$(sourced_paths "$SANDBOX" "skills/harness-ci/scripts/$name" "$language_file")"
+done <<'LANGUAGES'
+helper.sh|||path skills/orch/scripts/lib/lane-relaunch.sh
+shell-helper|#!/usr/bin/env bash||path skills/orch/scripts/lib/lane-relaunch.sh
+helper.py|#!/usr/bin/env python3|"""|
+python-helper|#!/usr/bin/env python3|"""|
+LANGUAGES
+require_rows narrow-boundary-languages "$language_rows"
+
+# Removing the language check must expose the Python text as a false include.
+sed -n '/^sourced_paths() {/,/^}/p' "$TEST_DIR/narrow-boundary.test.sh" >"$SANDBOX/reader"
+awk '
+  /^sourced_paths\(\) \{/ { sub(/^sourced_paths/, "sourced_paths_control") }
+  $0 == "  [ \"$family\" = hash-shell ] || return 0" { hits++; print "  :"; next }
+  { print }
+  END { exit hits == 1 ? 0 : 3 }
+' "$SANDBOX/reader" >"$SANDBOX/reader-control.sh"
+if cmp -s "$SANDBOX/reader" "$SANDBOX/reader-control.sh"; then
+  echo 'narrow-boundary: control=unchanged' >&2
+  exit 1
+fi
+# shellcheck source=/dev/null
+. "$SANDBOX/reader-control.sh"
+assert_eq "a reader without the language check misreads Python documentation" \
+  "path skills/orch/scripts/lib/lane-relaunch.sh" \
+  "$(sourced_paths_control "$SANDBOX" skills/harness-ci/scripts/helper.py "$SANDBOX/helper.py")"
+
 boundary_drift() { # CATALOG CONF
   local catalog="$1" conf="$2" declared globs files path glob kind loaded hit
   declared="$(boundary_declared "$catalog" | sort -u)"
@@ -242,7 +285,7 @@ assert_eq "the shared branch measurement is carried" "1" \
 assert_eq "the Linear CLI read for the allowance is not" "0" \
   "$(grep -cxF 'skills/linear/scripts/linear.sh' <<<"$declared" || true)"
 
-# One planted drift per rule, each on a fresh copy of the two packages, each
+# One planted drift per rule, each on a fresh copy of the dependencies, each
 # answering exactly the line that rule prints. @CATALOG@ and @CONF@ stand for
 # the copy's catalog and conf, @LAST_LINE@ for the line an edit appended.
 # label | the edit | the drift expected
@@ -250,10 +293,11 @@ fixture_rows=0
 while IFS='|' read -r label edit expected; do
   fixture_rows=$((fixture_rows + 1))
   fixture="$SANDBOX/catalog-$fixture_rows"
-  mkdir -p "$fixture/orch/references" "$fixture/harness-ci"
+  mkdir -p "$fixture/orch/references" "$fixture/harness-ci" "$fixture/bot-instructions"
   cp -R "$CATALOG/orch/scripts" "$fixture/orch/scripts"
   cp "$REAL_CONF" "$fixture/orch/references/narrow-change.conf"
   cp -R "$CATALOG/harness-ci/scripts" "$fixture/harness-ci/scripts"
+  cp -R "$CATALOG/bot-instructions/scripts" "$fixture/bot-instructions/scripts"
   conf="$fixture/orch/references/narrow-change.conf"
   measured="$fixture/harness-ci/scripts/change-class"
   case "$edit" in

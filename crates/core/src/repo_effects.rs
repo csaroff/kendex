@@ -93,10 +93,21 @@ fn launch_script(
     argv: Vec<std::ffi::OsString>,
     index: Option<&std::path::Path>,
 ) -> crate::error::Result<crate::guard::GuardReport> {
-    let mut script = crate::process::Hardened::package_script(program, argv, repo);
+    let mut script = crate::process::Hardened::package_script(
+        program,
+        argv,
+        repo,
+        crate::process::ScriptEnvironment::Installed,
+    )?;
     if let Some(index) = index {
         script = script.env("GIT_INDEX_FILE", &index.to_string_lossy());
     }
+    script_report(script)
+}
+
+fn script_report(
+    script: crate::process::Hardened,
+) -> crate::error::Result<crate::guard::GuardReport> {
     let output = script.run().map_err(|error| err(error.to_string()))?;
     Ok(crate::guard::relay(&output))
 }
@@ -137,6 +148,23 @@ pub(crate) fn run_script_program(
 ) -> crate::error::Result<crate::guard::GuardReport> {
     let (repo, program, _) = resolve_script(scope, root, declared)?;
     launch_script(repo, &program, argv, None)
+}
+
+/// Run a caller-selected trusted checker with tool values selected by the
+/// process owner, without the installed package's inherited settings.
+pub(crate) fn run_trusted_script_program(
+    scope: &crate::model::Scope,
+    root: &std::path::Path,
+    program: &str,
+    argv: Vec<std::ffi::OsString>,
+) -> crate::error::Result<crate::guard::GuardReport> {
+    let (repo, program, _) = resolve_script(scope, root, program)?;
+    script_report(crate::process::Hardened::package_script(
+        &program,
+        argv,
+        repo,
+        crate::process::ScriptEnvironment::Trusted,
+    )?)
 }
 
 /// Whether kendex recorded arming this package's declared effect here.

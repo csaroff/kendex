@@ -49,6 +49,7 @@ git unable to answer exits 2 under the source key|rendered no-git|check|2|source
 a spec copy with no doctrine source exits 2 under the spec key|rendered spec:no-doctrine|check|2|spec|-
 flag misuse exits 2 before any read, under the usage key|rendered|render --staged|2|usage|--staged
 an unknown verb exits 2 from the parser under the usage key|rendered|bogus|2|usage|-
+JSON output on a writing verb refuses before any read|rendered|render --json|2|usage|-
 "
 
 # A row renders the key, so the value beside it is asserted here, on a world
@@ -313,5 +314,185 @@ if [ "$status" -eq 0 ] && [ "$(printf '%s\n' "$out" | wc -l)" -eq 1 ] \
 else
   bad 'one owned heading answers with a single bounds line and exits 0' "exit $status: $out"
 fi
+
+# kendex verify consumes only a successful JSON report. Whole-file ownership
+# includes the generated Copilot file but excludes the shared AGENTS region.
+case "$(uname -s)" in MINGW* | MSYS*) export MSYS=winsymlinks:nativestrict ;; esac
+json_repo="$(bi_rendered_repo exit-json)" || exit 1
+owned_report() {
+  python3 -c 'import json, sys
+try:
+    report = json.load(sys.stdin)
+    paths = report["paths"]
+    good = report["version"] == 1 and isinstance(paths, list)
+    good = good and ".github/copilot-instructions.md" in paths
+    good = good and ".github/instructions/code-review.md" in paths
+    good = good and "AGENTS.md" not in paths
+except (ValueError, KeyError, TypeError):
+    good = False
+sys.exit(0 if good else 1)'
+}
+json_out="$("$BI" check --json --repo "$json_repo")"
+json_status=$?
+if [ "$json_status" -eq 0 ] && owned_report <<<"$json_out"; then
+  ok 'the JSON report owns verified whole files and no shared region'
+else
+  bad 'the JSON report owns verified whole files and no shared region' "exit $json_status: $json_out"
+fi
+json_mutant="$(bi_mutant json-empty scripts/lib/cli.py \
+  'print(json.dumps({"version": 1, "paths": sorted(ctx.build.files)}))' \
+  'print(json.dumps({"version": 1, "paths": []}))')" || exit 1
+json_out="$("$json_mutant" check --json --repo "$json_repo")"
+json_status=$?
+if [ "$json_status" -eq 0 ] && ! owned_report <<<"$json_out"; then
+  ok 'control: omitting verified paths turns the ownership assertion red'
+else
+  bad 'control: omitting verified paths turns the ownership assertion red' "exit $json_status: $json_out"
+fi
+verb_mutant="$(bi_mutant json-verb scripts/lib/cli.py \
+  'p.error("--json belongs to check")' 'return 0')" || exit 1
+"$verb_mutant" render --json --repo "$json_repo" >"$BI_TMP/json-verb" 2>&1
+json_status=$?
+if [ "$json_status" -eq 0 ]; then
+  ok 'control: bypassing JSON flag validation turns the writing-verb refusal red'
+else
+  bad 'control: bypassing JSON flag validation turns the writing-verb refusal red' "exit $json_status"
+fi
+printf '\nstale\n' >>"$json_repo/.github/copilot-instructions.md"
+"$BI" check --json --repo "$json_repo" >"$BI_TMP/json-report" 2>"$BI_TMP/json-findings"
+json_status=$?
+if [ "$json_status" -eq 1 ] && [ ! -s "$BI_TMP/json-report" ]; then
+  ok 'a failed comparison publishes no owned paths'
+else
+  bad 'a failed comparison publishes no owned paths' "exit $json_status"
+fi
+comparison_mutant="$(bi_mutant json-unchecked scripts/lib/cli.py \
+  'lines = verbs.check_verb(ctx)' 'lines = []')" || exit 1
+"$comparison_mutant" check --json --repo "$json_repo" \
+  >"$BI_TMP/json-unchecked" 2>"$BI_TMP/json-unchecked-findings"
+json_status=$?
+if [ "$json_status" -eq 0 ] && owned_report <"$BI_TMP/json-unchecked"; then
+  ok 'control: bypassing comparison turns the failed-output refusal red'
+else
+  bad 'control: bypassing comparison turns the failed-output refusal red' "exit $json_status"
+fi
+
+# Git checkout restores output links. A link's target can hold the exact
+# render bytes, so content comparison alone cannot grant whole-file ownership.
+entry_mutant="$(bi_mutant json-output-type scripts/lib/validators_repo.py \
+  '        if whole_file:' '        if False and whole_file:')" || exit 1
+while IFS='|' read -r entry_kind mode; do
+  entry_repo="$(bi_rendered_repo "exit-json-entry-$entry_kind-$mode")" || exit 1
+  output_path='.github/copilot-instructions.md'
+  case "$entry_kind" in
+    link)
+      cp "$entry_repo/$output_path" "$entry_repo/copilot-data.md" || exit 1
+      rm "$entry_repo/$output_path" || exit 1
+      ln -s ../copilot-data.md "$entry_repo/$output_path" || exit 1
+      [ -L "$entry_repo/$output_path" ] || exit 1
+      bi_commit "$entry_repo"
+      ;;
+    blob-link)
+      # The index can store a symlink blob with the exact rendered contents.
+      # This isolates entry-type refusal from a content-difference refusal.
+      output_oid="$(git -C "$entry_repo" rev-parse "HEAD:$output_path")" || exit 1
+      git -C "$entry_repo" update-index --cacheinfo "120000,$output_oid,$output_path" || exit 1
+      ;;
+    regular) ;;
+    *) exit 1 ;;
+  esac
+  case "$mode" in worktree) set -- ;; staged) set -- --staged ;; *) exit 1 ;; esac
+  "$BI" check --json "$@" --repo "$entry_repo" \
+    >"$BI_TMP/entry-report" 2>"$BI_TMP/entry-findings"
+  json_status=$?
+  if [ "$entry_kind" = regular ]; then
+    if [ "$json_status" -eq 0 ] && owned_report <"$BI_TMP/entry-report"; then
+      ok "$mode: a regular whole-file output receives verified ownership"
+    else
+      bad "$mode: a regular whole-file output receives verified ownership" "exit $json_status"
+    fi
+  else
+    bi_out="$(cat "$BI_TMP/entry-findings")"
+    if [ "$json_status" -eq 1 ] && [ ! -s "$BI_TMP/entry-report" ] && [ "$(bi_fired)" = 'drift ' ]; then
+      ok "$mode $entry_kind: a nonregular output receives no owned paths"
+    else
+      bad "$mode $entry_kind: a nonregular output receives no owned paths" "exit $json_status: $bi_out"
+    fi
+    if [ "$entry_kind" = blob-link ] || [ "$mode" = worktree ]; then
+      "$entry_mutant" check --json "$@" --repo "$entry_repo" \
+        >"$BI_TMP/entry-control" 2>"$BI_TMP/entry-control-findings"
+      json_status=$?
+      if [ "$json_status" -eq 0 ] && owned_report <"$BI_TMP/entry-control"; then
+        ok "$mode $entry_kind control: byte-only reads turn the entry refusal red"
+      else
+        bad "$mode $entry_kind control: byte-only reads turn the entry refusal red" "exit $json_status"
+      fi
+    fi
+  fi
+done <<'EOF'
+regular|worktree
+regular|staged
+link|worktree
+link|staged
+blob-link|staged
+EOF
+
+# The trusted checker reads a disabled installed package as data. The rename
+# must preserve the canonical render markers and verified whole-file paths.
+disabled_repo="$(bi_vendored_repo exit-disabled-json)" || exit 1
+disabled_spec="$disabled_repo/$BI_VENDORED_SPEC"
+mv "$disabled_spec/SKILL.md" "$disabled_spec/SKILL.md.disabled" || exit 1
+bi_commit "$disabled_repo"
+disabled_mutant="$(bi_mutant disabled-unread scripts/lib/spec.py \
+  '            skill_text = spec_tree.read(skill_rel)' \
+  '            if False:
+                skill_text = spec_tree.read(skill_rel)')" || exit 1
+for mode in worktree staged; do
+  case "$mode" in
+    worktree) set -- ;;
+    staged) set -- --staged ;;
+  esac
+  json_out="$("$BI" check --json "$@" --repo "$disabled_repo" --spec "$disabled_spec")"
+  json_status=$?
+  if [ "$json_status" -eq 0 ] && owned_report <<<"$json_out"; then
+    ok "$mode: the disabled installed doctrine preserves verified ownership"
+  else
+    bad "$mode: the disabled installed doctrine preserves verified ownership" "exit $json_status: $json_out"
+  fi
+  "$disabled_mutant" check --json "$@" --repo "$disabled_repo" --spec "$disabled_spec" \
+    >"$BI_TMP/disabled-control" 2>"$BI_TMP/disabled-control-findings"
+  json_status=$?
+  if [ "$json_status" -eq 2 ] && [ ! -s "$BI_TMP/disabled-control" ]; then
+    ok "$mode control: disabling the fallback rejects the installed doctrine"
+  else
+    bad "$mode control: disabling the fallback rejects the installed doctrine" "exit $json_status"
+  fi
+  python3 - "$disabled_spec/SKILL.md.disabled" <<'PY' || exit 1
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+text = path.read_text()
+old = "### declined\n"
+assert text.count(old) == 1, "the doctrine fixture shape changed"
+changed = text.replace(old, old + "\nDisabled doctrine content changed.\n", 1)
+assert changed != text
+path.write_text(changed)
+PY
+  if [ "$mode" = staged ]; then
+    expect_green 'staged: an unstaged disabled doctrine edit does not change the check' \
+      check --staged --repo "$disabled_repo" --spec "$disabled_spec"
+  fi
+  git -C "$disabled_repo" add -A || exit 1
+  "$BI" check --json "$@" --repo "$disabled_repo" --spec "$disabled_spec" \
+    >"$BI_TMP/disabled-report" 2>"$BI_TMP/disabled-findings"
+  json_status=$?
+  bi_out="$(cat "$BI_TMP/disabled-findings")"
+  if [ "$json_status" -eq 1 ] && [ ! -s "$BI_TMP/disabled-report" ] && [ "$(bi_fired)" = 'drift ' ]; then
+    ok "$mode: a disabled doctrine edit rejects stale outputs with no owned paths"
+  else
+    bad "$mode: a disabled doctrine edit rejects stale outputs with no owned paths" "exit $json_status: $bi_out"
+  fi
+  git -C "$disabled_repo" reset -q --hard HEAD || exit 1
+done
 
 bi_summary
