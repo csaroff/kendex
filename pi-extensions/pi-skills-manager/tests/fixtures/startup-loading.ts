@@ -18,9 +18,17 @@ const settings = {
 };
 writeFileSync(join(agentDir, "settings.json"), JSON.stringify(settings));
 
+let startupSkillsRendered = -1;
+class MockInteractiveMode {
+  session?: { resourceLoader?: { getSkills?: () => { skills: unknown[] } } };
+
+  showLoadedResources() {
+    startupSkillsRendered = this.session?.resourceLoader?.getSkills?.().skills.length ?? -1;
+  }
+}
 mock.module("@earendil-works/pi-coding-agent", () => {
   loaded.push("host-sdk");
-  return { getAgentDir: () => agentDir, InteractiveMode: class { showLoadedResources() {} } };
+  return { getAgentDir: () => agentDir, InteractiveMode: MockInteractiveMode };
 });
 mock.module("../../extensions/skills-manager/creation.js", () => {
   loaded.push("creation");
@@ -53,7 +61,7 @@ const pi = {
   events: { on: () => () => {} },
 };
 await skillsManager(pi as unknown as ExtensionAPI);
-const needsStartupPatch = mode === "resources" || mode === "header";
+const needsStartupPatch = mode === "resources" || mode === "header" || mode === "reload-visible";
 assert.deepEqual(loaded, needsStartupPatch ? ["host-sdk"] : []);
 const handler = commands.get("skill")?.handler;
 assert(handler);
@@ -83,5 +91,28 @@ if (mode === "disabled") {
     clearPackageConfigCache();
     for (const callback of sessionHandlers) await callback({}, ctx);
     assert(loaded.includes("host-sdk"));
+  }
+
+  if (mode === "reload-visible") {
+    const interactiveMode = new MockInteractiveMode();
+    interactiveMode.session = { resourceLoader: { getSkills: () => ({ skills: ["sample"] }) } };
+    interactiveMode.showLoadedResources();
+    assert.equal(startupSkillsRendered, 0);
+
+    // Pi keeps its patched prototype and global flags, but reloads the entrypoint.
+    // Turning hiding off must therefore clear the previous extension instance's flag.
+    settings.kendex.extensionManager.config["@vanillagreen/pi-skills-manager"].hideStartupSkillsBlock = false;
+    writeFileSync(join(agentDir, "settings.json"), JSON.stringify(settings));
+    clearPackageConfigCache();
+    const { default: reloadedSkillsManager } = await import("../../extensions/skills-manager.ts?reload-visible");
+    const reloadedPi = {
+      registerCommand: pi.registerCommand,
+      on: pi.on,
+      events: pi.events,
+    };
+    await reloadedSkillsManager(reloadedPi as unknown as ExtensionAPI);
+
+    interactiveMode.showLoadedResources();
+    assert.equal(startupSkillsRendered, 1);
   }
 }

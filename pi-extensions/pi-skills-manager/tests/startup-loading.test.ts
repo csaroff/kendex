@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { test } from "bun:test";
 
 const fixture = fileURLToPath(new URL("./fixtures/startup-loading.ts", import.meta.url));
-for (const mode of ["quiet", "resources", "header", "visible", "disabled"]) {
+for (const mode of ["quiet", "resources", "header", "visible", "disabled", "reload-visible"]) {
   test(`startup loads only the modules needed by ${mode} sessions`, () => {
     const root = mkdtempSync(join(tmpdir(), "skills-startup-"));
     try {
