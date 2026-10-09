@@ -13,7 +13,7 @@ const settings = {
   quietStartup: mode === "header" ? "header" : mode === "quiet",
   kendex: { extensionManager: { config: { "@vanillagreen/pi-skills-manager": {
     enabled: mode !== "disabled",
-    hideStartupSkillsBlock: mode !== "visible",
+    hideStartupSkillsBlock: !["visible", "registry-error", "dialog-error"].includes(mode),
   } } } },
 };
 writeFileSync(join(agentDir, "settings.json"), JSON.stringify(settings));
@@ -36,11 +36,20 @@ mock.module("../../extensions/skills-manager/creation.js", () => {
 });
 mock.module("../../extensions/skills-manager/dialog.js", () => {
   loaded.push("dialog");
-  return { showSkillsManager: async () => ({ name: "sample" }) };
+  return { showSkillsManager: async () => {
+    if (mode === "dialog-error") throw new Error("dialog failed");
+    return { name: "sample" };
+  } };
 });
 mock.module("../../extensions/skills-manager/registry.js", () => {
   loaded.push("registry");
-  return { loadSkillRegistry: async () => ({ skills: [] }), deleteSkill: async () => undefined };
+  return {
+    loadSkillRegistry: async () => {
+      if (mode === "registry-error") throw new Error("registry failed");
+      return { skills: [] };
+    },
+    deleteSkill: async () => undefined,
+  };
 });
 mock.module("../../extensions/skills-manager/toggle.js", () => {
   loaded.push("toggle");
@@ -71,18 +80,37 @@ if (mode === "disabled") {
 } else {
   // Non-UI calls and command arguments must not load a menu the user cannot open.
   const inserted: string[] = [];
-  const ctx = { cwd: process.cwd(), hasUI: false, ui: { notify() {}, pasteToEditor: (text: string) => inserted.push(text) } } as unknown as ExtensionCommandContext;
+  const notifications: string[] = [];
+  const ctx = {
+    cwd: process.cwd(),
+    hasUI: false,
+    ui: {
+      notify: (message: string) => notifications.push(message),
+      pasteToEditor: (text: string) => inserted.push(text),
+    },
+  } as unknown as ExtensionCommandContext;
   await handler("", ctx);
   await handler("invalid-argument", { ...ctx, hasUI: true });
   assert.deepEqual(loaded, needsStartupPatch ? ["host-sdk"] : []);
+  notifications.length = 0;
 
-  // The first interactive command still opens the manager; later commands reuse the modules.
-  await handler("", { ...ctx, hasUI: true });
-  assert.deepEqual(new Set(loaded.filter((name) => name !== "host-sdk")), new Set(["creation", "dialog", "registry", "toggle"]));
-  assert.deepEqual(inserted, ["/skill:sample\n"]);
-  const count = loaded.length;
-  await handler("", { ...ctx, hasUI: true });
-  assert.equal(loaded.length, count);
+  if (mode === "registry-error") {
+    // Registry failures retain their actionable message instead of looking like import failures.
+    await handler("", { ...ctx, hasUI: true });
+    assert.deepEqual(notifications, ["Failed to load skills list: registry failed"]);
+  } else if (mode === "dialog-error") {
+    // The dialog owns its failures; the lazy import boundary must not relabel or swallow them.
+    await assert.rejects(handler("", { ...ctx, hasUI: true }), /dialog failed/);
+    assert.deepEqual(notifications, []);
+  } else {
+    // The first interactive command still opens the manager; later commands reuse the modules.
+    await handler("", { ...ctx, hasUI: true });
+    assert.deepEqual(new Set(loaded.filter((name) => name !== "host-sdk")), new Set(["creation", "dialog", "registry", "toggle"]));
+    assert.deepEqual(inserted, ["/skill:sample\n"]);
+    const count = loaded.length;
+    await handler("", { ...ctx, hasUI: true });
+    assert.equal(loaded.length, count);
+  }
 
   if (mode === "quiet") {
     // A later session with resources visible still gets startup-list hiding.
