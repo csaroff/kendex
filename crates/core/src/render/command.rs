@@ -1,11 +1,32 @@
-//! A declared command as each harness's own file. Every harness with a
-//! commands directory of its own reads the author's file untouched; the two
-//! that do not — Codex, which retired prompts for skills, and Gemini, which
-//! reads a TOML table — get a generated one.
+//! A declared command as each harness's own file. Native markdown commands
+//! keep the publisher's bytes when no command instructions apply. Codex
+//! converts commands to skills, and Gemini converts them to TOML tables.
+//! Each format carries any applicable command instructions.
+
+use std::borrow::Cow;
 
 use crate::frontmatter::Value;
-use crate::render::agent::GENERATED_BANNER;
+use crate::manifest::Manifest;
+use crate::render::agent::{GENERATED_BANNER, merged_instructions};
 use crate::render::yaml_scalar;
+
+/// The command with the project's `[command-instructions]` for it, the
+/// one input every tool's copy renders from: the block a skill takes,
+/// after the frontmatter and above the publisher's prose, so Gemini's
+/// prompt and Codex's skill carry it once as they carry that prose. With
+/// none configured the publisher's bytes pass through untouched.
+pub fn with_instructions<'a>(bytes: &'a [u8], manifest: &Manifest, name: &str) -> Cow<'a, [u8]> {
+    match merged_instructions(&manifest.command_instructions, name) {
+        None => Cow::Borrowed(bytes),
+        Some(instructions) => Cow::Owned(
+            crate::render::skill::inject_instructions(
+                &String::from_utf8_lossy(bytes),
+                Some(&instructions),
+            )
+            .into_bytes(),
+        ),
+    }
+}
 
 /// The prompt Gemini runs, from the command's prose. A body is written in
 /// Claude's spelling of the argument placeholder, `$ARGUMENTS`, and Gemini
@@ -85,7 +106,9 @@ fn description(front: Option<&str>, prose: &str, name: &str) -> String {
     if let Some(declared) = declared {
         return declared;
     }
-    for line in prose.lines() {
+    // The project's instructions block describes the project, not the
+    // command, so the fallback reads the publisher's prose alone.
+    for line in crate::render::skill::strip_block(prose).lines() {
         let line = line.trim().trim_start_matches('#').trim();
         if !line.is_empty() {
             return line.to_owned();
@@ -101,6 +124,50 @@ mod tests {
     fn described(body: &str, name: &str) -> String {
         let (front, prose) = split(body);
         description(front, prose, name)
+    }
+
+    /// Configured instructions sit above the prose; a command describing
+    /// itself only in prose still says what it does, not the block's marker.
+    #[test]
+    fn the_prose_fallback_skips_the_project_instructions() {
+        let manifest: Manifest = toml::from_str(
+            "schema = 6\n[command-instructions]\nship = \"Keep the merge review.\"\n",
+        )
+        .unwrap();
+        let bytes = with_instructions(b"\n# Ship the branch\n\nSteps.\n", &manifest, "ship");
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(body.contains("Keep the merge review."), "{body}");
+        assert_eq!(described(&body, "ship"), "Ship the branch");
+        let table: toml::Table = gemini(&bytes, "ship").unwrap().parse().unwrap();
+        assert_eq!(table["description"].as_str(), Some("Ship the branch"));
+        assert!(
+            codex_skill("ship", &body, "ship")
+                .starts_with("---\nname: ship\ndescription: Ship the branch\n"),
+            "{body}"
+        );
+    }
+
+    /// YAML closes frontmatter with `...` as well as `---`; the block goes
+    /// after either, so the tool still reads the command's own metadata.
+    #[test]
+    fn instructions_land_after_a_dot_terminated_frontmatter() {
+        let manifest: Manifest = toml::from_str(
+            "schema = 6\n[command-instructions]\nship = \"Keep the merge review.\"\n",
+        )
+        .unwrap();
+        let bytes = with_instructions(
+            b"---\ndescription: Ship it\n...\n\nSteps.\n",
+            &manifest,
+            "ship",
+        );
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(
+            body.starts_with("---\ndescription: Ship it\n...\n"),
+            "{body}"
+        );
+        assert!(body.contains("Keep the merge review."), "{body}");
+        let table: toml::Table = gemini(&bytes, "ship").unwrap().parse().unwrap();
+        assert_eq!(table["description"].as_str(), Some("Ship it"));
     }
 
     #[test]

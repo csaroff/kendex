@@ -13,7 +13,8 @@ use super::desired_kinds::declared;
 use super::targets::disabled_name;
 
 pub(super) fn desired_command(ctx: &ItemCtx, state: &mut DesiredState) -> Result<()> {
-    let bytes = ctx.sealed.read(ctx.item_path)?;
+    let source = ctx.sealed.read(ctx.item_path)?;
+    let bytes = crate::render::command::with_instructions(&source, ctx.manifest, ctx.name);
     for harness in ctx.harnesses.clone() {
         let item = match crate::harness::capabilities(harness, ItemKind::Command).installs_as {
             None => native_file(ctx, state, harness, &bytes)?,
@@ -55,8 +56,9 @@ fn native_file(
     let Some(dir) = native_dir(ctx.env, ctx.scope, harness, ItemKind::Command) else {
         return Ok(None);
     };
-    // Every other harness reads the author's own file, which installs byte
-    // for byte; Gemini reads a table, so its file is generated.
+    // Gemini requires a generated table. Other native command formats keep
+    // the publisher's bytes when no command instructions apply; applicable
+    // instructions are already in bytes before this format conversion.
     let bytes = match harness {
         HarnessId::Gemini => match crate::render::command::gemini(bytes, ctx.name) {
             Ok(text) => text.into_bytes(),

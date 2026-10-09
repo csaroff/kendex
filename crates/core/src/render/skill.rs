@@ -149,7 +149,7 @@ pub fn inject_instructions(skill_md: &str, instructions: Option<&str>) -> String
     }
 }
 
-fn strip_block(text: &str) -> String {
+pub(crate) fn strip_block(text: &str) -> String {
     let Some((start, cut_to)) = instructions_block_range(text) else {
         return text.to_owned();
     };
@@ -163,20 +163,10 @@ fn strip_block(text: &str) -> String {
     format!("{}{}", &text[..cut_from], &text[cut_to..])
 }
 
+/// Where the body starts: after the block [`crate::frontmatter::split`]
+/// reads, whichever terminator closes it, or at 0 where it reads none.
 fn frontmatter_end(text: &str) -> usize {
-    let Some(rest) = text.strip_prefix("---") else {
-        return 0;
-    };
-    match rest.find("\n---") {
-        Some(index) => {
-            let after = 3 + index + 4;
-            text[after..]
-                .find('\n')
-                .map(|n| after + n + 1)
-                .unwrap_or(text.len())
-        }
-        None => 0,
-    }
+    crate::frontmatter::split(text).map_or(0, |(_, body)| text.len() - body.len())
 }
 
 #[cfg(test)]
