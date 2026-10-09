@@ -10,7 +10,6 @@ mkdirSync(agentDir, { recursive: true });
 const loaded: string[] = [];
 const mode = process.argv[2];
 const settings = {
-  quietStartup: mode === "header" ? "header" : mode === "quiet",
   kendex: { extensionManager: { config: { "@vanillagreen/pi-skills-manager": {
     enabled: mode !== "disabled",
     hideStartupSkillsBlock: !["visible", "registry-error", "dialog-error"].includes(mode),
@@ -70,7 +69,7 @@ const pi = {
   events: { on: () => () => {} },
 };
 await skillsManager(pi as unknown as ExtensionAPI);
-const needsStartupPatch = mode === "resources" || mode === "header" || mode === "reload-visible";
+const needsStartupPatch = mode === "resources" || mode === "reload-visible";
 assert.deepEqual(loaded, needsStartupPatch ? ["host-sdk"] : []);
 const handler = commands.get("skill")?.handler;
 assert(handler);
@@ -112,14 +111,6 @@ if (mode === "disabled") {
     assert.equal(loaded.length, count);
   }
 
-  if (mode === "quiet") {
-    // A later session with resources visible still gets startup-list hiding.
-    settings.quietStartup = false;
-    writeFileSync(join(agentDir, "settings.json"), JSON.stringify(settings));
-    clearPackageConfigCache();
-    for (const callback of sessionHandlers) await callback({}, ctx);
-    assert(loaded.includes("host-sdk"));
-  }
 
   if (mode === "reload-visible") {
     const interactiveMode = new MockInteractiveMode();

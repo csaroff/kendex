@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { PACKAGE_ID } from "./constants.js";
-import { clearPackageConfigCache, piSettingsPaths, piUserDir, projectSettingsPath, projectSettingsTrustedForCwd, readPackageConfig, readSettingsFiles } from "./package-config.js";
+import { clearPackageConfigCache, piUserDir, projectSettingsPath, projectSettingsTrustedForCwd, readPackageConfig } from "./package-config.js";
 import { detectExtensionInstallScope } from "./paths.js";
 import type { ExtensionInstallScope, OverlaySize, SettingsFile } from "./types.js";
 
@@ -44,15 +44,6 @@ function packageConfigFromFile(file: SettingsFile): Record<string, unknown> | un
 // and must throw on malformed JSON rather than overwrite it.
 function readkendexConfig(cwd = process.cwd()): Record<string, unknown> {
 	return readPackageConfig(PACKAGE_ID, cwd);
-}
-
-/** Only full quiet startup suppresses the resources list; "header" still shows it. */
-export function piQuietStartup(cwd = process.cwd()): boolean {
-	let quietStartup: unknown;
-	for (const file of readSettingsFiles(piSettingsPaths(cwd))) {
-		if (file.kind === "parsed" && file.settings.quietStartup !== undefined) quietStartup = file.settings.quietStartup;
-	}
-	return quietStartup === true;
 }
 
 export function settingBoolean(key: string, fallback: boolean, cwd = process.cwd()): boolean {

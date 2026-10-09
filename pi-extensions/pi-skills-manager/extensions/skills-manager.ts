@@ -6,9 +6,9 @@
  */
 
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { INSTALL_SYMBOL } from "./skills-manager/constants.js";
+import { INSTALL_SYMBOL, STARTUP_HIDE_ENABLED_SYMBOL } from "./skills-manager/constants.js";
 import { installSettingsCacheRefresh, recordProjectTrust } from "./skills-manager/package-config.js";
-import { piQuietStartup, settingBoolean, updatePackageConfig } from "./skills-manager/settings.js";
+import { settingBoolean, updatePackageConfig } from "./skills-manager/settings.js";
 import type { SkillEntry } from "./skills-manager/types.js";
 
 function errorMessage(error: unknown): string {
@@ -23,15 +23,16 @@ function insertNativeSkillCommand(ctx: ExtensionContext, skill: SkillEntry): voi
 type StartupModule = typeof import("./skills-manager/startup.js");
 let startupModule: StartupModule | undefined;
 
+function setStartupHideEnabled(enabled: boolean): void {
+	(globalThis as unknown as Record<PropertyKey, unknown>)[STARTUP_HIDE_ENABLED_SYMBOL] = enabled;
+}
+
 async function configureStartupSkillsBlock(cwd = process.cwd()): Promise<void> {
 	const hideSkills = settingBoolean("enabled", true, cwd) && settingBoolean("hideStartupSkillsBlock", true, cwd);
-	if (!hideSkills || piQuietStartup(cwd)) {
-		startupModule?.setStartupHideEnabled(false);
-		return;
-	}
+	setStartupHideEnabled(hideSkills);
+	if (!hideSkills) return;
 	startupModule ??= await import("./skills-manager/startup.js");
 	startupModule.patchInteractiveModeStartupSkillsBlock();
-	startupModule.setStartupHideEnabled(true);
 }
 
 export default async function skillsManager(pi: ExtensionAPI): Promise<void> {
@@ -96,24 +97,33 @@ export default async function skillsManager(pi: ExtensionAPI): Promise<void> {
 				ctx.ui.notify("/skill manager requires interactive mode", "warning");
 				return;
 			}
+			let modules;
 			try {
-				const [{ createSkillFromAnswers }, { showSkillsManager }, { deleteSkill, loadSkillRegistry }, { setSkillEnabled }] = await Promise.all([
+				modules = await Promise.all([
 					import("./skills-manager/creation.js"),
 					import("./skills-manager/dialog.js"),
 					import("./skills-manager/registry.js"),
 					import("./skills-manager/toggle.js"),
 				]);
-				const registry = await loadSkillRegistry(ctx.cwd);
-				const selection = await showSkillsManager(ctx, registry, {
-					onCreate: async (answers, signal) => await createSkillFromAnswers(ctx, answers, { thinkingLevel: pi.getThinkingLevel(), signal }),
-					onDelete: async (skill) => await deleteSkill(ctx, skill),
-					onToggle: async (skill, enabled) => await setSkillEnabled(ctx.cwd, skill, enabled),
-					onRefresh: async () => await loadSkillRegistry(ctx.cwd),
-				});
-				if (selection) insertNativeSkillCommand(ctx, selection);
 			} catch (error) {
 				ctx.ui.notify(`Failed to load skills manager: ${errorMessage(error)}`, "error");
+				return;
 			}
+			const [{ createSkillFromAnswers }, { showSkillsManager }, { deleteSkill, loadSkillRegistry }, { setSkillEnabled }] = modules;
+			let registry;
+			try {
+				registry = await loadSkillRegistry(ctx.cwd);
+			} catch (error) {
+				ctx.ui.notify(`Failed to load skills list: ${errorMessage(error)}`, "error");
+				return;
+			}
+			const selection = await showSkillsManager(ctx, registry, {
+				onCreate: async (answers, signal) => await createSkillFromAnswers(ctx, answers, { thinkingLevel: pi.getThinkingLevel(), signal }),
+				onDelete: async (skill) => await deleteSkill(ctx, skill),
+				onToggle: async (skill, enabled) => await setSkillEnabled(ctx.cwd, skill, enabled),
+				onRefresh: async () => await loadSkillRegistry(ctx.cwd),
+			});
+			if (selection) insertNativeSkillCommand(ctx, selection);
 		},
 	});
 

@@ -4,7 +4,7 @@
 
 ### Unreleased
 
-- Pi loads the skills manager's dialog, inventory, toggles, and generation code only when `/skill` opens it. Quiet startup, disabled startup-list hiding, and a disabled manager also avoid loading the host startup patch.
+- Pi loads the skills manager's dialog, inventory, toggles, and generation code only when `/skill` opens it. Disabled startup-list hiding and a disabled manager also avoid loading the host startup patch.
 
 ### 2.0.4
 
