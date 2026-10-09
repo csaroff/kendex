@@ -26,11 +26,17 @@ TMP_ROOT="$(mktemp -d)" || { echo "oversee_succeed: scratch=mktemp-failed" >&2; 
 TMP_ROOT="$(cd -- "$TMP_ROOT" && pwd -P)" || { echo "oversee_succeed: scratch=resolve-failed" >&2; exit 1; }
 SOCK="oversee-succeed-$$"
 cleanup() {
+  [[ ! -f "$TMP_ROOT/work/tmp/oversee-watch.pid" ]] || fixture_watch_stop "$TMP_ROOT/work/tmp/workflow-state-oversee.json" || true
   tmux -L "$SOCK" kill-server 2>/dev/null || true
   [[ -z "${FOREIGN_PID:-}" ]] || kill "$FOREIGN_PID" 2>/dev/null || true
   rm -rf -- "${TMP_ROOT:?}"
 }
 trap cleanup EXIT
+source "$TEST_DIR/lib/watch-fixture.sh"
+QUIET_SCRIPTS="$(mutant_scripts fixture-watch oversee-succeed)" || exit 1
+cp -p -- "$SUCCEED" "$QUIET_SCRIPTS/oversee-succeed"
+SUCCEED="$QUIET_SCRIPTS/oversee-succeed"
+fixture_watch_neighbor "$SUCCEED"
 tm() { tmux -L "$SOCK" "$@"; }
 
 # shellcheck source=lib/assertions.sh
@@ -205,6 +211,7 @@ record_caller() { # SCREEN PANE
 # screens' own. COMMAND is the pane's own command, defaulting to one whose
 # foreground process names no harness.
 new_caller() {
+  fixture_watch_stop "$TMP_ROOT/work/tmp/workflow-state-oversee.json"
   local f="$TMP_ROOT/caller.screen" spec marker="${2:-(fixture@example.com)}"
   local cmd="${3:-cat '$f'; exec sleep 100000}"
   printf '%s\n' "$1" > "$f"
@@ -212,6 +219,7 @@ new_caller() {
   tm move-window -r -t fleet
   spec="$(tm new-window -d -t fleet:1 -c "$TMP_ROOT/work" -P -F '#{pane_id} #{window_id}' "$cmd")"
   read -r CALLER_PANE CALLER_WINDOW <<<"$spec"
+  fixture_watch_predecessor "$SUCCEED" "$TMP_ROOT/work/tmp/workflow-state-oversee.json" "$TMP_ROOT/work" "$CALLER_PANE"
   record_caller "$1" "$CALLER_PANE"
   for _ in 1 2 3 4 5 6 7 8 9 10; do
     [[ "$(tm capture-pane -p -t "$CALLER_PANE")" != *"$marker"* ]] || return 0
@@ -334,6 +342,7 @@ chmod +x "$TMP_ROOT/succeed-env" "$TMP_ROOT/in-pane"
 # exec_succeed ROW PREFERENCE ARGS... — replaces the calling subshell with
 # the script, so a background launch's pid is the script's own.
 exec_succeed() {
+  fixture_watch_neighbor "${SUCCEED_BIN:-$SUCCEED}"
   exec env TMUX="$TMUX_ADDR" TMUX_PANE="$CALLER_PANE" "$TMP_ROOT/succeed-env" "$@"
 }
 
@@ -478,13 +487,14 @@ rm -f "${TMP_ROOT:?}"/argv.*
 spec="$(tm new-window -d -t fleet:3 -P -F '#{pane_id} #{window_id} #{pane_pid}' \
   "exec '$TMP_ROOT/in-pane' success 'claude:fable:high' -- --dangerously-skip-permissions --verbose")"
 read -r CALLER_PANE CALLER_WINDOW caller_pid <<<"$spec"
+fixture_watch_predecessor "$SUCCEED" "$TMP_ROOT/work/tmp/workflow-state-oversee.json" "$TMP_ROOT/work" "$CALLER_PANE"
 record_caller "$MARK" "$CALLER_PANE"
 for _ in $(seq 1 100); do kill -0 "$caller_pid" 2>/dev/null || break; sleep 0.2; done
 # Before the close that ends its own window, the run names the fleet watch it
 # hands to the successor, here that none runs on the fleet state
 # (oversee_succeed_watch.sh holds the handover itself).
-assert_eq "$(layout)|$(caller_open)|$(grep '^oversee-succeed:' "$TMP_ROOT/in-pane.out" | sed 's/window=@[0-9]*/window=@N/; s/pane=%[0-9]*/pane=%N/; s|path=.*/tmp/workflow-state-oversee.json$|path=STATE|' | tr '\n' ';')|$(recorded claude)" \
-  "0 overseer;|no|oversee-succeed: successor-launch form=prefix lane=$H/.claude trust=account-config;${UNOBSERVED_LINE}oversee-succeed: watch-absent path=STATE;oversee-succeed: successor-working window=@N pane=%N;|lane=$H/.claude;-n;overseer;--model;fable;--effort;high;$CLAUDE_COMPACT;--dangerously-skip-permissions;--verbose;$BRIEF;" \
+assert_eq "$(layout)|$(caller_open)|$(grep '^oversee-succeed:' "$TMP_ROOT/in-pane.out" | sed 's/window=@[0-9]*/window=@N/; s/pane=%[0-9]*/pane=%N/; s|path=.*/tmp/workflow-state-oversee.json$|path=STATE|; s/watch-started .*/watch-started/' | tr '\n' ';')|$(recorded claude)" \
+  "0 overseer;|no|oversee-succeed: successor-launch form=prefix lane=$H/.claude trust=account-config;${UNOBSERVED_LINE}oversee-succeed: watch-started;oversee-succeed: successor-working window=@N pane=%N;|lane=$H/.claude;-n;overseer;--model;fable;--effort;high;$CLAUDE_COMPACT;--dangerously-skip-permissions;--verbose;$BRIEF;" \
   "success in the caller's own pane: successor at the base index, caller window gone"
 
 # The record that succession wrote before the successor's first turn, over the
@@ -2907,13 +2917,15 @@ exec "$REAL_TMUX" "\$@"
 SHIM
   chmod +x "$BIN/tmux"
   VIRTUAL_CLOCK=1 SUCCEED_BIN="${2:-$SUCCEED}" succeed_shim "$1" 'claude:fable:high' --wait-secs 1
+  printf '%s\n' "$OUT" > "$TMP_ROOT/lastsecond.out"
+  [[ ! -f "$TMP_ROOT/work/tmp/oversee-watch.err" ]] || cat "$TMP_ROOT/work/tmp/oversee-watch.err" >> "$TMP_ROOT/lastsecond.out"
   rm -f -- "${BIN:?}/tmux" "${TMP_ROOT:?}/selects-late" "${TMP_ROOT:?}/late-gate" "${TMP_ROOT:?}/late-release"
 }
 if observed_row "a deciding read with the budget already spent still looks, and catches the handover"; then
   lastsecond_run lastsecond
   assert_eq "$RC|$(keyed successor-wrong-lane "$OUT" | sed -n 1p)|$(caller_open)|$(overseers)" \
     "1|oversee-succeed: successor-wrong-lane picked=$H/.4claude observed=$H/.claude|yes|0" \
-    "a deciding read with the budget already spent still looks, and catches the handover"
+    "a deciding read with the budget already spent still looks, and catches the handover" "$TMP_ROOT/lastsecond.out"
   # The control: the deciding read handed the raw budget instead of its floor
   # cannot look, so the row above reaches that read with the budget spent.
   NOFLOOR="$(mutant_scripts nofloor lib/overseer-launch.sh)" || exit 1
@@ -2923,7 +2935,7 @@ if observed_row "a deciding read with the budget already spent still looks, and 
   lastsecond_run nofloor "$NOFLOOR/oversee-succeed"
   assert_eq "$RC|$(keyed successor-lane-unobserved "$OUT" | sed -n 1p)" \
     "0|oversee-succeed: successor-lane-unobserved reason=no-settle-budget" \
-    "control: a deciding read handed the raw budget cannot look, and the handover stands"
+    "control: a deciding read handed the raw budget cannot look, and the handover stands" "$TMP_ROOT/lastsecond.out"
 fi
 
 echo "=== an overseer whose ACCOUNT is spent, which reaches none of the marks either ==="

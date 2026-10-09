@@ -215,7 +215,7 @@ assert_eq "$(grep -c "^stopped $OLD\$" "$TMP_ROOT/watch.log")|$(kill -0 "$OLD" 2
   "1|gone" \
   "the watch serving the caller's pane is stopped, once"
 assert_eq "${NEW:+found}|$(started_line "${NEW:-none}")" \
-  "found|pane=$SUCC_PANE origin=succession lane=$H/.claude cwd=$TMP_ROOT/work argv=$WATCH_ARGS --harness claude -- --model fable --effort high --settings={\"env\":{\"DISABLE_AUTO_COMPACT\":\"1\"}} --permission-mode dontAsk --verbose" \
+  "found|pane=$SUCC_PANE origin=succession lane=$H/.claude cwd=$TMP_ROOT/work argv=$WATCH_ARGS --handoff tmp/handoffs/OVERSEER-HANDOFF.md --harness claude -- --model fable --effort high --settings={\"env\":{\"DISABLE_AUTO_COMPACT\":\"1\"}} --permission-mode dontAsk --verbose" \
   "and started again from the successor pane, with the successor's harness, flags and account"
 assert_eq "$(grep -c "^oversee-succeed: watch-restarted pid=$NEW pane=$SUCC_PANE $SETSID_LINE\$" "$WATCH_ERR")|$(grep -c '^started ' "$TMP_ROOT/watch.log")" \
   "1|2" \
@@ -248,20 +248,21 @@ else
   printf '  skip  no systemd user manager answers on this host; the unit handover row did not run\n'
 fi
 
-# No watch runs on the fleet state: nothing is started, and the run says so.
+# A succession with no watch starts one before the caller closes.
 new_caller
 fresh_output
-STARTED="$(grep -c '^started ' "$TMP_ROOT/watch.log")"
 run_succeed
-assert_eq "$RC|$(grep -c '^oversee-succeed: watch-absent path=.*/tmp/workflow-state-oversee.json$' <<<"$OUT")|$(grep -c '^started ' "$TMP_ROOT/watch.log")" \
-  "0|1|$STARTED" \
-  "a fleet with no running watch reports watch-absent and starts none"
+LIVE_RC=0
+watch_pid_live "$FLEET_STATE" || LIVE_RC=$?
+assert_eq "$RC|$LIVE_RC|$WATCH_PANE|$(sed -n 's/^runner=//p' "$WATCH_RUNNER_FILE")" \
+  "0|0|$SUCC_PANE|setsid" "a succession starts a missing repeat watch through the job runner"
+watch_stop "$WATCH_PID" "$FLEET_STATE"
 
 # The suite's one must-fail control: the succession as it stood before the
 # handover, which closes the caller and leaves its watch reading the pane that
 # closed. The line is matched whole, so the mutation lands on that one site.
 UNPATCHED="$(mutant_scripts unpatched oversee-succeed)" || exit 1
-awk '$0 == "      [[ \"$MODE\" != succeed ]] || hand_over_watch ;;" { print "      ;;"; hits++; next } { print }
+awk '$0 == "      hand_over_watch ;;" { print "      ;;"; hits++; next } { print }
      END { if (hits != 1) exit 1 }' "$SUCCEED" > "$UNPATCHED/oversee-succeed" \
   || { echo "fixture: the handover mutant found no single site" >&2; exit 1; }
 new_caller
@@ -283,9 +284,11 @@ restart_helper() {
   new_caller
   fresh_output
   start_watch
+  watch_argv_read "$FLEET_STATE"
   SUCC_PANE="$(tm new-window -d -t fleet:2 -P -F '#{pane_id}' 'exec sleep 100000')"
   ( cd "$TMP_ROOT/work" && env -i HOME="$H" PATH="$NO_MANAGER:$BIN:$PATH" TMUX="$TMUX_ADDR" \
       "${1:-$SUCCEED}" --watch-restart "$FLEET_STATE" "$CALLER_PANE" "$SUCC_PANE" CLAUDE_CONFIG_DIR "$H/.claude" claude \
+      "$WATCH_CWD" "$WATCH_SCRIPT" "${#WATCH_ARGV[@]}" "${WATCH_ARGV[@]}" \
       >>"$WATCH_ERR" 2>&1 </dev/null & )
 }
 restart_helper
@@ -360,10 +363,9 @@ start_watch
 rm -f -- "${TMP_ROOT:?}/work/tmp/oversee-watch.argv"
 STARTED="$(grep -c '^started ' "$TMP_ROOT/watch.log")"
 run_succeed
-wait_failed 100
-assert_eq "$RC|$FAILED_LINE|$(grep -c '^started ' "$TMP_ROOT/watch.log")" \
-  "0|oversee-succeed: watch-restart-failed step=argv pid=$OLD|$STARTED" \
-  "a restart with no recorded command is a notice beside the fleet state, and starts nothing"
+assert_eq "$RC|$(grep -c '^oversee-succeed: watch-restart-failed step=argv ' <<<"$OUT")|$(grep -c '^started ' "$TMP_ROOT/watch.log")" \
+  "1|1|$STARTED" \
+  "a missing recorded command refuses before closing the predecessor"
 watch_stop "$OLD" "$FLEET_STATE" || true
 
 touch "$TMP_ROOT/norecord"
@@ -375,7 +377,7 @@ run_succeed
 wait_failed 300
 rm -f -- "${TMP_ROOT:?}/norecord"
 assert_eq "$RC|$FAILED_LINE|$(grep -c '^started ' "$TMP_ROOT/watch.log")" \
-  "0|oversee-succeed: watch-restart-failed step=start log=$(cd "$TMP_ROOT/work/tmp" && pwd -P)/oversee-watch.err|$STARTED" \
+  "0|oversee-succeed: watch-restart-failed step=claim log=$(cd "$TMP_ROOT/work/tmp" && pwd -P)/oversee-watch.err $SETSID_LINE|$STARTED" \
   "a restarted watch that never records itself is a notice beside the fleet state"
 watch_stop "$OLD" "$FLEET_STATE" || true
 
@@ -394,8 +396,8 @@ if command -v setsid >/dev/null 2>&1; then
   rmdir -- "$RUNNER_PART"
   HELPER_LINE="$(grep '^oversee-succeed: watch-restart-failed step=helper ' <<<"$OUT" || true)"
   assert_eq "$RC|$HELPER_LINE|$(grep -c '^oversee-succeed: watch-handover ' <<<"$OUT")|$(grep -c '^started ' "$TMP_ROOT/watch.log")" \
-    "0|oversee-succeed: watch-restart-failed step=helper pid=$OLD error=record-unwritable path=$(cd "$TMP_ROOT/work/tmp" && pwd -P)/oversee-watch.runner|0|$STARTED" \
-    "a helper the runner refuses is a notice with the runner's error, and no handover or restart"
+    "1|oversee-succeed: watch-restart-failed step=helper pid=$OLD error=record-unwritable path=$(cd "$TMP_ROOT/work/tmp" && pwd -P)/oversee-watch.runner|0|$STARTED" \
+    "a helper the runner refuses stops succession with the runner error"
   watch_stop "$OLD" "$FLEET_STATE" || true
 
   REAL_SETSID="$(command -v setsid)"
@@ -410,7 +412,7 @@ if command -v setsid >/dev/null 2>&1; then
   ROW_PATH="$TMP_ROOT/helper-only" run_succeed
   wait_failed 100
   assert_eq "$RC|$FAILED_LINE|$(grep -c '^started ' "$TMP_ROOT/watch.log")" \
-    "0|oversee-succeed: watch-restart-failed step=start dir=$TMP_ROOT/work error=launch-failed status=1|$STARTED" \
+    "0|oversee-succeed: watch-restart-failed step=start error=launch-failed status=1|$STARTED" \
     "a restart the runner refuses is a notice beside the fleet state with the runner's error, and starts nothing"
   watch_stop "$OLD" "$FLEET_STATE" || true
 else
